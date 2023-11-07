@@ -1,5 +1,7 @@
+use std::mem::replace;
+
 use async_trait::async_trait;
-use http_kit::{Endpoint, Request, Response};
+use http_kit::{Endpoint, Method, Request, Response};
 use hyper::client::HttpConnector;
 use hyper::http;
 
@@ -12,8 +14,9 @@ pub struct HyperBackend {
 
 #[async_trait]
 impl Endpoint for HyperBackend {
-    async fn call_endpoint(&self, request: Request) -> http_kit::Result<Response> {
-        let request: http::Request<http_kit::Body> = request.into();
+    async fn call_endpoint(&self, request: &mut Request) -> http_kit::Result<Response> {
+        let request: http::Request<http_kit::Body> =
+            replace(request, Request::new(Method::GET, "/")).into();
         let request = request.map(|body| hyper::Body::wrap_stream(body));
 
         let response = self.client.request(request).await?;
