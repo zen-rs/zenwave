@@ -24,6 +24,14 @@ pub struct Client<B = DefaultBackend> {
 }
 
 impl<B: ClientBackend> Client<B> {
+    pub fn method<U>(&self, method: Method, uri: U) -> RequestBuilder<B>
+    where
+        U: TryInto<Uri>,
+        U::Error: Debug,
+    {
+        RequestBuilder::new(Request::new(method, uri.try_into().unwrap()), self)
+    }
+
     pub fn cookie(self, cookie: Cookie<'static>) -> Self {
         self.set_cookie(cookie);
         self
@@ -55,7 +63,7 @@ macro_rules! impl_client {
                     U: TryInto<Uri>,
                     U::Error: Debug,
                 {
-                    RequestBuilder::new(Request::new(Method::$method, uri), self)
+                    self.method(Method::$method,uri)
                 }
             )*
         }
