@@ -2,15 +2,14 @@ pub mod backend;
 pub use backend::ClientBackend;
 use backend::HyperBackend;
 
-use bytes::Bytes;
-use bytestr::ByteStr;
 use cookie::{Cookie, CookieJar};
-use http::{HeaderName, HeaderValue};
+use http::HeaderValue;
 use http_kit::{header, Method, Request, Response, Uri};
 use hyper::http;
 use once_cell::sync::Lazy;
 use std::fmt::Debug;
 use std::future::{Future, IntoFuture};
+use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::RwLock;
 
@@ -92,38 +91,18 @@ impl<'a, B: ClientBackend> RequestBuilder<'a, B> {
     fn new(request: Request, client: &'a Client<B>) -> Self {
         Self { request, client }
     }
+}
 
-    fn insert_header(&mut self, name: HeaderName, value: HeaderValue) {
-        self.request.insert_header(name, value);
+impl<'a, B> Deref for RequestBuilder<'a, B> {
+    type Target = Request;
+    fn deref(&self) -> &Self::Target {
+        &self.request
     }
+}
 
-    pub async fn bytes(self) -> http_kit::Result<Bytes> {
-        let mut response = self.await?;
-        Ok(response.take_body()?.into_bytes().await?)
-    }
-
-    pub async fn text(self) -> http_kit::Result<ByteStr> {
-        let mut response = self.await?;
-        Ok(response.take_body()?.into_string().await?)
-    }
-
-    pub async fn json<T: serde::de::DeserializeOwned>(self) -> http_kit::Result<T> {
-        let mut response = self.await?;
-        Ok(response.take_body()?.into_json().await?)
-    }
-
-    pub async fn form<T: serde::de::DeserializeOwned>(self) -> http_kit::Result<T> {
-        let mut response = self.await?;
-        Ok(response.take_body()?.into_form().await?)
-    }
-
-    pub fn header<V>(mut self, name: HeaderName, value: V) -> Self
-    where
-        V: TryInto<HeaderValue>,
-        V::Error: Debug,
-    {
-        self.insert_header(name, value.try_into().unwrap());
-        self
+impl<'a, B> DerefMut for RequestBuilder<'a, B> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.request
     }
 }
 
@@ -188,18 +167,13 @@ static DEFAULT_CLIENT: Lazy<Client> = Lazy::new(|| Client::default());
 
 #[cfg(test)]
 mod test {
-    use http_kit::Request;
-
     use crate::Client;
 
     #[tokio::test]
     async fn example() {
         let client = Client::new();
-        let mut response = client
-            .send(Request::get("http://example.com"))
-            .await
-            .unwrap();
-        let string = response.take_body().unwrap().into_string().await.unwrap();
+        let mut response = client.get("http://example.com").await.unwrap();
+        let string = response.into_string().await.unwrap();
         println!("{}", string);
     }
 }
