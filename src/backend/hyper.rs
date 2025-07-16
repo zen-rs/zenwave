@@ -3,6 +3,7 @@ use std::mem::replace;
 use http_body_util::BodyDataStream;
 use http_kit::{Endpoint, Method, Request, Response};
 use hyper::http;
+use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
@@ -11,7 +12,7 @@ use crate::ClientBackend;
 
 #[derive(Debug)]
 pub struct HyperBackend {
-    client: HyperClient<HttpConnector, http_kit::Body>,
+    client: HyperClient<HttpsConnector<HttpConnector>, http_kit::Body>,
 }
 
 impl Default for HyperBackend {
@@ -22,7 +23,7 @@ impl Default for HyperBackend {
 
 impl HyperBackend {
     pub fn new() -> Self {
-        let client = HyperClient::builder(TokioExecutor::new()).build(HttpConnector::new());
+        let client = HyperClient::builder(TokioExecutor::new()).build(HttpsConnector::new());
 
         Self { client }
     }

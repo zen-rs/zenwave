@@ -8,7 +8,7 @@
 //! - Backend and runtime
 //!
 //! # Quick start
-//! ```
+//! ```rust,no_run
 //! use zenwave::get;
 //! let response = get("https://example.com/").await?;
 //! let text = response.into_string().await?;
@@ -16,6 +16,8 @@
 //! ```
 
 pub mod backend;
+#[cfg(test)]
+mod tests;
 pub use backend::ClientBackend;
 use backend::DefaultBackend;
 pub use client::Client;
