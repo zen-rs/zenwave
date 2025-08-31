@@ -8,7 +8,7 @@ use http_kit::{
 };
 use serde::de::DeserializeOwned;
 
-use crate::{ClientBackend, cookie_store::CookieStore, redirect::FollowRedirect};
+use crate::{ClientBackend, cookie_store::CookieStore, redirect::FollowRedirect, auth::{BearerAuth, BasicAuth}};
 
 pub struct RequestBuilder<'a, T: Client> {
     client: &'a mut T,
@@ -29,6 +29,33 @@ impl<'a, T: Client> IntoFuture for RequestBuilder<'a, T> {
 }
 
 impl<T: Client> RequestBuilder<'_, T> {
+    pub fn bearer_auth(mut self, token: impl Into<String>) -> Self {
+        let auth_value = format!("Bearer {}", token.into());
+        self.request.insert_header(
+            http_kit::header::AUTHORIZATION,
+            auth_value.parse().unwrap(),
+        );
+        self
+    }
+
+    pub fn basic_auth(mut self, username: impl Into<String>, password: Option<impl Into<String>>) -> Self {
+        use base64::Engine;
+        
+        let credentials = match password {
+            Some(p) => format!("{}:{}", username.into(), p.into()),
+            None => format!("{}:", username.into()),
+        };
+        
+        let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
+        let auth_value = format!("Basic {}", encoded);
+        
+        self.request.insert_header(
+            http_kit::header::AUTHORIZATION,
+            auth_value.parse().unwrap(),
+        );
+        self
+    }
+
     pub async fn json<Res: DeserializeOwned>(self) -> Result<Res> {
         let mut response = self.await?;
         response.into_json().await
@@ -61,6 +88,14 @@ pub trait Client: Endpoint + Sized {
 
     fn enable_cookie(self) -> impl Client {
         WithMiddleware::new(self, CookieStore::default())
+    }
+
+    fn bearer_auth(self, token: impl Into<String>) -> impl Client {
+        WithMiddleware::new(self, BearerAuth::new(token))
+    }
+
+    fn basic_auth(self, username: impl Into<String>, password: Option<impl Into<String>>) -> impl Client {
+        WithMiddleware::new(self, BasicAuth::new(username, password))
     }
 
     fn method<U>(&mut self, method: Method, uri: U) -> RequestBuilder<'_, Self>

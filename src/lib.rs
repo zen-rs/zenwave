@@ -1,18 +1,21 @@
 //! # Ergonomic HTTP client framework
-//! Zenwave is an ergonomic, and full-featured HTTP client framework.
+//! Zenwave is an ergonomic HTTP client framework.
 //! It has a lot of features:
 //! - Follow redirect
 //! - Cookie store
+//! - Bearer and Basic authentication
 //! - Powerful middleware system (Add features you need!)
 //! - Streaming body transfer
-//! - Backend and runtime
 //!
 //! # Quick start
 //! ```rust,no_run
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! use zenwave::get;
-//! let response = get("https://example.com/").await?;
+//! let mut response = get("https://example.com/").await?;
 //! let text = response.into_string().await?;
 //! println!("{text}");
+//! # Ok(())
+//! # }
 //! ```
 
 pub mod backend;
@@ -23,10 +26,11 @@ use backend::DefaultBackend;
 pub use client::Client;
 pub use http_kit::*;
 
-pub(crate) mod cookie_store;
+pub mod auth;
+pub mod cookie_store;
 
 mod client;
-pub(crate) mod redirect;
+pub mod redirect;
 
 pub fn client() -> DefaultBackend {
     DefaultBackend::default()

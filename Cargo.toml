@@ -10,6 +10,7 @@ license = "MIT"
 http-kit = { version = "0.1.2", features = ["http_body"]}
 executor-core = { version = "0.1.0" }
 serde = { version = "1.0", default-features = false}
+base64 = "0.22"
 
 # Dependencies for hyper backend
 
@@ -34,6 +35,7 @@ hyper-tls = "0.6.0"
 
 [dev-dependencies]
 tokio = { version = "1.45", features = ["macros", "rt"] }
+serde_json = "1.0"
 
 [features]
 default = ["hyper-backend", "web-backend"]

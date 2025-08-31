@@ -1,3 +1,11 @@
+mod auth_tests;
+mod client_tests;
+mod convenience_tests;
+mod backend_tests;
+mod middleware_tests;
+mod error_tests;
+mod integration_tests;
+
 use crate::{Client, client};
 
 #[tokio::test]
