@@ -24,7 +24,7 @@ async fn test_user_agent_header() {
 #[tokio::test]
 async fn test_custom_headers() {
     let mut client = client();
-    let mut response = client.get("https://httpbin.org/headers").await.unwrap();
+    let response = client.get("https://httpbin.org/headers").await.unwrap();
     let text = response.into_body().into_string().await.unwrap();
 
     // Should contain header information
@@ -67,7 +67,7 @@ async fn test_large_response() {
     // Test handling of larger responses
     let response = get("https://httpbin.org/base64/aGVsbG8gd29ybGQ=").await;
     assert!(response.is_ok());
-    let mut response = response.unwrap();
+    let response = response.unwrap();
     let body = response.into_body().into_bytes().await;
     assert!(body.is_ok());
     let bytes = body.unwrap();
@@ -79,7 +79,7 @@ async fn test_gzip_compression() {
     // httpbin.org supports gzip compression
     let response = get("https://httpbin.org/gzip").await;
     assert!(response.is_ok());
-    let mut response = response.unwrap();
+    let response = response.unwrap();
     let bytes = response.into_body().into_bytes().await.unwrap();
     // Should get some response data (gzipped content is handled by the HTTP client)
     assert!(!bytes.is_empty());
@@ -97,7 +97,7 @@ async fn test_cookie_persistence() {
         .unwrap();
 
     // Verify cookie is sent in subsequent request
-    let mut response = client.get("https://httpbin.org/cookies").await.unwrap();
+    let response = client.get("https://httpbin.org/cookies").await.unwrap();
     let body = response.into_body().into_string().await.unwrap();
     assert!(body.contains("test"));
     assert!(body.contains("cookievalue"));

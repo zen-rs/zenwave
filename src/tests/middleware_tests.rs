@@ -16,7 +16,7 @@ async fn test_cookie_store_middleware() {
     let response = client.get("https://httpbin.org/cookies").await;
     assert!(response.is_ok());
     
-    let mut response = response.unwrap();
+    let response = response.unwrap();
     let body = response.into_body().into_string().await.unwrap();
     assert!(body.contains("test"));
     assert!(body.contains("value"));
@@ -111,7 +111,7 @@ async fn test_middleware_with_custom_middleware() {
     let response = client.get("https://httpbin.org/headers").await;
     assert!(response.is_ok());
     
-    let mut response = response.unwrap();
+    let response = response.unwrap();
     let body = response.into_body().into_string().await.unwrap();
     assert!(body.contains("X-Test"));
     assert!(body.contains("middleware-test"));

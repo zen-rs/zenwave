@@ -1,9 +1,7 @@
 use std::mem::replace;
 
-use http_body_util::{BodyDataStream, BodyExt};
-use http_kit::utils::StreamExt;
+use http_body_util::BodyDataStream;
 use http_kit::{Endpoint, Method, Request, Response};
-use hyper::body::Bytes;
 use hyper::http;
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client as HyperClient;
@@ -46,17 +44,6 @@ impl Endpoint for HyperBackend {
             let stream = BodyDataStream::new(body);
             http_kit::Body::from_stream(stream)
         });
-
-        if response.status().is_client_error() || response.status().is_server_error() {
-            let status = response.status();
-            let bytes: Vec<Bytes> = response.into_data_stream().try_collect().await?;
-            let bytes = bytes.concat();
-
-            return Err(
-                http_kit::Error::msg(String::from_utf8_lossy(&bytes).into_owned())
-                    .set_status(status),
-            );
-        }
 
         Ok(response)
     }
