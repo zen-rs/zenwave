@@ -7,9 +7,10 @@ description = "Ergonomic HTTP client framework."
 license = "MIT"
 
 [dependencies]
-http-kit = { version = "0.1.2", features = ["http_body"]}
+http-kit = { version = "0.2.0", path = "../http-kit"}
 executor-core = { version = "0.1.0" }
-serde = { version = "1.0", default-features = false}
+serde = { version = "1.0", default-features = false, features = ["derive"]}
+serde_json = "1.0"
 base64 = "0.22"
 
 # Dependencies for hyper backend

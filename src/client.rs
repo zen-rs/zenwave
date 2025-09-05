@@ -1,5 +1,5 @@
 use core::pin::Pin;
-use std::fmt::Debug;
+use std::{fmt::Debug, future::Future};
 
 use http_kit::{
     Endpoint, Method, Middleware, Request, Response, Result, Uri,
@@ -8,7 +8,12 @@ use http_kit::{
 };
 use serde::de::DeserializeOwned;
 
-use crate::{ClientBackend, cookie_store::CookieStore, redirect::FollowRedirect, auth::{BearerAuth, BasicAuth}};
+use crate::{
+    ClientBackend,
+    auth::{BasicAuth, BearerAuth},
+    cookie_store::CookieStore,
+    redirect::FollowRedirect,
+};
 
 pub struct RequestBuilder<'a, T: Client> {
     client: &'a mut T,
@@ -31,49 +36,81 @@ impl<'a, T: Client> IntoFuture for RequestBuilder<'a, T> {
 impl<T: Client> RequestBuilder<'_, T> {
     pub fn bearer_auth(mut self, token: impl Into<String>) -> Self {
         let auth_value = format!("Bearer {}", token.into());
-        self.request.insert_header(
-            http_kit::header::AUTHORIZATION,
-            auth_value.parse().unwrap(),
-        );
+        self.request
+            .headers_mut()
+            .insert(http_kit::header::AUTHORIZATION, auth_value.parse().unwrap());
         self
     }
 
-    pub fn basic_auth(mut self, username: impl Into<String>, password: Option<impl Into<String>>) -> Self {
+    pub fn basic_auth(
+        mut self,
+        username: impl Into<String>,
+        password: Option<impl Into<String>>,
+    ) -> Self {
         use base64::Engine;
-        
+
         let credentials = match password {
             Some(p) => format!("{}:{}", username.into(), p.into()),
             None => format!("{}:", username.into()),
         };
-        
+
         let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
         let auth_value = format!("Basic {}", encoded);
-        
-        self.request.insert_header(
-            http_kit::header::AUTHORIZATION,
-            auth_value.parse().unwrap(),
-        );
+
+        self.request
+            .headers_mut()
+            .insert(http_kit::header::AUTHORIZATION, auth_value.parse().unwrap());
         self
     }
 
     pub async fn json<Res: DeserializeOwned>(self) -> Result<Res> {
-        let mut response = self.await?;
-        response.into_json().await
+        let response = self.await?;
+        let mut body = response.into_body();
+        body.into_json().await.map_err(|e| http_kit::Error::new(e, http_kit::StatusCode::BAD_REQUEST))
     }
 
     pub async fn string(self) -> Result<ByteStr> {
-        let mut response = self.await?;
-        Ok(response.into_string().await?)
+        let response = self.await?;
+        let body = response.into_body();
+        Ok(body.into_string().await?)
     }
 
     pub async fn bytes(self) -> Result<Bytes> {
-        let mut response = self.await?;
-        Ok(response.into_bytes().await?)
+        let response = self.await?;
+        let body = response.into_body();
+        Ok(body.into_bytes().await?)
     }
 
     pub async fn form<Res: DeserializeOwned>(self) -> Result<Res> {
-        let mut response = self.await?;
-        response.into_form().await
+        let response = self.await?;
+        let mut body = response.into_body();
+        body.into_form().await.map_err(|e| http_kit::Error::new(e, http_kit::StatusCode::BAD_REQUEST))
+    }
+
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        let header_name: http_kit::header::HeaderName = name.into().parse().unwrap();
+        let header_value: http_kit::header::HeaderValue = value.into().parse().unwrap();
+        self.request
+            .headers_mut()
+            .insert(header_name, header_value);
+        self
+    }
+
+    pub fn json_body<B: serde::Serialize>(mut self, body: &B) -> Result<Self> {
+        let json = serde_json::to_string(body)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize JSON: {}", e))?;
+
+        // Set the body directly
+        *self.request.body_mut() = http_kit::Body::from(json);
+        
+        // Add content-type header
+        let content_type: http_kit::header::HeaderName = "content-type".parse().unwrap();
+        let json_type: http_kit::header::HeaderValue = "application/json".parse().unwrap();
+        self.request
+            .headers_mut()
+            .insert(content_type, json_type);
+        
+        Ok(self)
     }
 }
 
@@ -94,7 +131,11 @@ pub trait Client: Endpoint + Sized {
         WithMiddleware::new(self, BearerAuth::new(token))
     }
 
-    fn basic_auth(self, username: impl Into<String>, password: Option<impl Into<String>>) -> impl Client {
+    fn basic_auth(
+        self,
+        username: impl Into<String>,
+        password: Option<impl Into<String>>,
+    ) -> impl Client {
         WithMiddleware::new(self, BasicAuth::new(username, password))
     }
 
@@ -103,9 +144,16 @@ pub trait Client: Endpoint + Sized {
         U: TryInto<Uri> + Send + Sync,
         U::Error: Debug,
     {
+        let uri = uri.try_into().unwrap();
+        let request = http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(http_kit::Body::empty())
+            .unwrap();
+        
         RequestBuilder {
             client: self,
-            request: Request::new(method, uri),
+            request,
         }
     }
 

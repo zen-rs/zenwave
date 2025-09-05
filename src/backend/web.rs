@@ -86,7 +86,7 @@ fn fetch(
         let request_init = web_sys::RequestInit::new();
         request_init.set_method(request.method().as_str());
         let headers = web_sys::Headers::new().unwrap();
-        let body = request.take_body()?.map(|result| {
+        let body = std::mem::replace(request.body_mut(), http_kit::Body::empty()).map(|result| {
             result
                 .map(|chunk| {
                     let chunk: Box<[u8]> = chunk.to_vec().into_boxed_slice();
@@ -152,6 +152,6 @@ fn fetch(
 
         *response.headers_mut() = headers;
         *response.status_mut() = status;
-        Ok(response.into())
+        Ok(response)
     })
 }

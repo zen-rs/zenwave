@@ -17,7 +17,7 @@ async fn test_cookie_store_middleware() {
     assert!(response.is_ok());
     
     let mut response = response.unwrap();
-    let body = response.into_string().await.unwrap();
+    let body = response.into_body().into_string().await.unwrap();
     assert!(body.contains("test"));
     assert!(body.contains("value"));
 }
@@ -98,7 +98,9 @@ async fn test_middleware_with_custom_middleware() {
             mut next: impl Endpoint
         ) -> http_kit::Result<http_kit::Response> {
             // Add a custom header
-            request.insert_header("X-Test".parse().unwrap(), "middleware-test".parse().unwrap());
+            let header_name: http_kit::header::HeaderName = "X-Test".parse().unwrap();
+            let header_value: http_kit::header::HeaderValue = "middleware-test".parse().unwrap();
+            request.headers_mut().insert(header_name, header_value);
             next.respond(request).await
         }
     }
@@ -110,7 +112,7 @@ async fn test_middleware_with_custom_middleware() {
     assert!(response.is_ok());
     
     let mut response = response.unwrap();
-    let body = response.into_string().await.unwrap();
+    let body = response.into_body().into_string().await.unwrap();
     assert!(body.contains("X-Test"));
     assert!(body.contains("middleware-test"));
 }

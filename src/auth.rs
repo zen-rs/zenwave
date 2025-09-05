@@ -16,9 +16,9 @@ impl BearerAuth {
 impl Middleware for BearerAuth {
     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
         // Only add auth header if one isn't already present
-        if request.get_header(header::AUTHORIZATION).is_none() {
+        if !request.headers().contains_key(header::AUTHORIZATION) {
             let auth_value = format!("Bearer {}", self.token);
-            request.insert_header(
+            request.headers_mut().insert(
                 header::AUTHORIZATION,
                 auth_value.parse().unwrap(),
             );
@@ -46,7 +46,7 @@ impl BasicAuth {
 impl Middleware for BasicAuth {
     async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
         // Only add auth header if one isn't already present
-        if request.get_header(header::AUTHORIZATION).is_none() {
+        if !request.headers().contains_key(header::AUTHORIZATION) {
             use base64::Engine;
             
             let credentials = match &self.password {
@@ -57,7 +57,7 @@ impl Middleware for BasicAuth {
             let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
             let auth_value = format!("Basic {}", encoded);
             
-            request.insert_header(
+            request.headers_mut().insert(
                 header::AUTHORIZATION,
                 auth_value.parse().unwrap(),
             );

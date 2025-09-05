@@ -11,8 +11,8 @@
 //! ```rust,no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! use zenwave::get;
-//! let mut response = get("https://example.com/").await?;
-//! let text = response.into_string().await?;
+//! let response = get("https://example.com/").await?;
+//! let text = response.into_body().into_string().await?;
 //! println!("{text}");
 //! # Ok(())
 //! # }

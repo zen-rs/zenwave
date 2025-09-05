@@ -1,4 +1,4 @@
-use http_kit::{Endpoint, Method, Request};
+use http_kit::{Endpoint, Method};
 use crate::backend::{HyperBackend, ClientBackend};
 
 #[tokio::test]
@@ -17,7 +17,11 @@ async fn test_hyper_backend_default() {
 #[tokio::test]
 async fn test_hyper_backend_get_request() {
     let mut backend = HyperBackend::new();
-    let mut request = Request::new(Method::GET, "https://httpbin.org/get");
+    let mut request = http::Request::builder()
+        .method(Method::GET)
+        .uri("https://httpbin.org/get")
+        .body(http_kit::Body::empty())
+        .unwrap();
     let response = backend.respond(&mut request).await;
     assert!(response.is_ok());
     let response = response.unwrap();
@@ -27,7 +31,11 @@ async fn test_hyper_backend_get_request() {
 #[tokio::test]
 async fn test_hyper_backend_post_request() {
     let mut backend = HyperBackend::new();
-    let mut request = Request::new(Method::POST, "https://httpbin.org/post");
+    let mut request = http::Request::builder()
+        .method(Method::POST)
+        .uri("https://httpbin.org/post")
+        .body(http_kit::Body::empty())
+        .unwrap();
     let response = backend.respond(&mut request).await;
     assert!(response.is_ok());
     let response = response.unwrap();
@@ -37,7 +45,11 @@ async fn test_hyper_backend_post_request() {
 #[tokio::test]
 async fn test_hyper_backend_https_request() {
     let mut backend = HyperBackend::new();
-    let mut request = Request::new(Method::GET, "https://httpbin.org/get");
+    let mut request = http::Request::builder()
+        .method(Method::GET)
+        .uri("https://httpbin.org/get")
+        .body(http_kit::Body::empty())
+        .unwrap();
     let response = backend.respond(&mut request).await;
     assert!(response.is_ok());
     let response = response.unwrap();
@@ -47,7 +59,11 @@ async fn test_hyper_backend_https_request() {
 #[tokio::test]
 async fn test_hyper_backend_invalid_uri() {
     let mut backend = HyperBackend::new();
-    let mut request = Request::new(Method::GET, "invalid-uri");
+    let mut request = http::Request::builder()
+        .method(Method::GET)
+        .uri("invalid-uri")
+        .body(http_kit::Body::empty())
+        .unwrap();
     let response = backend.respond(&mut request).await;
     assert!(response.is_err());
 }

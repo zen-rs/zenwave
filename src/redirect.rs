@@ -27,7 +27,8 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
         // Follow redirects up to MAX_REDIRECTS times
         while current_response.status().is_redirection() && redirect_count < MAX_REDIRECTS {
             let location = current_response
-                .get_header(LOCATION)
+                .headers()
+                .get(LOCATION)
                 .ok_or(http_kit::Error::msg("Missing Location header"))?
                 .to_str()
                 .status(StatusCode::BAD_REQUEST)?;

@@ -66,8 +66,8 @@ async fn test_basic_auth_no_password() {
         .await;
     
     assert!(response.is_ok());
-    let mut response = response.unwrap();
-    let body = response.into_string().await.unwrap();
+    let response = response.unwrap();
+    let body = response.into_body().into_string().await.unwrap();
     
     // Check that the Authorization header is present
     assert!(body.contains("Authorization"));
@@ -94,13 +94,13 @@ async fn test_auth_headers_sent() {
     let mut client = client();
     
     // Test that Bearer auth header is correctly sent
-    let mut response = client
+    let response = client
         .get("https://httpbin.org/headers")
         .bearer_auth("secret-token")
         .await
         .unwrap();
     
-    let body = response.into_string().await.unwrap();
+    let body = response.into_body().into_string().await.unwrap();
     assert!(body.contains("Bearer secret-token"));
 }
 
@@ -109,13 +109,13 @@ async fn test_basic_auth_encoding() {
     let mut client = client();
     
     // Test Basic auth encoding
-    let mut response = client
+    let response = client
         .get("https://httpbin.org/headers")
         .basic_auth("testuser", Some("testpass"))
         .await
         .unwrap();
     
-    let body = response.into_string().await.unwrap();
+    let body = response.into_body().into_string().await.unwrap();
     // The base64 encoding of "testuser:testpass" should be present
     assert!(body.contains("Basic"));
 }
@@ -129,8 +129,8 @@ async fn test_multiple_auth_requests() {
     for _ in 0..3 {
         let response = client.get("https://httpbin.org/headers").await;
         assert!(response.is_ok());
-        let mut response = response.unwrap();
-        let body = response.into_string().await.unwrap();
+        let response = response.unwrap();
+        let body = response.into_body().into_string().await.unwrap();
         assert!(body.contains("Bearer persistent-token"));
     }
 }
@@ -156,13 +156,13 @@ async fn test_override_auth_per_request() {
     let mut client = client;
     
     // The per-request auth should override the middleware auth
-    let mut response = client
+    let response = client
         .get("https://httpbin.org/headers")
         .bearer_auth("override-token")
         .await
         .unwrap();
     
-    let body = response.into_string().await.unwrap();
+    let body = response.into_body().into_string().await.unwrap();
     // Should contain the override token, not the default one
     assert!(body.contains("Bearer override-token"));
 }

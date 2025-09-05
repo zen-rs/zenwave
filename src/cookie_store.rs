@@ -18,14 +18,14 @@ impl Middleware for CookieStore {
             .collect::<Vec<_>>()
             .join(";");
 
-        request.insert_header(
+        request.headers_mut().insert(
             header::COOKIE,
             HeaderValue::from_maybe_shared(cookie_header).status(StatusCode::BAD_REQUEST)?,
         );
 
         let res = next.respond(request).await?;
 
-        for set_cookie in res.get_headers(header::SET_COOKIE) {
+        for set_cookie in res.headers().get_all(header::SET_COOKIE) {
             let set_cookie = set_cookie.to_str().status(StatusCode::BAD_REQUEST)?;
             let cookie = set_cookie
                 .parse::<Cookie>()

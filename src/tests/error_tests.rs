@@ -1,4 +1,4 @@
-use crate::{get, client, Client};
+use crate::{Client, client, get};
 use http_kit::Method;
 
 #[tokio::test]
@@ -39,7 +39,7 @@ async fn test_timeout_behavior() {
 #[tokio::test]
 async fn test_json_parsing_error() {
     use serde_json::Value;
-    
+
     let mut client = client();
     // Get plain text and try to parse as JSON
     let result: Result<Value, _> = client.get("https://httpbin.org/html").json().await;
@@ -77,11 +77,11 @@ async fn test_method_construction_with_invalid_uri() {
 async fn test_empty_response_handling() {
     let result = get("https://httpbin.org/status/204").await;
     assert!(result.is_ok());
-    let mut response = result.unwrap();
+    let response = result.unwrap();
     assert_eq!(response.status().as_u16(), 204);
-    
+
     // Getting the body of a 204 should work (empty body)
-    let body = response.into_string().await;
+    let body = response.into_body().into_string().await;
     assert!(body.is_ok());
     let body_str = body.unwrap();
     assert!(body_str.is_empty());

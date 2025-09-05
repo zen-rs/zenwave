@@ -1,4 +1,4 @@
-use crate::{get, post, put, delete};
+use crate::{delete, get, post, put};
 
 #[tokio::test]
 async fn test_convenience_get() {
@@ -40,8 +40,8 @@ async fn test_convenience_get_invalid_uri() {
 
 #[tokio::test]
 async fn test_convenience_get_response_text() {
-    let mut response = get("https://httpbin.org/get").await.unwrap();
-    let text = response.into_string().await;
+    let response = get("https://httpbin.org/get").await.unwrap();
+    let text = response.into_body().into_string().await;
     assert!(text.is_ok());
     let text = text.unwrap();
     assert!(!text.is_empty());
@@ -51,9 +51,9 @@ async fn test_convenience_get_response_text() {
 #[tokio::test]
 async fn test_convenience_get_response_json() {
     use serde_json::Value;
-    
-    let mut response = get("https://httpbin.org/json").await.unwrap();
-    let json: Result<Value, _> = response.into_json().await;
+
+    let response = get("https://httpbin.org/json").await.unwrap();
+    let json: Result<Value, _> = response.into_body().into_json().await;
     assert!(json.is_ok());
     let json = json.unwrap();
     assert!(json.is_object());
