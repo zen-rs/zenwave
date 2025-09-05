@@ -4,6 +4,7 @@ use std::{fmt::Debug, future::Future};
 use http_kit::{
     Endpoint, Method, Middleware, Request, Response, Result, Uri,
     endpoint::WithMiddleware,
+    sse::SseStream,
     utils::{ByteStr, Bytes},
 };
 use serde::de::DeserializeOwned;
@@ -66,7 +67,9 @@ impl<T: Client> RequestBuilder<'_, T> {
     pub async fn json<Res: DeserializeOwned>(self) -> Result<Res> {
         let response = self.await?;
         let mut body = response.into_body();
-        body.into_json().await.map_err(|e| http_kit::Error::new(e, http_kit::StatusCode::BAD_REQUEST))
+        body.into_json()
+            .await
+            .map_err(|e| http_kit::Error::new(e, http_kit::StatusCode::BAD_REQUEST))
     }
 
     pub async fn string(self) -> Result<ByteStr> {
@@ -84,15 +87,21 @@ impl<T: Client> RequestBuilder<'_, T> {
     pub async fn form<Res: DeserializeOwned>(self) -> Result<Res> {
         let response = self.await?;
         let mut body = response.into_body();
-        body.into_form().await.map_err(|e| http_kit::Error::new(e, http_kit::StatusCode::BAD_REQUEST))
+        body.into_form()
+            .await
+            .map_err(|e| http_kit::Error::new(e, http_kit::StatusCode::BAD_REQUEST))
+    }
+
+    pub async fn sse(self) -> Result<SseStream> {
+        let response = self.await?;
+        let body = response.into_body();
+        Ok(body.into_sse())
     }
 
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         let header_name: http_kit::header::HeaderName = name.into().parse().unwrap();
         let header_value: http_kit::header::HeaderValue = value.into().parse().unwrap();
-        self.request
-            .headers_mut()
-            .insert(header_name, header_value);
+        self.request.headers_mut().insert(header_name, header_value);
         self
     }
 
@@ -102,14 +111,12 @@ impl<T: Client> RequestBuilder<'_, T> {
 
         // Set the body directly
         *self.request.body_mut() = http_kit::Body::from(json);
-        
+
         // Add content-type header
         let content_type: http_kit::header::HeaderName = "content-type".parse().unwrap();
         let json_type: http_kit::header::HeaderValue = "application/json".parse().unwrap();
-        self.request
-            .headers_mut()
-            .insert(content_type, json_type);
-        
+        self.request.headers_mut().insert(content_type, json_type);
+
         Ok(self)
     }
 }
@@ -150,7 +157,7 @@ pub trait Client: Endpoint + Sized {
             .uri(uri)
             .body(http_kit::Body::empty())
             .unwrap();
-        
+
         RequestBuilder {
             client: self,
             request,
