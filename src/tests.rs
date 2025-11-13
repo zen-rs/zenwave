@@ -1,10 +1,10 @@
 mod auth_tests;
+mod backend_tests;
 mod client_tests;
 mod convenience_tests;
-mod backend_tests;
-mod middleware_tests;
 mod error_tests;
 mod integration_tests;
+mod middleware_tests;
 
 use crate::{Client, client};
 

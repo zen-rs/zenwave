@@ -1,5 +1,5 @@
+use crate::backend::{ClientBackend, HyperBackend};
 use http_kit::{Endpoint, Method};
-use crate::backend::{HyperBackend, ClientBackend};
 
 #[tokio::test]
 async fn test_hyper_backend_creation() {

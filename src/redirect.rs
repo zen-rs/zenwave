@@ -19,11 +19,11 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
         // Store the original URI before it gets modified by the backend
         let original_uri = request.uri().clone();
         let original_method = request.method().clone();
-        
+
         let mut current_response = self.client.respond(request).await?;
         let mut redirect_count = 0;
         const MAX_REDIRECTS: u32 = 10;
-        
+
         // Follow redirects up to MAX_REDIRECTS times
         while current_response.status().is_redirection() && redirect_count < MAX_REDIRECTS {
             let location = current_response
@@ -32,7 +32,7 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
                 .ok_or(http_kit::Error::msg("Missing Location header"))?
                 .to_str()
                 .status(StatusCode::BAD_REQUEST)?;
-                
+
             // According to RFC 9110
             let method = match current_response.status() {
                 StatusCode::MULTIPLE_CHOICES | StatusCode::FOUND | StatusCode::SEE_OTHER => {
@@ -40,14 +40,16 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
                 }
                 _ => original_method.clone(),
             };
-            
+
             // Handle relative URLs by resolving against the original request URI
-            let redirect_uri = if location.starts_with("http://") || location.starts_with("https://") {
+            let redirect_uri = if location.starts_with("http://")
+                || location.starts_with("https://")
+            {
                 location.to_string()
             } else {
                 // For relative URLs, use the same scheme and host as the original request
                 let base_uri = original_uri.to_string();
-                
+
                 if let Some(scheme_end) = base_uri.find("://") {
                     let after_scheme = scheme_end + 3;
                     let path_start = base_uri[after_scheme..].find("/").map(|i| i + after_scheme);
@@ -61,15 +63,15 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
                     location.to_string()
                 }
             };
-            
+
             current_response = self.client.method(method, redirect_uri).await?;
             redirect_count += 1;
         }
-        
+
         if redirect_count >= MAX_REDIRECTS {
             return Err(http_kit::Error::msg("Too many redirects"));
         }
-        
+
         Ok(current_response)
     }
 }

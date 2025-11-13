@@ -1,5 +1,5 @@
-use http_kit::Method;
 use crate::{Client, client};
+use http_kit::Method;
 
 #[tokio::test]
 async fn test_client_get_method() {
@@ -73,7 +73,7 @@ async fn test_request_builder_bytes() {
 #[tokio::test]
 async fn test_request_builder_json() {
     use serde_json::Value;
-    
+
     let mut client = client();
     let response_json: Result<Value, _> = client.get("https://httpbin.org/json").json().await;
     assert!(response_json.is_ok());
@@ -85,9 +85,11 @@ async fn test_request_builder_json() {
 async fn test_client_with_middleware() {
     let client = client().enable_cookie();
     let mut client = client;
-    let response = client.get("https://httpbin.org/cookies/set/test/value").await;
+    let response = client
+        .get("https://httpbin.org/cookies/set/test/value")
+        .await;
     assert!(response.is_ok());
-    
+
     // Follow up request should include cookie
     let response2 = client.get("https://httpbin.org/cookies").await;
     assert!(response2.is_ok());
@@ -103,7 +105,7 @@ async fn test_client_follow_redirect() {
     assert!(response.status().is_success());
 }
 
-#[tokio::test] 
+#[tokio::test]
 async fn test_invalid_uri() {
     let mut client = client();
     let response = client.get("invalid-uri").await;
