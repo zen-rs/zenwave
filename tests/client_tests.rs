@@ -1,5 +1,7 @@
-use crate::{Client, client};
+//! Tests for client functionality
+
 use http_kit::Method;
+use zenwave::{Client, client};
 
 #[tokio::test]
 async fn test_client_get_method() {

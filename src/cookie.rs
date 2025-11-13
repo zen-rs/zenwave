@@ -1,9 +1,12 @@
+//! Middleware for managing cookies in HTTP requests and responses.
+
 use crate::header;
 use crate::{Endpoint, Middleware, Request, Response, Result};
 use http_kit::cookie::{Cookie, CookieJar};
 use http_kit::header::HeaderValue;
 use http_kit::{ResultExt, StatusCode};
 
+/// Middleware for managing cookies in HTTP requests and responses.
 #[derive(Debug, Default)]
 pub struct CookieStore {
     store: CookieJar,

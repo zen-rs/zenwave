@@ -12,10 +12,12 @@ use serde::de::DeserializeOwned;
 use crate::{
     ClientBackend,
     auth::{BasicAuth, BearerAuth},
-    cookie_store::CookieStore,
+    cookie::CookieStore,
     redirect::FollowRedirect,
 };
 
+/// Builder for HTTP requests using a Client.
+#[derive(Debug)]
 pub struct RequestBuilder<'a, T: Client> {
     client: &'a mut T,
     request: Request,
@@ -56,7 +58,7 @@ impl<T: Client> RequestBuilder<'_, T> {
         };
 
         let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
-        let auth_value = format!("Basic {}", encoded);
+        let auth_value = format!("Basic {encoded}");
 
         self.request
             .headers_mut()
@@ -107,7 +109,7 @@ impl<T: Client> RequestBuilder<'_, T> {
 
     pub fn json_body<B: serde::Serialize>(mut self, body: &B) -> Result<Self> {
         let json = serde_json::to_string(body)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize JSON: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to serialize JSON: {e}"))?;
 
         // Set the body directly
         *self.request.body_mut() = http_kit::Body::from(json);
@@ -121,23 +123,29 @@ impl<T: Client> RequestBuilder<'_, T> {
     }
 }
 
+/// Trait representing an HTTP client with middleware support.
 pub trait Client: Endpoint + Sized {
+    /// Add middleware to the client.
     fn with(self, middleware: impl Middleware) -> impl Client {
         WithMiddleware::new(self, middleware)
     }
 
+    /// Enable automatic redirect following.
     fn follow_redirect(self) -> impl Client {
         FollowRedirect::new(self)
     }
 
+    /// Enable cookie management.
     fn enable_cookie(self) -> impl Client {
         WithMiddleware::new(self, CookieStore::default())
     }
 
+    /// Add Bearer Token Authentication middleware.
     fn bearer_auth(self, token: impl Into<String>) -> impl Client {
         WithMiddleware::new(self, BearerAuth::new(token))
     }
 
+    /// Add Basic Authentication middleware.
     fn basic_auth(
         self,
         username: impl Into<String>,
@@ -146,6 +154,7 @@ pub trait Client: Endpoint + Sized {
         WithMiddleware::new(self, BasicAuth::new(username, password))
     }
 
+    /// Create a request with the specified method and URI.
     fn method<U>(&mut self, method: Method, uri: U) -> RequestBuilder<'_, Self>
     where
         U: TryInto<Uri> + Send + Sync,
@@ -164,6 +173,7 @@ pub trait Client: Endpoint + Sized {
         }
     }
 
+    /// Create a GET request.
     fn get<U>(&mut self, uri: U) -> RequestBuilder<'_, Self>
     where
         U: TryInto<Uri> + Send + Sync,
@@ -172,6 +182,7 @@ pub trait Client: Endpoint + Sized {
         self.method(Method::GET, uri)
     }
 
+    /// Create a POST request.
     fn post<U>(&mut self, uri: U) -> RequestBuilder<'_, Self>
     where
         U: TryInto<Uri> + Send + Sync,
@@ -180,6 +191,7 @@ pub trait Client: Endpoint + Sized {
         self.method(Method::POST, uri)
     }
 
+    /// Create a PUT request.
     fn put<U>(&mut self, uri: U) -> RequestBuilder<'_, Self>
     where
         U: TryInto<Uri> + Send + Sync,
@@ -188,6 +200,7 @@ pub trait Client: Endpoint + Sized {
         self.method(Method::PUT, uri)
     }
 
+    /// Create a DELETE request.
     fn delete<U>(&mut self, uri: U) -> RequestBuilder<'_, Self>
     where
         U: TryInto<Uri> + Send + Sync,

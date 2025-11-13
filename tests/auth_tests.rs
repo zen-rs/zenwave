@@ -1,5 +1,7 @@
-use crate::auth::{BasicAuth, BearerAuth};
-use crate::{Client, client};
+//! Tests for authentication middleware and request builders
+
+use zenwave::auth::{BasicAuth, BearerAuth};
+use zenwave::{Client, client};
 
 #[tokio::test]
 async fn test_bearer_auth_middleware() {
@@ -79,16 +81,16 @@ async fn test_basic_auth_no_password() {
 #[tokio::test]
 async fn test_bearer_auth_creation() {
     let bearer_auth = BearerAuth::new("my-token");
-    assert!(!format!("{:?}", bearer_auth).is_empty());
+    assert!(!format!("{bearer_auth:?}").is_empty());
 }
 
 #[tokio::test]
 async fn test_basic_auth_creation() {
     let basic_auth = BasicAuth::new("username", Some("password"));
-    assert!(!format!("{:?}", basic_auth).is_empty());
+    assert!(!format!("{basic_auth:?}").is_empty());
 
     let basic_auth_no_pass = BasicAuth::new("username", None::<String>);
-    assert!(!format!("{:?}", basic_auth_no_pass).is_empty());
+    assert!(!format!("{basic_auth_no_pass:?}").is_empty());
 }
 
 #[tokio::test]

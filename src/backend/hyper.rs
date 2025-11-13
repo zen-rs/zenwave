@@ -10,6 +10,7 @@ use hyper_util::rt::TokioExecutor;
 
 use crate::ClientBackend;
 
+/// Hyper-based HTTP client backend.
 #[derive(Debug)]
 pub struct HyperBackend {
     client: HyperClient<HttpsConnector<HttpConnector>, http_kit::Body>,
@@ -22,6 +23,8 @@ impl Default for HyperBackend {
 }
 
 impl HyperBackend {
+    /// Create a new `HyperBackend`.
+    #[must_use]
     pub fn new() -> Self {
         let client = HyperClient::builder(TokioExecutor::new()).build(HttpsConnector::new());
 

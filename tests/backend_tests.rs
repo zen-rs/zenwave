@@ -1,17 +1,19 @@
-use crate::backend::{ClientBackend, HyperBackend};
+//! Tests for backend implementations
+
 use http_kit::{Endpoint, Method};
+use zenwave::backend::{ClientBackend, HyperBackend};
 
 #[tokio::test]
 async fn test_hyper_backend_creation() {
     let backend = HyperBackend::new();
     // Just ensure it can be created
-    assert!(!format!("{:?}", backend).is_empty());
+    assert!(!format!("{backend:?}").is_empty());
 }
 
 #[tokio::test]
 async fn test_hyper_backend_default() {
     let backend = HyperBackend::default();
-    assert!(!format!("{:?}", backend).is_empty());
+    assert!(!format!("{backend:?}").is_empty());
 }
 
 #[tokio::test]

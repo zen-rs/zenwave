@@ -19,15 +19,13 @@
 //! ```
 
 pub mod backend;
-#[cfg(test)]
-mod tests;
 pub use backend::ClientBackend;
 use backend::DefaultBackend;
 pub use client::Client;
 pub use http_kit::*;
 
 pub mod auth;
-pub mod cookie_store;
+pub mod cookie;
 
 mod client;
 pub mod redirect;
@@ -36,10 +34,16 @@ mod ext;
 
 pub use ext::ResponseExt;
 
+/// Create a default HTTP client backend.
+#[must_use]
 pub fn client() -> DefaultBackend {
     DefaultBackend::default()
 }
 
+/// Send a GET request to the specified URI using the default client backend.
+///
+/// # Errors
+/// If the request fails, an error is returned.
 pub async fn get<U>(uri: U) -> Result<Response>
 where
     U: TryInto<Uri> + Send + Sync,
@@ -49,6 +53,10 @@ where
     client.method(Method::GET, uri).await
 }
 
+/// Send a POST request to the specified URI using the default client backend.
+///
+/// # Errors
+/// If the request fails, an error is returned.
 pub async fn post<U>(uri: U) -> Result<Response>
 where
     U: TryInto<Uri> + Send + Sync,
@@ -58,6 +66,10 @@ where
     client.method(Method::POST, uri).await
 }
 
+/// Send a PUT request to the specified URI using the default client backend.
+///
+/// # Errors
+/// If the request fails, an error is returned.
 pub async fn put<U>(uri: U) -> Result<Response>
 where
     U: TryInto<Uri> + Send + Sync,
@@ -67,6 +79,10 @@ where
     client.method(Method::PUT, uri).await
 }
 
+/// Send a DELETE request to the specified URI using the default client backend.
+///
+/// # Errors
+/// If the request fails, an error is returned.
 pub async fn delete<U>(uri: U) -> Result<Response>
 where
     U: TryInto<Uri> + Send + Sync,

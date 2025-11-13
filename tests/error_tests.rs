@@ -1,5 +1,7 @@
-use crate::{Client, client, get};
+//! Tests for error handling in Zenwave
+
 use http_kit::Method;
+use zenwave::{Client, client, get};
 
 #[tokio::test]
 async fn test_invalid_url_error() {

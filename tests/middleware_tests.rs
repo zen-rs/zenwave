@@ -1,7 +1,8 @@
-use crate::cookie_store::CookieStore;
-use crate::redirect::FollowRedirect;
-use crate::{Client, client};
-use http_kit::{Endpoint, Middleware, Request};
+//! Tests for middleware components in Zenwave
+
+use zenwave::cookie::CookieStore;
+use zenwave::redirect::FollowRedirect;
+use zenwave::{Client, Endpoint, Middleware, Request, client};
 
 #[tokio::test]
 async fn test_cookie_store_middleware() {
@@ -27,7 +28,7 @@ async fn test_cookie_store_middleware() {
 #[tokio::test]
 async fn test_cookie_store_creation() {
     let cookie_store = CookieStore::default();
-    assert!(!format!("{:?}", cookie_store).is_empty());
+    assert!(!format!("{cookie_store:?}").is_empty());
 }
 
 #[tokio::test]

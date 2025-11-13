@@ -1,6 +1,7 @@
-use crate::{Client, client, get};
-use http_kit::Method;
+//! Integration tests for Zenwave using real HTTP requests
+
 use serde_json::Value;
+use zenwave::{Client, Method, client, get};
 
 #[tokio::test]
 async fn test_real_world_api_request() {
@@ -46,7 +47,7 @@ async fn test_post_with_json_body() {
 #[tokio::test]
 async fn test_response_status_codes() {
     for status_code in [200, 201, 400, 401, 403, 404, 500, 502, 503] {
-        let url = format!("https://httpbin.org/status/{}", status_code);
+        let url = format!("https://httpbin.org/status/{status_code}");
         let response = get(&url).await.unwrap();
         assert_eq!(response.status().as_u16(), status_code);
     }
@@ -119,12 +120,11 @@ async fn test_method_overrides() {
     for (method, url) in methods {
         let method_clone = method.clone();
         let response = client.method(method, url).await;
-        assert!(response.is_ok(), "Failed for method: {:?}", method_clone);
+        assert!(response.is_ok(), "Failed for method: {method_clone:?}");
         let response = response.unwrap();
         assert!(
             response.status().is_success(),
-            "Failed for method: {:?}",
-            method_clone
+            "Failed for method: {method_clone:?}"
         );
     }
 }

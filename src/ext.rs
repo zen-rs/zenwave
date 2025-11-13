@@ -15,10 +15,20 @@ pub trait ResponseExt {
         self,
     ) -> impl Future<Output = Result<T, BodyError>> + Send;
 
+    /// Consumes the response body and returns an SSE stream.
     fn into_sse(self) -> SseStream;
 
+    /// Consumes the response body and returns it as a string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the body cannot be converted to a string.
     fn into_string(self) -> impl Future<Output = Result<ByteStr, BodyError>> + Send;
-
+    /// Consumes the response body and returns it as bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the body cannot be converted to bytes.
     fn into_bytes(self) -> impl Future<Output = Result<Bytes, BodyError>> + Send;
 }
 

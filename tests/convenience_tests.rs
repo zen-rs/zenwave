@@ -1,4 +1,6 @@
-use crate::{delete, get, post, put};
+//! Tests for convenience functions in Zenwave
+
+use zenwave::{delete, get, post, put};
 
 #[tokio::test]
 async fn test_convenience_get() {

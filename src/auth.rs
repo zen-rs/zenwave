@@ -1,11 +1,16 @@
+//! Authentication middlewares for HTTP requests.
+
 use http_kit::{Endpoint, Middleware, Request, Response, Result, header};
 
+/// Middleware for Bearer Token Authentication.
+/// Adds an `Authorization: Bearer <token>` header to requests.
 #[derive(Debug, Clone)]
 pub struct BearerAuth {
     token: String,
 }
 
 impl BearerAuth {
+    /// Create a new `BearerAuth` middleware with the given token.
     pub fn new(token: impl Into<String>) -> Self {
         Self {
             token: token.into(),
@@ -27,6 +32,8 @@ impl Middleware for BearerAuth {
     }
 }
 
+/// Middleware for Basic Authentication.
+/// Adds an `Authorization: Basic <base64-encoded-credentials>` header to requests.
 #[derive(Debug, Clone)]
 pub struct BasicAuth {
     username: String,
@@ -34,10 +41,11 @@ pub struct BasicAuth {
 }
 
 impl BasicAuth {
+    /// Create a new `BasicAuth` middleware with the given username and optional password.
     pub fn new(username: impl Into<String>, password: Option<impl Into<String>>) -> Self {
         Self {
             username: username.into(),
-            password: password.map(|p| p.into()),
+            password: password.map(std::convert::Into::into),
         }
     }
 }
@@ -54,7 +62,7 @@ impl Middleware for BasicAuth {
             };
 
             let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
-            let auth_value = format!("Basic {}", encoded);
+            let auth_value = format!("Basic {encoded}");
 
             request
                 .headers_mut()
