@@ -32,6 +32,10 @@ pub mod cookie_store;
 mod client;
 pub mod redirect;
 
+mod ext;
+
+pub use ext::ResponseExt;
+
 pub fn client() -> DefaultBackend {
     DefaultBackend::default()
 }
