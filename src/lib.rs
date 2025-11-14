@@ -1,3 +1,5 @@
+#![allow(clippy::multiple_crate_versions)]
+
 //! # Ergonomic HTTP client framework
 //! Zenwave is an ergonomic HTTP client framework.
 //! It has a lot of features:
@@ -31,6 +33,8 @@ mod client;
 pub mod redirect;
 
 mod ext;
+/// Multipart/form-data utilities.
+pub mod multipart;
 
 pub use ext::ResponseExt;
 

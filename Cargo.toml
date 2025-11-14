@@ -10,11 +10,12 @@ keywords = ["http", "client", "async", "networking", "middleware"]
 categories = ["network-programming", "web-programming::http-client"]
 
 [dependencies]
-http-kit = { version = "0.2.0", path = "../http-kit"}
+http-kit = { version = "0.2.0", git = "https://github.com/zen-rs/http-kit"}
 executor-core = { version = "0.6.0" }
 serde = { version = "1.0", default-features = false, features = ["derive"]}
 serde_json = "1.0"
 base64 = "0.22"
+url = "2.5"
 
 # Dependencies for hyper backend
 
@@ -35,7 +36,6 @@ hyper-tls = "0.6.0"
 
 
 [dev-dependencies]
-tokio = { version = "1.48", features = ["macros", "rt"] }
 serde_json = "1.0"
 
 [features]
@@ -47,6 +47,12 @@ web-backend = []
 web-sys = { version = "0.3", features = ["Window", "Request","RequestInit","Headers","ReadableStream","Response"] }
 wasm-streams = "0.4.2"
 wasm-bindgen-futures = "0.4.55"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1.48", features = ["macros", "rt"] }
 
 
 [lints]

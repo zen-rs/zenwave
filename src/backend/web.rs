@@ -1,4 +1,5 @@
 use core::{
+    future::Future,
     ops::Deref,
     pin::Pin,
     task::{Context, Poll},
@@ -101,6 +102,7 @@ fn fetch(
         for (name, value) in request.headers().iter() {
             headers.set(name.as_str(), value.to_str()?).unwrap();
         }
+        request_init.set_headers(headers.as_ref());
 
         let request = web_sys::Request::new_with_str_and_init(
             request.uri().to_string().as_str(),

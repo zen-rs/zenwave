@@ -121,6 +121,11 @@ impl<T: Client> RequestBuilder<'_, T> {
 
         Ok(self)
     }
+
+    pub fn bytes_body(mut self, bytes: Vec<u8>) -> Self {
+        *self.request.body_mut() = http_kit::Body::from(bytes);
+        self
+    }
 }
 
 /// Trait representing an HTTP client with middleware support.

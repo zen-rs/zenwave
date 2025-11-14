@@ -3,7 +3,8 @@
 use http_kit::Method;
 use zenwave::{Client, client};
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_client_get_method() {
     let mut client = client();
     let request_builder = client.get("https://httpbin.org/get");
@@ -13,7 +14,8 @@ async fn test_client_get_method() {
     assert!(response.status().is_success());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_client_post_method() {
     let mut client = client();
     let request_builder = client.post("https://httpbin.org/post");
@@ -23,7 +25,8 @@ async fn test_client_post_method() {
     assert!(response.status().is_success());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_client_put_method() {
     let mut client = client();
     let request_builder = client.put("https://httpbin.org/put");
@@ -33,7 +36,8 @@ async fn test_client_put_method() {
     assert!(response.status().is_success());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_client_delete_method() {
     let mut client = client();
     let request_builder = client.delete("https://httpbin.org/delete");
@@ -43,7 +47,8 @@ async fn test_client_delete_method() {
     assert!(response.status().is_success());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_client_method_generic() {
     let mut client = client();
     let request_builder = client.method(Method::GET, "https://httpbin.org/get");
@@ -53,7 +58,8 @@ async fn test_client_method_generic() {
     assert!(response.status().is_success());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_request_builder_string() {
     let mut client = client();
     let response_string = client.get("https://httpbin.org/get").string().await;
@@ -63,7 +69,8 @@ async fn test_request_builder_string() {
     assert!(string.contains("httpbin"));
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_request_builder_bytes() {
     let mut client = client();
     let response_bytes = client.get("https://httpbin.org/get").bytes().await;
@@ -72,7 +79,8 @@ async fn test_request_builder_bytes() {
     assert!(!bytes.is_empty());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_request_builder_json() {
     use serde_json::Value;
 
@@ -83,7 +91,8 @@ async fn test_request_builder_json() {
     assert!(json.is_object());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_client_with_middleware() {
     let client = client().enable_cookie();
     let mut client = client;
@@ -97,7 +106,8 @@ async fn test_client_with_middleware() {
     assert!(response2.is_ok());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_client_follow_redirect() {
     let client = client().follow_redirect();
     let mut client = client;
@@ -107,7 +117,8 @@ async fn test_client_follow_redirect() {
     assert!(response.status().is_success());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_invalid_uri() {
     let mut client = client();
     let response = client.get("invalid-uri").await;

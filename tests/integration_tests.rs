@@ -3,7 +3,8 @@
 use serde_json::Value;
 use zenwave::{Client, Method, client, get};
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_real_world_api_request() {
     // Test with a real JSON API
     let response = get("https://httpbin.org/json").await.unwrap();
@@ -13,7 +14,8 @@ async fn test_real_world_api_request() {
     assert!(json.is_object());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_user_agent_header() {
     let response = get("https://httpbin.org/user-agent").await.unwrap();
     let text = response.into_body().into_string().await.unwrap();
@@ -22,7 +24,8 @@ async fn test_user_agent_header() {
     assert!(!text.is_empty());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_custom_headers() {
     let mut client = client();
     let response = client.get("https://httpbin.org/headers").await.unwrap();
@@ -32,7 +35,8 @@ async fn test_custom_headers() {
     assert!(text.contains("headers"));
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_post_with_json_body() {
     let mut client = client();
     let request = client.method(Method::POST, "https://httpbin.org/post");
@@ -44,7 +48,8 @@ async fn test_post_with_json_body() {
     assert!(response.status().is_success());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_response_status_codes() {
     for status_code in [200, 201, 400, 401, 403, 404, 500, 502, 503] {
         let url = format!("https://httpbin.org/status/{status_code}");
@@ -53,7 +58,8 @@ async fn test_response_status_codes() {
     }
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_redirect_chain() {
     let client = client().follow_redirect();
     let mut client = client;
@@ -63,7 +69,8 @@ async fn test_redirect_chain() {
     assert!(response.status().is_success());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_large_response() {
     // Test handling of larger responses
     let response = get("https://httpbin.org/base64/aGVsbG8gd29ybGQ=").await;
@@ -75,7 +82,8 @@ async fn test_large_response() {
     assert!(!bytes.is_empty());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_gzip_compression() {
     // httpbin.org supports gzip compression
     let response = get("https://httpbin.org/gzip").await;
@@ -86,7 +94,8 @@ async fn test_gzip_compression() {
     assert!(!bytes.is_empty());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_cookie_persistence() {
     let client = client().enable_cookie();
     let mut client = client;
@@ -104,7 +113,8 @@ async fn test_cookie_persistence() {
     assert!(body.contains("cookievalue"));
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_method_overrides() {
     let mut client = client();
 

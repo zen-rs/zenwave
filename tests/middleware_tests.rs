@@ -4,7 +4,8 @@ use zenwave::cookie::CookieStore;
 use zenwave::redirect::FollowRedirect;
 use zenwave::{Client, Endpoint, Middleware, Request, client};
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_cookie_store_middleware() {
     let client = client().enable_cookie();
     let mut client = client;
@@ -25,13 +26,15 @@ async fn test_cookie_store_middleware() {
     assert!(body.contains("value"));
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_cookie_store_creation() {
     let cookie_store = CookieStore::default();
     assert!(!format!("{cookie_store:?}").is_empty());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_follow_redirect_middleware() {
     // Test with redirect middleware
     let client = client().follow_redirect();
@@ -44,14 +47,16 @@ async fn test_follow_redirect_middleware() {
     assert!(response.status().is_success());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_follow_redirect_creation() {
     let base_client = client();
     let _redirect_client = FollowRedirect::new(base_client);
     // Just ensure it can be created
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_follow_redirect_multiple_redirects() {
     let client = client().follow_redirect();
     let mut client = client;
@@ -63,7 +68,8 @@ async fn test_follow_redirect_multiple_redirects() {
     assert!(response.status().is_success());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_client_with_multiple_middleware() {
     let client = client().follow_redirect().enable_cookie();
     let mut client = client;
@@ -79,7 +85,8 @@ async fn test_client_with_multiple_middleware() {
     assert!(response2.is_ok());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_without_redirect_middleware() {
     // Without redirect middleware, should get redirect response
     let mut client = client();
@@ -90,7 +97,8 @@ async fn test_without_redirect_middleware() {
     assert!(response.status().is_redirection());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_middleware_with_custom_middleware() {
     struct TestMiddleware;
 

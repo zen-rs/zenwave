@@ -2,7 +2,8 @@
 
 use zenwave::{delete, get, post, put};
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_convenience_get() {
     let response = get("https://httpbin.org/get").await;
     assert!(response.is_ok());
@@ -10,7 +11,8 @@ async fn test_convenience_get() {
     assert!(response.status().is_success());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_convenience_post() {
     let response = post("https://httpbin.org/post").await;
     assert!(response.is_ok());
@@ -18,7 +20,8 @@ async fn test_convenience_post() {
     assert!(response.status().is_success());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_convenience_put() {
     let response = put("https://httpbin.org/put").await;
     assert!(response.is_ok());
@@ -26,7 +29,8 @@ async fn test_convenience_put() {
     assert!(response.status().is_success());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_convenience_delete() {
     let response = delete("https://httpbin.org/delete").await;
     assert!(response.is_ok());
@@ -34,13 +38,15 @@ async fn test_convenience_delete() {
     assert!(response.status().is_success());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_convenience_get_invalid_uri() {
     let response = get("invalid-uri").await;
     assert!(response.is_err());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_convenience_get_response_text() {
     let response = get("https://httpbin.org/get").await.unwrap();
     let text = response.into_body().into_string().await;
@@ -50,7 +56,8 @@ async fn test_convenience_get_response_text() {
     assert!(text.contains("httpbin"));
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_convenience_get_response_json() {
     use serde_json::Value;
 

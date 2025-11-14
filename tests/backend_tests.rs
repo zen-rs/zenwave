@@ -3,20 +3,23 @@
 use http_kit::{Endpoint, Method};
 use zenwave::backend::{ClientBackend, HyperBackend};
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_hyper_backend_creation() {
     let backend = HyperBackend::new();
     // Just ensure it can be created
     assert!(!format!("{backend:?}").is_empty());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_hyper_backend_default() {
     let backend = HyperBackend::default();
     assert!(!format!("{backend:?}").is_empty());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_hyper_backend_get_request() {
     let mut backend = HyperBackend::new();
     let mut request = http::Request::builder()
@@ -30,7 +33,8 @@ async fn test_hyper_backend_get_request() {
     assert!(response.status().is_success());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_hyper_backend_post_request() {
     let mut backend = HyperBackend::new();
     let mut request = http::Request::builder()
@@ -44,7 +48,8 @@ async fn test_hyper_backend_post_request() {
     assert!(response.status().is_success());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_hyper_backend_https_request() {
     let mut backend = HyperBackend::new();
     let mut request = http::Request::builder()
@@ -58,7 +63,8 @@ async fn test_hyper_backend_https_request() {
     assert!(response.status().is_success());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_hyper_backend_invalid_uri() {
     let mut backend = HyperBackend::new();
     let mut request = http::Request::builder()
@@ -70,7 +76,8 @@ async fn test_hyper_backend_invalid_uri() {
     assert!(response.is_err());
 }
 
-#[tokio::test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_hyper_backend_client_backend_trait() {
     fn assert_client_backend<T: ClientBackend>(_: &T) {}
     let backend = HyperBackend::new();
@@ -82,15 +89,17 @@ async fn test_hyper_backend_client_backend_trait() {
 #[cfg(target_arch = "wasm32")]
 mod web_backend_tests {
     use super::*;
-    use crate::backend::WebBackend;
+    use zenwave::backend::WebBackend;
 
-    #[tokio::test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
     async fn test_web_backend_creation() {
         let backend = WebBackend::new();
         // Basic creation test - we can't test much without a browser context
     }
 
-    #[tokio::test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
     async fn test_web_backend_default() {
         let backend = WebBackend::default();
         // Basic default test
