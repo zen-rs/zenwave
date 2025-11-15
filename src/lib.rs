@@ -8,6 +8,7 @@
 //! - Bearer and Basic authentication
 //! - Powerful middleware system (Add features you need!)
 //! - Streaming body transfer
+//! - Cross-platform websocket client
 //!
 //! # Quick start
 //! ```rust,no_run
@@ -35,6 +36,8 @@ pub mod redirect;
 mod ext;
 /// Multipart/form-data utilities.
 pub mod multipart;
+/// Websocket utilities.
+pub mod websocket;
 
 pub use ext::ResponseExt;
 
@@ -50,7 +53,7 @@ pub fn client() -> DefaultBackend {
 /// If the request fails, an error is returned.
 pub async fn get<U>(uri: U) -> Result<Response>
 where
-    U: TryInto<Uri> + Send + Sync,
+    U: TryInto<Uri>,
     U::Error: core::fmt::Debug,
 {
     let mut client = DefaultBackend::default();
@@ -63,7 +66,7 @@ where
 /// If the request fails, an error is returned.
 pub async fn post<U>(uri: U) -> Result<Response>
 where
-    U: TryInto<Uri> + Send + Sync,
+    U: TryInto<Uri>,
     U::Error: core::fmt::Debug,
 {
     let mut client = DefaultBackend::default();
@@ -76,7 +79,7 @@ where
 /// If the request fails, an error is returned.
 pub async fn put<U>(uri: U) -> Result<Response>
 where
-    U: TryInto<Uri> + Send + Sync,
+    U: TryInto<Uri>,
     U::Error: core::fmt::Debug,
 {
     let mut client = DefaultBackend::default();
@@ -89,7 +92,7 @@ where
 /// If the request fails, an error is returned.
 pub async fn delete<U>(uri: U) -> Result<Response>
 where
-    U: TryInto<Uri> + Send + Sync,
+    U: TryInto<Uri>,
     U::Error: core::fmt::Debug,
 {
     let mut client = DefaultBackend::default();

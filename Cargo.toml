@@ -16,6 +16,8 @@ serde = { version = "1.0", default-features = false, features = ["derive"]}
 serde_json = "1.0"
 base64 = "0.22"
 url = "2.5"
+futures-util = "0.3"
+futures-channel = "0.3"
 
 # Dependencies for hyper backend
 
@@ -51,8 +53,12 @@ wasm-bindgen-futures = "0.4.55"
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
 
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-tokio = { version = "1.48", features = ["macros", "rt"] }
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1.48", features = ["macros", "rt", "net"] }
+async-tungstenite = { version = "0.26", default-features = false, features = [
+    "tokio-runtime",
+    "tokio-native-tls",
+] }
 
 
 [lints]

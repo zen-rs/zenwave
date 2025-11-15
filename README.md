@@ -57,6 +57,23 @@ Zenwave supports WASM targets and can run in browsers or Cloudflare Workers usin
 - Custom client: `zenwave::client()`
 - Middleware support: `.with(middleware)`
 - Cookie and redirect support
+- Websocket client: `zenwave::websocket::connect(uri)`
+
+## Websocket Support
+
+Zenwave includes a cross-platform websocket client that works both on native (Tokio + Hyper) and
+wasm targets (via `web_sys::WebSocket`). Connecting to a websocket endpoint is as simple as:
+
+```rust
+use zenwave::websocket;
+
+let mut ws = websocket::connect("wss://echo.websocket.org").await?;
+ws.send_text("hello").await?;
+if let Some(message) = ws.recv().await? {
+    println!("Received: {:?}", message);
+}
+ws.close().await?;
+```
 
 ## Installation
 

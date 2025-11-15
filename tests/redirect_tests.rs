@@ -117,6 +117,7 @@ async fn follow_redirect_resolves_relative_paths_and_keeps_headers() {
     assert_eq!(state.seen[1].custom_header.as_deref(), Some("keep-me"));
     // Method should downgrade to GET after 302
     assert_eq!(state.seen[1].method, Method::GET);
+    drop(state);
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
@@ -149,4 +150,5 @@ async fn follow_redirect_strips_sensitive_headers_on_host_change() {
         "authorization header should be cleared when host changes"
     );
     assert_eq!(state.seen[1].uri, "https://example.net/next");
+    drop(state);
 }

@@ -162,7 +162,7 @@ pub trait Client: Endpoint + Sized {
     /// Create a request with the specified method and URI.
     fn method<U>(&mut self, method: Method, uri: U) -> RequestBuilder<'_, Self>
     where
-        U: TryInto<Uri> + Send + Sync,
+        U: TryInto<Uri>,
         U::Error: Debug,
     {
         let uri = uri.try_into().unwrap();
@@ -181,7 +181,7 @@ pub trait Client: Endpoint + Sized {
     /// Create a GET request.
     fn get<U>(&mut self, uri: U) -> RequestBuilder<'_, Self>
     where
-        U: TryInto<Uri> + Send + Sync,
+        U: TryInto<Uri>,
         U::Error: Debug,
     {
         self.method(Method::GET, uri)
@@ -190,7 +190,7 @@ pub trait Client: Endpoint + Sized {
     /// Create a POST request.
     fn post<U>(&mut self, uri: U) -> RequestBuilder<'_, Self>
     where
-        U: TryInto<Uri> + Send + Sync,
+        U: TryInto<Uri>,
         U::Error: Debug,
     {
         self.method(Method::POST, uri)
@@ -199,7 +199,7 @@ pub trait Client: Endpoint + Sized {
     /// Create a PUT request.
     fn put<U>(&mut self, uri: U) -> RequestBuilder<'_, Self>
     where
-        U: TryInto<Uri> + Send + Sync,
+        U: TryInto<Uri>,
         U::Error: Debug,
     {
         self.method(Method::PUT, uri)
@@ -208,7 +208,7 @@ pub trait Client: Endpoint + Sized {
     /// Create a DELETE request.
     fn delete<U>(&mut self, uri: U) -> RequestBuilder<'_, Self>
     where
-        U: TryInto<Uri> + Send + Sync,
+        U: TryInto<Uri>,
         U::Error: Debug,
     {
         self.method(Method::DELETE, uri)

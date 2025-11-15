@@ -54,14 +54,14 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
                 .to_str()
                 .status(StatusCode::BAD_REQUEST)?;
 
-            let next_url = Url::parse(location)
+            let redirect_url = Url::parse(location)
                 .or_else(|_| current_url.join(location))
                 .map_err(|err| {
                     Error::msg(format!("Invalid redirect location: {err}"))
                         .set_status(StatusCode::BAD_REQUEST)
                 })?;
 
-            let next_uri: Uri = next_url.as_str().parse().map_err(|err| {
+            let next_uri: Uri = redirect_url.as_str().parse().map_err(|err| {
                 Error::msg(format!("Invalid redirect URI: {err}"))
                     .set_status(StatusCode::BAD_REQUEST)
             })?;
@@ -85,14 +85,14 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
             let mut headers = initial_headers.clone();
             headers.remove(HOST);
             headers.remove(CONTENT_LENGTH);
-            if current_url.host_str() != next_url.host_str() {
+            if current_url.host_str() != redirect_url.host_str() {
                 headers.remove(AUTHORIZATION);
                 headers.remove(COOKIE);
             }
             *new_request.headers_mut() = headers;
 
             *request = new_request;
-            current_url = next_url;
+            current_url = redirect_url;
             current_method = next_method;
             redirect_count += 1;
         }
