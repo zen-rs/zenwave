@@ -82,7 +82,7 @@ impl Endpoint for WebBackend {
 fn fetch(
     window: &Window,
     request: &mut http_kit::Request,
-) -> impl Future<Output = http_kit::Result<http_kit::Response>> + Send + Sync {
+) -> impl Future<Output = http_kit::Result<http_kit::Response>> + Send {
     SingleThreaded(async move {
         let request_init = web_sys::RequestInit::new();
         request_init.set_method(request.method().as_str());

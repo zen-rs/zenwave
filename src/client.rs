@@ -26,7 +26,7 @@ pub struct RequestBuilder<'a, T: Client> {
 impl<'a, T: Client> IntoFuture for RequestBuilder<'a, T> {
     type Output = Result<Response>;
 
-    type IntoFuture = Pin<Box<dyn Future<Output = Result<Response>> + Send + Sync + 'a>>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Result<Response>> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
