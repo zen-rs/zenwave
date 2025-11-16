@@ -1,13 +1,25 @@
+#[cfg(not(target_arch = "wasm32"))]
+use anyhow::Error as AnyhowError;
 use core::pin::Pin;
 use std::{fmt::Debug, future::Future};
+#[cfg(not(target_arch = "wasm32"))]
+use std::{
+    io::{ErrorKind, SeekFrom},
+    path::PathBuf,
+};
 
 use http_kit::{
-    Endpoint, Method, Middleware, Request, Response, Result, Uri,
+    Endpoint, Method, Middleware, Request, Response, Result, StatusCode, Uri,
     endpoint::WithMiddleware,
     sse::SseStream,
     utils::{ByteStr, Bytes},
 };
 use serde::de::DeserializeOwned;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::{
+    fs::OpenOptions,
+    io::{AsyncSeekExt, AsyncWriteExt},
+};
 
 use crate::{
     ClientBackend,
@@ -125,6 +137,264 @@ impl<T: Client> RequestBuilder<'_, T> {
     pub fn bytes_body(mut self, bytes: Vec<u8>) -> Self {
         *self.request.body_mut() = http_kit::Body::from(bytes);
         self
+    }
+
+    /// Download the response body into the provided path, resuming partial files automatically.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn download_to_path(
+        self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<DownloadReport> {
+        self.download_to_path_with(path, DownloadOptions::default())
+            .await
+    }
+
+    /// Download the response body into a path using custom [`DownloadOptions`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn download_to_path_with(
+        mut self,
+        path: impl AsRef<std::path::Path>,
+        options: DownloadOptions,
+    ) -> Result<DownloadReport> {
+        use futures_util::StreamExt;
+        let path_buf: PathBuf = path.as_ref().to_path_buf();
+        let resume_from = if options.resume_existing {
+            match tokio::fs::metadata(&path_buf).await {
+                Ok(meta) => meta.len(),
+                Err(err) if err.kind() == ErrorKind::NotFound => 0,
+                Err(err) => {
+                    return Err(http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR));
+                }
+            }
+        } else {
+            0
+        };
+
+        if resume_from > 0 {
+            let value = format!("bytes={resume_from}-");
+            self = self.header(http_kit::header::RANGE.as_str(), value);
+        }
+
+        let response = self.await?;
+        let status = response.status();
+        let mut body = response.into_body();
+
+        let mut resumed_from = 0_u64;
+        let mut file = if resume_from > 0 && status == StatusCode::PARTIAL_CONTENT {
+            resumed_from = resume_from;
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&path_buf)
+                .await
+                .map_err(|err| http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+            file.seek(SeekFrom::Start(resume_from))
+                .await
+                .map_err(|err| http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+            file
+        } else {
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path_buf)
+                .await
+                .map_err(|err| http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR))?
+        };
+
+        let mut bytes_written = 0_u64;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|err| {
+                http_kit::Error::new(AnyhowError::msg(err.to_string()), StatusCode::BAD_GATEWAY)
+            })?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|err| http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+            bytes_written += chunk.len() as u64;
+        }
+        file.flush()
+            .await
+            .map_err(|err| http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+
+        Ok(DownloadReport {
+            path: path_buf,
+            resumed_from,
+            bytes_written,
+        })
+    }
+}
+
+/// Report describing the result of a download operation.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone)]
+pub struct DownloadReport {
+    /// Destination path that was written to.
+    pub path: PathBuf,
+    /// Offset the download resumed from (0 if this was a fresh download).
+    pub resumed_from: u64,
+    /// Number of bytes written during this invocation.
+    pub bytes_written: u64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl DownloadReport {
+    /// Total bytes now persisted on disk.
+    pub fn total_bytes(&self) -> u64 {
+        self.resumed_from + self.bytes_written
+    }
+}
+
+/// Configures how downloads should behave.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadOptions {
+    /// Attempt to resume when the destination file already contains data.
+    pub resume_existing: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for DownloadOptions {
+    fn default() -> Self {
+        Self {
+            resume_existing: true,
+        }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use crate::backend::ClientBackend;
+    use http::Response;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::fs;
+
+    #[tokio::test]
+    async fn download_to_path_resumes_existing_file() {
+        let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("download.bin");
+        fs::write(&path, &payload[..1024]).await.unwrap();
+
+        let mut client = FakeBackend::with_payload(payload.clone());
+        client
+            .get("http://example.com/file.bin")
+            .download_to_path(&path)
+            .await
+            .unwrap();
+
+        let final_bytes = fs::read(&path).await.unwrap();
+        assert_eq!(final_bytes, payload);
+    }
+
+    #[tokio::test]
+    async fn download_to_path_restarts_when_range_is_not_supported() {
+        let payload: Vec<u8> = (0..2048).map(|i| (i % 199) as u8).collect();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("download.bin");
+        fs::write(&path, &[1_u8, 2, 3, 4]).await.unwrap();
+
+        let mut client = FakeBackend::without_range(payload.clone());
+        client
+            .get("http://example.com/file.bin")
+            .download_to_path(&path)
+            .await
+            .unwrap();
+
+        let final_bytes = fs::read(&path).await.unwrap();
+        assert_eq!(final_bytes, payload);
+    }
+
+    #[derive(Clone)]
+    struct FakeBackend {
+        payload: Arc<Vec<u8>>,
+        honor_range: bool,
+    }
+
+    impl FakeBackend {
+        fn with_payload(payload: Vec<u8>) -> Self {
+            Self {
+                payload: Arc::new(payload),
+                honor_range: true,
+            }
+        }
+
+        fn without_range(payload: Vec<u8>) -> Self {
+            Self {
+                payload: Arc::new(payload),
+                honor_range: false,
+            }
+        }
+    }
+
+    impl Default for FakeBackend {
+        fn default() -> Self {
+            Self {
+                payload: Arc::new(Vec::new()),
+                honor_range: true,
+            }
+        }
+    }
+
+    impl Endpoint for FakeBackend {
+        async fn respond(
+            &mut self,
+            request: &mut Request,
+        ) -> http_kit::Result<Response<http_kit::Body>> {
+            let start = if self.honor_range {
+                parse_range(request)
+            } else {
+                0
+            };
+            let start = start.min(self.payload.len());
+            let data = self.payload[start..].to_vec();
+
+            let mut response = Response::builder()
+                .status(if start > 0 && self.honor_range {
+                    StatusCode::PARTIAL_CONTENT
+                } else {
+                    StatusCode::OK
+                })
+                .body(http_kit::Body::from(data))
+                .unwrap();
+
+            if self.honor_range {
+                response.headers_mut().insert(
+                    http_kit::header::ACCEPT_RANGES,
+                    http_kit::header::HeaderValue::from_static("bytes"),
+                );
+            }
+
+            if start > 0 && self.honor_range {
+                response.headers_mut().insert(
+                    http_kit::header::CONTENT_RANGE,
+                    format!(
+                        "bytes {}-{}/{}",
+                        start,
+                        self.payload.len().saturating_sub(1),
+                        self.payload.len()
+                    )
+                    .parse()
+                    .unwrap(),
+                );
+            }
+
+            Ok(response)
+        }
+    }
+
+    impl ClientBackend for FakeBackend {}
+
+    fn parse_range(request: &Request) -> usize {
+        request
+            .headers()
+            .get(http_kit::header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|text| text.strip_prefix("bytes="))
+            .and_then(|range| range.split('-').next())
+            .and_then(|start| start.trim().parse().ok())
+            .unwrap_or(0)
     }
 }
 

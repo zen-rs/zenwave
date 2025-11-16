@@ -88,6 +88,38 @@ You can also call `.basic_auth` or `.with(custom_middleware)` to plug in your ow
 request builder supports `.header`, `.bearer_auth`, `.basic_auth`, `.json_body`, `.bytes_body`, and
 body readers (`.json()`, `.string()`, `.bytes()`, `.form()`, `.sse()`).
 
+## Large downloads with resume
+
+Native targets get an ergonomic helper for writing large responses to disk without buffering into
+memory. Any request builder can call `download_to_path` to stream the body into a file. When the
+file already exists Zenwave automatically issues a `Range` request and appends only the missing
+bytes, so interrupted transfers can resume without starting from scratch.
+
+```rust
+use zenwave::Client;
+
+# async fn example() -> zenwave::Result<()> {
+let mut client = zenwave::client();
+let report = client
+    .get("https://example.com/big.iso")
+    .download_to_path("big.iso")
+    .await?;
+
+println!(
+    "Resumed from {} bytes and wrote {} bytes ({} total)",
+    report.resumed_from,
+    report.bytes_written,
+    report.total_bytes()
+);
+# Ok(())
+# }
+```
+
+If you need to opt out of resume logic you can call `download_to_path_with` and pass
+`DownloadOptions { resume_existing: false }`. Both methods return a `DownloadReport` so you can log
+how much data was appended and what now resides on disk. This helper is currently available on
+non-wasm targets where direct filesystem access exists.
+
 ## Web & Cloudflare Workers
 
 Zenwave targets both `wasm32` and native platforms. On wasm it relies on `web_sys::Request`/`Fetch`,
