@@ -96,12 +96,16 @@ sharing code between targets is straightforward.
 
 ## Apple platforms
 
-On Apple targets (iOS, iPadOS, tvOS, watchOS, and macOS) Zenwave dispatches HTTP requests through
-`URLSession`. This satisfies App Store requirements for watchOS and gives you the same security,
-power management, and proxy behavior as native Swift/Objective-C apps without changing any Rust
-code. Note that `URLSession` always follows HTTP redirects and automatically manages cookies, so the
-`FollowRedirect` and `CookieStore` middleware are effectively no-ops on Apple platforms. The two
-tests that asserted “no redirect / no automatic cookies” are skipped on Apple for this reason.
+By default Apple targets (iOS, iPadOS, tvOS, watchOS, macOS) also use the Hyper backend. There is an
+experimental `apple-backend` feature that swaps Hyper out for `URLSession`, which satisfies
+watchOS/App Store restrictions but currently auto-follows redirects and auto-manages cookies. The
+two middleware tests that asserted “no redirect / no automatic cookies” are skipped whenever the
+`apple-backend` feature is enabled. Until the URLSession backend is stabilized, we recommend keeping
+the default Hyper backend on Apple. If you still want to opt in:
+
+```toml
+zenwave = { version = "0.1.0", features = ["apple-backend"] }
+```
 
 ## Curl backend
 
@@ -156,14 +160,14 @@ zenwave = { version = "0.1.0", default-features = false, features = ["web-backen
 
 ### Feature flags
 
-- `hyper-backend` (default) – enables the Hyper/Tokio-based backend for non-Apple native targets (it
-  is still available on Apple if you instantiate `HyperBackend` explicitly).
+- `hyper-backend` (default) – enables the Hyper/Tokio-based backend for native targets (including
+  Apple by default).
 - `web-backend` (default) – enables the Fetch-based backend for `wasm32`.
 - `curl-backend` – enables the libcurl backend for platforms that provide libcurl (disable
   `hyper-backend` if you want to rely on libcurl exclusively).
+- `apple-backend` – experimental URLSession backend for Apple platforms. Opt-in only.
 
-Disable default features if you only need one backend. The URLSession-based backend is compiled
-automatically on Apple targets and does not need a feature flag.
+Disable default features if you only need one backend.
 
 ## License
 

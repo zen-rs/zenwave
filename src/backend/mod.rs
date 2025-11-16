@@ -12,28 +12,30 @@ mod curl;
 #[cfg(all(not(target_arch = "wasm32"), feature = "curl-backend"))]
 pub use curl::CurlBackend;
 
-#[cfg(target_vendor = "apple")]
+#[cfg(all(target_vendor = "apple", feature = "apple-backend"))]
 mod apple;
-#[cfg(target_vendor = "apple")]
+#[cfg(all(target_vendor = "apple", feature = "apple-backend"))]
 pub use apple::AppleBackend;
 
 /// Trait for HTTP client backends.
 pub trait ClientBackend: http_kit::Endpoint + Default + 'static {}
 
 /// The default HTTP client backend for the current platform.
-#[cfg(all(not(target_arch = "wasm32"), target_vendor = "apple"))]
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    target_vendor = "apple",
+    feature = "apple-backend"
+))]
 pub type DefaultBackend = AppleBackend;
 
 #[cfg(all(
     not(target_arch = "wasm32"),
-    not(target_vendor = "apple"),
     feature = "hyper-backend"
 ))]
 pub type DefaultBackend = HyperBackend;
 
 #[cfg(all(
     not(target_arch = "wasm32"),
-    not(target_vendor = "apple"),
     not(feature = "hyper-backend"),
     feature = "curl-backend"
 ))]
@@ -50,9 +52,9 @@ pub type DefaultBackend = WebBackend;
 
 #[cfg(all(
     not(target_arch = "wasm32"),
-    not(target_vendor = "apple"),
     not(feature = "hyper-backend"),
-    not(feature = "curl-backend")
+    not(feature = "curl-backend"),
+    not(all(target_vendor = "apple", feature = "apple-backend"))
 ))]
 compile_error!(
     "Enable at least one of `hyper-backend` or `curl-backend` for native zenwave builds."
