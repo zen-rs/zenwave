@@ -8,12 +8,12 @@ use std::{
     mem::replace,
     os::raw::c_char,
     ptr,
-    sync::{Arc, Mutex, Once},
+    sync::{Arc, Mutex},
 };
 
 use crate::ClientBackend;
 use anyhow::{Error, anyhow};
-use block::{Block, ConcreteBlock};
+use block::ConcreteBlock;
 use futures_channel::oneshot;
 use http::{
     HeaderMap,
@@ -21,11 +21,9 @@ use http::{
 };
 use http_kit::{Body, Endpoint, Request, Response, Result, StatusCode};
 use objc::{
-    class,
-    declare::ClassDecl,
-    msg_send,
-    rc::autoreleasepool,
-    runtime::{BOOL, Class, Object, Sel, YES},
+    class, msg_send,
+    rc::{StrongPtr, autoreleasepool},
+    runtime::{BOOL, Object, YES},
     sel, sel_impl,
 };
 
@@ -33,61 +31,20 @@ use objc::{
 unsafe extern "C" {}
 
 /// HTTP backend backed by Apple's `URLSession`.
-#[derive(Debug)]
 pub struct AppleBackend {
-    _marker: (),
+    session: StrongPtr,
+    handle: SessionHandle,
 }
 
-struct OwnedSession {
-    session: *mut Object,
-    delegate: *mut Object,
-    queue: *mut Object,
-}
+#[derive(Clone, Copy)]
+struct SessionHandle(*mut Object);
 
-unsafe impl Send for OwnedSession {}
-unsafe impl Sync for OwnedSession {}
+unsafe impl Send for SessionHandle {}
+unsafe impl Sync for SessionHandle {}
 
-impl OwnedSession {
-    unsafe fn new() -> Self {
-        let config: *mut Object = msg_send![
-            class!(NSURLSessionConfiguration),
-            defaultSessionConfiguration
-        ];
-        let _: () = msg_send![config, setHTTPShouldSetCookies: false];
-        let _: () = msg_send![config, setHTTPCookieStorage: ptr::null_mut::<Object>()];
-
-        let delegate = create_delegate();
-        let queue: *mut Object = msg_send![class!(NSOperationQueue), new];
-        let _: () = msg_send![queue, setMaxConcurrentOperationCount: 1_isize];
-
-        let session: *mut Object = msg_send![
-            class!(NSURLSession),
-            sessionWithConfiguration: config
-            delegate: delegate
-            delegateQueue: queue
-        ];
-        let _: () = msg_send![config, release];
-
-        Self {
-            session,
-            delegate,
-            queue,
-        }
-    }
-
-    const fn session_ptr(&self) -> *mut Object {
-        self.session
-    }
-}
-
-impl Drop for OwnedSession {
-    fn drop(&mut self) {
-        unsafe {
-            let _: () = msg_send![self.session, finishTasksAndInvalidate];
-            let _: () = msg_send![self.session, release];
-            let _: () = msg_send![self.delegate, release];
-            let _: () = msg_send![self.queue, release];
-        }
+impl SessionHandle {
+    const fn as_ptr(self) -> *mut Object {
+        self.0
     }
 }
 
@@ -95,10 +52,27 @@ unsafe impl Send for AppleBackend {}
 unsafe impl Sync for AppleBackend {}
 
 impl AppleBackend {
-    /// Create a new backend backed by `[NSURLSession sharedSession]`.
+    /// Create a new backend backed by an ephemeral `URLSession`.
     #[must_use]
     pub fn new() -> Self {
-        Self { _marker: () }
+        unsafe {
+            let config: StrongPtr = StrongPtr::retain(msg_send![
+                class!(NSURLSessionConfiguration),
+                ephemeralSessionConfiguration
+            ]);
+            let nil: *mut Object = ptr::null_mut();
+            let _: () = msg_send![*config, setURLCache: nil];
+            let _: () = msg_send![*config, setHTTPCookieStorage: nil];
+            let _: () = msg_send![*config, setHTTPCookieAcceptPolicy: 0isize];
+
+            let session: *mut Object =
+                msg_send![class!(NSURLSession), sessionWithConfiguration: *config];
+
+            Self {
+                session: StrongPtr::retain(session),
+                handle: SessionHandle(session),
+            }
+        }
     }
 }
 
@@ -109,13 +83,23 @@ impl Default for AppleBackend {
 }
 
 impl Drop for AppleBackend {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        unsafe {
+            let _: () = msg_send![*self.session, invalidateAndCancel];
+        }
+    }
 }
 
 impl Endpoint for AppleBackend {
     async fn respond(&mut self, request: &mut Request) -> Result<Response> {
-        let session = unsafe { OwnedSession::new() };
-        send_with_url_session(&session, request).await
+        let handle = self.handle;
+        send_with_url_session(handle, request).await
+    }
+}
+
+impl core::fmt::Debug for AppleBackend {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AppleBackend").finish()
     }
 }
 
@@ -130,7 +114,7 @@ struct SessionResponse {
 
 type CompletionSender = Arc<Mutex<Option<oneshot::Sender<Result<SessionResponse>>>>>;
 
-async fn send_with_url_session(session: &OwnedSession, request: &mut Request) -> Result<Response> {
+async fn send_with_url_session(handle: SessionHandle, request: &mut Request) -> Result<Response> {
     let method = request.method().as_str().to_owned();
     let uri = request.uri().to_string();
 
@@ -159,7 +143,7 @@ async fn send_with_url_session(session: &OwnedSession, request: &mut Request) ->
     let sender = Arc::new(Mutex::new(Some(tx)));
 
     start_task(
-        session,
+        handle,
         &method,
         &uri,
         &collected_headers,
@@ -182,7 +166,7 @@ async fn send_with_url_session(session: &OwnedSession, request: &mut Request) ->
 }
 
 fn start_task(
-    session: &OwnedSession,
+    handle: SessionHandle,
     method: &str,
     url: &str,
     headers: &[(String, String)],
@@ -190,21 +174,23 @@ fn start_task(
     sender: CompletionSender,
 ) -> Result<()> {
     autoreleasepool(|| unsafe {
-        let session_ptr = session.session_ptr();
+        let session = handle.as_ptr();
         let request = build_request(method, url, headers, body)?;
 
         let completion = ConcreteBlock::new(
             move |data: *mut Object, response: *mut Object, error: *mut Object| {
-                let result = handle_completion(data, response, error);
-                if let Some(tx) = sender.lock().expect("mutex poisoned").take() {
-                    let _ = tx.send(result);
-                }
+                autoreleasepool(|| {
+                    let result = handle_completion(data, response, error);
+                    if let Some(tx) = sender.lock().expect("mutex poisoned").take() {
+                        let _ = tx.send(result);
+                    }
+                });
             },
         )
         .copy();
 
         let task: *mut Object =
-            msg_send![session_ptr, dataTaskWithRequest: request completionHandler: &*completion];
+            msg_send![session, dataTaskWithRequest: request completionHandler: &*completion];
         if task.is_null() {
             return Err(http_kit::Error::new(
                 anyhow!("Failed to create URLSession data task"),
@@ -401,61 +387,5 @@ unsafe fn error_to_anyhow(error: *mut Object) -> Error {
         anyhow!(message)
     } else {
         anyhow!("URLSession error")
-    }
-}
-
-fn create_delegate() -> *mut Object {
-    static INIT: Once = Once::new();
-    static mut DELEGATE: *mut Object = std::ptr::null_mut();
-    INIT.call_once(|| unsafe {
-        let cls = delegate_class();
-        let delegate: *mut Object = msg_send![cls, new];
-        let _: () = msg_send![delegate, retain];
-        DELEGATE = delegate;
-    });
-    unsafe { DELEGATE }
-}
-
-fn delegate_class() -> *const Class {
-    static INIT: Once = Once::new();
-    static mut CLASS_PTR: *const Class = std::ptr::null();
-    INIT.call_once(|| unsafe {
-        let superclass = class!(NSObject);
-        let mut decl =
-            ClassDecl::new("ZenwaveURLSessionDelegate", superclass).expect("delegate creation");
-        decl.add_method(
-            sel!(URLSession:task:willPerformHTTPRedirection:newRequest:completionHandler:),
-            handle_redirect
-                as extern "C" fn(
-                    &Object,
-                    Sel,
-                    *mut Object,
-                    *mut Object,
-                    *mut Object,
-                    *mut Object,
-                    *mut Object,
-                ),
-        );
-        CLASS_PTR = decl.register();
-    });
-
-    unsafe { CLASS_PTR }
-}
-
-extern "C" fn handle_redirect(
-    _this: &Object,
-    _cmd: Sel,
-    _session: *mut Object,
-    _task: *mut Object,
-    _response: *mut Object,
-    request: *mut Object,
-    completion_handler: *mut Object,
-) {
-    unsafe {
-        if completion_handler.is_null() {
-            return;
-        }
-        let block = &*(completion_handler as *mut Block<(*mut Object,), ()>);
-        block.call((request,));
     }
 }

@@ -28,17 +28,21 @@ pub trait ClientBackend: http_kit::Endpoint + Default + 'static {}
 ))]
 pub type DefaultBackend = AppleBackend;
 
+/// The default HTTP client backend for the current platform.
 #[cfg(all(
     not(target_arch = "wasm32"),
+    not(feature = "apple-backend"),
     feature = "hyper-backend"
 ))]
 pub type DefaultBackend = HyperBackend;
 
 #[cfg(all(
     not(target_arch = "wasm32"),
+    not(feature = "apple-backend"),
     not(feature = "hyper-backend"),
     feature = "curl-backend"
 ))]
+/// The default HTTP client backend for the current platform.
 pub type DefaultBackend = CurlBackend;
 
 #[cfg(target_arch = "wasm32")]
@@ -52,9 +56,10 @@ pub type DefaultBackend = WebBackend;
 
 #[cfg(all(
     not(target_arch = "wasm32"),
+    not(feature = "apple-backend"),
     not(feature = "hyper-backend"),
     not(feature = "curl-backend"),
-    not(all(target_vendor = "apple", feature = "apple-backend"))
+    not(target_vendor = "apple")
 ))]
 compile_error!(
     "Enable at least one of `hyper-backend` or `curl-backend` for native zenwave builds."
