@@ -10,6 +10,8 @@ URLSession on iOS/tvOS/watchOS/macOS) and browser/Cloudflare Workers targets thr
 - **Opt-in middleware** – add redirect following, cookie storage, or authentication only when you
   need it.
 - **Streaming bodies** – handle large uploads/downloads or upgrade to SSE without buffering.
+- **HTTP caching** – drop-in middleware honors `Cache-Control`, `Expires`, `ETag`, and
+  `Last-Modified` to avoid redundant network hops.
 - **WebSocket ready** – one API that works natively and in WASM.
 - **Pluggable backends** – Hyper on general native targets, URLSession on Apple platforms, libcurl
   when you want small binaries, and Fetch on wasm, all behind the same `zenwave::client()` interface.
@@ -45,7 +47,7 @@ Feel free to copy these examples as starting points for your own projects.
 
 ```rust
 use serde::{Deserialize, Serialize};
-use zenwave::{self, Client};
+use zenwave::{self, Cache, Client};
 
 #[derive(Serialize)]
 struct MessageRequest<'a> {
@@ -68,6 +70,7 @@ async fn main() -> zenwave::Result<()> {
 
     // Compose only the middleware you need.
     let mut client = zenwave::client()
+        .with(Cache::new())
         .follow_redirect()
         .enable_cookie()
         .bearer_auth(token);
@@ -119,6 +122,15 @@ If you need to opt out of resume logic you can call `download_to_path_with` and 
 `DownloadOptions { resume_existing: false }`. Both methods return a `DownloadReport` so you can log
 how much data was appended and what now resides on disk. This helper is currently available on
 non-wasm targets where direct filesystem access exists.
+
+## HTTP cache middleware
+
+Add `Cache::new()` as middleware to enable RFC-compliant client-side caching. The middleware caches
+successful GET responses when permitted by `Cache-Control`/`Expires`, automatically injects
+validators for stale entries (`If-None-Match`, `If-Modified-Since`), and serves `304 Not Modified`
+responses straight from memory. Requests with `Authorization` headers are skipped unless the
+response explicitly declares itself `public`. Because it is implemented as middleware you can keep
+it for native builds only or combine it with other layers as needed.
 
 ## Web & Cloudflare Workers
 

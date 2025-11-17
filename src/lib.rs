@@ -24,10 +24,12 @@
 pub mod backend;
 pub use backend::ClientBackend;
 use backend::DefaultBackend;
+pub use cache::Cache;
 pub use client::Client;
 pub use http_kit::*;
 
 pub mod auth;
+pub mod cache;
 pub mod cookie;
 
 mod client;
