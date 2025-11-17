@@ -7,7 +7,7 @@ URLSession on iOS/tvOS/watchOS/macOS) and browser/Cloudflare Workers targets thr
 ## Why Zenwave?
 
 - **Ergonomic requests** – convenience helpers (`get`, `post`, …) and a fluent `RequestBuilder`.
-- **Opt-in middleware** – add redirect following, cookie storage, or authentication only when you
+- **Opt-in middleware** – add redirect following, cookie storage, OAuth2 refresh, or redirects only when you
   need it.
 - **Streaming bodies** – handle large uploads/downloads or upgrade to SSE without buffering.
 - **HTTP caching** – drop-in middleware honors `Cache-Control`, `Expires`, `ETag`, and
@@ -47,7 +47,7 @@ Feel free to copy these examples as starting points for your own projects.
 
 ```rust
 use serde::{Deserialize, Serialize};
-use zenwave::{self, Cache, Client};
+use zenwave::{self, Cache, Client, OAuth2ClientCredentials};
 
 #[derive(Serialize)]
 struct MessageRequest<'a> {
@@ -71,6 +71,11 @@ async fn main() -> zenwave::Result<()> {
     // Compose only the middleware you need.
     let mut client = zenwave::client()
         .with(Cache::new())
+        .with(OAuth2ClientCredentials::new(
+            "https://auth.example.com/token",
+            "client-id",
+            "client-secret",
+        ))
         .follow_redirect()
         .enable_cookie()
         .bearer_auth(token);
@@ -131,6 +136,14 @@ validators for stale entries (`If-None-Match`, `If-Modified-Since`), and serves 
 responses straight from memory. Requests with `Authorization` headers are skipped unless the
 response explicitly declares itself `public`. Because it is implemented as middleware you can keep
 it for native builds only or combine it with other layers as needed.
+
+## OAuth2 client credentials
+
+Use `OAuth2ClientCredentials::new(token_url, client_id, client_secret)` to automatically obtain and
+refresh bearer tokens. The middleware performs the client credentials flow against the configured
+token endpoint, caches responses until they near expiration, and injects the `Authorization` header
+for every outgoing request. Call `.with_scope("scope1 scope2")` or `.with_audience("api")` if your
+provider requires additional parameters.
 
 ## Web & Cloudflare Workers
 

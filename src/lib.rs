@@ -27,10 +27,12 @@ use backend::DefaultBackend;
 pub use cache::Cache;
 pub use client::Client;
 pub use http_kit::*;
+pub use oauth2::OAuth2ClientCredentials;
 
 pub mod auth;
 pub mod cache;
 pub mod cookie;
+pub mod oauth2;
 
 mod client;
 pub mod redirect;
