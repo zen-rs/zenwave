@@ -187,7 +187,7 @@ struct TokenEndpointResponse {
     expires_in: Option<u64>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use http::{Request as HttpRequest, Response as HttpResponse};

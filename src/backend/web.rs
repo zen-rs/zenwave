@@ -1,4 +1,5 @@
 use core::{
+    fmt,
     future::Future,
     ops::Deref,
     pin::Pin,
@@ -15,12 +16,21 @@ use web_sys::{
     Window,
     wasm_bindgen::{JsCast, JsValue},
 };
+
+use super::ClientBackend;
+/// HTTP client backend for browser environments using `fetch`.
 pub struct WebBackend {
     window: SingleThreaded<Window>,
 }
 
-// Broswer is not multi-threaded, so we can safely implement Send and Sync
-// since the WebBackend will only be used in the main thread
+impl fmt::Debug for WebBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebBackend").finish()
+    }
+}
+
+// Browser is not multi-threaded, so we can safely implement `Send` and `Sync`
+// since the WebBackend will only be used on the main thread
 struct SingleThreaded<T>(pub T);
 
 impl<T: Stream> Stream for SingleThreaded<T> {
@@ -55,6 +65,7 @@ impl<T: Future> Future for SingleThreaded<T> {
 }
 
 impl WebBackend {
+    /// Construct a new `WebBackend` bound to the global `window`.
     pub fn new() -> Self {
         let window = web_sys::window().expect("No global `window` exists");
 
@@ -87,17 +98,21 @@ fn fetch(
         let request_init = web_sys::RequestInit::new();
         request_init.set_method(request.method().as_str());
         let headers = web_sys::Headers::new().unwrap();
-        let body = std::mem::replace(request.body_mut(), http_kit::Body::empty()).map(|result| {
-            result
-                .map(|chunk| {
-                    let chunk: Box<[u8]> = chunk.to_vec().into_boxed_slice();
-                    JsValue::from(chunk)
-                })
-                .map_err(|e| JsValue::from_str(&format!("{e:?}")))
-        });
-        let body = wasm_streams::ReadableStream::from_stream(body).into_raw();
+        let body = std::mem::replace(request.body_mut(), http_kit::Body::empty());
+        let has_body = body.is_empty().map(|empty| !empty).unwrap_or(true);
 
-        request_init.set_body(body.dyn_ref().unwrap());
+        if has_body {
+            let body_stream = body.map(|result| {
+                result
+                    .map(|chunk| {
+                        let chunk: Box<[u8]> = chunk.to_vec().into_boxed_slice();
+                        JsValue::from(chunk)
+                    })
+                    .map_err(|e| JsValue::from_str(&format!("{e:?}")))
+            });
+            let body_value = wasm_streams::ReadableStream::from_stream(body_stream).into_raw();
+            request_init.set_body(body_value.dyn_ref().unwrap());
+        }
 
         for (name, value) in request.headers().iter() {
             headers.set(name.as_str(), value.to_str()?).unwrap();
@@ -157,3 +172,5 @@ fn fetch(
         Ok(response)
     })
 }
+
+impl ClientBackend for WebBackend {}

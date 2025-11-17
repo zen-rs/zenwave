@@ -8,12 +8,12 @@ use std::{
     mem::replace,
     os::raw::c_char,
     ptr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use crate::ClientBackend;
 use anyhow::{Error, anyhow};
-use block::ConcreteBlock;
+use block::{Block, ConcreteBlock};
 use futures_channel::oneshot;
 use http::{
     HeaderMap,
@@ -21,9 +21,11 @@ use http::{
 };
 use http_kit::{Body, Endpoint, Request, Response, Result, StatusCode};
 use objc::{
-    class, msg_send,
+    class,
+    declare::ClassDecl,
+    msg_send,
     rc::{StrongPtr, autoreleasepool},
-    runtime::{BOOL, Object, YES},
+    runtime::{BOOL, Class, Object, Sel, YES, NO},
     sel, sel_impl,
 };
 
@@ -33,6 +35,8 @@ unsafe extern "C" {}
 /// HTTP backend backed by Apple's `URLSession`.
 pub struct AppleBackend {
     session: StrongPtr,
+    delegate: StrongPtr,
+    queue: StrongPtr,
     handle: SessionHandle,
 }
 
@@ -64,12 +68,24 @@ impl AppleBackend {
             let _: () = msg_send![*config, setURLCache: nil];
             let _: () = msg_send![*config, setHTTPCookieStorage: nil];
             let _: () = msg_send![*config, setHTTPCookieAcceptPolicy: 0isize];
+            let _: () = msg_send![*config, setHTTPShouldSetCookies: NO];
 
-            let session: *mut Object =
-                msg_send![class!(NSURLSession), sessionWithConfiguration: *config];
+            let delegate_class = session_delegate_class();
+            let delegate = StrongPtr::new(msg_send![delegate_class, new]);
+            let queue = StrongPtr::new(msg_send![class!(NSOperationQueue), new]);
+            let _: () = msg_send![*queue, setMaxConcurrentOperationCount: 1isize];
+
+            let session: *mut Object = msg_send![
+                class!(NSURLSession),
+                sessionWithConfiguration: *config
+                delegate: *delegate
+                delegateQueue: *queue
+            ];
 
             Self {
                 session: StrongPtr::retain(session),
+                delegate,
+                queue,
                 handle: SessionHandle(session),
             }
         }
@@ -233,6 +249,7 @@ unsafe fn build_request(
             let _: () = msg_send![request, setHTTPBody: data];
         }
     }
+    let _: () = msg_send![request, setHTTPShouldHandleCookies: NO];
 
     Ok(request)
 }
@@ -387,5 +404,45 @@ unsafe fn error_to_anyhow(error: *mut Object) -> Error {
         anyhow!(message)
     } else {
         anyhow!("URLSession error")
+    }
+}
+
+fn session_delegate_class() -> *const Class {
+    static CLASS: OnceLock<*const Class> = OnceLock::new();
+    *CLASS.get_or_init(|| unsafe {
+        let superclass = class!(NSObject);
+        let mut decl = ClassDecl::new("ZenwaveURLSessionDelegate", superclass)
+            .expect("failed to declare delegate class");
+        decl.add_method(
+            sel!(URLSession:task:willPerformHTTPRedirection:newRequest:completionHandler:),
+            redirect_handler as extern "C" fn(
+                &Object,
+                Sel,
+                *mut Object,
+                *mut Object,
+                *mut Object,
+                *mut Object,
+                *mut Object,
+            ),
+        );
+        decl.register()
+    })
+}
+
+extern "C" fn redirect_handler(
+    _this: &Object,
+    _cmd: Sel,
+    _session: *mut Object,
+    _task: *mut Object,
+    _response: *mut Object,
+    _new_request: *mut Object,
+    completion_handler: *mut Object,
+) {
+    unsafe {
+        if completion_handler.is_null() {
+            return;
+        }
+        let handler = &*(completion_handler as *mut Block<(*mut Object,), ()>);
+        let _ = handler.call((ptr::null_mut(),));
     }
 }

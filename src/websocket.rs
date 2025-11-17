@@ -246,9 +246,9 @@ mod wasm {
     use futures_util::StreamExt;
     use http_kit::{Result, StatusCode};
     use wasm_bindgen::{JsCast, JsValue, closure::Closure};
-    use web_sys::{BinaryType, CloseEvent, ErrorEvent, MessageEvent, WebSocket};
+    use web_sys::{BinaryType, CloseEvent, ErrorEvent, MessageEvent, WebSocket as BrowserWebSocket};
 
-    use super::{Error, WebSocketMessage};
+    use super::{Error, WebSocketMessage, serialize_payload};
 
     enum WsEvent {
         Message(WebSocketMessage),
@@ -258,7 +258,7 @@ mod wasm {
 
     /// Browser/wasm websocket connection backed by `web_sys`.
     pub struct WebSocket {
-        socket: WebSocket,
+        socket: BrowserWebSocket,
         receiver: mpsc::UnboundedReceiver<WsEvent>,
         _on_message: Closure<dyn FnMut(MessageEvent)>,
         _on_error: Closure<dyn FnMut(ErrorEvent)>,
@@ -279,7 +279,7 @@ mod wasm {
     ///
     /// Returns an error if the browser reports an error or the connection fails.
     pub async fn connect(uri: impl AsRef<str>) -> Result<WebSocket> {
-        let socket = WebSocket::new(uri.as_ref())
+        let socket = BrowserWebSocket::new(uri.as_ref())
             .map_err(|e| Error::new(anyhow!(format_js_value(&e)), StatusCode::BAD_REQUEST))?;
         socket.set_binary_type(BinaryType::Arraybuffer);
 
@@ -304,7 +304,7 @@ mod wasm {
                 return;
             }
 
-            if let Ok(array) = data.dyn_into::<js_sys::ArrayBuffer>() {
+            if let Ok(array) = data.clone().dyn_into::<js_sys::ArrayBuffer>() {
                 let view = js_sys::Uint8Array::new(&array);
                 let mut bytes = vec![0; view.length() as usize];
                 view.copy_to(&mut bytes[..]);
@@ -445,7 +445,7 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if the browser refuses to close the socket.
-        pub async fn close(mut self) -> Result<()> {
+        pub async fn close(self) -> Result<()> {
             self.socket
                 .close()
                 .map_err(|e| Error::new(anyhow!(format_js_value(&e)), StatusCode::BAD_GATEWAY))

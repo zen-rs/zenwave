@@ -5,10 +5,6 @@ use zenwave::redirect::FollowRedirect;
 use zenwave::{Client, Endpoint, Middleware, Request, client};
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(
-    all(not(target_arch = "wasm32"), target_vendor = "apple"),
-    ignore = "URLSession always manages cookies automatically"
-)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_cookie_store_middleware() {
     let client = client().enable_cookie();
@@ -90,10 +86,6 @@ async fn test_client_with_multiple_middleware() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(
-    all(not(target_arch = "wasm32"), target_vendor = "apple"),
-    ignore = "URLSession automatically follows redirects"
-)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_without_redirect_middleware() {
     // Without redirect middleware, should get redirect response

@@ -95,14 +95,7 @@ async fn test_gzip_compression() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(
-    not(target_arch = "wasm32"),
-    tokio::test,
-    cfg_attr(
-        all(target_vendor = "apple", feature = "apple-backend"),
-        ignore = "URLSession cookie store is automatic on Apple backend"
-    )
-)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_cookie_persistence() {
     let client = client().enable_cookie();
     let mut client = client;

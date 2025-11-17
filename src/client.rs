@@ -11,8 +11,10 @@ use std::{
 };
 
 use futures_util::{Stream, StreamExt};
+#[cfg(not(target_arch = "wasm32"))]
+use http_kit::StatusCode;
 use http_kit::{
-    Endpoint, Method, Middleware, Request, Response, Result, StatusCode, Uri,
+    Endpoint, Method, Middleware, Request, Response, Result, Uri,
     endpoint::WithMiddleware,
     sse::SseStream,
     utils::{ByteStr, Bytes},
