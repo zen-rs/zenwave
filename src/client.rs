@@ -10,6 +10,7 @@ use std::{
     path::PathBuf,
 };
 
+use futures_util::{Stream, StreamExt};
 use http_kit::{
     Endpoint, Method, Middleware, Request, Response, Result, StatusCode, Uri,
     endpoint::WithMiddleware,
@@ -20,7 +21,7 @@ use serde::de::DeserializeOwned;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::{
     fs::OpenOptions,
-    io::{AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncSeekExt, AsyncWriteExt},
 };
 
 use crate::{
@@ -141,6 +142,54 @@ impl<T: Client> RequestBuilder<'_, T> {
         self
     }
 
+    /// Provide an async reader as the request body.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn reader_body<R>(mut self, reader: R, length: Option<u64>) -> Self
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+    {
+        use http_kit::header;
+        use tokio_util::io::ReaderStream;
+
+        if let Some(len) = length
+            && let Ok(value) = header::HeaderValue::from_str(&len.to_string())
+        {
+            self.request
+                .headers_mut()
+                .insert(header::CONTENT_LENGTH, value);
+        }
+
+        let stream = ReaderStream::new(reader);
+        self.stream_body(stream)
+    }
+
+    /// Stream a file from disk as the request body without loading it into memory.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn file_body(self, path: impl AsRef<std::path::Path>) -> Result<Self> {
+        use tokio::fs::File;
+
+        let file = File::open(path.as_ref())
+            .await
+            .map_err(|err| http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+        let metadata = file
+            .metadata()
+            .await
+            .map_err(|err| http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+        Ok(self.reader_body(file, Some(metadata.len())))
+    }
+
+    /// Attach a streaming body composed from arbitrary async chunks.
+    pub fn stream_body<Chunk, ErrType, S>(mut self, stream: S) -> Self
+    where
+        Chunk: Into<Bytes> + Send + 'static,
+        ErrType: Into<Box<dyn core::error::Error + Send + Sync>> + Send + Sync + 'static,
+        S: Stream<Item = std::result::Result<Chunk, ErrType>> + Send + 'static,
+    {
+        let mapped = stream.map(|result| result.map_err(Into::into));
+        *self.request.body_mut() = http_kit::Body::from_stream(mapped);
+        self
+    }
+
     /// Download the response body into the provided path, resuming partial files automatically.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn download_to_path(
@@ -158,7 +207,6 @@ impl<T: Client> RequestBuilder<'_, T> {
         path: impl AsRef<std::path::Path>,
         options: DownloadOptions,
     ) -> Result<DownloadReport> {
-        use futures_util::StreamExt;
         let path_buf: PathBuf = path.as_ref().to_path_buf();
         let existing_len = if options.resume_existing {
             match tokio::fs::metadata(&path_buf).await {
@@ -268,10 +316,11 @@ impl Default for DownloadOptions {
 mod tests {
     use super::*;
     use crate::backend::ClientBackend;
+    use futures_util::stream;
     use http::Response;
     use std::sync::Arc;
     use tempfile::tempdir;
-    use tokio::fs;
+    use tokio::{fs, sync::Mutex};
 
     #[tokio::test]
     async fn download_to_path_resumes_existing_file() {
@@ -307,6 +356,50 @@ mod tests {
 
         let final_bytes = fs::read(&path).await.unwrap();
         assert_eq!(final_bytes, payload);
+    }
+
+    #[tokio::test]
+    async fn file_body_streams_files_without_buffering() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("upload.bin");
+        let payload: Vec<u8> = (0..2048).map(|i| i as u8).collect();
+        fs::write(&path, &payload).await.unwrap();
+
+        let backend = RecordingBackend::default();
+        let recorded = backend.recorded.clone();
+        let mut client = backend;
+
+        client
+            .post("http://example.com/upload")
+            .file_body(&path)
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+
+        let data = recorded.lock().await.clone();
+        assert_eq!(data, payload);
+    }
+
+    #[tokio::test]
+    async fn stream_body_uploads_chunks() {
+        let backend = RecordingBackend::default();
+        let recorded = backend.recorded.clone();
+        let mut client = backend;
+
+        let stream = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"chunk-a")),
+            Ok(Bytes::from_static(b"chunk-b")),
+        ]);
+
+        client
+            .post("http://example.com/upload")
+            .stream_body(stream)
+            .await
+            .unwrap();
+
+        let data = recorded.lock().await.clone();
+        assert_eq!(data, b"chunk-achunk-b");
     }
 
     #[derive(Clone)]
@@ -389,6 +482,32 @@ mod tests {
 
     impl ClientBackend for FakeBackend {}
 
+    #[derive(Clone, Default)]
+    struct RecordingBackend {
+        recorded: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Endpoint for RecordingBackend {
+        async fn respond(
+            &mut self,
+            request: &mut Request,
+        ) -> http_kit::Result<Response<http_kit::Body>> {
+            let body = match request.body_mut().take() {
+                Ok(body) => body,
+                Err(_) => http_kit::Body::empty(),
+            };
+            let bytes = body.into_bytes().await?;
+            *self.recorded.lock().await = bytes.to_vec();
+
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(http_kit::Body::empty())
+                .unwrap())
+        }
+    }
+
+    impl ClientBackend for RecordingBackend {}
+
     fn parse_range(request: &Request) -> usize {
         request
             .headers()
@@ -416,6 +535,12 @@ pub trait Client: Endpoint + Sized {
     /// Enable cookie management.
     fn enable_cookie(self) -> impl Client {
         WithMiddleware::new(self, CookieStore::default())
+    }
+
+    /// Enable cookie management with persistent backing storage (native targets only).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn enable_persistent_cookie(self) -> impl Client {
+        WithMiddleware::new(self, CookieStore::persistent_default())
     }
 
     /// Add Bearer Token Authentication middleware.

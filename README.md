@@ -128,6 +128,36 @@ If you need to opt out of resume logic you can call `download_to_path_with` and 
 how much data was appended and what now resides on disk. This helper is currently available on
 non-wasm targets where direct filesystem access exists.
 
+## Streaming uploads
+
+Use `file_body` to upload large files directly from disk without buffering, `reader_body` to wrap
+any `AsyncRead`, or `stream_body` to hook up custom chunk producers. Each helper integrates with
+Tokio so uploads backpressure naturally with the network stack.
+
+```rust
+# async fn example() -> zenwave::Result<()> {
+use zenwave::client;
+use tokio::fs::File;
+
+let mut client = client();
+let response = client
+    .post("https://example.com/upload")
+    .file_body("video.mp4")
+    .await?
+    .await?;
+assert!(response.status().is_success());
+
+let mut stream_client = client();
+let file = File::open("log.txt").await?;
+let response = stream_client
+    .post("https://example.com/logs")
+    .reader_body(file, None)
+    .await?;
+assert!(response.status().is_success());
+# Ok(())
+# }
+```
+
 ## HTTP cache middleware
 
 Add `Cache::new()` as middleware to enable RFC-compliant client-side caching. The middleware caches
@@ -136,6 +166,14 @@ validators for stale entries (`If-None-Match`, `If-Modified-Since`), and serves 
 responses straight from memory. Requests with `Authorization` headers are skipped unless the
 response explicitly declares itself `public`. Because it is implemented as middleware you can keep
 it for native builds only or combine it with other layers as needed.
+
+## Persistent cookie store
+
+Call `.enable_persistent_cookie()` to transparently load and save cookies between runs on native
+targets. Zenwave automatically picks a cache file under your platform's local data directory using
+the name `zenwave_cookie_store_<crate_name>.json`, so crates only share cookies with themselves by
+default. You can also fully control the path via `CookieStore::persistent_with_path` if you want to
+sync cookies across binaries.
 
 ## OAuth2 client credentials
 
