@@ -135,7 +135,7 @@ async fn test_hyper_backend_request_cancellation() {
     let mut delay = Box::pin(tokio::time::sleep(Duration::from_millis(50)));
     tokio::select! {
         _ = &mut future => panic!("request unexpectedly completed before cancellation"),
-        _ = &mut delay => {},
+        () = &mut delay => {},
     }
     drop(future);
 

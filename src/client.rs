@@ -1,3 +1,5 @@
+#![allow(clippy::cast_sign_loss)]
+
 #[cfg(not(target_arch = "wasm32"))]
 use anyhow::Error as AnyhowError;
 use core::pin::Pin;
@@ -158,7 +160,7 @@ impl<T: Client> RequestBuilder<'_, T> {
     ) -> Result<DownloadReport> {
         use futures_util::StreamExt;
         let path_buf: PathBuf = path.as_ref().to_path_buf();
-        let resume_from = if options.resume_existing {
+        let existing_len = if options.resume_existing {
             match tokio::fs::metadata(&path_buf).await {
                 Ok(meta) => meta.len(),
                 Err(err) if err.kind() == ErrorKind::NotFound => 0,
@@ -170,8 +172,8 @@ impl<T: Client> RequestBuilder<'_, T> {
             0
         };
 
-        if resume_from > 0 {
-            let value = format!("bytes={resume_from}-");
+        if existing_len > 0 {
+            let value = format!("bytes={existing_len}-");
             self = self.header(http_kit::header::RANGE.as_str(), value);
         }
 
@@ -180,15 +182,16 @@ impl<T: Client> RequestBuilder<'_, T> {
         let mut body = response.into_body();
 
         let mut resumed_from = 0_u64;
-        let mut file = if resume_from > 0 && status == StatusCode::PARTIAL_CONTENT {
-            resumed_from = resume_from;
+        let mut file = if existing_len > 0 && status == StatusCode::PARTIAL_CONTENT {
+            resumed_from = existing_len;
             let mut file = OpenOptions::new()
                 .create(true)
                 .write(true)
+                .truncate(false)
                 .open(&path_buf)
                 .await
                 .map_err(|err| http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
-            file.seek(SeekFrom::Start(resume_from))
+            file.seek(SeekFrom::Start(existing_len))
                 .await
                 .map_err(|err| http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
             file
@@ -239,7 +242,7 @@ pub struct DownloadReport {
 #[cfg(not(target_arch = "wasm32"))]
 impl DownloadReport {
     /// Total bytes now persisted on disk.
-    pub fn total_bytes(&self) -> u64 {
+    pub const fn total_bytes(&self) -> u64 {
         self.resumed_from + self.bytes_written
     }
 }
