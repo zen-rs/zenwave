@@ -1,7 +1,8 @@
 use std::mem::replace;
 
+use http::StatusCode;
 use http_body_util::BodyDataStream;
-use http_kit::{Endpoint, Method, Request, Response};
+use http_kit::{Endpoint, Method, Request, Response, ResultExt};
 use hyper::http;
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client as HyperClient;
@@ -41,7 +42,7 @@ impl Endpoint for HyperBackend {
             .unwrap();
         let request: http::Request<http_kit::Body> = replace(request, dummy_request);
 
-        let response = self.client.request(request).await?;
+        let response = self.client.request(request).await.status(StatusCode::SERVICE_UNAVAILABLE)?;
 
         let response = response.map(|body| {
             let stream = BodyDataStream::new(body);

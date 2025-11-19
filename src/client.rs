@@ -14,10 +14,10 @@ use futures_util::{Stream, StreamExt};
 #[cfg(not(target_arch = "wasm32"))]
 use http_kit::StatusCode;
 use http_kit::{
-    Endpoint, Method, Middleware, Request, Response, Result, Uri,
+    Endpoint, Method, Middleware, Request, Response, Result, ResultExt, Uri,
     endpoint::WithMiddleware,
     sse::SseStream,
-    utils::{ByteStr, Bytes},
+    utils::{ByteStr, Bytes},error
 };
 use serde::de::DeserializeOwned;
 #[cfg(not(target_arch = "wasm32"))]
@@ -94,13 +94,19 @@ impl<T: Client> RequestBuilder<'_, T> {
     pub async fn string(self) -> Result<ByteStr> {
         let response = self.await?;
         let body = response.into_body();
-        Ok(body.into_string().await?)
+        Ok(body
+            .into_string()
+            .await
+            .status(StatusCode::SERVICE_UNAVAILABLE)?)
     }
 
     pub async fn bytes(self) -> Result<Bytes> {
         let response = self.await?;
         let body = response.into_body();
-        Ok(body.into_bytes().await?)
+        Ok(body
+            .into_bytes()
+            .await
+            .status(StatusCode::SERVICE_UNAVAILABLE)?)
     }
 
     pub async fn form<Res: DeserializeOwned>(self) -> Result<Res> {
@@ -125,8 +131,7 @@ impl<T: Client> RequestBuilder<'_, T> {
     }
 
     pub fn json_body<B: serde::Serialize>(mut self, body: &B) -> Result<Self> {
-        let json = serde_json::to_string(body)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize JSON: {e}"))?;
+        let json = serde_json::to_string(body).status(StatusCode::SERVICE_UNAVAILABLE)?;
 
         // Set the body directly
         *self.request.body_mut() = http_kit::Body::from(json);
@@ -148,7 +153,7 @@ impl<T: Client> RequestBuilder<'_, T> {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn reader_body<R>(mut self, reader: R, length: Option<u64>) -> Self
     where
-        R: AsyncRead + Send + Unpin + 'static,
+        R: AsyncRead + Send + Sync + Unpin + 'static,
     {
         use http_kit::header;
         use tokio_util::io::ReaderStream;
@@ -185,7 +190,7 @@ impl<T: Client> RequestBuilder<'_, T> {
     where
         Chunk: Into<Bytes> + Send + 'static,
         ErrType: Into<Box<dyn core::error::Error + Send + Sync>> + Send + Sync + 'static,
-        S: Stream<Item = std::result::Result<Chunk, ErrType>> + Send + 'static,
+        S: Stream<Item = std::result::Result<Chunk, ErrType>> + Send + Sync + 'static,
     {
         let mapped = stream.map(|result| result.map_err(Into::into));
         *self.request.body_mut() = http_kit::Body::from_stream(mapped);
@@ -258,7 +263,7 @@ impl<T: Client> RequestBuilder<'_, T> {
         let mut bytes_written = 0_u64;
         while let Some(chunk) = body.next().await {
             let chunk = chunk.map_err(|err| {
-                http_kit::Error::new(AnyhowError::msg(err.to_string()), StatusCode::BAD_GATEWAY)
+                error!(500,"{err}")
             })?;
             file.write_all(&chunk)
                 .await
@@ -498,7 +503,7 @@ mod tests {
                 Ok(body) => body,
                 Err(_) => http_kit::Body::empty(),
             };
-            let bytes = body.into_bytes().await?;
+            let bytes = body.into_bytes().await.status(StatusCode::SERVICE_UNAVAILABLE)?;
             *self.recorded.lock().await = bytes.to_vec();
 
             Ok(Response::builder()
