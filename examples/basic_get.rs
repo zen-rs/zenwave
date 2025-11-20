@@ -17,7 +17,10 @@ struct Todo {
 async fn main() -> zenwave::Result<()> {
     // `zenwave::get` is perfect for one-off requests.
     let response = zenwave::get("https://jsonplaceholder.typicode.com/todos/1").await?;
-    let todo: Todo = response.into_json().await.status(StatusCode::SERVICE_UNAVAILABLE)?;
+    let todo: Todo = response
+        .into_json()
+        .await
+        .status(StatusCode::SERVICE_UNAVAILABLE)?;
 
     println!(
         "Todo #{id} for user #{user}: {title} (completed: {completed})",

@@ -25,7 +25,7 @@ use objc::{
     declare::ClassDecl,
     msg_send,
     rc::{StrongPtr, autoreleasepool},
-    runtime::{BOOL, Class, Object, Sel, YES, NO},
+    runtime::{BOOL, Class, NO, Object, Sel, YES},
     sel, sel_impl,
 };
 
@@ -415,15 +415,16 @@ fn session_delegate_class() -> *const Class {
             .expect("failed to declare delegate class");
         decl.add_method(
             sel!(URLSession:task:willPerformHTTPRedirection:newRequest:completionHandler:),
-            redirect_handler as extern "C" fn(
-                &Object,
-                Sel,
-                *mut Object,
-                *mut Object,
-                *mut Object,
-                *mut Object,
-                *mut Object,
-            ),
+            redirect_handler
+                as extern "C" fn(
+                    &Object,
+                    Sel,
+                    *mut Object,
+                    *mut Object,
+                    *mut Object,
+                    *mut Object,
+                    *mut Object,
+                ),
         );
         decl.register()
     })

@@ -17,7 +17,7 @@ use http_kit::{
     Endpoint, Method, Middleware, Request, Response, Result, ResultExt, Uri,
     endpoint::WithMiddleware,
     sse::SseStream,
-    utils::{ByteStr, Bytes},error
+    utils::{ByteStr, Bytes},
 };
 use serde::de::DeserializeOwned;
 #[cfg(not(target_arch = "wasm32"))]
@@ -177,11 +177,11 @@ impl<T: Client> RequestBuilder<'_, T> {
 
         let file = File::open(path.as_ref())
             .await
-            .map_err(|err| http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+            ?;
         let metadata = file
             .metadata()
             .await
-            .map_err(|err| http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+            ?;
         Ok(self.reader_body(file, Some(metadata.len())))
     }
 
@@ -245,10 +245,10 @@ impl<T: Client> RequestBuilder<'_, T> {
                 .truncate(false)
                 .open(&path_buf)
                 .await
-                .map_err(|err| http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+                ?;
             file.seek(SeekFrom::Start(existing_len))
                 .await
-                .map_err(|err| http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+                ?;
             file
         } else {
             OpenOptions::new()
@@ -257,22 +257,18 @@ impl<T: Client> RequestBuilder<'_, T> {
                 .truncate(true)
                 .open(&path_buf)
                 .await
-                .map_err(|err| http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR))?
+                ?
         };
 
         let mut bytes_written = 0_u64;
         while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|err| {
-                error!(500,"{err}")
-            })?;
+            let chunk = chunk?;
             file.write_all(&chunk)
-                .await
-                .map_err(|err| http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+                .await?;
             bytes_written += chunk.len() as u64;
         }
         file.flush()
-            .await
-            .map_err(|err| http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+            .await?;
 
         Ok(DownloadReport {
             path: path_buf,
@@ -503,7 +499,7 @@ mod tests {
                 Ok(body) => body,
                 Err(_) => http_kit::Body::empty(),
             };
-            let bytes = body.into_bytes().await.status(StatusCode::SERVICE_UNAVAILABLE)?;
+            let bytes = body.into_bytes().await?;
             *self.recorded.lock().await = bytes.to_vec();
 
             Ok(Response::builder()

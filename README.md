@@ -12,6 +12,7 @@ URLSession on iOS/tvOS/watchOS/macOS) and browser/Cloudflare Workers targets thr
 - **Streaming bodies** – handle large uploads/downloads or upgrade to SSE without buffering.
 - **HTTP caching** – drop-in middleware honors `Cache-Control`, `Expires`, `ETag`, and
   `Last-Modified` to avoid redundant network hops.
+- **Proxy aware** – honor `HTTP(S)_PROXY`/`NO_PROXY` or define custom SOCKS/HTTP proxies when using the Hyper or curl backends.
 - **WebSocket ready** – one API that works natively and in WASM.
 - **Pluggable backends** – Hyper on general native targets, URLSession on Apple platforms, libcurl
   when you want small binaries, and Fetch on wasm, all behind the same `zenwave::client()` interface.
@@ -95,6 +96,36 @@ async fn main() -> zenwave::Result<()> {
 You can also call `.basic_auth` or `.with(custom_middleware)` to plug in your own behavior. Every
 request builder supports `.header`, `.bearer_auth`, `.basic_auth`, `.json_body`, `.bytes_body`, and
 body readers (`.json()`, `.string()`, `.bytes()`, `.form()`, `.sse()`).
+
+## Proxy configuration (native Hyper / curl backends)
+
+Zenwave can route requests through HTTP or SOCKS proxies by reading the
+standard `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` variables or
+by constructing a matcher manually. Both the Hyper and libcurl-native backends
+honor the same configuration:
+
+```rust
+use zenwave::{self, Proxy};
+
+fn main() {
+    // Inherit proxy settings from the environment (`*_PROXY` / `NO_PROXY`).
+    let proxy = Proxy::from_env();
+    let mut client = zenwave::client_with_proxy(proxy);
+
+    // Or build one manually. Supports http, socks4, socks4a, socks5, and socks5h schemes.
+    let custom = Proxy::builder()
+        .http("http://corp-proxy:8080")
+        .no_proxy("internal.example.com")
+        .build();
+    let mut custom_client = zenwave::client_with_proxy(custom);
+
+    // Clients returned by `zenwave::client()` can also be swapped afterwards:
+    let mut swapped = zenwave::client().proxy(Proxy::from_system());
+}
+```
+
+Only the Hyper and curl backends currently honor proxies. HTTP CONNECT proxies
+(`http://` / `https://`) and SOCKS4/5 proxies (`socks4[a]`, `socks5[h]`) are supported.
 
 ## Large downloads with resume
 

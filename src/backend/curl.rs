@@ -1,19 +1,44 @@
 use std::{mem::replace, str};
 
-use anyhow::anyhow;
-use curl::easy::{Easy2, Handler, List, ReadError, WriteError};
+use anyhow::{Context, anyhow};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use curl::easy::{Easy2, Handler, List, ProxyType, ReadError, WriteError};
 use http::{
     HeaderMap, Method,
     header::{HeaderName, HeaderValue},
 };
 use http_kit::{Body, Endpoint, Request, Response, Result, StatusCode};
+use hyper_util::client::proxy::matcher;
 use tokio::task;
 
-use crate::ClientBackend;
+use crate::{ClientBackend, Proxy};
 
 /// HTTP backend implemented with libcurl.
-#[derive(Debug, Default)]
-pub struct CurlBackend;
+#[derive(Debug, Clone, Default)]
+pub struct CurlBackend {
+    proxy: Option<Proxy>,
+}
+
+impl CurlBackend {
+    /// Create a new backend without proxy configuration.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a backend configured to use the supplied proxy matcher.
+    #[must_use]
+    pub fn with_proxy(proxy: Proxy) -> Self {
+        Self { proxy: Some(proxy) }
+    }
+
+    /// Replace the proxy matcher.
+    #[must_use]
+    pub fn proxy(self, proxy: Proxy) -> Self {
+        Self::with_proxy(proxy)
+    }
+}
 
 impl ClientBackend for CurlBackend {}
 
@@ -25,11 +50,11 @@ impl Endpoint for CurlBackend {
             .body(Body::empty())
             .expect("building dummy request failed");
         let mut request = replace(request, dummy_request);
-        execute(request).await
+        execute(request, self.proxy.clone()).await
     }
 }
 
-async fn execute(request: Request) -> Result<Response> {
+async fn execute(request: Request, proxy: Option<Proxy>) -> Result<Response> {
     let (parts, body) = request.into_parts();
     let mut headers = Vec::with_capacity(parts.headers.len());
     for (name, value) in parts.headers.iter() {
@@ -45,11 +70,20 @@ async fn execute(request: Request) -> Result<Response> {
         .map_err(|e| http_kit::Error::new(e, StatusCode::BAD_REQUEST))?
         .to_vec();
 
+    let proxy = proxy
+        .as_ref()
+        .and_then(|cfg| cfg.intercept(&parts.uri))
+        .map(|intercept| {
+            resolve_proxy(intercept).map_err(|e| http_kit::Error::new(e, StatusCode::BAD_REQUEST))
+        })
+        .transpose()?;
+
     let prepared = PreparedRequest {
         method: parts.method.as_str().to_owned(),
         url: parts.uri.to_string(),
         headers,
         body: body_bytes,
+        proxy,
     };
 
     task::spawn_blocking(move || perform(prepared))
@@ -82,6 +116,10 @@ fn perform(request: PreparedRequest) -> Result<Response> {
         header_list = Some(easy.http_headers(list).map_err(map_curl_error)?);
     }
 
+    if let Some(proxy) = &request.proxy {
+        apply_proxy(&mut easy, proxy).map_err(map_curl_error)?;
+    }
+
     easy.perform().map_err(map_curl_error)?;
 
     // Keep the header list alive until this point.
@@ -109,6 +147,98 @@ struct PreparedRequest {
     url: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    proxy: Option<ResolvedProxy>,
+}
+#[derive(Debug)]
+struct ResolvedProxy {
+    endpoint: String,
+    kind: ProxyType,
+    credentials: Option<String>,
+}
+
+fn apply_proxy(
+    handler: &mut Easy2<CurlHandler>,
+    proxy: &ResolvedProxy,
+) -> std::result::Result<(), curl::Error> {
+    handler.proxy(&proxy.endpoint)?;
+    handler.proxy_type(proxy.kind)?;
+    if let Some(creds) = &proxy.credentials {
+        handler.proxy_userpwd(creds)?;
+    }
+    Ok(())
+}
+
+fn resolve_proxy(intercept: matcher::Intercept) -> anyhow::Result<ResolvedProxy> {
+    let scheme = intercept
+        .uri()
+        .scheme_str()
+        .unwrap_or("http")
+        .to_ascii_lowercase();
+    let authority = intercept
+        .uri()
+        .authority()
+        .context("proxy URI missing authority")?
+        .as_str();
+    let endpoint = format!("{scheme}://{authority}");
+
+    let (kind, credentials) = match scheme.as_str() {
+        "http" => (
+            ProxyType::Http,
+            intercept
+                .basic_auth()
+                .and_then(decode_basic_auth)
+                .map(|(user, pass)| format!("{user}:{pass}")),
+        ),
+        "https" => (
+            ProxyType::Https,
+            intercept
+                .basic_auth()
+                .and_then(decode_basic_auth)
+                .map(|(user, pass)| format!("{user}:{pass}")),
+        ),
+        "socks4" => (
+            ProxyType::Socks4,
+            intercept
+                .raw_auth()
+                .map(|(user, pass)| format!("{user}:{pass}")),
+        ),
+        "socks4a" => (
+            ProxyType::Socks4a,
+            intercept
+                .raw_auth()
+                .map(|(user, pass)| format!("{user}:{pass}")),
+        ),
+        "socks5" => (
+            ProxyType::Socks5,
+            intercept
+                .raw_auth()
+                .map(|(user, pass)| format!("{user}:{pass}")),
+        ),
+        "socks5h" => (
+            ProxyType::Socks5Hostname,
+            intercept
+                .raw_auth()
+                .map(|(user, pass)| format!("{user}:{pass}")),
+        ),
+        other => return Err(anyhow!("unsupported proxy scheme `{other}`")),
+    };
+
+    Ok(ResolvedProxy {
+        endpoint,
+        kind,
+        credentials,
+    })
+}
+
+fn decode_basic_auth(value: &HeaderValue) -> Option<(String, String)> {
+    let text = value.to_str().ok()?;
+    let encoded = text.strip_prefix("Basic ")?;
+    let decoded = BASE64_STANDARD.decode(encoded).ok()?;
+    let creds = String::from_utf8(decoded).ok()?;
+    let mut parts = creds.splitn(2, ':');
+    let user = parts.next()?.to_string();
+    let pass = parts.next().unwrap_or("").to_string();
+    Some((user, pass))
 }
 
 #[derive(Debug)]

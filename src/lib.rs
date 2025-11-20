@@ -40,10 +40,14 @@ pub mod redirect;
 mod ext;
 /// Multipart/form-data utilities.
 pub mod multipart;
+#[cfg(all(not(target_arch = "wasm32"), feature = "proxy-support"))]
+pub mod proxy;
 /// Websocket utilities.
 pub mod websocket;
 
 pub use ext::ResponseExt;
+#[cfg(all(not(target_arch = "wasm32"), feature = "proxy-support"))]
+pub use proxy::{Proxy, ProxyBuilder};
 
 /// Create a default HTTP client backend.
 #[must_use]
@@ -51,6 +55,18 @@ pub fn client() -> DefaultBackend {
     DefaultBackend::default()
 }
 
+/// Construct a Hyper backend configured with a proxy matcher.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "proxy-support",
+    not(all(target_vendor = "apple", feature = "apple-backend"))
+))]
+#[must_use]
+pub fn client_with_proxy(proxy: Proxy) -> DefaultBackend {
+    DefaultBackend::with_proxy(proxy)
+}
+
+/// Create a default HTTP client backend.
 /// Send a GET request to the specified URI using the default client backend.
 ///
 /// # Errors

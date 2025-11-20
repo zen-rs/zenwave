@@ -8,8 +8,8 @@ use std::{
 use http::{HeaderMap, HeaderValue, Method, Response as HttpResponse, StatusCode, header};
 use httpdate::parse_http_date;
 
-use http_kit::{ResultExt, utils::Bytes};
 use http_kit::{Endpoint, Middleware, Request, Response, Result};
+use http_kit::{ResultExt, utils::Bytes};
 
 /// Middleware implementing an in-memory HTTP cache.
 ///
@@ -145,7 +145,10 @@ impl CachedResponse {
             return Ok((response, None));
         }
 
-        let bytes = body.into_bytes().await.status(StatusCode::SERVICE_UNAVAILABLE)?;
+        let bytes = body
+            .into_bytes()
+            .await
+            .status(StatusCode::SERVICE_UNAVAILABLE)?;
         parts.headers.remove(header::AGE);
         let response = HttpResponse::from_parts(parts, http_kit::Body::from(bytes.clone()));
 

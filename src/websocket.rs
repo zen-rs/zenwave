@@ -246,7 +246,9 @@ mod wasm {
     use futures_util::StreamExt;
     use http_kit::{Result, StatusCode};
     use wasm_bindgen::{JsCast, JsValue, closure::Closure};
-    use web_sys::{BinaryType, CloseEvent, ErrorEvent, MessageEvent, WebSocket as BrowserWebSocket};
+    use web_sys::{
+        BinaryType, CloseEvent, ErrorEvent, MessageEvent, WebSocket as BrowserWebSocket,
+    };
 
     use super::{Error, WebSocketMessage, serialize_payload};
 
