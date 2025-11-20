@@ -126,6 +126,9 @@ fn main() {
 
 Only the Hyper and curl backends currently honor proxies. HTTP CONNECT proxies
 (`http://` / `https://`) and SOCKS4/5 proxies (`socks4[a]`, `socks5[h]`) are supported.
+The Apple (`apple-backend`) and Web (`wasm32`) backends do not expose proxy
+APIs, so helper functions such as `client_with_proxy` or `.proxy(...)` are not
+compiled when those backends are selected as the default.
 
 ## Large downloads with resume
 

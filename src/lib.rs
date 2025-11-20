@@ -29,14 +29,8 @@ pub use client::Client;
 pub use http_kit::*;
 pub mod error;
 pub use error::{
-    CacheError,
-    ClientError,
-    CookieStoreError,
-    DownloadError,
-    HyperBackendError,
-    PersistenceOperation,
-    RedirectError,
-    WebBackendError,
+    CacheError, ClientError, CookieStoreError, DownloadError, HyperBackendError,
+    PersistenceOperation, RedirectError, WebBackendError,
 };
 pub use oauth2::OAuth2ClientCredentials;
 
@@ -51,13 +45,13 @@ pub mod redirect;
 mod ext;
 /// Multipart/form-data utilities.
 pub mod multipart;
-#[cfg(all(not(target_arch = "wasm32"), feature = "proxy-support"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "proxy"))]
 pub mod proxy;
 /// Websocket utilities.
 pub mod websocket;
 
 pub use ext::ResponseExt;
-#[cfg(all(not(target_arch = "wasm32"), feature = "proxy-support"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "proxy"))]
 pub use proxy::{Proxy, ProxyBuilder};
 
 /// Create a default HTTP client backend.
@@ -66,10 +60,14 @@ pub fn client() -> DefaultBackend {
     DefaultBackend::default()
 }
 
-/// Construct a Hyper backend configured with a proxy matcher.
+/// Construct the default backend configured with a proxy matcher.
+///
+/// This helper only exists when the default backend is proxy-capable (Hyper or
+/// curl). Apple (`apple-backend`) and Web (`wasm32`) targets do not compile this
+/// API because their backends ignore proxy settings.
 #[cfg(all(
     not(target_arch = "wasm32"),
-    feature = "proxy-support",
+    feature = "proxy",
     not(all(target_vendor = "apple", feature = "apple-backend"))
 ))]
 #[must_use]

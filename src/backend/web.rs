@@ -139,8 +139,8 @@ fn fetch(
             .map_err(|_| anyhow!("Failed to cast to Response"))
             .status(StatusCode::BAD_GATEWAY)?;
 
-        let status = StatusCode::from_u16(response.status() as u16)
-            .status(StatusCode::BAD_GATEWAY)?;
+        let status =
+            StatusCode::from_u16(response.status() as u16).status(StatusCode::BAD_GATEWAY)?;
         let mut headers = http_kit::header::HeaderMap::new();
         for pair in response.headers().entries() {
             let pair = pair

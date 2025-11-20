@@ -70,7 +70,7 @@ impl Endpoint for HyperBackend {
 
         let response = response.map(|body| {
             let stream = BodyDataStream::new(body);
-            let stream = stream.map_err(|error|{
+            let stream = stream.map_err(|error| {
                 http_kit::BodyError::Other(Box::new(error)) // TODO: improve error conversion
             });
             http_kit::Body::from_stream(stream)
@@ -115,7 +115,7 @@ mod proxy_support {
 
     impl ProxyConnector {
         pub(super) fn from_proxy(proxy: Option<Proxy>) -> Self {
-            let matcher = proxy.map(|p| p.into_matcher());
+            let matcher = proxy.map(crate::proxy::Proxy::into_matcher);
             let mut http = HttpConnector::new();
             http.enforce_http(false);
 
@@ -138,10 +138,10 @@ mod proxy_support {
             let proxied = direct.clone();
 
             Box::pin(async move {
-                if let Some(matcher) = matcher {
-                    if let Some(intercept) = matcher.intercept(&dst) {
-                        return connect_via_proxy(proxied, intercept, dst).await;
-                    }
+                if let Some(matcher) = matcher
+                    && let Some(intercept) = matcher.intercept(&dst)
+                {
+                    return connect_via_proxy(proxied, intercept, dst).await;
                 }
 
                 let mut connector = direct;
@@ -158,8 +158,7 @@ mod proxy_support {
         let proxy_uri = intercept.uri().clone();
         let scheme = proxy_uri
             .scheme_str()
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_else(|| "http".into());
+            .map_or_else(|| "http".into(), str::to_ascii_lowercase);
         let basic_auth = intercept.basic_auth().cloned();
         let raw_auth = intercept
             .raw_auth()

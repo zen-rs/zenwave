@@ -1,6 +1,5 @@
 #![allow(clippy::cast_sign_loss)]
 
-
 use core::pin::Pin;
 use std::{fmt::Debug, future::Future};
 #[cfg(not(target_arch = "wasm32"))]
@@ -93,19 +92,17 @@ impl<T: Client> RequestBuilder<'_, T> {
     pub async fn string(self) -> Result<ByteStr> {
         let response = self.await?;
         let body = response.into_body();
-        Ok(body
-            .into_string()
+        body.into_string()
             .await
-            .status(StatusCode::SERVICE_UNAVAILABLE)?)
+            .status(StatusCode::SERVICE_UNAVAILABLE)
     }
 
     pub async fn bytes(self) -> Result<Bytes> {
         let response = self.await?;
         let body = response.into_body();
-        Ok(body
-            .into_bytes()
+        body.into_bytes()
             .await
-            .status(StatusCode::SERVICE_UNAVAILABLE)?)
+            .status(StatusCode::SERVICE_UNAVAILABLE)
     }
 
     pub async fn form<Res: DeserializeOwned>(self) -> Result<Res> {
@@ -174,13 +171,8 @@ impl<T: Client> RequestBuilder<'_, T> {
     pub async fn file_body(self, path: impl AsRef<std::path::Path>) -> Result<Self> {
         use tokio::fs::File;
 
-        let file = File::open(path.as_ref())
-            .await
-            ?;
-        let metadata = file
-            .metadata()
-            .await
-            ?;
+        let file = File::open(path.as_ref()).await?;
+        let metadata = file.metadata().await?;
         Ok(self.reader_body(file, Some(metadata.len())))
     }
 

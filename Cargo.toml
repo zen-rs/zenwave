@@ -41,7 +41,7 @@ tempfile = "3.13"
 
 [features]
 default = ["hyper-backend", "web-backend"]
-proxy-support = [
+proxy = [
     "dep:hyper-util",
     "hyper-util/client",
     "hyper-util/client-proxy",
@@ -51,7 +51,7 @@ hyper-backend = [
     "dep:hyper",
     "dep:http-body-util",
     "dep:hyper-tls",
-    "proxy-support",
+    "proxy",
     "hyper-util/client-legacy",
     "hyper-util/http1",
     "hyper-util/http2",
@@ -59,7 +59,7 @@ hyper-backend = [
 ]
 web-backend = []
 apple-backend = []
-curl-backend = ["dep:curl", "proxy-support"]
+curl-backend = ["dep:curl", "proxy"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-sys = { version = "0.3", features = [

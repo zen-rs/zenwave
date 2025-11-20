@@ -50,36 +50,36 @@ impl Error {
     #[must_use]
     pub fn into_http_error(self) -> http_kit::Error {
         match self {
-            Error::Client(inner) => {
+            Self::Client(inner) => {
                 let status = inner.status();
                 http_error_from(inner, status)
             }
-            Error::Download(inner) => {
+            Self::Download(inner) => {
                 let status = inner.status();
                 http_error_from(inner, status)
             }
-            Error::CookieStore(inner) => {
+            Self::CookieStore(inner) => {
                 let status = inner.status();
                 http_error_from(inner, status)
             }
-            Error::Cache(inner) => {
+            Self::Cache(inner) => {
                 let status = inner.status();
                 http_error_from(inner, status)
             }
-            Error::Redirect(inner) => {
+            Self::Redirect(inner) => {
                 let status = inner.status();
                 http_error_from(inner, status)
             }
-            Error::WebBackend(inner) => {
+            Self::WebBackend(inner) => {
                 let status = inner.status();
                 http_error_from(inner, status)
             }
             #[cfg(feature = "hyper-backend")]
-            Error::HyperBackend(inner) => {
+            Self::HyperBackend(inner) => {
                 let status = inner.status();
                 http_error_from(inner, status)
             }
-            Error::Http(inner) => inner,
+            Self::Http(inner) => inner,
         }
     }
 }
@@ -219,9 +219,9 @@ pub enum CookieStoreError {
 impl CookieStoreError {
     const fn status(&self) -> StatusCode {
         match self {
-            Self::HeaderEncoding { .. }
-            | Self::HeaderToStr { .. }
-            | Self::CookieParse { .. } => StatusCode::BAD_REQUEST,
+            Self::HeaderEncoding { .. } | Self::HeaderToStr { .. } | Self::CookieParse { .. } => {
+                StatusCode::BAD_REQUEST
+            }
             Self::Persistence { .. }
             | Self::SnapshotSerialize { .. }
             | Self::SnapshotDeserialize { .. } => StatusCode::INTERNAL_SERVER_ERROR,

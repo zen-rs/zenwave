@@ -1,5 +1,10 @@
-#![cfg(all(not(target_arch = "wasm32"), feature = "proxy-support"))]
+#![cfg(all(not(target_arch = "wasm32"), feature = "proxy"))]
 //! Proxy configuration helpers for proxy-capable backends.
+//!
+//! This module is only compiled on native targets with the `proxy` feature
+//! enabled. Apple (`apple-backend`) and Web (`wasm32`) backends ignore proxy
+//! settings, so the helpers exposed here are intended for the Hyper and curl
+//! implementations.
 
 use std::{fmt, sync::Arc};
 
@@ -59,7 +64,7 @@ impl Proxy {
     }
 }
 
-/// Builder for [`Proxy`] allowing custom overrides for HTTP/HTTPS/NO_PROXY.
+/// Builder for [`Proxy`] allowing custom overrides for `HTTP/HTTPS/NO_PROXY`.
 pub struct ProxyBuilder {
     inner: matcher::Builder,
 }
