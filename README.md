@@ -12,6 +12,8 @@ URLSession on iOS/tvOS/watchOS/macOS) and browser/Cloudflare Workers targets thr
 - **Streaming bodies** – handle large uploads/downloads or upgrade to SSE without buffering.
 - **HTTP caching** – drop-in middleware honors `Cache-Control`, `Expires`, `ETag`, and
   `Last-Modified` to avoid redundant network hops.
+- **Native timers** – enforce per-request deadlines with high-precision timers on every supported
+  platform via a simple `.timeout(...)` helper.
 - **Proxy aware** – honor `HTTP(S)_PROXY`/`NO_PROXY` or define custom SOCKS/HTTP proxies when using the Hyper or curl backends.
 - **WebSocket ready** – one API that works natively and in WASM.
 - **Pluggable backends** – Hyper on general native targets, URLSession on Apple platforms, libcurl
@@ -47,6 +49,8 @@ Feel free to copy these examples as starting points for your own projects.
 ## Building richer clients
 
 ```rust
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use zenwave::{self, Cache, Client, OAuth2ClientCredentials};
 
@@ -71,7 +75,8 @@ async fn main() -> zenwave::Result<()> {
 
     // Compose only the middleware you need.
     let mut client = zenwave::client()
-        .with(Cache::new())
+        .timeout(Duration::from_secs(2))
+        .enable_cache()
         .with(OAuth2ClientCredentials::new(
             "https://auth.example.com/token",
             "client-id",
@@ -96,6 +101,10 @@ async fn main() -> zenwave::Result<()> {
 You can also call `.basic_auth` or `.with(custom_middleware)` to plug in your own behavior. Every
 request builder supports `.header`, `.bearer_auth`, `.basic_auth`, `.json_body`, `.bytes_body`, and
 body readers (`.json()`, `.string()`, `.bytes()`, `.form()`, `.sse()`).
+
+Timeouts are middleware too. Calling `.timeout(Duration::from_secs(2))` wraps the client in a
+native-executor-backed timer so every subsequent request automatically fails with a
+`504 Gateway Timeout` when the deadline is exceeded.
 
 ## Proxy configuration (native Hyper / curl backends)
 
@@ -194,7 +203,7 @@ assert!(response.status().is_success());
 
 ## HTTP cache middleware
 
-Add `Cache::new()` as middleware to enable RFC-compliant client-side caching. The middleware caches
+Call `.enable_cache()` to enable RFC-compliant client-side caching. The middleware caches
 successful GET responses when permitted by `Cache-Control`/`Expires`, automatically injects
 validators for stale entries (`If-None-Match`, `If-Modified-Since`), and serves `304 Not Modified`
 responses straight from memory. Requests with `Authorization` headers are skipped unless the

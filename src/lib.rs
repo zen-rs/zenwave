@@ -38,6 +38,7 @@ pub mod auth;
 pub mod cache;
 pub mod cookie;
 pub mod oauth2;
+pub mod timeout;
 
 mod client;
 pub mod redirect;
@@ -53,6 +54,7 @@ pub mod websocket;
 pub use ext::ResponseExt;
 #[cfg(all(not(target_arch = "wasm32"), feature = "proxy"))]
 pub use proxy::{Proxy, ProxyBuilder};
+pub use timeout::Timeout;
 
 /// Create a default HTTP client backend.
 #[must_use]

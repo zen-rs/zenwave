@@ -1,6 +1,6 @@
 #![allow(clippy::cast_sign_loss)]
 
-use core::pin::Pin;
+use core::{pin::Pin, time::Duration};
 use std::{fmt::Debug, future::Future};
 #[cfg(not(target_arch = "wasm32"))]
 use std::{
@@ -27,8 +27,10 @@ use tokio::{
 use crate::{
     ClientBackend,
     auth::{BasicAuth, BearerAuth},
+    cache::Cache,
     cookie::CookieStore,
     redirect::FollowRedirect,
+    timeout::Timeout,
 };
 
 /// Builder for HTTP requests using a Client.
@@ -528,6 +530,11 @@ pub trait Client: Endpoint + Sized {
         FollowRedirect::new(self)
     }
 
+    /// Enable HTTP caching middleware.
+    fn enable_cache(self) -> impl Client {
+        WithMiddleware::new(self, Cache::new())
+    }
+
     /// Enable cookie management.
     fn enable_cookie(self) -> impl Client {
         WithMiddleware::new(self, CookieStore::default())
@@ -537,6 +544,11 @@ pub trait Client: Endpoint + Sized {
     #[cfg(not(target_arch = "wasm32"))]
     fn enable_persistent_cookie(self) -> impl Client {
         WithMiddleware::new(self, CookieStore::persistent_default())
+    }
+
+    /// Enforce a timeout for individual requests issued by this client.
+    fn timeout(self, duration: Duration) -> impl Client {
+        WithMiddleware::new(self, Timeout::new(duration))
     }
 
     /// Add Bearer Token Authentication middleware.

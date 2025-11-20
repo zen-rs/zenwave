@@ -1,8 +1,10 @@
 //! Tests for middleware components in Zenwave
 
+use std::time::Duration;
 use zenwave::cookie::CookieStore;
+
 use zenwave::redirect::FollowRedirect;
-use zenwave::{Client, Endpoint, Middleware, Request, client};
+use zenwave::{Body, Client, Endpoint, Middleware, Request, Response, StatusCode, client};
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
@@ -126,4 +128,62 @@ async fn test_middleware_with_custom_middleware() {
     let body = response.into_body().into_string().await.unwrap();
     assert!(body.contains("X-Test"));
     assert!(body.contains("middleware-test"));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+struct SlowClient {
+    delay: Duration,
+    status: StatusCode,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Endpoint for SlowClient {
+    async fn respond(&mut self, _request: &mut Request) -> zenwave::Result<Response> {
+        tokio::time::sleep(self.delay).await;
+        Ok(http::Response::builder()
+            .status(self.status)
+            .body(Body::empty())
+            .unwrap())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Client for SlowClient {}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test]
+async fn test_timeout_middleware_success() {
+    let mut client = SlowClient {
+        delay: Duration::from_millis(20),
+        status: StatusCode::OK,
+    }
+    .timeout(Duration::from_secs(1));
+
+    let response = client
+        .get("https://example.com")
+        .await
+        .expect("request should complete before timeout");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test]
+async fn test_timeout_middleware_triggers_gateway_timeout() {
+    let mut client = SlowClient {
+        delay: Duration::from_millis(200),
+        status: StatusCode::OK,
+    }
+    .timeout(Duration::from_millis(10));
+
+    let err = client
+        .get("https://example.com")
+        .await
+        .expect_err("timeout should trigger before slow backend responds");
+
+    assert_eq!(err.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert!(
+        err.to_string().contains("timed out"),
+        "error message should mention timeout"
+    );
 }
