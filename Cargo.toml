@@ -18,6 +18,7 @@ base64 = "0.22"
 url = "2.5"
 futures-util = "0.3"
 futures-channel = "0.3"
+thiserror = "1.0"
 
 # Dependencies for hyper backend
 

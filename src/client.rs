@@ -1,7 +1,6 @@
 #![allow(clippy::cast_sign_loss)]
 
-#[cfg(not(target_arch = "wasm32"))]
-use anyhow::Error as AnyhowError;
+
 use core::pin::Pin;
 use std::{fmt::Debug, future::Future};
 #[cfg(not(target_arch = "wasm32"))]
@@ -245,10 +244,10 @@ impl<T: Client> RequestBuilder<'_, T> {
                 .truncate(false)
                 .open(&path_buf)
                 .await
-                ?;
+                .status(StatusCode::INTERNAL_SERVER_ERROR)?;
             file.seek(SeekFrom::Start(existing_len))
                 .await
-                ?;
+                .status(StatusCode::INTERNAL_SERVER_ERROR)?;
             file
         } else {
             OpenOptions::new()
@@ -257,18 +256,20 @@ impl<T: Client> RequestBuilder<'_, T> {
                 .truncate(true)
                 .open(&path_buf)
                 .await
-                ?
+                .status(StatusCode::INTERNAL_SERVER_ERROR)?
         };
 
         let mut bytes_written = 0_u64;
         while let Some(chunk) = body.next().await {
-            let chunk = chunk?;
+            let chunk = chunk.status(StatusCode::BAD_GATEWAY)?;
             file.write_all(&chunk)
-                .await?;
+                .await
+                .status(StatusCode::INTERNAL_SERVER_ERROR)?;
             bytes_written += chunk.len() as u64;
         }
         file.flush()
-            .await?;
+            .await
+            .status(StatusCode::INTERNAL_SERVER_ERROR)?;
 
         Ok(DownloadReport {
             path: path_buf,

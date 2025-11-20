@@ -27,6 +27,17 @@ use backend::DefaultBackend;
 pub use cache::Cache;
 pub use client::Client;
 pub use http_kit::*;
+pub mod error;
+pub use error::{
+    CacheError,
+    ClientError,
+    CookieStoreError,
+    DownloadError,
+    HyperBackendError,
+    PersistenceOperation,
+    RedirectError,
+    WebBackendError,
+};
 pub use oauth2::OAuth2ClientCredentials;
 
 pub mod auth;

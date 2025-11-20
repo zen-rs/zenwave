@@ -131,16 +131,16 @@ impl CookieStore {
         if let Some(parent) = path.parent() {
             async_fs::create_dir_all(parent)
                 .await
-                ?;
+                .status(StatusCode::INTERNAL_SERVER_ERROR)?;
         }
 
         let tmp = path.with_extension("tmp");
         async_fs::write(&tmp, &data)
             .await
-            ?;
+            .status(StatusCode::INTERNAL_SERVER_ERROR)?;
         async_fs::rename(&tmp, path)
             .await
-            ?;
+            .status(StatusCode::INTERNAL_SERVER_ERROR)?;
 
         Ok(())
     }

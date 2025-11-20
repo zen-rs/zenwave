@@ -3,6 +3,7 @@
 
 use std::{fmt, sync::Arc};
 
+#[cfg(any(feature = "curl-backend", test))]
 use http::Uri;
 use hyper_util::client::proxy::matcher;
 
