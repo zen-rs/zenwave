@@ -1,4 +1,4 @@
-use http_kit::{Error, StatusCode};
+use http_kit::{HttpError, StatusCode};
 use serde::Serialize;
 
 /// Message transmitted over a websocket connection.
@@ -8,6 +8,27 @@ pub enum WebSocketMessage {
     Text(String),
     /// Binary payload.
     Binary(Vec<u8>),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WebSocketError {
+    #[error("Fail to encode payload: {0}")]
+    FailToEncodePayload(serde_json::Error),
+
+    #[error("Unsupported websocket scheme: {0}")]
+    UnsupportedScheme(String),
+
+    #[error("Invalid URI: {0}")]
+    InvalidUri(#[from] url::ParseError),
+
+    #[error("Connection failed: {0}")]
+    ConnectionFailed(async_tungstenite::tungstenite::Error),
+}
+
+impl HttpError for WebSocketError {
+    fn status(&self) -> Option<StatusCode> {
+        None
+    }
 }
 
 impl WebSocketMessage {
@@ -84,11 +105,11 @@ impl From<&[u8]> for WebSocketMessage {
     }
 }
 
-fn serialize_payload<T>(value: &T) -> http_kit::Result<String>
+fn serialize_payload<T>(value: &T) -> Result<String, WebSocketError>
 where
     T: Serialize,
 {
-    serde_json::to_string(value).map_err(|e| Error::new(e, StatusCode::BAD_REQUEST))
+    Ok(serde_json::to_string(value).map_err(WebSocketError::FailToEncodePayload)?)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -109,10 +130,9 @@ mod native {
         tungstenite::Message as TungsteniteMessage,
     };
     use futures_util::{SinkExt, StreamExt};
-    use http_kit::{Result, StatusCode};
     use url::Url;
 
-    use super::{Error, WebSocketMessage, serialize_payload};
+    use super::{WebSocketError, WebSocketMessage, serialize_payload};
 
     type NativeSocket = WebSocketStream<ConnectStream>;
 
@@ -132,23 +152,20 @@ mod native {
     /// # Errors
     ///
     /// Returns an error if the URI is invalid or the connection attempt fails.
-    pub async fn connect(uri: impl AsRef<str>) -> Result<WebSocket> {
-        let url = Url::parse(uri.as_ref()).map_err(|e| Error::new(e, StatusCode::BAD_REQUEST))?;
+    pub async fn connect(uri: impl AsRef<str>) -> Result<WebSocket, WebSocketError> {
+        let url = Url::parse(uri.as_ref())?;
 
         match url.scheme() {
             "ws" | "wss" => {}
             _ => {
-                return Err(
-                    Error::msg(format!("Unsupported websocket scheme '{}'", url.scheme()))
-                        .set_status(StatusCode::BAD_REQUEST),
-                );
+                return Err(WebSocketError::UnsupportedScheme(url.scheme().to_string()));
             }
         }
 
         let request: String = url.into();
         let (stream, _) = connect_async(request)
             .await
-            .map_err(|e| Error::new(e, StatusCode::BAD_GATEWAY))?;
+            .map_err(|e| WebSocketError::ConnectionFailed(e))?;
 
         Ok(WebSocket { inner: stream })
     }
@@ -160,7 +177,7 @@ mod native {
         ///
         /// Returns an error if serialization fails or when the underlying socket cannot
         /// write the resulting frame.
-        pub async fn send<T>(&mut self, value: T) -> Result<()>
+        pub async fn send<T>(&mut self, value: T) -> Result<(), WebSocketError>
         where
             T: serde::Serialize,
         {
@@ -173,7 +190,7 @@ mod native {
         /// # Errors
         ///
         /// Returns an error when the underlying socket cannot write the frame.
-        pub async fn send_text(&mut self, text: impl Into<String>) -> Result<()> {
+        pub async fn send_text(&mut self, text: impl Into<String>) -> Result<(), WebSocketError> {
             self.send_message(WebSocketMessage::text(text)).await
         }
 
@@ -182,15 +199,18 @@ mod native {
         /// # Errors
         ///
         /// Returns an error when the underlying socket cannot write the frame.
-        pub async fn send_binary(&mut self, bytes: impl Into<Vec<u8>>) -> Result<()> {
+        pub async fn send_binary(
+            &mut self,
+            bytes: impl Into<Vec<u8>>,
+        ) -> Result<(), WebSocketError> {
             self.send_message(WebSocketMessage::binary(bytes)).await
         }
 
-        async fn send_message(&mut self, message: WebSocketMessage) -> Result<()> {
+        async fn send_message(&mut self, message: WebSocketMessage) -> Result<(), WebSocketError> {
             self.inner
                 .send(message.into())
                 .await
-                .map_err(|e| Error::new(e, StatusCode::BAD_GATEWAY))
+                .map_err(|e| WebSocketError::ConnectionFailed(e))
         }
 
         /// Receive the next websocket message.
@@ -198,9 +218,9 @@ mod native {
         /// # Errors
         ///
         /// Returns an error when the underlying socket cannot read the next frame.
-        pub async fn recv(&mut self) -> Result<Option<WebSocketMessage>> {
+        pub async fn recv(&mut self) -> Result<Option<WebSocketMessage>, WebSocketError> {
             while let Some(message) = self.inner.next().await {
-                let message = message.map_err(|e| Error::new(e, StatusCode::BAD_GATEWAY))?;
+                let message = message.map_err(|e| WebSocketError::ConnectionFailed(e))?;
 
                 match message {
                     TungsteniteMessage::Text(text) => {
@@ -214,7 +234,7 @@ mod native {
                         self.inner
                             .send(TungsteniteMessage::Pong(payload))
                             .await
-                            .map_err(|e| Error::new(e, StatusCode::BAD_GATEWAY))?;
+                            .map_err(|e| WebSocketError::ConnectionFailed(e))?;
                     }
                     TungsteniteMessage::Pong(_) | TungsteniteMessage::Frame(_) => {}
                 }
@@ -228,11 +248,11 @@ mod native {
         /// # Errors
         ///
         /// Returns an error when the close frame cannot be sent.
-        pub async fn close(mut self) -> Result<()> {
+        pub async fn close(mut self) -> Result<(), WebSocketError> {
             self.inner
                 .close(None)
                 .await
-                .map_err(|e| Error::new(e, StatusCode::BAD_GATEWAY))
+                .map_err(|e| WebSocketError::ConnectionFailed(e))
         }
     }
 }

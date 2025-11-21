@@ -3,7 +3,7 @@
 use zenwave::websocket::{self, WebSocketMessage};
 
 #[tokio::main]
-async fn main() -> zenwave::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Public echo servers are great for demos.
     let mut socket = websocket::connect("wss://echo.websocket.events").await?;
 

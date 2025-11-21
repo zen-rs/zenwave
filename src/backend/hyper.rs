@@ -3,7 +3,7 @@ use std::mem::replace;
 use futures_util::TryStreamExt;
 use http::StatusCode;
 use http_body_util::BodyDataStream;
-use http_kit::{Endpoint, Method, Request, Response, ResultExt};
+use http_kit::{Endpoint, HttpError, Method, Request, Response};
 use hyper::http;
 use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client as HyperClient;
@@ -53,8 +53,28 @@ impl HyperBackend {
     }
 }
 
+#[derive(Debug)]
+pub struct HyperError {
+    error: hyper_util::client::legacy::Error,
+}
+
+impl core::fmt::Display for HyperError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "hyper error: {}", self.error)
+    }
+}
+
+impl core::error::Error for HyperError {}
+
+impl HttpError for HyperError {
+    fn status(&self) -> Option<StatusCode> {
+        None
+    }
+}
+
 impl Endpoint for HyperBackend {
-    async fn respond(&mut self, request: &mut Request) -> http_kit::Result<Response> {
+    type Error = HyperError;
+    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         let dummy_request = http::Request::builder()
             .method(Method::GET)
             .uri("/")
@@ -66,7 +86,7 @@ impl Endpoint for HyperBackend {
             .client
             .request(request)
             .await
-            .status(StatusCode::SERVICE_UNAVAILABLE)?;
+            .map_err(|error| HyperError { error })?;
 
         let response = response.map(|body| {
             let stream = BodyDataStream::new(body);

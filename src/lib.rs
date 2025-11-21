@@ -27,11 +27,6 @@ use backend::DefaultBackend;
 pub use cache::Cache;
 pub use client::Client;
 pub use http_kit::*;
-pub mod error;
-pub use error::{
-    CacheError, ClientError, CookieStoreError, DownloadError, HyperBackendError,
-    PersistenceOperation, RedirectError, WebBackendError,
-};
 pub use oauth2::OAuth2ClientCredentials;
 
 pub mod auth;
@@ -82,7 +77,7 @@ pub fn client_with_proxy(proxy: Proxy) -> DefaultBackend {
 ///
 /// # Errors
 /// If the request fails, an error is returned.
-pub async fn get<U>(uri: U) -> Result<Response>
+pub async fn get<U>(uri: U) -> Result<Response, <DefaultBackend as Endpoint>::Error>
 where
     U: TryInto<Uri>,
     U::Error: core::fmt::Debug,
@@ -95,7 +90,7 @@ where
 ///
 /// # Errors
 /// If the request fails, an error is returned.
-pub async fn post<U>(uri: U) -> Result<Response>
+pub async fn post<U>(uri: U) -> Result<Response, <DefaultBackend as Endpoint>::Error>
 where
     U: TryInto<Uri>,
     U::Error: core::fmt::Debug,
@@ -108,7 +103,7 @@ where
 ///
 /// # Errors
 /// If the request fails, an error is returned.
-pub async fn put<U>(uri: U) -> Result<Response>
+pub async fn put<U>(uri: U) -> Result<Response, <DefaultBackend as Endpoint>::Error>
 where
     U: TryInto<Uri>,
     U::Error: core::fmt::Debug,
@@ -121,7 +116,7 @@ where
 ///
 /// # Errors
 /// If the request fails, an error is returned.
-pub async fn delete<U>(uri: U) -> Result<Response>
+pub async fn delete<U>(uri: U) -> Result<Response, <DefaultBackend as Endpoint>::Error>
 where
     U: TryInto<Uri>,
     U::Error: core::fmt::Debug,

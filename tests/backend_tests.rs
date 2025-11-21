@@ -22,6 +22,7 @@ async fn test_hyper_backend_default() {
     assert!(!format!("{backend:?}").is_empty());
 }
 
+#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 #[cfg(feature = "hyper-backend")]
@@ -38,6 +39,7 @@ async fn test_hyper_backend_get_request() {
     assert!(response.status().is_success());
 }
 
+#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 #[cfg(feature = "hyper-backend")]
@@ -54,6 +56,7 @@ async fn test_hyper_backend_post_request() {
     assert!(response.status().is_success());
 }
 
+#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 #[cfg(feature = "hyper-backend")]
@@ -93,6 +96,7 @@ async fn test_hyper_backend_client_backend_trait() {
     assert_client_backend(&backend);
 }
 
+#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 #[cfg(feature = "hyper-backend")]

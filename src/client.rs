@@ -2,27 +2,25 @@
 
 use core::{pin::Pin, time::Duration};
 use std::{fmt::Debug, future::Future};
-#[cfg(not(target_arch = "wasm32"))]
-use std::{
-    io::{ErrorKind, SeekFrom},
-    path::PathBuf,
-};
 
 use futures_util::{Stream, StreamExt};
-#[cfg(not(target_arch = "wasm32"))]
+use http::{HeaderValue, header};
+#[cfg(all(test, not(target_arch = "wasm32")))]
 use http_kit::StatusCode;
 use http_kit::{
-    Endpoint, Method, Middleware, Request, Response, Result, ResultExt, Uri,
+    Endpoint, HttpError, Method, Middleware, Request, Response, Uri,
     endpoint::WithMiddleware,
     sse::SseStream,
     utils::{ByteStr, Bytes},
 };
 use serde::de::DeserializeOwned;
 #[cfg(not(target_arch = "wasm32"))]
-use tokio::{
-    fs::OpenOptions,
-    io::{AsyncRead, AsyncSeekExt, AsyncWriteExt},
-};
+use tokio::io::AsyncRead;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod download;
+#[cfg(not(target_arch = "wasm32"))]
+pub use download::{DownloadError, DownloadOptions, DownloadReport};
 
 use crate::{
     ClientBackend,
@@ -41,9 +39,9 @@ pub struct RequestBuilder<'a, T: Client> {
 }
 
 impl<'a, T: Client> IntoFuture for RequestBuilder<'a, T> {
-    type Output = Result<Response>;
+    type Output = Result<Response, T::Error>;
 
-    type IntoFuture = Pin<Box<dyn Future<Output = Result<Response>> + Send + 'a>>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
@@ -51,6 +49,15 @@ impl<'a, T: Client> IntoFuture for RequestBuilder<'a, T> {
             self.client.respond(&mut request).await
         })
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ClientError<T: HttpError> {
+    #[error("Request error: {0}")]
+    Remote(T),
+
+    #[error("Invalid response body: {0}")]
+    InvalidBody(#[from] http_kit::BodyError),
 }
 
 impl<T: Client> RequestBuilder<'_, T> {
@@ -83,40 +90,32 @@ impl<T: Client> RequestBuilder<'_, T> {
         self
     }
 
-    pub async fn json<Res: DeserializeOwned>(self) -> Result<Res> {
-        let response = self.await?;
+    pub async fn json<Res: DeserializeOwned>(self) -> Result<Res, ClientError<T::Error>> {
+        let response = self.await.map_err(ClientError::Remote)?;
         let mut body = response.into_body();
-        body.into_json()
-            .await
-            .map_err(|e| http_kit::Error::new(e, http_kit::StatusCode::BAD_REQUEST))
+        Ok(body.into_json().await?)
     }
 
-    pub async fn string(self) -> Result<ByteStr> {
-        let response = self.await?;
+    pub async fn string(self) -> Result<ByteStr, ClientError<T::Error>> {
+        let response = self.await.map_err(ClientError::Remote)?;
         let body = response.into_body();
-        body.into_string()
-            .await
-            .status(StatusCode::SERVICE_UNAVAILABLE)
+        Ok(body.into_string().await?)
     }
 
-    pub async fn bytes(self) -> Result<Bytes> {
-        let response = self.await?;
+    pub async fn bytes(self) -> Result<Bytes, ClientError<T::Error>> {
+        let response = self.await.map_err(ClientError::Remote)?;
         let body = response.into_body();
-        body.into_bytes()
-            .await
-            .status(StatusCode::SERVICE_UNAVAILABLE)
+        Ok(body.into_bytes().await?)
     }
 
-    pub async fn form<Res: DeserializeOwned>(self) -> Result<Res> {
-        let response = self.await?;
+    pub async fn form<Res: DeserializeOwned>(self) -> Result<Res, ClientError<T::Error>> {
+        let response = self.await.map_err(ClientError::Remote)?;
         let mut body = response.into_body();
-        body.into_form()
-            .await
-            .map_err(|e| http_kit::Error::new(e, http_kit::StatusCode::BAD_REQUEST))
+        Ok(body.into_form().await?)
     }
 
-    pub async fn sse(self) -> Result<SseStream> {
-        let response = self.await?;
+    pub async fn sse(self) -> Result<SseStream, ClientError<T::Error>> {
+        let response = self.await.map_err(ClientError::Remote)?;
         let body = response.into_body();
         Ok(body.into_sse())
     }
@@ -128,18 +127,23 @@ impl<T: Client> RequestBuilder<'_, T> {
         self
     }
 
-    pub fn json_body<B: serde::Serialize>(mut self, body: &B) -> Result<Self> {
-        let json = serde_json::to_string(body).status(StatusCode::SERVICE_UNAVAILABLE)?;
+    /// Set a JSON-encoded body for the request.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the body cannot be serialized to JSON.
+    pub fn json_body<B: serde::Serialize>(mut self, body: &B) -> Self {
+        let json = serde_json::to_string(body).expect("failed to serialize JSON body");
 
         // Set the body directly
         *self.request.body_mut() = http_kit::Body::from(json);
 
         // Add content-type header
-        let content_type: http_kit::header::HeaderName = "content-type".parse().unwrap();
-        let json_type: http_kit::header::HeaderValue = "application/json".parse().unwrap();
+        let content_type = header::CONTENT_TYPE;
+        let json_type = HeaderValue::from_static("application/json");
         self.request.headers_mut().insert(content_type, json_type);
 
-        Ok(self)
+        self
     }
 
     pub fn bytes_body(mut self, bytes: Vec<u8>) -> Self {
@@ -170,7 +174,10 @@ impl<T: Client> RequestBuilder<'_, T> {
 
     /// Stream a file from disk as the request body without loading it into memory.
     #[cfg(not(target_arch = "wasm32"))]
-    pub async fn file_body(self, path: impl AsRef<std::path::Path>) -> Result<Self> {
+    pub async fn file_body(
+        self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, std::io::Error> {
         use tokio::fs::File;
 
         let file = File::open(path.as_ref()).await?;
@@ -195,118 +202,18 @@ impl<T: Client> RequestBuilder<'_, T> {
     pub async fn download_to_path(
         self,
         path: impl AsRef<std::path::Path>,
-    ) -> Result<DownloadReport> {
-        self.download_to_path_with(path, DownloadOptions::default())
-            .await
+    ) -> Result<DownloadReport, DownloadError<T::Error>> {
+        download::download_to_path(self, path, DownloadOptions::default()).await
     }
 
     /// Download the response body into a path using custom [`DownloadOptions`].
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn download_to_path_with(
-        mut self,
+        self,
         path: impl AsRef<std::path::Path>,
         options: DownloadOptions,
-    ) -> Result<DownloadReport> {
-        let path_buf: PathBuf = path.as_ref().to_path_buf();
-        let existing_len = if options.resume_existing {
-            match tokio::fs::metadata(&path_buf).await {
-                Ok(meta) => meta.len(),
-                Err(err) if err.kind() == ErrorKind::NotFound => 0,
-                Err(err) => {
-                    return Err(http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR));
-                }
-            }
-        } else {
-            0
-        };
-
-        if existing_len > 0 {
-            let value = format!("bytes={existing_len}-");
-            self = self.header(http_kit::header::RANGE.as_str(), value);
-        }
-
-        let response = self.await?;
-        let status = response.status();
-        let mut body = response.into_body();
-
-        let mut resumed_from = 0_u64;
-        let mut file = if existing_len > 0 && status == StatusCode::PARTIAL_CONTENT {
-            resumed_from = existing_len;
-            let mut file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&path_buf)
-                .await
-                .status(StatusCode::INTERNAL_SERVER_ERROR)?;
-            file.seek(SeekFrom::Start(existing_len))
-                .await
-                .status(StatusCode::INTERNAL_SERVER_ERROR)?;
-            file
-        } else {
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&path_buf)
-                .await
-                .status(StatusCode::INTERNAL_SERVER_ERROR)?
-        };
-
-        let mut bytes_written = 0_u64;
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.status(StatusCode::BAD_GATEWAY)?;
-            file.write_all(&chunk)
-                .await
-                .status(StatusCode::INTERNAL_SERVER_ERROR)?;
-            bytes_written += chunk.len() as u64;
-        }
-        file.flush()
-            .await
-            .status(StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        Ok(DownloadReport {
-            path: path_buf,
-            resumed_from,
-            bytes_written,
-        })
-    }
-}
-
-/// Report describing the result of a download operation.
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug, Clone)]
-pub struct DownloadReport {
-    /// Destination path that was written to.
-    pub path: PathBuf,
-    /// Offset the download resumed from (0 if this was a fresh download).
-    pub resumed_from: u64,
-    /// Number of bytes written during this invocation.
-    pub bytes_written: u64,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl DownloadReport {
-    /// Total bytes now persisted on disk.
-    pub const fn total_bytes(&self) -> u64 {
-        self.resumed_from + self.bytes_written
-    }
-}
-
-/// Configures how downloads should behave.
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug, Clone, Copy)]
-pub struct DownloadOptions {
-    /// Attempt to resume when the destination file already contains data.
-    pub resume_existing: bool,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Default for DownloadOptions {
-    fn default() -> Self {
-        Self {
-            resume_existing: true,
-        }
+    ) -> Result<DownloadReport, DownloadError<T::Error>> {
+        download::download_to_path(self, path, options).await
     }
 }
 
@@ -316,7 +223,7 @@ mod tests {
     use crate::backend::ClientBackend;
     use futures_util::stream;
     use http::Response;
-    use std::sync::Arc;
+    use std::{convert::Infallible, sync::Arc};
     use tempfile::tempdir;
     use tokio::{fs, sync::Mutex};
 
@@ -432,10 +339,11 @@ mod tests {
     }
 
     impl Endpoint for FakeBackend {
+        type Error = Infallible;
         async fn respond(
             &mut self,
             request: &mut Request,
-        ) -> http_kit::Result<Response<http_kit::Body>> {
+        ) -> Result<Response<http_kit::Body>, Self::Error> {
             let start = if self.honor_range {
                 parse_range(request)
             } else {
@@ -486,15 +394,16 @@ mod tests {
     }
 
     impl Endpoint for RecordingBackend {
+        type Error = Infallible;
         async fn respond(
             &mut self,
             request: &mut Request,
-        ) -> http_kit::Result<Response<http_kit::Body>> {
+        ) -> Result<Response<http_kit::Body>, Self::Error> {
             let body = match request.body_mut().take() {
                 Ok(body) => body,
                 Err(_) => http_kit::Body::empty(),
             };
-            let bytes = body.into_bytes().await?;
+            let bytes = body.into_bytes().await.expect("failed to read body");
             *self.recorded.lock().await = bytes.to_vec();
 
             Ok(Response::builder()

@@ -2,12 +2,12 @@
 
 use http::Uri;
 use http_kit::{
-    Endpoint, Method, ResultExt,
+    Endpoint, HttpError, Method,
     header::{AUTHORIZATION, CONTENT_LENGTH, COOKIE, HOST, LOCATION},
 };
 use url::Url;
 
-use crate::{Body, Error, Request, Response, Result, StatusCode, client::Client};
+use crate::{Body, Request, Response, StatusCode, client::Client};
 
 /// Middleware that follows HTTP redirects.
 #[derive(Debug, Clone)]
@@ -24,47 +24,71 @@ impl<C: Client> FollowRedirect<C> {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum FollowRedirectError<H: HttpError> {
+    #[error("URL parse error: {0}")]
+    InvalidUrl(#[from] url::ParseError),
+    #[error("Remote error: {0}")]
+    RemoteError(H),
+
+    #[error("Too many redirects")]
+    TooManyRedirects,
+
+    #[error("Missing Location header in redirect response")]
+    MissingLocationHeader,
+
+    #[error("Invalid Location header in redirect response")]
+    InvalidLocationHeader,
+}
+
+impl<H: HttpError> HttpError for FollowRedirectError<H> {
+    fn status(&self) -> Option<StatusCode> {
+        match self {
+            Self::RemoteError(err) => err.status(),
+            _ => None,
+        }
+    }
+}
+
 impl<C: Client> Endpoint for FollowRedirect<C> {
-    async fn respond(&mut self, request: &mut Request) -> Result<Response> {
+    type Error = FollowRedirectError<C::Error>;
+    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         const MAX_REDIRECTS: u32 = 10;
         let initial_headers = request.headers().clone();
         let mut current_method = request.method().clone();
-        let mut current_url = Url::parse(&request.uri().to_string()).map_err(|err| {
-            Error::msg(format!("Invalid request URI: {err}")).set_status(StatusCode::BAD_REQUEST)
-        })?;
+        let mut current_url = Url::parse(&request.uri().to_string())?;
         let mut redirect_count = 0;
 
         loop {
-            let response = self.client.respond(request).await?;
+            let response = self
+                .client
+                .respond(request)
+                .await
+                .map_err(FollowRedirectError::RemoteError)?;
 
             if !response.status().is_redirection() {
                 return Ok(response);
             }
 
             if redirect_count >= MAX_REDIRECTS {
-                return Err(Error::msg("Too many redirects"));
+                return Err(FollowRedirectError::TooManyRedirects);
             }
 
             let location = response
                 .headers()
                 .get(LOCATION)
-                .ok_or_else(|| {
-                    Error::msg("Missing Location header").set_status(StatusCode::BAD_REQUEST)
-                })?
+                .ok_or(FollowRedirectError::MissingLocationHeader)?
                 .to_str()
-                .status(StatusCode::BAD_REQUEST)?;
+                .map_err(|_| FollowRedirectError::InvalidLocationHeader)?;
 
             let redirect_url = Url::parse(location)
                 .or_else(|_| current_url.join(location))
-                .map_err(|err| {
-                    Error::msg(format!("Invalid redirect location: {err}"))
-                        .set_status(StatusCode::BAD_REQUEST)
-                })?;
+                .map_err(|_| FollowRedirectError::InvalidLocationHeader)?;
 
-            let next_uri: Uri = redirect_url.as_str().parse().map_err(|err| {
-                Error::msg(format!("Invalid redirect URI: {err}"))
-                    .set_status(StatusCode::BAD_REQUEST)
-            })?;
+            let next_uri: Uri = redirect_url
+                .as_str()
+                .parse()
+                .map_err(|_| FollowRedirectError::InvalidLocationHeader)?;
 
             let next_method = match response.status() {
                 StatusCode::SEE_OTHER => Method::GET,
@@ -80,7 +104,7 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
                 .method(next_method.clone())
                 .uri(next_uri)
                 .body(Body::empty())
-                .unwrap();
+                .expect("failed to build redirect request"); // Safety: We have already made sure method and uri are valid.
 
             let mut headers = initial_headers.clone();
             headers.remove(HOST);

@@ -8,8 +8,8 @@ use std::{
 use http::{HeaderMap, HeaderValue, Method, Response as HttpResponse, StatusCode, header};
 use httpdate::parse_http_date;
 
-use http_kit::{Endpoint, Middleware, Request, Response, Result};
-use http_kit::{ResultExt, utils::Bytes};
+use http_kit::utils::Bytes;
+use http_kit::{Endpoint, HttpError, Middleware, Request, Response, middleware::MiddlewareError};
 
 /// Middleware implementing an in-memory HTTP cache.
 ///
@@ -39,15 +39,26 @@ impl Cache {
 }
 
 impl Middleware for Cache {
-    async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
+    type Error = CacheError;
+    async fn handle<E: Endpoint>(
+        &mut self,
+        request: &mut Request,
+        mut next: E,
+    ) -> Result<Response, http_kit::middleware::MiddlewareError<E::Error, Self::Error>> {
         let Some(key) = Self::cache_key(request) else {
-            return next.respond(request).await;
+            return next
+                .respond(request)
+                .await
+                .map_err(MiddlewareError::Endpoint);
         };
 
         let request_cc = CacheControl::from_header_map(request.headers());
         if request_cc.no_store {
             self.entries.remove(&key);
-            return next.respond(request).await;
+            return next
+                .respond(request)
+                .await
+                .map_err(MiddlewareError::Endpoint);
         }
 
         let now = Instant::now();
@@ -72,7 +83,10 @@ impl Middleware for Cache {
             }
         }
 
-        let response = next.respond(request).await?;
+        let response = next
+            .respond(request)
+            .await
+            .map_err(MiddlewareError::Endpoint)?;
         if response.status() == StatusCode::NOT_MODIFIED {
             if let Some(mut entry) = cached_entry {
                 entry.update_from_304(&response, now);
@@ -92,7 +106,8 @@ impl Middleware for Cache {
         if allow_shared && !response_cc.no_store {
             let (response, entry) =
                 CachedResponse::from_response(response, response_cc, now, request_cc.no_cache)
-                    .await?;
+                    .await
+                    .map_err(MiddlewareError::Middleware)?;
             if let Some(entry) = entry {
                 let result = entry.to_response(now);
                 self.entries.insert(key, entry);
@@ -117,13 +132,25 @@ struct CachedResponse {
     last_modified: Option<HeaderValue>,
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum CacheError {
+    #[error("Body error: {0}")]
+    BodyError(#[from] http_kit::BodyError),
+}
+
+impl HttpError for CacheError {
+    fn status(&self) -> Option<StatusCode> {
+        None
+    }
+}
+
 impl CachedResponse {
     async fn from_response(
         response: Response,
         directives: CacheControl,
         now: Instant,
         request_no_cache: bool,
-    ) -> Result<(Response, Option<Self>)> {
+    ) -> Result<(Response, Option<Self>), CacheError> {
         let (mut parts, body) = response.into_parts();
         let etag = parts.headers.get(header::ETAG).cloned();
         let last_modified = parts.headers.get(header::LAST_MODIFIED).cloned();
@@ -145,10 +172,7 @@ impl CachedResponse {
             return Ok((response, None));
         }
 
-        let bytes = body
-            .into_bytes()
-            .await
-            .status(StatusCode::SERVICE_UNAVAILABLE)?;
+        let bytes = body.into_bytes().await?;
         parts.headers.remove(header::AGE);
         let response = HttpResponse::from_parts(parts, http_kit::Body::from(bytes.clone()));
 
@@ -275,9 +299,12 @@ mod tests {
     use super::*;
     use http::Request as HttpRequest;
     use http_kit::{Body, Method};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        convert::Infallible,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     #[tokio::test]
@@ -370,7 +397,8 @@ mod tests {
     }
 
     impl Endpoint for CountingEndpoint {
-        async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
+        type Error = Infallible;
+        async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut builder = HttpResponse::builder().status(StatusCode::OK);
             for (name, value) in &self.headers {
@@ -404,7 +432,8 @@ mod tests {
     }
 
     impl Endpoint for ConditionalEndpoint {
-        async fn respond(&mut self, request: &mut Request) -> Result<Response> {
+        type Error = Infallible;
+        async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if request.headers().contains_key(header::IF_NONE_MATCH) {
                 self.conditional.fetch_add(1, Ordering::SeqCst);

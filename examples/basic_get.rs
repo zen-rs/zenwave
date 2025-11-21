@@ -1,8 +1,7 @@
 //! A basic example demonstrating a GET request and JSON deserialization.
 
-use http::StatusCode;
 use serde::Deserialize;
-use zenwave::{self, ResponseExt, ResultExt};
+use zenwave::{self, ResponseExt};
 
 #[derive(Debug, Deserialize)]
 struct Todo {
@@ -14,13 +13,10 @@ struct Todo {
 }
 
 #[tokio::main]
-async fn main() -> zenwave::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `zenwave::get` is perfect for one-off requests.
     let response = zenwave::get("https://jsonplaceholder.typicode.com/todos/1").await?;
-    let todo: Todo = response
-        .into_json()
-        .await
-        .status(StatusCode::SERVICE_UNAVAILABLE)?;
+    let todo: Todo = response.into_json().await?;
 
     println!(
         "Todo #{id} for user #{user}: {title} (completed: {completed})",

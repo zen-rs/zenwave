@@ -20,7 +20,7 @@ struct Message {
 }
 
 #[tokio::main]
-async fn main() -> zenwave::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token = std::env::var("ZENWAVE_TOKEN").unwrap_or_else(|_| "demo-token".into());
 
     // Compose the middleware you need.
@@ -36,7 +36,7 @@ async fn main() -> zenwave::Result<()> {
     let response: EchoResponse = client
         .post("https://httpbin.org/post")
         .header("x-request-id", "demo-request")
-        .json_body(&payload)?
+        .json_body(&payload)
         .json()
         .await?;
 

@@ -8,9 +8,10 @@
 use core::time::Duration;
 
 use futures_util::{future::Either, pin_mut};
-use http_kit::{Endpoint, Middleware, Request, Response, Result, StatusCode};
+use http_kit::{
+    Endpoint, Middleware, Request, Response, StatusCode, http_error, middleware::MiddlewareError,
+};
 use native_executor::timer::Timer;
-use thiserror::Error;
 
 /// Middleware that fails requests exceeding the configured duration.
 #[derive(Debug, Clone, Copy)]
@@ -26,14 +27,15 @@ impl Timeout {
     }
 }
 
-#[derive(Debug, Error)]
-#[error("request timed out after {duration:?}")]
-struct TimeoutError {
-    duration: Duration,
-}
+http_error!(pub TimeoutError, StatusCode::GATEWAY_TIMEOUT, "request timed out");
 
 impl Middleware for Timeout {
-    async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
+    type Error = TimeoutError;
+    async fn handle<E: Endpoint>(
+        &mut self,
+        request: &mut Request,
+        mut next: E,
+    ) -> Result<Response, http_kit::middleware::MiddlewareError<E::Error, Self::Error>> {
         let response_future = next.respond(request);
         let timeout_future = Timer::after(self.duration);
 
@@ -41,13 +43,8 @@ impl Middleware for Timeout {
         pin_mut!(timeout_future);
 
         match futures_util::future::select(response_future, timeout_future).await {
-            Either::Left((result, _)) => result,
-            Either::Right(((), _)) => Err(http_kit::Error::new(
-                TimeoutError {
-                    duration: self.duration,
-                },
-                StatusCode::GATEWAY_TIMEOUT,
-            )),
+            Either::Left((result, _)) => Ok(result.map_err(MiddlewareError::Endpoint)?),
+            Either::Right(((), _)) => Err(MiddlewareError::Middleware(TimeoutError::new())),
         }
     }
 }
@@ -55,8 +52,8 @@ impl Middleware for Timeout {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use http_kit::{Body, Method};
-    use std::time::Duration;
+    use http_kit::{Body, HttpError, Method};
+    use std::{convert::Infallible, time::Duration};
 
     fn request() -> Request {
         http::Request::builder()
@@ -73,7 +70,8 @@ mod tests {
     }
 
     impl Endpoint for SlowEndpoint {
-        async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
+        type Error = Infallible;
+        async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
             tokio::time::sleep(self.delay).await;
             let response = http::Response::builder()
                 .status(self.status)
@@ -114,7 +112,7 @@ mod tests {
             .await
             .expect_err("timeout should fire first");
 
-        assert_eq!(err.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(err.status(), Some(StatusCode::GATEWAY_TIMEOUT));
         assert!(err.to_string().contains("timed out"));
     }
 }

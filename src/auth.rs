@@ -1,6 +1,8 @@
 //! Authentication middlewares for HTTP requests.
 
-use http_kit::{Endpoint, Middleware, Request, Response, Result, header};
+use std::convert::Infallible;
+
+use http_kit::{Endpoint, Middleware, Request, Response, header, middleware::MiddlewareError};
 
 /// Middleware for Bearer Token Authentication.
 /// Adds an `Authorization: Bearer <token>` header to requests.
@@ -19,8 +21,13 @@ impl BearerAuth {
 }
 
 impl Middleware for BearerAuth {
-    async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
-        // Only add auth header if one isn't already present
+    type Error = Infallible;
+    async fn handle<E:Endpoint>(
+            &mut self,
+            request: &mut Request,
+            mut next: E,
+        ) -> Result<Response,http_kit::middleware::MiddlewareError<E::Error,Self::Error>> {
+         // Only add auth header if one isn't already present
         if !request.headers().contains_key(header::AUTHORIZATION) {
             let auth_value = format!("Bearer {}", self.token);
             request
@@ -28,7 +35,7 @@ impl Middleware for BearerAuth {
                 .insert(header::AUTHORIZATION, auth_value.parse().unwrap());
         }
 
-        next.respond(request).await
+        Ok(next.respond(request).await.map_err(MiddlewareError::Endpoint)?)
     }
 }
 
@@ -51,7 +58,12 @@ impl BasicAuth {
 }
 
 impl Middleware for BasicAuth {
-    async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
+    type Error = Infallible;
+    async fn handle<E:Endpoint>(
+            &mut self,
+            request: &mut Request,
+            mut next: E,
+        ) -> Result<Response,http_kit::middleware::MiddlewareError<E::Error,Self::Error>> {
         // Only add auth header if one isn't already present
         if !request.headers().contains_key(header::AUTHORIZATION) {
             use base64::Engine;
@@ -69,6 +81,6 @@ impl Middleware for BasicAuth {
                 .insert(header::AUTHORIZATION, auth_value.parse().unwrap());
         }
 
-        next.respond(request).await
+        Ok(next.respond(request).await.map_err(MiddlewareError::Endpoint)?)
     }
 }

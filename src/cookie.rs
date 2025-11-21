@@ -1,10 +1,11 @@
 //! Middleware for managing cookies in HTTP requests and responses.
 
 use crate::header;
-use crate::{Endpoint, Middleware, Request, Response, Result};
+use crate::{Endpoint, Middleware, Request, Response};
 use http_kit::cookie::{Cookie, CookieJar};
 use http_kit::header::HeaderValue;
-use http_kit::{ResultExt, StatusCode};
+use http_kit::middleware::MiddlewareError;
+use http_kit::{HttpError, StatusCode};
 #[cfg(not(target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +31,26 @@ pub struct CookieStore {
     store: CookieJar,
     #[cfg(not(target_arch = "wasm32"))]
     persistence: Option<Persistence>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CookieError {
+    #[error("Failed to load cookies from disk: {0}")]
+    FailToLoadCookiesFromDisk(std::io::Error),
+
+    #[error("Failed to parse cookies from disk: {0}")]
+    FailToParseCookiesFromDisk(serde_json::Error),
+
+    #[error("Failed to persist cookies to disk: {0}")]
+    FailToPersistCookiesToDisk(std::io::Error),
+
+    #[error("Invalid cookie header")]
+    InvalidCookieHeader,
+}
+impl HttpError for CookieError {
+    fn status(&self) -> Option<StatusCode> {
+        None
+    }
 }
 
 impl Default for CookieStore {
@@ -59,7 +80,7 @@ impl CookieStore {
         }
     }
 
-    async fn prepare(&mut self) -> Result<()> {
+    async fn prepare(&mut self) -> Result<(), CookieError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             if let Some(path) = self
@@ -81,7 +102,7 @@ impl CookieStore {
         Ok(())
     }
 
-    async fn finalize(&self, updated: bool) -> Result<()> {
+    async fn finalize(&self, updated: bool) -> Result<(), CookieError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             if updated && let Some(persistence) = &self.persistence {
@@ -92,7 +113,7 @@ impl CookieStore {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    async fn load_from_disk(&mut self, path: &Path) -> Result<()> {
+    async fn load_from_disk(&mut self, path: &Path) -> Result<(), CookieError> {
         let lock = file_mutex(path).await;
         let _guard = lock.lock().await;
 
@@ -101,12 +122,12 @@ impl CookieStore {
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 return Ok(());
             }
-            Err(err) => return Err(http_kit::Error::new(err, StatusCode::INTERNAL_SERVER_ERROR)),
+            Err(err) => return Err(CookieError::FailToLoadCookiesFromDisk(err)),
         };
 
         if !data.is_empty() {
             let cookies: Vec<PersistedCookie> = serde_json::from_slice(&data)
-                .map_err(|err| http_kit::Error::new(err, StatusCode::BAD_GATEWAY))?;
+                .map_err(|err| CookieError::FailToParseCookiesFromDisk(err))?;
             for stored in cookies {
                 self.store.add(stored.into_cookie());
             }
@@ -116,7 +137,7 @@ impl CookieStore {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    async fn persist_to_path(&self, path: &Path) -> Result<()> {
+    async fn persist_to_path(&self, path: &Path) -> Result<(), CookieError> {
         let lock = file_mutex(path).await;
         let _guard = lock.lock().await;
 
@@ -125,30 +146,34 @@ impl CookieStore {
             .iter()
             .map(|cookie| PersistedCookie::from_cookie(cookie.clone()))
             .collect();
-        let data = serde_json::to_vec(&snapshot)
-            .map_err(|err| http_kit::Error::new(err, StatusCode::BAD_GATEWAY))?;
+        let data = serde_json::to_vec(&snapshot).expect("failed to serialize cookies to JSON"); // Safety: Serialization should not fail.
 
         if let Some(parent) = path.parent() {
             async_fs::create_dir_all(parent)
                 .await
-                .status(StatusCode::INTERNAL_SERVER_ERROR)?;
+                .map_err(CookieError::FailToPersistCookiesToDisk)?;
         }
 
         let tmp = path.with_extension("tmp");
         async_fs::write(&tmp, &data)
             .await
-            .status(StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(CookieError::FailToPersistCookiesToDisk)?;
         async_fs::rename(&tmp, path)
             .await
-            .status(StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(CookieError::FailToPersistCookiesToDisk)?;
 
         Ok(())
     }
 }
 
 impl Middleware for CookieStore {
-    async fn handle(&mut self, request: &mut Request, mut next: impl Endpoint) -> Result<Response> {
-        self.prepare().await?;
+    type Error = CookieError;
+    async fn handle<E: Endpoint>(
+        &mut self,
+        request: &mut Request,
+        mut next: E,
+    ) -> Result<Response, http_kit::middleware::MiddlewareError<E::Error, Self::Error>> {
+        self.prepare().await.map_err(MiddlewareError::Middleware)?;
 
         let cookie_header = self
             .store
@@ -159,21 +184,29 @@ impl Middleware for CookieStore {
 
         request.headers_mut().insert(
             header::COOKIE,
-            HeaderValue::from_maybe_shared(cookie_header).status(StatusCode::BAD_REQUEST)?,
+            HeaderValue::from_maybe_shared(cookie_header)
+                .map_err(|_| MiddlewareError::Middleware(CookieError::InvalidCookieHeader))?,
         );
 
-        let res = next.respond(request).await?;
+        let res = next
+            .respond(request)
+            .await
+            .map_err(MiddlewareError::Endpoint)?;
 
         let mut updated = false;
         for set_cookie in res.headers().get_all(header::SET_COOKIE) {
-            let set_cookie = set_cookie.to_str().status(StatusCode::BAD_REQUEST)?;
+            let set_cookie = set_cookie
+                .to_str()
+                .map_err(|_| MiddlewareError::Middleware(CookieError::InvalidCookieHeader))?;
             let cookie = set_cookie
                 .parse::<Cookie>()
-                .status(StatusCode::BAD_REQUEST)?;
+                .map_err(|_| MiddlewareError::Middleware(CookieError::InvalidCookieHeader))?;
             self.store.add(cookie);
             updated = true;
         }
-        self.finalize(updated).await?;
+        self.finalize(updated)
+            .await
+            .map_err(MiddlewareError::Middleware)?;
         Ok(res)
     }
 }
@@ -265,6 +298,8 @@ async fn file_mutex(path: &Path) -> Arc<AsyncMutex<()>> {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    use std::convert::Infallible;
+
     use super::*;
     use http::{Request as HttpRequest, Response as HttpResponse};
     use http_kit::Body;
@@ -302,7 +337,8 @@ mod tests {
     struct SetCookieEndpoint;
 
     impl Endpoint for SetCookieEndpoint {
-        async fn respond(&mut self, _request: &mut Request) -> Result<Response> {
+        type Error = Infallible;
+        async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
             Ok(HttpResponse::builder()
                 .status(StatusCode::OK)
                 .header(header::SET_COOKIE, "session=abc; Path=/")
@@ -324,7 +360,8 @@ mod tests {
     }
 
     impl Endpoint for RecordingEndpoint {
-        async fn respond(&mut self, request: &mut Request) -> Result<Response> {
+        type Error = Infallible;
+        async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
             self.last_cookie = request
                 .headers()
                 .get(header::COOKIE)

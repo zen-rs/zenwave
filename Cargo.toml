@@ -10,7 +10,7 @@ keywords = ["http", "client", "async", "networking", "middleware"]
 categories = ["network-programming", "web-programming::http-client"]
 
 [dependencies]
-http-kit = { version = "0.2.0", git = "https://github.com/zen-rs/http-kit"}
+http-kit = { git = "https://github.com/zen-rs/http-kit"}
 executor-core = { version = "0.6.0" }
 serde = { version = "1.0", default-features = false, features = ["derive"]}
 serde_json = "1.0"

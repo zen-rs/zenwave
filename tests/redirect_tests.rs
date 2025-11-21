@@ -7,7 +7,7 @@ use std::{
 
 use http::StatusCode;
 use http_kit::{
-    Body, Endpoint, Method, Request, Response, Result as HttpResult,
+    Body, Endpoint, HttpError, Method, Request, Response,
     header::{HeaderValue, LOCATION},
 };
 use zenwave::Client;
@@ -32,6 +32,18 @@ struct MockClient {
     state: Arc<Mutex<MockState>>,
 }
 
+#[derive(Debug, thiserror::Error, Clone, Copy)]
+enum MockError {
+    #[error("no more mock responses")]
+    Exhausted,
+}
+
+impl HttpError for MockError {
+    fn status(&self) -> Option<StatusCode> {
+        None
+    }
+}
+
 impl MockClient {
     fn with_responses(responses: Vec<Response>) -> Self {
         let state = MockState {
@@ -49,7 +61,8 @@ impl MockClient {
 }
 
 impl Endpoint for MockClient {
-    async fn respond(&mut self, request: &mut Request) -> HttpResult<Response> {
+    type Error = MockError;
+    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         let mut state = self.state.lock().unwrap();
         state.seen.push(SeenRequest {
             method: request.method().clone(),
@@ -69,7 +82,7 @@ impl Endpoint for MockClient {
         state
             .responses
             .pop_front()
-            .ok_or_else(|| http_kit::Error::msg("No more mock responses"))
+            .ok_or(MockError::Exhausted)
     }
 }
 
