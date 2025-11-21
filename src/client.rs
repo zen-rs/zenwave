@@ -4,7 +4,7 @@ use core::{pin::Pin, time::Duration};
 use std::{fmt::Debug, future::Future};
 
 use futures_util::{Stream, StreamExt};
-use http::{HeaderValue, header};
+use http::{HeaderName, HeaderValue, header};
 #[cfg(all(test, not(target_arch = "wasm32")))]
 use http_kit::StatusCode;
 use http_kit::{
@@ -120,9 +120,13 @@ impl<T: Client> RequestBuilder<'_, T> {
         Ok(body.into_sse())
     }
 
-    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        let header_name: http_kit::header::HeaderName = name.into().parse().unwrap();
-        let header_value: http_kit::header::HeaderValue = value.into().parse().unwrap();
+    pub fn header(
+        mut self,
+        name: impl TryInto<HeaderName, Error: Debug>,
+        value: impl TryInto<HeaderValue, Error: Debug>,
+    ) -> Self {
+        let header_name: http_kit::header::HeaderName = name.try_into().unwrap();
+        let header_value: http_kit::header::HeaderValue = value.try_into().unwrap();
         self.request.headers_mut().insert(header_name, header_value);
         self
     }
