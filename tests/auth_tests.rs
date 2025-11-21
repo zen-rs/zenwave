@@ -3,7 +3,6 @@
 use zenwave::auth::{BasicAuth, BearerAuth};
 use zenwave::{Client, client};
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_bearer_auth_middleware() {
@@ -17,7 +16,6 @@ async fn test_bearer_auth_middleware() {
     assert!(response.status().is_success());
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_bearer_auth_request_builder() {
@@ -34,7 +32,6 @@ async fn test_bearer_auth_request_builder() {
     assert!(response.status().is_success());
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_basic_auth_middleware() {
@@ -50,7 +47,6 @@ async fn test_basic_auth_middleware() {
     assert!(response.status().is_success());
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_basic_auth_request_builder() {
@@ -67,7 +63,6 @@ async fn test_basic_auth_request_builder() {
     assert!(response.status().is_success());
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_basic_auth_no_password() {
@@ -105,7 +100,6 @@ async fn test_basic_auth_creation() {
     assert!(!format!("{basic_auth_no_pass:?}").is_empty());
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_auth_headers_sent() {
@@ -122,7 +116,6 @@ async fn test_auth_headers_sent() {
     assert!(body.contains("Bearer secret-token"));
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_basic_auth_encoding() {
@@ -140,7 +133,6 @@ async fn test_basic_auth_encoding() {
     assert!(body.contains("Basic"));
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_multiple_auth_requests() {
@@ -157,7 +149,6 @@ async fn test_multiple_auth_requests() {
     }
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_auth_with_other_middleware() {
@@ -174,7 +165,6 @@ async fn test_auth_with_other_middleware() {
     assert!(response.status().is_success());
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_override_auth_per_request() {
@@ -193,7 +183,6 @@ async fn test_override_auth_per_request() {
     assert!(body.contains("Bearer override-token"));
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_unauthorized_access() {
@@ -207,7 +196,6 @@ async fn test_unauthorized_access() {
     assert_eq!(response.status().as_u16(), 401);
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_invalid_basic_auth() {

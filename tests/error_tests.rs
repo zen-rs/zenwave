@@ -27,7 +27,7 @@ async fn test_client_invalid_url_error() {
     assert!(result.is_err());
 }
 
-#[ignore = "requires network access"]
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_unreachable_host_error() {
@@ -35,7 +35,7 @@ async fn test_unreachable_host_error() {
     assert!(result.is_err());
 }
 
-#[ignore = "requires network access"]
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_timeout_behavior() {
@@ -45,7 +45,7 @@ async fn test_timeout_behavior() {
     assert!(result.is_ok());
 }
 
-#[ignore = "requires network access"]
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_json_parsing_error() {
@@ -57,7 +57,7 @@ async fn test_json_parsing_error() {
     assert!(result.is_err());
 }
 
-#[ignore = "requires network access"]
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_404_not_found() {
@@ -67,7 +67,7 @@ async fn test_404_not_found() {
     assert_eq!(response.status().as_u16(), 404);
 }
 
-#[ignore = "requires network access"]
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_500_server_error() {
@@ -89,7 +89,7 @@ async fn test_method_construction_with_invalid_uri() {
     assert!(result.is_err());
 }
 
-#[ignore = "requires network access"]
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_empty_response_handling() {

@@ -2,7 +2,7 @@
 
 use zenwave::{delete, get, post, put};
 
-#[ignore = "requires network access"]
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_convenience_get() {
@@ -12,7 +12,7 @@ async fn test_convenience_get() {
     assert!(response.status().is_success());
 }
 
-#[ignore = "requires network access"]
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_convenience_post() {
@@ -22,7 +22,7 @@ async fn test_convenience_post() {
     assert!(response.status().is_success());
 }
 
-#[ignore = "requires network access"]
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_convenience_put() {
@@ -32,7 +32,7 @@ async fn test_convenience_put() {
     assert!(response.status().is_success());
 }
 
-#[ignore = "requires network access"]
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_convenience_delete() {
@@ -49,7 +49,7 @@ async fn test_convenience_get_invalid_uri() {
     assert!(response.is_err());
 }
 
-#[ignore = "requires network access"]
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_convenience_get_response_text() {
@@ -61,7 +61,7 @@ async fn test_convenience_get_response_text() {
     assert!(text.contains("httpbin"));
 }
 
-#[ignore = "requires network access"]
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_convenience_get_response_json() {

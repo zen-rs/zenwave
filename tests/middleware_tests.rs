@@ -13,7 +13,7 @@ use zenwave::cookie::CookieStore;
 use zenwave::redirect::FollowRedirect;
 use zenwave::{Body, Client, Endpoint, HttpError, Middleware, Request, Response, StatusCode, client};
 
-#[ignore = "requires network access"]
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_cookie_store_middleware() {
@@ -43,7 +43,7 @@ async fn test_cookie_store_creation() {
     assert!(!format!("{cookie_store:?}").is_empty());
 }
 
-#[ignore = "requires network access"]
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_follow_redirect_middleware() {
@@ -66,7 +66,7 @@ async fn test_follow_redirect_creation() {
     // Just ensure it can be created
 }
 
-#[ignore = "requires network access"]
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_follow_redirect_multiple_redirects() {
@@ -80,7 +80,7 @@ async fn test_follow_redirect_multiple_redirects() {
     assert!(response.status().is_success());
 }
 
-#[ignore = "requires network access"]
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_client_with_multiple_middleware() {
@@ -98,7 +98,7 @@ async fn test_client_with_multiple_middleware() {
     assert!(response2.is_ok());
 }
 
-#[ignore = "requires network access"]
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_without_redirect_middleware() {
@@ -111,7 +111,7 @@ async fn test_without_redirect_middleware() {
     assert!(response.status().is_redirection());
 }
 
-#[ignore = "requires network access"]
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_middleware_with_custom_middleware() {

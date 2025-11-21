@@ -3,7 +3,6 @@
 use serde_json::Value;
 use zenwave::{Client, Method, client, get};
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_real_world_api_request() {
@@ -15,7 +14,6 @@ async fn test_real_world_api_request() {
     assert!(json.is_object());
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_user_agent_header() {
@@ -26,7 +24,6 @@ async fn test_user_agent_header() {
     assert!(!text.is_empty());
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_custom_headers() {
@@ -38,7 +35,6 @@ async fn test_custom_headers() {
     assert!(text.contains("headers"));
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_post_with_json_body() {
@@ -52,7 +48,6 @@ async fn test_post_with_json_body() {
     assert!(response.status().is_success());
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_response_status_codes() {
@@ -63,7 +58,6 @@ async fn test_response_status_codes() {
     }
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_redirect_chain() {
@@ -75,7 +69,6 @@ async fn test_redirect_chain() {
     assert!(response.status().is_success());
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_large_response() {
@@ -89,7 +82,6 @@ async fn test_large_response() {
     assert!(!bytes.is_empty());
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_gzip_compression() {
@@ -102,7 +94,6 @@ async fn test_gzip_compression() {
     assert!(!bytes.is_empty());
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_cookie_persistence() {
@@ -122,7 +113,6 @@ async fn test_cookie_persistence() {
     assert!(body.contains("cookievalue"));
 }
 
-#[ignore = "requires network access"]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_method_overrides() {
