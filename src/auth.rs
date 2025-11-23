@@ -22,12 +22,12 @@ impl BearerAuth {
 
 impl Middleware for BearerAuth {
     type Error = Infallible;
-    async fn handle<E:Endpoint>(
-            &mut self,
-            request: &mut Request,
-            mut next: E,
-        ) -> Result<Response,http_kit::middleware::MiddlewareError<E::Error,Self::Error>> {
-         // Only add auth header if one isn't already present
+    async fn handle<E: Endpoint>(
+        &mut self,
+        request: &mut Request,
+        mut next: E,
+    ) -> Result<Response, http_kit::middleware::MiddlewareError<E::Error, Self::Error>> {
+        // Only add auth header if one isn't already present
         if !request.headers().contains_key(header::AUTHORIZATION) {
             let auth_value = format!("Bearer {}", self.token);
             request
@@ -35,7 +35,9 @@ impl Middleware for BearerAuth {
                 .insert(header::AUTHORIZATION, auth_value.parse().unwrap());
         }
 
-        Ok(next.respond(request).await.map_err(MiddlewareError::Endpoint)?)
+        next.respond(request)
+            .await
+            .map_err(MiddlewareError::Endpoint)
     }
 }
 
@@ -59,11 +61,11 @@ impl BasicAuth {
 
 impl Middleware for BasicAuth {
     type Error = Infallible;
-    async fn handle<E:Endpoint>(
-            &mut self,
-            request: &mut Request,
-            mut next: E,
-        ) -> Result<Response,http_kit::middleware::MiddlewareError<E::Error,Self::Error>> {
+    async fn handle<E: Endpoint>(
+        &mut self,
+        request: &mut Request,
+        mut next: E,
+    ) -> Result<Response, http_kit::middleware::MiddlewareError<E::Error, Self::Error>> {
         // Only add auth header if one isn't already present
         if !request.headers().contains_key(header::AUTHORIZATION) {
             use base64::Engine;
@@ -81,6 +83,8 @@ impl Middleware for BasicAuth {
                 .insert(header::AUTHORIZATION, auth_value.parse().unwrap());
         }
 
-        Ok(next.respond(request).await.map_err(MiddlewareError::Endpoint)?)
+        next.respond(request)
+            .await
+            .map_err(MiddlewareError::Endpoint)
     }
 }

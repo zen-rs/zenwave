@@ -16,14 +16,23 @@ use crate::{Client, DefaultBackend, client};
 
 type TokenError = OAuth2Error<<DefaultBackend as Endpoint>::Error>;
 
+/// Errors produced while performing `OAuth2` flows.
 #[derive(Debug, thiserror::Error)]
 pub enum OAuth2Error<H: HttpError> {
+    /// Network or backend failure while requesting a token.
     #[error("request failed: {0}")]
     Transport(#[source] H),
 
+    /// The token endpoint responded with a non-success status code.
     #[error("OAuth2 token endpoint returned {status}: {message}")]
-    Upstream { status: StatusCode, message: String },
+    Upstream {
+        /// HTTP status returned by the token endpoint.
+        status: StatusCode,
+        /// Error details from the token endpoint.
+        message: String,
+    },
 
+    /// The token response body could not be parsed.
     #[error("invalid token response: {0}")]
     InvalidResponse(BodyError),
 }
@@ -219,10 +228,9 @@ impl Middleware for OAuth2ClientCredentials {
             );
         }
 
-        Ok(next
-            .respond(request)
+        next.respond(request)
             .await
-            .map_err(MiddlewareError::Endpoint)?)
+            .map_err(MiddlewareError::Endpoint)
     }
 }
 
@@ -300,7 +308,7 @@ mod tests {
     }
 
     impl RecordingEndpoint {
-        fn calls(&self) -> usize {
+        const fn calls(&self) -> usize {
             self.calls
         }
 
@@ -342,7 +350,7 @@ mod tests {
         let tokens = Arc::new(Mutex::new(
             tokens
                 .into_iter()
-                .map(|t| t.to_string())
+                .map(ToString::to_string)
                 .collect::<Vec<_>>(),
         ));
 
@@ -351,10 +359,7 @@ mod tests {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
                     accepted = listener.accept() => {
-                        let (socket, _) = match accepted {
-                            Ok(conn) => conn,
-                            Err(_) => break,
-                        };
+                        let Ok((socket, _)) = accepted else { break };
                         let tokens = tokens.clone();
                         let hit_counter = hit_counter.clone();
                         tokio::spawn(async move {

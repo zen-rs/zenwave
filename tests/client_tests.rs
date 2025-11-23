@@ -3,7 +3,6 @@
 use http_kit::Method;
 use zenwave::{Client, client};
 
-
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_client_get_method() {
@@ -14,7 +13,6 @@ async fn test_client_get_method() {
     let response = response.unwrap();
     assert!(response.status().is_success());
 }
-
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
@@ -27,7 +25,6 @@ async fn test_client_post_method() {
     assert!(response.status().is_success());
 }
 
-
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_client_put_method() {
@@ -38,7 +35,6 @@ async fn test_client_put_method() {
     let response = response.unwrap();
     assert!(response.status().is_success());
 }
-
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
@@ -51,7 +47,6 @@ async fn test_client_delete_method() {
     assert!(response.status().is_success());
 }
 
-
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_client_method_generic() {
@@ -62,7 +57,6 @@ async fn test_client_method_generic() {
     let response = response.unwrap();
     assert!(response.status().is_success());
 }
-
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
@@ -75,7 +69,6 @@ async fn test_request_builder_string() {
     assert!(string.contains("httpbin"));
 }
 
-
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_request_builder_bytes() {
@@ -85,7 +78,6 @@ async fn test_request_builder_bytes() {
     let bytes = response_bytes.unwrap();
     assert!(!bytes.is_empty());
 }
-
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
@@ -98,7 +90,6 @@ async fn test_request_builder_json() {
     let json = response_json.unwrap();
     assert!(json.is_object());
 }
-
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
@@ -114,7 +105,6 @@ async fn test_client_with_middleware() {
     let response2 = client.get("https://httpbin.org/cookies").await;
     assert!(response2.is_ok());
 }
-
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]

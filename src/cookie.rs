@@ -33,17 +33,22 @@ pub struct CookieStore {
     persistence: Option<Persistence>,
 }
 
+/// Errors encountered while handling HTTP cookies.
 #[derive(Debug, thiserror::Error)]
 pub enum CookieError {
+    /// Failed to read persisted cookies from disk.
     #[error("Failed to load cookies from disk: {0}")]
     FailToLoadCookiesFromDisk(std::io::Error),
 
+    /// Failed to decode persisted cookie data.
     #[error("Failed to parse cookies from disk: {0}")]
     FailToParseCookiesFromDisk(serde_json::Error),
 
+    /// Failed to write cookies to the persistence layer.
     #[error("Failed to persist cookies to disk: {0}")]
     FailToPersistCookiesToDisk(std::io::Error),
 
+    /// Encountered an invalid cookie header value.
     #[error("Invalid cookie header")]
     InvalidCookieHeader,
 }
@@ -126,8 +131,8 @@ impl CookieStore {
         };
 
         if !data.is_empty() {
-            let cookies: Vec<PersistedCookie> = serde_json::from_slice(&data)
-                .map_err(|err| CookieError::FailToParseCookiesFromDisk(err))?;
+            let cookies: Vec<PersistedCookie> =
+                serde_json::from_slice(&data).map_err(CookieError::FailToParseCookiesFromDisk)?;
             for stored in cookies {
                 self.store.add(stored.into_cookie());
             }

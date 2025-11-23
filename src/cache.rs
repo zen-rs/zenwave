@@ -132,8 +132,10 @@ struct CachedResponse {
     last_modified: Option<HeaderValue>,
 }
 
+/// Errors that can occur while caching HTTP responses.
 #[derive(thiserror::Error, Debug)]
 pub enum CacheError {
+    /// Failed to read or buffer the response body.
     #[error("Body error: {0}")]
     BodyError(#[from] http_kit::BodyError),
 }

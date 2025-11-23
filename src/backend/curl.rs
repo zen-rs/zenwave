@@ -8,8 +8,9 @@ use http::{
     HeaderMap, Method,
     header::{HeaderName, HeaderValue},
 };
-use http_kit::{Body, Endpoint, Request, Response, Result, StatusCode};
+use http_kit::{Body, Endpoint, HttpError, Request, Response, StatusCode};
 use hyper_util::client::proxy::matcher;
+use thiserror::Error;
 use tokio::task;
 
 use crate::{ClientBackend, Proxy};
@@ -18,6 +19,33 @@ use crate::{ClientBackend, Proxy};
 #[derive(Debug, Clone, Default)]
 pub struct CurlBackend {
     proxy: Option<Proxy>,
+}
+
+#[derive(Debug, Error)]
+pub enum CurlError {
+    #[error("bad request: {0}")]
+    BadRequest(#[source] anyhow::Error),
+    #[error("bad gateway: {0}")]
+    BadGateway(#[source] anyhow::Error),
+}
+
+impl HttpError for CurlError {
+    fn status(&self) -> Option<StatusCode> {
+        Some(match self {
+            Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
+        })
+    }
+}
+
+impl CurlError {
+    fn bad_request(error: impl Into<anyhow::Error>) -> Self {
+        Self::BadRequest(error.into())
+    }
+
+    fn bad_gateway(error: impl Into<anyhow::Error>) -> Self {
+        Self::BadGateway(error.into())
+    }
 }
 
 impl CurlBackend {
@@ -29,7 +57,7 @@ impl CurlBackend {
 
     /// Create a backend configured to use the supplied proxy matcher.
     #[must_use]
-    pub fn with_proxy(proxy: Proxy) -> Self {
+    pub const fn with_proxy(proxy: Proxy) -> Self {
         Self { proxy: Some(proxy) }
     }
 
@@ -43,39 +71,36 @@ impl CurlBackend {
 impl ClientBackend for CurlBackend {}
 
 impl Endpoint for CurlBackend {
-    async fn respond(&mut self, request: &mut Request) -> Result<Response> {
+    type Error = CurlError;
+    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         let dummy_request = http::Request::builder()
             .method(Method::GET)
             .uri("/")
             .body(Body::empty())
             .expect("building dummy request failed");
-        let mut request = replace(request, dummy_request);
+        let request = replace(request, dummy_request);
         execute(request, self.proxy.clone()).await
     }
 }
 
-async fn execute(request: Request, proxy: Option<Proxy>) -> Result<Response> {
+async fn execute(request: Request, proxy: Option<Proxy>) -> Result<Response, CurlError> {
     let (parts, body) = request.into_parts();
     let mut headers = Vec::with_capacity(parts.headers.len());
-    for (name, value) in parts.headers.iter() {
-        let value_str = value
-            .to_str()
-            .map_err(|e| http_kit::Error::new(e, StatusCode::BAD_REQUEST))?;
+    for (name, value) in &parts.headers {
+        let value_str = value.to_str().map_err(CurlError::bad_request)?;
         headers.push((name.as_str().to_string(), value_str.to_string()));
     }
 
     let body_bytes = body
         .into_bytes()
         .await
-        .map_err(|e| http_kit::Error::new(e, StatusCode::BAD_REQUEST))?
+        .map_err(CurlError::bad_request)?
         .to_vec();
 
     let proxy = proxy
         .as_ref()
         .and_then(|cfg| cfg.intercept(&parts.uri))
-        .map(|intercept| {
-            resolve_proxy(intercept).map_err(|e| http_kit::Error::new(e, StatusCode::BAD_REQUEST))
-        })
+        .map(|intercept| resolve_proxy(&intercept).map_err(CurlError::bad_request))
         .transpose()?;
 
     let prepared = PreparedRequest {
@@ -86,13 +111,15 @@ async fn execute(request: Request, proxy: Option<Proxy>) -> Result<Response> {
         proxy,
     };
 
-    task::spawn_blocking(move || perform(prepared))
+    let response = task::spawn_blocking(move || perform(prepared))
         .await
-        .map_err(|e| http_kit::Error::new(e, StatusCode::BAD_GATEWAY))??
+        .map_err(CurlError::bad_gateway)??;
+
+    Ok(response)
 }
 
-fn perform(request: PreparedRequest) -> Result<Response> {
-    let mut handler = CurlHandler::new(request.body);
+fn perform(request: PreparedRequest) -> Result<Response, CurlError> {
+    let handler = CurlHandler::new(request.body);
     let upload_len = handler.request_body_len();
 
     let mut easy = Easy2::new(handler);
@@ -106,15 +133,16 @@ fn perform(request: PreparedRequest) -> Result<Response> {
             .map_err(map_curl_error)?;
     }
 
-    let mut header_list = None;
-    if !request.headers.is_empty() {
+    let header_list = if request.headers.is_empty() {
+        None
+    } else {
         let mut list = List::new();
         for (name, value) in &request.headers {
             list.append(&format!("{name}: {value}"))
                 .map_err(map_curl_error)?;
         }
-        header_list = Some(easy.http_headers(list).map_err(map_curl_error)?);
-    }
+        Some(easy.http_headers(list).map_err(map_curl_error)?)
+    };
 
     if let Some(proxy) = &request.proxy {
         apply_proxy(&mut easy, proxy).map_err(map_curl_error)?;
@@ -123,12 +151,10 @@ fn perform(request: PreparedRequest) -> Result<Response> {
     easy.perform().map_err(map_curl_error)?;
 
     // Keep the header list alive until this point.
-    drop(header_list);
+    let _ = header_list;
 
-    let handler = easy.into_inner();
-    let response = handler
-        .into_response()
-        .map_err(|e| http_kit::Error::new(e, StatusCode::BAD_GATEWAY))?;
+    let handler = easy.get_mut();
+    let response = handler.take_response().map_err(CurlError::bad_gateway)?;
 
     let mut http_response = http::Response::new(Body::from(response.body));
     *http_response.status_mut() = response.status;
@@ -137,8 +163,8 @@ fn perform(request: PreparedRequest) -> Result<Response> {
     Ok(http_response)
 }
 
-fn map_curl_error(error: curl::Error) -> http_kit::Error {
-    http_kit::Error::new(error, StatusCode::BAD_GATEWAY)
+fn map_curl_error(error: curl::Error) -> CurlError {
+    CurlError::bad_gateway(error)
 }
 
 #[derive(Debug)]
@@ -163,12 +189,16 @@ fn apply_proxy(
     handler.proxy(&proxy.endpoint)?;
     handler.proxy_type(proxy.kind)?;
     if let Some(creds) = &proxy.credentials {
-        handler.proxy_userpwd(creds)?;
+        let (username, password) = creds
+            .split_once(':')
+            .map_or((creds.as_str(), ""), |(user, pass)| (user, pass));
+        handler.proxy_username(username)?;
+        handler.proxy_password(password)?;
     }
     Ok(())
 }
 
-fn resolve_proxy(intercept: matcher::Intercept) -> anyhow::Result<ResolvedProxy> {
+fn resolve_proxy(intercept: &matcher::Intercept) -> anyhow::Result<ResolvedProxy> {
     let scheme = intercept
         .uri()
         .scheme_str()
@@ -190,7 +220,7 @@ fn resolve_proxy(intercept: matcher::Intercept) -> anyhow::Result<ResolvedProxy>
                 .map(|(user, pass)| format!("{user}:{pass}")),
         ),
         "https" => (
-            ProxyType::Https,
+            ProxyType::Http,
             intercept
                 .basic_auth()
                 .and_then(decode_basic_auth)
@@ -266,14 +296,14 @@ impl CurlHandler {
         self.request_body.as_ref().map_or(0, Vec::len)
     }
 
-    fn into_response(self) -> anyhow::Result<SessionResponse> {
+    fn take_response(&mut self) -> anyhow::Result<SessionResponse> {
         let status = self
             .status
             .ok_or_else(|| anyhow!("curl response missing HTTP status line"))?;
         Ok(SessionResponse {
             status,
-            headers: self.headers,
-            body: self.response_body,
+            headers: std::mem::take(&mut self.headers),
+            body: std::mem::take(&mut self.response_body),
         })
     }
 
@@ -282,15 +312,13 @@ impl CurlHandler {
             return;
         }
 
-        if let Some(rest) = line.strip_prefix("HTTP/") {
-            if let Some(code) = rest.split_whitespace().nth(1) {
-                if let Ok(value) = code.parse::<u16>() {
-                    if let Ok(status) = StatusCode::from_u16(value) {
-                        self.status = Some(status);
-                        self.headers.clear();
-                    }
-                }
-            }
+        if let Some(rest) = line.strip_prefix("HTTP/")
+            && let Some(code) = rest.split_whitespace().nth(1)
+            && let Ok(value) = code.parse::<u16>()
+            && let Ok(status) = StatusCode::from_u16(value)
+        {
+            self.status = Some(status);
+            self.headers.clear();
             return;
         }
 

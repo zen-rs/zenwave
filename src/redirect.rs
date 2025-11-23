@@ -24,19 +24,25 @@ impl<C: Client> FollowRedirect<C> {
     }
 }
 
+/// Errors encountered while following HTTP redirects.
 #[derive(Debug, thiserror::Error)]
 pub enum FollowRedirectError<H: HttpError> {
+    /// Failed to parse a redirect target as a URL.
     #[error("URL parse error: {0}")]
     InvalidUrl(#[from] url::ParseError),
+    /// Upstream backend returned an error.
     #[error("Remote error: {0}")]
     RemoteError(H),
 
+    /// Redirect limit exceeded.
     #[error("Too many redirects")]
     TooManyRedirects,
 
+    /// Redirect response did not include a `Location` header.
     #[error("Missing Location header in redirect response")]
     MissingLocationHeader,
 
+    /// Redirect target was not a valid `Location` header.
     #[error("Invalid Location header in redirect response")]
     InvalidLocationHeader,
 }

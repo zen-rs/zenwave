@@ -66,7 +66,7 @@ where
     fn status(&self) -> Option<StatusCode> {
         match self {
             Self::Remote(err) => err.status(),
-            _ => None,
+            Self::InvalidBody(_) => None,
         }
     }
 }
@@ -282,7 +282,9 @@ mod tests {
     async fn file_body_streams_files_without_buffering() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("upload.bin");
-        let payload: Vec<u8> = (0..2048).map(|i| i as u8).collect();
+        let payload: Vec<u8> = (0..2048)
+            .map(|i| u8::try_from(i % 256).expect("value fits in u8"))
+            .collect();
         fs::write(&path, &payload).await.unwrap();
 
         let backend = RecordingBackend::default();
@@ -414,10 +416,10 @@ mod tests {
             &mut self,
             request: &mut Request,
         ) -> Result<Response<http_kit::Body>, Self::Error> {
-            let body = match request.body_mut().take() {
-                Ok(body) => body,
-                Err(_) => http_kit::Body::empty(),
-            };
+            let body = request
+                .body_mut()
+                .take()
+                .unwrap_or_else(|_| http_kit::Body::empty());
             let bytes = body.into_bytes().await.expect("failed to read body");
             *self.recorded.lock().await = bytes.to_vec();
 

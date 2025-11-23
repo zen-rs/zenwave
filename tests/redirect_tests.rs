@@ -79,10 +79,7 @@ impl Endpoint for MockClient {
                 .map(ToOwned::to_owned),
         });
 
-        state
-            .responses
-            .pop_front()
-            .ok_or(MockError::Exhausted)
+        state.responses.pop_front().ok_or(MockError::Exhausted)
     }
 }
 

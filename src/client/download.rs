@@ -71,8 +71,8 @@ impl Default for DownloadOptions {
     }
 }
 
-pub async fn download_to_path<'a, T: crate::Client>(
-    mut builder: RequestBuilder<'a, T>,
+pub async fn download_to_path<T: crate::Client>(
+    mut builder: RequestBuilder<'_, T>,
     path: impl AsRef<Path>,
     options: DownloadOptions,
 ) -> Result<DownloadReport, DownloadError<T::Error>> {

@@ -10,17 +10,22 @@ pub enum WebSocketMessage {
     Binary(Vec<u8>),
 }
 
+/// Errors returned by websocket operations.
 #[derive(Debug, thiserror::Error)]
 pub enum WebSocketError {
+    /// Failed to encode a payload for transmission.
     #[error("Fail to encode payload: {0}")]
     FailToEncodePayload(serde_json::Error),
 
+    /// Unsupported websocket URI scheme encountered.
     #[error("Unsupported websocket scheme: {0}")]
     UnsupportedScheme(String),
 
+    /// Provided websocket URI was invalid.
     #[error("Invalid URI: {0}")]
     InvalidUri(#[from] url::ParseError),
 
+    /// Underlying websocket connection failed.
     #[error("Connection failed: {0}")]
     ConnectionFailed(async_tungstenite::tungstenite::Error),
 }
@@ -105,11 +110,12 @@ impl From<&[u8]> for WebSocketMessage {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn serialize_payload<T>(value: &T) -> Result<String, WebSocketError>
 where
     T: Serialize,
 {
-    Ok(serde_json::to_string(value).map_err(WebSocketError::FailToEncodePayload)?)
+    serde_json::to_string(value).map_err(WebSocketError::FailToEncodePayload)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -165,7 +171,7 @@ mod native {
         let request: String = url.into();
         let (stream, _) = connect_async(request)
             .await
-            .map_err(|e| WebSocketError::ConnectionFailed(e))?;
+            .map_err(WebSocketError::ConnectionFailed)?;
 
         Ok(WebSocket { inner: stream })
     }
@@ -210,7 +216,7 @@ mod native {
             self.inner
                 .send(message.into())
                 .await
-                .map_err(|e| WebSocketError::ConnectionFailed(e))
+                .map_err(WebSocketError::ConnectionFailed)
         }
 
         /// Receive the next websocket message.
@@ -220,7 +226,7 @@ mod native {
         /// Returns an error when the underlying socket cannot read the next frame.
         pub async fn recv(&mut self) -> Result<Option<WebSocketMessage>, WebSocketError> {
             while let Some(message) = self.inner.next().await {
-                let message = message.map_err(|e| WebSocketError::ConnectionFailed(e))?;
+                let message = message.map_err(WebSocketError::ConnectionFailed)?;
 
                 match message {
                     TungsteniteMessage::Text(text) => {
@@ -234,7 +240,7 @@ mod native {
                         self.inner
                             .send(TungsteniteMessage::Pong(payload))
                             .await
-                            .map_err(|e| WebSocketError::ConnectionFailed(e))?;
+                            .map_err(WebSocketError::ConnectionFailed)?;
                     }
                     TungsteniteMessage::Pong(_) | TungsteniteMessage::Frame(_) => {}
                 }
@@ -252,7 +258,7 @@ mod native {
             self.inner
                 .close(None)
                 .await
-                .map_err(|e| WebSocketError::ConnectionFailed(e))
+                .map_err(WebSocketError::ConnectionFailed)
         }
     }
 }

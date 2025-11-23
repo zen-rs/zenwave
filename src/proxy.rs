@@ -122,7 +122,10 @@ mod tests {
         let uri: Uri = "http://example.com".parse().unwrap();
         let intercept = proxy.intercept(&uri).expect("intercept");
         assert_eq!(
-            intercept.uri().authority().map(|a| a.as_str()),
+            intercept
+                .uri()
+                .authority()
+                .map(http::uri::Authority::as_str),
             Some("localhost:8080")
         );
     }

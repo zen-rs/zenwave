@@ -9,9 +9,10 @@ use core::time::Duration;
 
 use futures_util::{future::Either, pin_mut};
 use http_kit::{
-    Endpoint, Middleware, Request, Response, StatusCode, http_error, middleware::MiddlewareError,
+    Endpoint, HttpError, Middleware, Request, Response, StatusCode, middleware::MiddlewareError,
 };
 use native_executor::timer::Timer;
+use thiserror::Error;
 
 /// Middleware that fails requests exceeding the configured duration.
 #[derive(Debug, Clone, Copy)]
@@ -27,7 +28,16 @@ impl Timeout {
     }
 }
 
-http_error!(pub TimeoutError, StatusCode::GATEWAY_TIMEOUT, "request timed out");
+/// Error returned when a request exceeds the configured timeout.
+#[derive(Debug, Error)]
+#[error("request timed out")]
+pub struct TimeoutError;
+
+impl HttpError for TimeoutError {
+    fn status(&self) -> Option<StatusCode> {
+        Some(StatusCode::GATEWAY_TIMEOUT)
+    }
+}
 
 impl Middleware for Timeout {
     type Error = TimeoutError;
@@ -44,7 +54,7 @@ impl Middleware for Timeout {
 
         match futures_util::future::select(response_future, timeout_future).await {
             Either::Left((result, _)) => Ok(result.map_err(MiddlewareError::Endpoint)?),
-            Either::Right(((), _)) => Err(MiddlewareError::Middleware(TimeoutError::new())),
+            Either::Right(((), _)) => Err(MiddlewareError::Middleware(TimeoutError)),
         }
     }
 }

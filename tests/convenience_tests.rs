@@ -2,7 +2,6 @@
 
 use zenwave::{delete, get, post, put};
 
-
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_convenience_get() {
@@ -11,7 +10,6 @@ async fn test_convenience_get() {
     let response = response.unwrap();
     assert!(response.status().is_success());
 }
-
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
@@ -22,7 +20,6 @@ async fn test_convenience_post() {
     assert!(response.status().is_success());
 }
 
-
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_convenience_put() {
@@ -31,7 +28,6 @@ async fn test_convenience_put() {
     let response = response.unwrap();
     assert!(response.status().is_success());
 }
-
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
@@ -49,7 +45,6 @@ async fn test_convenience_get_invalid_uri() {
     assert!(response.is_err());
 }
 
-
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_convenience_get_response_text() {
@@ -60,7 +55,6 @@ async fn test_convenience_get_response_text() {
     assert!(!text.is_empty());
     assert!(text.contains("httpbin"));
 }
-
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
