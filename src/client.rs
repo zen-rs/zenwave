@@ -5,7 +5,6 @@ use std::{fmt::Debug, future::Future};
 
 use futures_util::{Stream, StreamExt};
 use http::{HeaderName, HeaderValue, header};
-#[cfg(all(test, not(target_arch = "wasm32")))]
 use http_kit::StatusCode;
 use http_kit::{
     Endpoint, HttpError, Method, Middleware, Request, Response, Uri,
@@ -58,6 +57,18 @@ pub enum ClientError<T: HttpError> {
 
     #[error("Invalid response body: {0}")]
     InvalidBody(#[from] http_kit::BodyError),
+}
+
+impl<T> HttpError for ClientError<T>
+where
+    T: HttpError,
+{
+    fn status(&self) -> Option<StatusCode> {
+        match self {
+            Self::Remote(err) => err.status(),
+            _ => None,
+        }
+    }
 }
 
 impl<T: Client> RequestBuilder<'_, T> {
