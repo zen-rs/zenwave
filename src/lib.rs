@@ -68,6 +68,7 @@ pub fn client() -> DefaultBackend {
     not(all(target_vendor = "apple", feature = "apple-backend"))
 ))]
 #[must_use]
+#[allow(clippy::missing_const_for_fn)]
 pub fn client_with_proxy(proxy: Proxy) -> DefaultBackend {
     DefaultBackend::with_proxy(proxy)
 }

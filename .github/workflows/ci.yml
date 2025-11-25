@@ -38,14 +38,8 @@ jobs:
           path: target
           key: ${{ runner.os }}-cargo-target-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy
-        run: cargo clippy --all-targets --all-features --workspace -- -D warnings
-
-      - name: cargo test
-        run: cargo test --all-features --workspace
+      - name: Run native test suite (all backends)
+        run: bash scripts/test-native.sh
 
   wasm-linux:
     name: wasm-pack (Linux - ${{ matrix.browser }})
@@ -67,7 +61,7 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
 
       - name: wasm-pack test
-        run: wasm-pack test --${{ matrix.browser }} --headless -- --no-default-features --features web-backend
+        run: bash scripts/test-wasm.sh ${{ matrix.browser }}
 
   wasm-macos:
     name: wasm-pack (macOS Safari)
@@ -88,4 +82,34 @@ jobs:
         run: sudo safaridriver --enable
 
       - name: wasm-pack test (Safari)
-        run: wasm-pack test --safari --headless -- --no-default-features --features web-backend
+        run: bash scripts/test-wasm.sh safari
+
+  apple-backend:
+    name: Apple backend (macOS)
+    runs-on: macos-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target dir
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run apple backend suite
+        run: bash scripts/test-apple.sh

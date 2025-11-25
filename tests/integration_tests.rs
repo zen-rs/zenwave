@@ -1,13 +1,27 @@
-//! Integration tests for Zenwave using real HTTP requests
+//! Integration tests for Zenwave using real HTTP requests.
+
+use std::env;
 
 use serde_json::Value;
 use zenwave::{Client, Method, client, get};
+
+fn base_url() -> String {
+    env::var("ZENWAVE_TEST_BASE_URL").unwrap_or_else(|_| "https://httpbin.org".to_string())
+}
+
+fn endpoint(path: &str) -> String {
+    format!(
+        "{}/{}",
+        base_url().trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_real_world_api_request() {
     // Test with a real JSON API
-    let response = get("https://httpbin.org/json").await.unwrap();
+    let response = get(endpoint("/json")).await.unwrap();
     assert!(response.status().is_success());
 
     let json: Value = response.into_body().into_json().await.unwrap();
@@ -17,7 +31,7 @@ async fn test_real_world_api_request() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_user_agent_header() {
-    let response = get("https://httpbin.org/user-agent").await.unwrap();
+    let response = get(endpoint("/user-agent")).await.unwrap();
     let text = response.into_body().into_string().await.unwrap();
 
     // Should contain some user agent info
@@ -28,7 +42,7 @@ async fn test_user_agent_header() {
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_custom_headers() {
     let mut client = client();
-    let response = client.get("https://httpbin.org/headers").await.unwrap();
+    let response = client.get(endpoint("/headers")).await.unwrap();
     let text = response.into_body().into_string().await.unwrap();
 
     // Should contain header information
@@ -39,7 +53,7 @@ async fn test_custom_headers() {
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_post_with_json_body() {
     let mut client = client();
-    let request = client.method(Method::POST, "https://httpbin.org/post");
+    let request = client.method(Method::POST, endpoint("/post"));
     // Note: In a real implementation, you'd want to add a body() method to RequestBuilder
     let response = request.await;
 
@@ -52,8 +66,8 @@ async fn test_post_with_json_body() {
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_response_status_codes() {
     for status_code in [200, 201, 400, 401, 403, 404, 500, 502, 503] {
-        let url = format!("https://httpbin.org/status/{status_code}");
-        let response = get(&url).await.unwrap();
+        let url = endpoint(&format!("/status/{status_code}"));
+        let response = get(url).await.unwrap();
         assert_eq!(response.status().as_u16(), status_code);
     }
 }
@@ -65,7 +79,7 @@ async fn test_redirect_chain() {
     let mut client = client;
 
     // Test a redirect chain
-    let response = client.get("https://httpbin.org/redirect/5").await.unwrap();
+    let response = client.get(endpoint("/redirect/5")).await.unwrap();
     assert!(response.status().is_success());
 }
 
@@ -73,7 +87,7 @@ async fn test_redirect_chain() {
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_large_response() {
     // Test handling of larger responses
-    let response = get("https://httpbin.org/base64/aGVsbG8gd29ybGQ=").await;
+    let response = get(endpoint("/base64/aGVsbG8gd29ybGQ=")).await;
     assert!(response.is_ok());
     let response = response.unwrap();
     let body = response.into_body().into_bytes().await;
@@ -86,7 +100,7 @@ async fn test_large_response() {
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_gzip_compression() {
     // httpbin.org supports gzip compression
-    let response = get("https://httpbin.org/gzip").await;
+    let response = get(endpoint("/gzip")).await;
     assert!(response.is_ok());
     let response = response.unwrap();
     let bytes = response.into_body().into_bytes().await.unwrap();
@@ -102,12 +116,12 @@ async fn test_cookie_persistence() {
 
     // Set a cookie
     let _response = client
-        .get("https://httpbin.org/cookies/set/test/cookievalue")
+        .get(endpoint("/cookies/set/test/cookievalue"))
         .await
         .unwrap();
 
     // Verify cookie is sent in subsequent request
-    let response = client.get("https://httpbin.org/cookies").await.unwrap();
+    let response = client.get(endpoint("/cookies")).await.unwrap();
     let body = response.into_body().into_string().await.unwrap();
     assert!(body.contains("test"));
     assert!(body.contains("cookievalue"));
@@ -120,16 +134,16 @@ async fn test_method_overrides() {
 
     // Test different HTTP methods
     let methods = [
-        (Method::GET, "https://httpbin.org/get"),
-        (Method::POST, "https://httpbin.org/post"),
-        (Method::PUT, "https://httpbin.org/put"),
-        (Method::DELETE, "https://httpbin.org/delete"),
-        (Method::PATCH, "https://httpbin.org/patch"),
+        (Method::GET, "/get"),
+        (Method::POST, "/post"),
+        (Method::PUT, "/put"),
+        (Method::DELETE, "/delete"),
+        (Method::PATCH, "/patch"),
     ];
 
     for (method, url) in methods {
         let method_clone = method.clone();
-        let response = client.method(method, url).await;
+        let response = client.method(method, endpoint(url)).await;
         assert!(response.is_ok(), "Failed for method: {method_clone:?}");
         let response = response.unwrap();
         assert!(

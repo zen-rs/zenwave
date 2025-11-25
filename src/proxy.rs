@@ -54,6 +54,7 @@ impl Proxy {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn into_matcher(self) -> Arc<matcher::Matcher> {
         self.matcher
     }
