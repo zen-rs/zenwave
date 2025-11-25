@@ -1,13 +1,16 @@
-use http_kit::{HttpError, StatusCode};
+use http_kit::{
+    HttpError, StatusCode,
+    utils::{ByteStr, Bytes},
+};
 use serde::Serialize;
 
 /// Message transmitted over a websocket connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WebSocketMessage {
     /// UTF-8 text payload.
-    Text(String),
+    Text(ByteStr),
     /// Binary payload.
-    Binary(Vec<u8>),
+    Binary(Bytes),
 }
 
 /// Errors returned by websocket operations.
@@ -39,13 +42,13 @@ impl HttpError for WebSocketError {
 impl WebSocketMessage {
     /// Construct a text message.
     #[must_use]
-    pub fn text(value: impl Into<String>) -> Self {
+    pub fn text(value: impl Into<ByteStr>) -> Self {
         Self::Text(value.into())
     }
 
     /// Construct a binary message.
     #[must_use]
-    pub fn binary(value: impl Into<Vec<u8>>) -> Self {
+    pub fn binary(value: impl Into<Bytes>) -> Self {
         Self::Binary(value.into())
     }
 
@@ -69,7 +72,7 @@ impl WebSocketMessage {
 
     /// Converts the payload into owned text when possible.
     #[must_use]
-    pub fn into_text(self) -> Option<String> {
+    pub fn into_text(self) -> Option<ByteStr> {
         match self {
             Self::Text(text) => Some(text),
             Self::Binary(_) => None,
@@ -78,7 +81,7 @@ impl WebSocketMessage {
 
     /// Converts the payload into owned bytes when possible.
     #[must_use]
-    pub fn into_bytes(self) -> Option<Vec<u8>> {
+    pub fn into_bytes(self) -> Option<Bytes> {
         match self {
             Self::Text(_) => None,
             Self::Binary(bytes) => Some(bytes),
@@ -88,25 +91,37 @@ impl WebSocketMessage {
 
 impl From<String> for WebSocketMessage {
     fn from(value: String) -> Self {
+        Self::Text(value.into())
+    }
+}
+
+impl From<ByteStr> for WebSocketMessage {
+    fn from(value: ByteStr) -> Self {
         Self::Text(value)
     }
 }
 
 impl From<&str> for WebSocketMessage {
     fn from(value: &str) -> Self {
-        Self::Text(value.to_owned())
+        Self::Text(value.to_owned().into())
+    }
+}
+
+impl From<Bytes> for WebSocketMessage {
+    fn from(value: Bytes) -> Self {
+        Self::Binary(value)
     }
 }
 
 impl From<Vec<u8>> for WebSocketMessage {
     fn from(value: Vec<u8>) -> Self {
-        Self::Binary(value)
+        Self::Binary(value.into())
     }
 }
 
 impl From<&[u8]> for WebSocketMessage {
     fn from(value: &[u8]) -> Self {
-        Self::Binary(value.to_vec())
+        Self::Binary(value.to_vec().into())
     }
 }
 
@@ -122,7 +137,11 @@ where
 impl From<WebSocketMessage> for async_tungstenite::tungstenite::Message {
     fn from(value: WebSocketMessage) -> Self {
         match value {
-            WebSocketMessage::Text(text) => Self::Text(text),
+            WebSocketMessage::Text(text) => Self::Text(unsafe {
+                use async_tungstenite::tungstenite::Utf8Bytes;
+
+                Utf8Bytes::from_bytes_unchecked(text.into_bytes())
+            }),
             WebSocketMessage::Binary(bytes) => Self::Binary(bytes),
         }
     }
@@ -131,7 +150,8 @@ impl From<WebSocketMessage> for async_tungstenite::tungstenite::Message {
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use async_tungstenite::{WebSocketStream, tungstenite::Message as TungsteniteMessage};
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::StreamExt;
+    use http_kit::utils::{ByteStr, Bytes};
     use tokio::net::TcpStream;
     use tokio_util::compat::TokioAsyncReadCompatExt;
     use url::Url;
@@ -337,10 +357,7 @@ mod native {
         /// # Errors
         ///
         /// Returns an error when the underlying socket cannot write the frame.
-        pub async fn send_binary(
-            &mut self,
-            bytes: impl Into<Vec<u8>>,
-        ) -> Result<(), WebSocketError> {
+        pub async fn send_binary(&mut self, bytes: impl Into<Bytes>) -> Result<(), WebSocketError> {
             self.send_message(WebSocketMessage::binary(bytes)).await
         }
 
@@ -362,7 +379,9 @@ mod native {
 
                 match message {
                     TungsteniteMessage::Text(text) => {
-                        return Ok(Some(WebSocketMessage::Text(text)));
+                        return Ok(Some(WebSocketMessage::Text(unsafe {
+                            ByteStr::from_utf8_unchecked(text.into())
+                        })));
                     }
                     TungsteniteMessage::Binary(bytes) => {
                         return Ok(Some(WebSocketMessage::Binary(bytes)));
@@ -567,7 +586,7 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if the browser fails to queue the frame.
-        pub async fn send_binary(&mut self, bytes: impl Into<Vec<u8>>) -> Result<()> {
+        pub async fn send_binary(&mut self, bytes: impl Into<Bytes>) -> Result<()> {
             self.send_message(WebSocketMessage::binary(bytes)).await
         }
 

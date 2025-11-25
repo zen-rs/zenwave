@@ -2,7 +2,7 @@
 #![allow(missing_docs)]
 
 use async_tungstenite::{accept_async, tokio::TokioAdapter, tungstenite::Message};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use tokio::net::TcpListener;
 
 #[tokio::test]
