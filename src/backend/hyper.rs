@@ -54,13 +54,27 @@ impl HyperBackend {
 }
 
 #[derive(Debug)]
-pub struct HyperError {
-    error: hyper_util::client::legacy::Error,
+pub enum HyperError {
+    Connection(hyper_util::client::legacy::Error),
+    Remote {
+        status: StatusCode,
+        body: Option<String>,
+        raw_response: Response,
+    },
 }
 
 impl core::fmt::Display for HyperError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "hyper error: {}", self.error)
+        match self {
+            Self::Connection(err) => write!(f, "connection error: {}", err),
+            Self::Remote { status, body, .. } => {
+                if let Some(body) = body {
+                    write!(f, "remote error: {} - {}", status, body)
+                } else {
+                    write!(f, "remote error: {}", status)
+                }
+            }
+        }
     }
 }
 
@@ -86,15 +100,32 @@ impl Endpoint for HyperBackend {
             .client
             .request(request)
             .await
-            .map_err(|error| HyperError { error })?;
+            .map_err(|error| HyperError::Connection(error))?;
 
-        let response = response.map(|body| {
+        let mut response = response.map(|body| {
             let stream = BodyDataStream::new(body);
             let stream = stream.map_err(|error| {
                 http_kit::BodyError::Other(Box::new(error)) // TODO: improve error conversion
             });
             http_kit::Body::from_stream(stream)
         });
+
+        let is_error = response.status().is_client_error() || response.status().is_server_error();
+
+        if is_error {
+            // Let's read the body to include it in the error response
+            let error_msg: Option<String> = response
+                .body_mut()
+                .as_str()
+                .await
+                .ok()
+                .map(|s| s.to_owned());
+            return Err(HyperError::Remote {
+                status: response.status(),
+                body: error_msg,
+                raw_response: response,
+            });
+        }
 
         Ok(response)
     }
