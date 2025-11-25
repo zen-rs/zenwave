@@ -1,3 +1,10 @@
+// Compile-time check: native-tls and rustls are mutually exclusive
+#[cfg(all(feature = "native-tls", feature = "rustls"))]
+compile_error!(
+    "Features `native-tls` and `rustls` are mutually exclusive. \
+     Please enable only one TLS backend."
+);
+
 use std::mem::replace;
 
 use futures_util::TryStreamExt;
@@ -5,7 +12,6 @@ use http::StatusCode;
 use http_body_util::BodyDataStream;
 use http_kit::{Endpoint, HttpError, Method, Request, Response};
 use hyper::http;
-use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
 
@@ -13,10 +19,25 @@ use crate::{ClientBackend, Proxy};
 
 use self::proxy_support::ProxyConnector;
 
+// TLS connector types based on feature flags
+#[cfg(all(feature = "native-tls", not(feature = "rustls")))]
+use hyper_tls::HttpsConnector;
+
+#[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+use hyper_rustls::HttpsConnector;
+
+// Type alias for the HTTPS connector with proxy support
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
+type TlsConnector = HttpsConnector<ProxyConnector>;
+
+// Fallback type when no TLS feature is enabled (HTTP only)
+#[cfg(not(any(feature = "native-tls", feature = "rustls")))]
+type TlsConnector = ProxyConnector;
+
 /// Hyper-based HTTP client backend.
 #[derive(Debug)]
 pub struct HyperBackend {
-    client: HyperClient<HttpsConnector<ProxyConnector>, http_kit::Body>,
+    client: HyperClient<TlsConnector, http_kit::Body>,
 }
 
 impl Default for HyperBackend {
@@ -46,8 +67,24 @@ impl HyperBackend {
 
     fn with_proxy_impl(proxy: Option<Proxy>) -> Self {
         let connector = ProxyConnector::from_proxy(proxy);
+
+        #[cfg(feature = "native-tls")]
         let https = HttpsConnector::new_with_connector(connector);
+
+        #[cfg(feature = "rustls")]
+        let https = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .expect("Failed to load native root certificates")
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .wrap_connector(connector);
+
+        #[cfg(any(feature = "native-tls", feature = "rustls"))]
         let client = HyperClient::builder(TokioExecutor::new()).build(https);
+
+        #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
+        let client = HyperClient::builder(TokioExecutor::new()).build(connector);
 
         Self { client }
     }

@@ -1,5 +1,3 @@
-#![allow(clippy::multiple_crate_versions)]
-
 //! # Ergonomic HTTP client framework
 //! Zenwave is an ergonomic HTTP client framework.
 //! It has a lot of features:
@@ -20,6 +18,28 @@
 //! # Ok(())
 //! # }
 //! ```
+
+#![allow(clippy::multiple_crate_versions)]
+
+// Compile-time check: native-tls and rustls are mutually exclusive
+#[cfg(all(feature = "native-tls", feature = "rustls"))]
+compile_error!(
+    "Features `native-tls` and `rustls` are mutually exclusive. \
+     Please enable only one TLS backend."
+);
+
+#[cfg(all(
+    any(feature = "native-tls", feature = "rustls"),
+    any(
+        feature = "apple-backend",
+        feature = "curl-backend",
+        target_arch = "wasm32"
+    )
+))]
+compile_error!(
+    "Your current backend has its own TLS implementation. \
+     Please disable `native-tls` and `rustls` features."
+);
 
 pub mod backend;
 pub use backend::ClientBackend;

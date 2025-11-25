@@ -1,13 +1,13 @@
 # Browser Compatibility Test Status
 
 Zenwave’s browser support is exercised through `wasm-pack test --headless` with
-`--no-default-features --features web-backend` so that the wasm-only backend is
+`--no-default-features` so that the wasm-only backend is
 compiled and shipped without the native Hyper stack.
 
 ## Chrome
 
 - Command  
-  `wasm-pack test --headless --chrome --chromedriver /tmp/chromedriver --no-default-features --features web-backend`
+  `wasm-pack test --headless --chrome --chromedriver /tmp/chromedriver --no-default-features`
 - Result: ✅ Pass  
   After installing a matching ChromeDriver binary (v142.0.7444.162) the wasm
   tests run, including the new `tests/wasm_browser_tests.rs` suite that exercises
@@ -16,7 +16,7 @@ compiled and shipped without the native Hyper stack.
 ## Firefox
 
 - Command  
-  `wasm-pack test --headless --firefox --geckodriver /opt/homebrew/bin/geckodriver --no-default-features --features web-backend`
+  `wasm-pack test --headless --firefox --geckodriver /opt/homebrew/bin/geckodriver --no-default-features`
 - Result: ✅ Pass  
   Headless Firefox completes the same wasm tests with Geckodriver 0.36.0 and no
   additional configuration.
@@ -24,7 +24,7 @@ compiled and shipped without the native Hyper stack.
 ## Safari
 
 - Command  
-  `wasm-pack test --headless --safari --safaridriver /usr/bin/safaridriver --no-default-features --features web-backend`
+  `wasm-pack test --headless --safari --safaridriver /usr/bin/safaridriver --no-default-features`
 - Result: ⚠️ Blocked  
   Safari’s WebDriver (`safaridriver`) exits with `SIGKILL`/HTTP 500 because the
   machine has not granted automation permission. On macOS this must be enabled

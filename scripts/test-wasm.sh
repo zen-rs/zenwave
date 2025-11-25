@@ -11,4 +11,4 @@ fi
 rustup target add wasm32-unknown-unknown
 
 echo "Running wasm-pack tests for browser=${BROWSER}..."
-wasm-pack test --"${BROWSER}" --headless -- --no-default-features --features web-backend
+wasm-pack test --"${BROWSER}" --headless -- --no-default-features
