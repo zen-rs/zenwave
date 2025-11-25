@@ -40,7 +40,7 @@ async fn test_basic_auth_middleware() {
 
     // Test Basic auth with username and password
     let response = client
-        .get("https://httpbin.org/basic-auth/testuser/testpass")
+        .get("https://httpbingo.org/basic-auth/testuser/testpass")
         .await;
     assert!(response.is_ok());
     let response = response.unwrap();
@@ -54,7 +54,7 @@ async fn test_basic_auth_request_builder() {
 
     // Test Basic auth on individual request
     let response = client
-        .get("https://httpbin.org/basic-auth/user123/pass456")
+        .get("https://httpbingo.org/basic-auth/user123/pass456")
         .basic_auth("user123", Some("pass456"))
         .await;
 
@@ -70,7 +70,7 @@ async fn test_basic_auth_no_password() {
 
     // Test Basic auth with only username (no password)
     let response = client
-        .get("https://httpbin.org/headers")
+        .get("https://httpbingo.org/headers")
         .basic_auth("onlyuser", None::<String>)
         .await;
 
@@ -107,7 +107,7 @@ async fn test_auth_headers_sent() {
 
     // Test that Bearer auth header is correctly sent
     let response = client
-        .get("https://httpbin.org/headers")
+        .get("https://httpbingo.org/headers")
         .bearer_auth("secret-token")
         .await
         .unwrap();
@@ -123,7 +123,7 @@ async fn test_basic_auth_encoding() {
 
     // Test Basic auth encoding
     let response = client
-        .get("https://httpbin.org/headers")
+        .get("https://httpbingo.org/headers")
         .basic_auth("testuser", Some("testpass"))
         .await
         .unwrap();
@@ -141,7 +141,7 @@ async fn test_multiple_auth_requests() {
 
     // Multiple requests should all use the same Bearer token
     for _ in 0..3 {
-        let response = client.get("https://httpbin.org/headers").await;
+        let response = client.get("https://httpbingo.org/headers").await;
         assert!(response.is_ok());
         let response = response.unwrap();
         let body = response.into_body().into_string().await.unwrap();
@@ -159,7 +159,7 @@ async fn test_auth_with_other_middleware() {
         .follow_redirect();
     let mut client = client;
 
-    let response = client.get("https://httpbin.org/headers").await;
+    let response = client.get("https://httpbingo.org/headers").await;
     assert!(response.is_ok());
     let response = response.unwrap();
     assert!(response.status().is_success());
@@ -173,7 +173,7 @@ async fn test_override_auth_per_request() {
 
     // The per-request auth should override the middleware auth
     let response = client
-        .get("https://httpbin.org/headers")
+        .get("https://httpbingo.org/headers")
         .bearer_auth("override-token")
         .await
         .unwrap();
@@ -190,10 +190,16 @@ async fn test_unauthorized_access() {
 
     // Test accessing an endpoint that requires auth without providing it
     let response = client.get("https://httpbin.org/bearer").await;
-    assert!(response.is_ok());
-    let response = response.unwrap();
-    // Should get 401 Unauthorized
-    assert_eq!(response.status().as_u16(), 401);
+    assert!(
+        response.is_err(),
+        "expected unauthenticated access to return an error"
+    );
+    let err = response.unwrap_err();
+    let description = format!("{err}");
+    assert!(
+        description.contains("401"),
+        "error should mention 401 status: {description}"
+    );
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
@@ -207,8 +213,14 @@ async fn test_invalid_basic_auth() {
         .basic_auth("wrong", Some("credentials"))
         .await;
 
-    assert!(response.is_ok());
-    let response = response.unwrap();
-    // Should get 401 Unauthorized
-    assert_eq!(response.status().as_u16(), 401);
+    assert!(
+        response.is_err(),
+        "expected invalid credentials to produce an error"
+    );
+    let err = response.unwrap_err();
+    let description = format!("{err}");
+    assert!(
+        description.contains("401"),
+        "error should mention 401 status: {description}"
+    );
 }

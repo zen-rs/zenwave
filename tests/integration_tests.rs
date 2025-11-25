@@ -6,7 +6,7 @@ use serde_json::Value;
 use zenwave::{Client, Method, client, get};
 
 fn base_url() -> String {
-    env::var("ZENWAVE_TEST_BASE_URL").unwrap_or_else(|_| "https://httpbin.org".to_string())
+    env::var("ZENWAVE_TEST_BASE_URL").unwrap_or_else(|_| "https://httpbingo.org".to_string())
 }
 
 fn endpoint(path: &str) -> String {
@@ -67,8 +67,18 @@ async fn test_post_with_json_body() {
 async fn test_response_status_codes() {
     for status_code in [200, 201, 400, 401, 403, 404, 500, 502, 503] {
         let url = endpoint(&format!("/status/{status_code}"));
-        let response = get(url).await.unwrap();
-        assert_eq!(response.status().as_u16(), status_code);
+        let response = get(url).await;
+        if status_code < 400 {
+            let response = response.unwrap();
+            assert_eq!(response.status().as_u16(), status_code);
+        } else {
+            let error = response.expect_err("expected error status to surface as Err");
+            let description = format!("{error}");
+            assert!(
+                description.contains(&status_code.to_string()),
+                "error message should mention status code {status_code}: {description}"
+            );
+        }
     }
 }
 
@@ -116,12 +126,12 @@ async fn test_cookie_persistence() {
 
     // Set a cookie
     let _response = client
-        .get(endpoint("/cookies/set/test/cookievalue"))
+        .get("https://httpbin.org/cookies/set/test/cookievalue")
         .await
         .unwrap();
 
     // Verify cookie is sent in subsequent request
-    let response = client.get(endpoint("/cookies")).await.unwrap();
+    let response = client.get("https://httpbin.org/cookies").await.unwrap();
     let body = response.into_body().into_string().await.unwrap();
     assert!(body.contains("test"));
     assert!(body.contains("cookievalue"));

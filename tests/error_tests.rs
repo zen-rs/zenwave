@@ -58,18 +58,26 @@ async fn test_json_parsing_error() {
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_404_not_found() {
     let result = get("https://httpbin.org/status/404").await;
-    assert!(result.is_ok());
-    let response = result.unwrap();
-    assert_eq!(response.status().as_u16(), 404);
+    assert!(result.is_err(), "expected 404 to surface as error");
+    let error = result.unwrap_err();
+    let description = format!("{error}");
+    assert!(
+        description.contains("404"),
+        "error message should mention status code: {description}"
+    );
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_500_server_error() {
     let result = get("https://httpbin.org/status/500").await;
-    assert!(result.is_ok());
-    let response = result.unwrap();
-    assert_eq!(response.status().as_u16(), 500);
+    assert!(result.is_err(), "expected 500 to surface as error");
+    let error = result.unwrap_err();
+    let description = format!("{error}");
+    assert!(
+        description.contains("500"),
+        "error message should mention status code: {description}"
+    );
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]

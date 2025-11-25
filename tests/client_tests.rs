@@ -7,7 +7,7 @@ use zenwave::{Client, client};
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_client_get_method() {
     let mut client = client();
-    let request_builder = client.get("https://httpbin.org/get");
+    let request_builder = client.get("https://httpbingo.org/get");
     let response = request_builder.await;
     assert!(response.is_ok());
     let response = response.unwrap();
@@ -18,7 +18,7 @@ async fn test_client_get_method() {
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_client_post_method() {
     let mut client = client();
-    let request_builder = client.post("https://httpbin.org/post");
+    let request_builder = client.post("https://httpbingo.org/post");
     let response = request_builder.await;
     assert!(response.is_ok());
     let response = response.unwrap();
@@ -29,7 +29,7 @@ async fn test_client_post_method() {
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_client_put_method() {
     let mut client = client();
-    let request_builder = client.put("https://httpbin.org/put");
+    let request_builder = client.put("https://httpbingo.org/put");
     let response = request_builder.await;
     assert!(response.is_ok());
     let response = response.unwrap();
@@ -40,7 +40,7 @@ async fn test_client_put_method() {
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_client_delete_method() {
     let mut client = client();
-    let request_builder = client.delete("https://httpbin.org/delete");
+    let request_builder = client.delete("https://httpbingo.org/delete");
     let response = request_builder.await;
     assert!(response.is_ok());
     let response = response.unwrap();
@@ -51,7 +51,7 @@ async fn test_client_delete_method() {
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_client_method_generic() {
     let mut client = client();
-    let request_builder = client.method(Method::GET, "https://httpbin.org/get");
+    let request_builder = client.method(Method::GET, "https://httpbingo.org/get");
     let response = request_builder.await;
     assert!(response.is_ok());
     let response = response.unwrap();
@@ -62,18 +62,18 @@ async fn test_client_method_generic() {
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_request_builder_string() {
     let mut client = client();
-    let response_string = client.get("https://httpbin.org/get").string().await;
+    let response_string = client.get("https://httpbingo.org/get").string().await;
     assert!(response_string.is_ok());
     let string = response_string.unwrap();
     assert!(!string.is_empty());
-    assert!(string.contains("httpbin"));
+    assert!(string.contains("httpbingo"));
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 async fn test_request_builder_bytes() {
     let mut client = client();
-    let response_bytes = client.get("https://httpbin.org/get").bytes().await;
+    let response_bytes = client.get("https://httpbingo.org/get").bytes().await;
     assert!(response_bytes.is_ok());
     let bytes = response_bytes.unwrap();
     assert!(!bytes.is_empty());
@@ -85,7 +85,7 @@ async fn test_request_builder_json() {
     use serde_json::Value;
 
     let mut client = client();
-    let response_json: Result<Value, _> = client.get("https://httpbin.org/json").json().await;
+    let response_json: Result<Value, _> = client.get("https://httpbingo.org/json").json().await;
     assert!(response_json.is_ok());
     let json = response_json.unwrap();
     assert!(json.is_object());

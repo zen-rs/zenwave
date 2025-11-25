@@ -96,6 +96,44 @@ async fn test_hyper_backend_client_backend_trait() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
 #[cfg(feature = "hyper-backend")]
+async fn test_hyper_backend_http_error_returns_err() {
+    let mut backend = HyperBackend::new();
+    let mut request = http::Request::builder()
+        .method(Method::GET)
+        .uri("https://httpbin.org/status/404")
+        .body(http_kit::Body::empty())
+        .unwrap();
+
+    let response = backend.respond(&mut request).await;
+    assert!(
+        response.is_err(),
+        "expected non-success status to surface as Err"
+    );
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg(all(not(target_arch = "wasm32"), feature = "curl-backend"))]
+async fn test_curl_backend_http_error_returns_err() {
+    use zenwave::backend::CurlBackend;
+
+    let mut backend = CurlBackend::new();
+    let mut request = http::Request::builder()
+        .method(Method::GET)
+        .uri("https://httpbin.org/status/500")
+        .body(http_kit::Body::empty())
+        .unwrap();
+
+    let response = backend.respond(&mut request).await;
+    assert!(
+        response.is_err(),
+        "expected non-success status to surface as Err"
+    );
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg(feature = "hyper-backend")]
 #[cfg(not(target_arch = "wasm32"))]
 async fn test_hyper_backend_request_cancellation() {
     use tokio::io::AsyncReadExt;
