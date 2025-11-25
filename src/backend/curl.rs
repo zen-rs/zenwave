@@ -27,6 +27,12 @@ pub enum CurlError {
     BadRequest(#[source] anyhow::Error),
     #[error("bad gateway: {0}")]
     BadGateway(#[source] anyhow::Error),
+    #[error("remote error: {status}")]
+    Remote {
+        status: StatusCode,
+        body: Option<String>,
+        raw_response: Response,
+    },
 }
 
 impl HttpError for CurlError {
@@ -34,6 +40,7 @@ impl HttpError for CurlError {
         Some(match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
+            Self::Remote { status, .. } => *status,
         })
     }
 }
@@ -156,9 +163,30 @@ fn perform(request: PreparedRequest) -> Result<Response, CurlError> {
     let handler = easy.get_mut();
     let response = handler.take_response().map_err(CurlError::bad_gateway)?;
 
-    let mut http_response = http::Response::new(Body::from(response.body));
-    *http_response.status_mut() = response.status;
-    *http_response.headers_mut() = response.headers;
+    let SessionResponse {
+        status,
+        headers,
+        body,
+    } = response;
+
+    let is_error = status.is_client_error() || status.is_server_error();
+    let error_body = if is_error {
+        String::from_utf8(body.clone()).ok()
+    } else {
+        None
+    };
+
+    let mut http_response = http::Response::new(Body::from(body));
+    *http_response.status_mut() = status;
+    *http_response.headers_mut() = headers;
+
+    if is_error {
+        return Err(CurlError::Remote {
+            status,
+            body: error_body,
+            raw_response: http_response,
+        });
+    }
 
     Ok(http_response)
 }

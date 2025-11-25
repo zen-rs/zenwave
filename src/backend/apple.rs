@@ -46,6 +46,12 @@ pub enum AppleError {
     BadRequest(#[source] anyhow::Error),
     #[error("bad gateway: {0}")]
     BadGateway(#[source] anyhow::Error),
+    #[error("remote error: {status}")]
+    Remote {
+        status: StatusCode,
+        body: Option<String>,
+        raw_response: Response,
+    },
 }
 
 impl AppleError {
@@ -63,6 +69,7 @@ impl HttpError for AppleError {
         Some(match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
+            Self::Remote { status, .. } => *status,
         })
     }
 }
@@ -202,9 +209,29 @@ async fn send_with_url_session(
         .await
         .map_err(|_| AppleError::bad_gateway(anyhow!("URLSession task cancelled")))??;
 
-    let mut http_response = http::Response::new(Body::from(response.body));
-    *http_response.status_mut() = response.status;
-    *http_response.headers_mut() = response.headers;
+    let SessionResponse {
+        status,
+        headers,
+        body,
+    } = response;
+
+    let mut http_response = http::Response::new(Body::from(body));
+    *http_response.status_mut() = status;
+    *http_response.headers_mut() = headers;
+
+    if status.is_client_error() || status.is_server_error() {
+        let body = http_response
+            .body_mut()
+            .as_str()
+            .await
+            .ok()
+            .map(|text| text.to_owned());
+        return Err(AppleError::Remote {
+            status,
+            body,
+            raw_response: http_response,
+        });
+    }
 
     Ok(http_response)
 }

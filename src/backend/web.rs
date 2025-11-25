@@ -24,25 +24,44 @@ pub struct WebBackend {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("{source}")]
-pub struct WebError {
-    #[source]
-    source: anyhow::Error,
-    status: StatusCode,
+pub enum WebError {
+    #[error("{source}")]
+    Transport {
+        #[source]
+        source: anyhow::Error,
+        status: StatusCode,
+    },
+    #[error("remote error: {status}")]
+    Remote {
+        status: StatusCode,
+        body: Option<String>,
+        raw_response: http_kit::Response,
+    },
 }
 
 impl WebError {
     fn new(status: StatusCode, error: impl Into<anyhow::Error>) -> Self {
-        Self {
+        Self::Transport {
             source: error.into(),
             status,
+        }
+    }
+
+    fn remote(status: StatusCode, body: Option<String>, raw_response: http_kit::Response) -> Self {
+        Self::Remote {
+            status,
+            body,
+            raw_response,
         }
     }
 }
 
 impl HttpError for WebError {
     fn status(&self) -> Option<StatusCode> {
-        Some(self.status)
+        Some(match self {
+            Self::Transport { status, .. } => *status,
+            Self::Remote { status, .. } => *status,
+        })
     }
 }
 
@@ -215,10 +234,21 @@ fn fetch(
             })
             .unwrap_or_else(http_kit::Body::empty);
 
+        let is_error = status.is_client_error() || status.is_server_error();
         let mut response: http::Response<http_kit::Body> = http::Response::new(body);
 
         *response.headers_mut() = headers;
         *response.status_mut() = status;
+
+        if is_error {
+            let body = response
+                .body_mut()
+                .as_str()
+                .await
+                .ok()
+                .map(|text| text.to_owned());
+            return Err(WebError::remote(status, body, response));
+        }
         Ok(response)
     })
 }
