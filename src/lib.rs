@@ -1,4 +1,5 @@
 //! # Ergonomic HTTP client framework
+//!
 //! Zenwave is an ergonomic HTTP client framework.
 //! It has a lot of features:
 //! - Follow redirect
@@ -18,6 +19,30 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Backend Selection
+//!
+//! ## WASM (wasm32)
+//! On WebAssembly targets, Zenwave automatically uses the built-in web backend
+//! powered by the browser's Fetch API. No configuration is needed or available.
+//!
+//! ## Native Platforms
+//! On native platforms, Zenwave supports multiple HTTP client backends.
+//! By default, `hyper-backend` with `rustls` TLS is used.
+//!
+//! Available backends (enable via Cargo features):
+//! - **`hyper-backend`** (default): Hyper with async-io. Supports `rustls` (default) or `native-tls`.
+//! - **`curl-backend`**: libcurl-based backend with proxy support.
+//! - **`apple-backend`**: Apple's native NSURLSession (macOS/iOS only).
+//!
+//! To use a different backend, disable default features and enable your choice:
+//! ```toml
+//! # Use curl backend instead
+//! zenwave = { version = "*", default-features = false, features = ["curl-backend"] }
+//!
+//! # Use hyper with native-tls instead of rustls
+//! zenwave = { version = "*", default-features = false, features = ["hyper-backend", "native-tls"] }
+//! ```
 
 #![allow(clippy::multiple_crate_versions)]
 
@@ -28,17 +53,20 @@ compile_error!(
      Please enable only one TLS backend."
 );
 
+// TLS features are only applicable to hyper-backend on native platforms.
+// Other backends (apple-backend, curl-backend, wasm32) have their own TLS implementations.
 #[cfg(all(
     any(feature = "native-tls", feature = "rustls"),
     any(
-        feature = "apple-backend",
+        all(target_vendor = "apple", feature = "apple-backend"),
         feature = "curl-backend",
         target_arch = "wasm32"
     )
 ))]
 compile_error!(
-    "Your current backend has its own TLS implementation. \
-     Please disable `native-tls` and `rustls` features."
+    "The `native-tls` and `rustls` features only apply to `hyper-backend`. \
+     Your current backend (apple-backend, curl-backend, or wasm) has its own TLS implementation. \
+     Please disable these TLS features."
 );
 
 pub mod backend;

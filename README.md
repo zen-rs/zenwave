@@ -286,31 +286,58 @@ async fn main() -> zenwave::Result<()> {
 
 ## Installation
 
-Add Zenwave to your `Cargo.toml` (native defaults shown):
+Add Zenwave to your `Cargo.toml`. The default configuration uses the Hyper backend with rustls TLS:
 
 ```toml
 [dependencies]
 zenwave = { version = "0.1.0" }
 ```
 
-For browser/Workers builds you can opt out of the Hyper backend and depend only on the wasm
-implementation:
+For browser/Workers builds, no special configuration is needed - Zenwave automatically uses the
+built-in web backend (Fetch API) on wasm32 targets:
 
 ```toml
-[dependencies]
-zenwave = { version = "0.1.0", default-features = false, features = ["web-backend"] }
+# For wasm32 targets, default features are ignored and the web backend is used automatically
+zenwave = { version = "0.1.0" }
 ```
 
 ### Feature flags
 
-- `hyper-backend` (default) – enables the Hyper/Tokio-based backend for native targets (including
-  Apple by default).
-- `web-backend` (default) – enables the Fetch-based backend for `wasm32`.
-- `curl-backend` – enables the libcurl backend for platforms that provide libcurl (disable
-  `hyper-backend` if you want to rely on libcurl exclusively).
-- `apple-backend` – experimental URLSession backend for Apple platforms. Opt-in only.
+#### Backend Selection (native platforms only)
 
-Disable default features if you only need one backend.
+On wasm32 targets, the built-in web backend is always used automatically. No backend selection
+is needed or available.
+
+On native platforms, you can choose from:
+
+- `hyper-backend` (default) – Hyper with async-io/async-net. The recommended choice for most use cases.
+- `curl-backend` – libcurl-based backend with built-in proxy support. Good for platforms with system libcurl.
+- `apple-backend` – experimental URLSession backend for Apple platforms (macOS/iOS).
+
+#### TLS Selection (hyper-backend only)
+
+- `rustls` (default) – pure-Rust TLS implementation. Cross-platform and secure.
+- `native-tls` – uses the platform's native TLS (OpenSSL on Linux, Secure Transport on macOS, SChannel on Windows).
+
+Only one TLS feature can be enabled at a time. These features only apply to `hyper-backend`;
+other backends have their own TLS implementations.
+
+#### Other Features
+
+- `proxy` – enables proxy support (automatically enabled with `curl-backend`).
+
+### Example configurations
+
+```toml
+# Use curl backend instead of hyper
+zenwave = { version = "0.1.0", default-features = false, features = ["curl-backend"] }
+
+# Use hyper with native-tls instead of rustls  
+zenwave = { version = "0.1.0", default-features = false, features = ["hyper-backend", "native-tls"] }
+
+# Use Apple's native URLSession on macOS/iOS
+zenwave = { version = "0.1.0", default-features = false, features = ["apple-backend"] }
+```
 
 ## License
 

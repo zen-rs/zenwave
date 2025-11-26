@@ -32,8 +32,16 @@ tempfile = "3.13"
 async-std = { version = "1.13", features = ["attributes"] }
 
 [features]
-default = ["curl-backend"]
-# TLS features - only one can be enabled at a time
+# Default: hyper backend with rustls TLS on native platforms.
+# On wasm32, the built-in web backend is always used automatically.
+default = ["default-backend"]
+
+# Use the default backend configuration (hyper + rustls on native platforms).
+# This is a convenience feature that enables the recommended setup.
+default-backend = ["hyper-backend", "rustls"]
+
+# TLS features - only one can be enabled at a time (native platforms only).
+# These features are mutually exclusive and only apply to hyper-backend.
 native-tls = ["dep:async-native-tls", "dep:native-tls"]
 rustls = [
     "dep:futures-rustls",
@@ -41,7 +49,12 @@ rustls = [
     "dep:webpki-roots",
     "dep:rustls-native-certs",
 ]
+
+# Proxy support for hyper-backend and curl-backend (native platforms only).
 proxy = []
+
+# Backend selection (native platforms only, wasm32 always uses built-in web backend).
+# Users can choose one of these backends:
 hyper-backend = [
     "dep:hyper",
     "dep:http-body-util",
@@ -79,7 +92,7 @@ curl = { version = "0.4", optional = true }
 executor-core = { version = "0.7.0" }
 hyper = { version = "1.8", default-features = false, features = ["client", "http1"], optional = true }
 http-body-util = { version = "0.1.3", optional = true }
-async-native-tls = { version = "0.5.0", optional = true, default-features = false }
+async-native-tls = { version = "0.5.0", optional = true, default-features = false, features = ["runtime-async-std"] }
 futures-rustls = { version = "0.26", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = { version = "0.8", optional = true }
