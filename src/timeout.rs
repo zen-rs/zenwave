@@ -5,14 +5,23 @@
 //! `async-io`'s timers so it works uniformly across targets without pulling
 //! in a dedicated async runtime.
 
+#[cfg(target_arch = "wasm32")]
+use core::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use core::time::Duration;
 
 use futures_util::{future::Either, pin_mut};
 use http_kit::{
     Endpoint, HttpError, Middleware, Request, Response, StatusCode, middleware::MiddlewareError,
 };
-use async_io::Timer;
 use thiserror::Error;
+#[cfg(target_arch = "wasm32")]
+use gloo_timers::future::TimeoutFuture;
+#[cfg(not(target_arch = "wasm32"))]
+use async_io::Timer;
 
 /// Middleware that fails requests exceeding the configured duration.
 #[derive(Debug, Clone, Copy)]
@@ -47,7 +56,7 @@ impl Middleware for Timeout {
         mut next: E,
     ) -> Result<Response, http_kit::middleware::MiddlewareError<E::Error, Self::Error>> {
         let response_future = next.respond(request);
-        let timeout_future = Timer::after(self.duration);
+        let timeout_future = timeout_future(self.duration);
 
         pin_mut!(response_future);
         pin_mut!(timeout_future);
@@ -56,6 +65,40 @@ impl Middleware for Timeout {
             Either::Left((result, _)) => Ok(result.map_err(MiddlewareError::Endpoint)?),
             Either::Right((_, _)) => Err(MiddlewareError::Middleware(TimeoutError)),
         }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn timeout_future(duration: Duration) -> SingleThreaded<TimeoutFuture> {
+    // gloo expects milliseconds as u32; saturate to avoid overflow for long durations.
+    let millis = duration
+        .as_millis()
+        .try_into()
+        .unwrap_or(u32::MAX);
+    SingleThreaded(TimeoutFuture::new(millis))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn timeout_future(duration: Duration) -> Timer {
+    Timer::after(duration)
+}
+
+#[cfg(target_arch = "wasm32")]
+struct SingleThreaded<T>(T);
+
+#[cfg(target_arch = "wasm32")]
+unsafe impl<T> Send for SingleThreaded<T> {}
+#[cfg(target_arch = "wasm32")]
+unsafe impl<T> Sync for SingleThreaded<T> {}
+
+#[cfg(target_arch = "wasm32")]
+impl<T: Future> Future for SingleThreaded<T> {
+    type Output = T::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: SingleThreaded is a newtype wrapper; we never move the inner future.
+        let inner = unsafe { self.map_unchecked_mut(|this| &mut this.0) };
+        inner.poll(cx)
     }
 }
 

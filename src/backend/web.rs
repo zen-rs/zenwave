@@ -8,9 +8,10 @@ use core::{
 
 use anyhow::anyhow;
 use http_kit::{
-    Endpoint, HttpError, StatusCode,
+    BodyError, Endpoint, HttpError, StatusCode,
     utils::{Stream, StreamExt},
 };
+use std::io;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Window,
@@ -163,19 +164,25 @@ fn fetch(
                 .map_err(|e| WebError::new(StatusCode::BAD_REQUEST, e))?;
             headers
                 .set(name.as_str(), value)
-                .map_err(|err| WebError::new(StatusCode::BAD_REQUEST, anyhow!(err)))?;
+                .map_err(|err| WebError::new(
+                    StatusCode::BAD_REQUEST,
+                    anyhow!(format_js_value(&err)),
+                ))?;
         }
         request_init.set_headers(headers.as_ref());
 
         let uri = request.uri().to_string();
         let fetch_request = web_sys::Request::new_with_str_and_init(uri.as_str(), &request_init)
-            .map_err(|err| WebError::new(StatusCode::BAD_REQUEST, anyhow!(err)))?;
+            .map_err(|err| WebError::new(
+                StatusCode::BAD_REQUEST,
+                anyhow!(format_js_value(&err)),
+            ))?;
 
         let promise = window.fetch_with_request(&fetch_request);
         let fut = SingleThreaded(JsFuture::from(promise));
         let response = fut
             .await
-            .map_err(|e| WebError::new(StatusCode::BAD_GATEWAY, anyhow!(e)))?;
+            .map_err(|e| WebError::new(StatusCode::BAD_GATEWAY, anyhow!(format_js_value(&e))))?;
         let response: web_sys::Response = response.dyn_into().map_err(|_| {
             WebError::new(
                 StatusCode::BAD_GATEWAY,
@@ -187,7 +194,12 @@ fn fetch(
             .map_err(|e| WebError::new(StatusCode::BAD_GATEWAY, e))?;
         let mut headers = http_kit::header::HeaderMap::new();
         for pair in response.headers().entries() {
-            let pair = pair.map_err(|err| WebError::new(StatusCode::BAD_GATEWAY, anyhow!(err)))?;
+            let pair = pair.map_err(|err| {
+                WebError::new(
+                    StatusCode::BAD_GATEWAY,
+                    anyhow!(format_js_value(&err)),
+                )
+            })?;
             let entry: js_sys::Array = pair.dyn_into().map_err(|_| {
                 WebError::new(
                     StatusCode::BAD_GATEWAY,
@@ -228,7 +240,12 @@ fn fetch(
                             let chunk: Box<[u8]> = vec.into_boxed_slice();
                             chunk
                         })
-                        .map_err(|e| anyhow!("Failed to read body: {e:?}"))
+                        .map_err(|e| {
+                            BodyError::Other(Box::new(io::Error::new(
+                                io::ErrorKind::Other,
+                                format!("Failed to read body: {e:?}"),
+                            )))
+                        })
                 });
                 http_kit::Body::from_stream(SingleThreaded(stream))
             })
@@ -251,6 +268,10 @@ fn fetch(
         }
         Ok(response)
     })
+}
+
+fn format_js_value(value: &JsValue) -> String {
+    value.as_string().unwrap_or_else(|| format!("{value:?}"))
 }
 
 impl ClientBackend for WebBackend {}

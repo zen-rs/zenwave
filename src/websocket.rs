@@ -278,16 +278,18 @@ mod native {
 mod wasm {
     use std::{cell::RefCell, fmt, rc::Rc};
 
-    use anyhow::anyhow;
     use futures_channel::{mpsc, oneshot};
     use futures_util::StreamExt;
-    use http_kit::{Result, StatusCode};
+    use http_kit::utils::Bytes;
+    use std::io;
     use wasm_bindgen::{JsCast, JsValue, closure::Closure};
     use web_sys::{
         BinaryType, CloseEvent, ErrorEvent, MessageEvent, WebSocket as BrowserWebSocket,
     };
 
-    use super::{Error, WebSocketMessage, serialize_payload};
+    use super::{WebSocketError, WebSocketMessage, serialize_payload};
+
+    type Result<T> = core::result::Result<T, WebSocketError>;
 
     enum WsEvent {
         Message(WebSocketMessage),
@@ -319,7 +321,7 @@ mod wasm {
     /// Returns an error if the browser reports an error or the connection fails.
     pub async fn connect(uri: impl AsRef<str>) -> Result<WebSocket> {
         let socket = BrowserWebSocket::new(uri.as_ref())
-            .map_err(|e| Error::new(anyhow!(format_js_value(&e)), StatusCode::BAD_REQUEST))?;
+            .map_err(|e| connection_failed(format_js_value(&e)))?;
         socket.set_binary_type(BinaryType::Arraybuffer);
 
         let (event_tx, event_rx) = mpsc::unbounded::<WsEvent>();
@@ -339,7 +341,7 @@ mod wasm {
             let data = event.data();
             if let Some(text) = data.as_string() {
                 let _ =
-                    on_message_tx.unbounded_send(WsEvent::Message(WebSocketMessage::Text(text)));
+                    on_message_tx.unbounded_send(WsEvent::Message(WebSocketMessage::from(text)));
                 return;
             }
 
@@ -348,7 +350,7 @@ mod wasm {
                 let mut bytes = vec![0; view.length() as usize];
                 view.copy_to(&mut bytes[..]);
                 let _ =
-                    on_message_tx.unbounded_send(WsEvent::Message(WebSocketMessage::Binary(bytes)));
+                    on_message_tx.unbounded_send(WsEvent::Message(WebSocketMessage::from(bytes)));
                 return;
             }
 
@@ -356,7 +358,7 @@ mod wasm {
                 let mut bytes = vec![0; view.length() as usize];
                 view.copy_to(&mut bytes[..]);
                 let _ =
-                    on_message_tx.unbounded_send(WsEvent::Message(WebSocketMessage::Binary(bytes)));
+                    on_message_tx.unbounded_send(WsEvent::Message(WebSocketMessage::from(bytes)));
                 return;
             }
 
@@ -399,13 +401,10 @@ mod wasm {
                 drop(on_open);
             }
             Ok(Err(message)) => {
-                return Err(Error::new(anyhow!(message), StatusCode::BAD_GATEWAY));
+                return Err(connection_failed(message));
             }
             Err(_) => {
-                return Err(Error::new(
-                    anyhow!("WebSocket connection cancelled"),
-                    StatusCode::BAD_GATEWAY,
-                ));
+                return Err(connection_failed("WebSocket connection cancelled"));
             }
         }
 
@@ -452,14 +451,14 @@ mod wasm {
 
         async fn send_message(&mut self, message: WebSocketMessage) -> Result<()> {
             match message {
-                WebSocketMessage::Text(text) => self.socket.send_with_str(&text).map_err(|e| {
-                    Error::new(anyhow!(format_js_value(&e)), StatusCode::BAD_GATEWAY)
-                })?,
-                WebSocketMessage::Binary(bytes) => {
-                    self.socket.send_with_u8_array(&bytes).map_err(|e| {
-                        Error::new(anyhow!(format_js_value(&e)), StatusCode::BAD_GATEWAY)
-                    })?
-                }
+                WebSocketMessage::Text(text) => self
+                    .socket
+                    .send_with_str(&text)
+                    .map_err(|e| connection_failed(format_js_value(&e)))?,
+                WebSocketMessage::Binary(bytes) => self
+                    .socket
+                    .send_with_u8_array(&bytes)
+                    .map_err(|e| connection_failed(format_js_value(&e)))?,
             }
             Ok(())
         }
@@ -473,9 +472,7 @@ mod wasm {
             match self.receiver.next().await {
                 Some(WsEvent::Message(message)) => Ok(Some(message)),
                 Some(WsEvent::Closed) | None => Ok(None),
-                Some(WsEvent::Error(message)) => {
-                    Err(Error::new(anyhow!(message), StatusCode::BAD_GATEWAY))
-                }
+                Some(WsEvent::Error(message)) => Err(connection_failed(message)),
             }
         }
 
@@ -487,8 +484,15 @@ mod wasm {
         pub async fn close(self) -> Result<()> {
             self.socket
                 .close()
-                .map_err(|e| Error::new(anyhow!(format_js_value(&e)), StatusCode::BAD_GATEWAY))
+                .map_err(|e| connection_failed(format_js_value(&e)))
         }
+    }
+
+    fn connection_failed(message: impl Into<String>) -> WebSocketError {
+        WebSocketError::ConnectionFailed(Box::new(io::Error::new(
+            io::ErrorKind::Other,
+            message.into(),
+        )))
     }
 
     fn format_js_value(value: &JsValue) -> String {
