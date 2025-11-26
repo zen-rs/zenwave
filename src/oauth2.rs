@@ -246,29 +246,28 @@ struct TokenEndpointResponse {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use async_lock::Mutex;
+    use async_net::{TcpListener, TcpStream};
+    use async_std::task::{self, JoinHandle};
     use http::{Request as HttpRequest, Response as HttpResponse};
+    use http_kit::utils::{AsyncReadExt, AsyncWriteExt};
     use http_kit::{Body, Method};
     use std::convert::Infallible;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::{TcpListener, TcpStream},
-        sync::oneshot,
-        task::JoinHandle,
-    };
 
-    #[tokio::test]
-    async fn acquires_token_and_attaches_header() {
-        let (url, shutdown, handle, hits) = match spawn_token_server(vec!["token-one"]).await {
-            Ok(values) => values,
-            Err(err) => {
-                eprintln!("skipping oauth2 token test: {err}");
-                return;
-            }
-        };
+    #[test]
+    fn acquires_token_and_attaches_header() {
+        let (url, handle, hits) =
+            match async_io::block_on(async { spawn_token_server(vec!["token-one"]).await }) {
+                Ok(values) => values,
+                Err(err) => {
+                    eprintln!("skipping oauth2 token test: {err}");
+                    return;
+                }
+            };
         let mut middleware = OAuth2ClientCredentials::new(url, "abc", "xyz");
         let mut request = HttpRequest::builder()
             .method(Method::GET)
@@ -277,28 +276,29 @@ mod tests {
             .unwrap();
         let mut endpoint = RecordingEndpoint::default();
 
-        middleware
-            .handle(&mut request, &mut endpoint)
-            .await
-            .unwrap();
-        assert_eq!(endpoint.calls(), 1);
-        assert_eq!(endpoint.last_auth(), Some("Bearer token-one".to_string()));
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        async_io::block_on(async {
+            middleware
+                .handle(&mut request, &mut endpoint)
+                .await
+                .unwrap();
+            assert_eq!(endpoint.calls(), 1);
+            assert_eq!(endpoint.last_auth(), Some("Bearer token-one".to_string()));
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
 
-        let mut request = HttpRequest::builder()
-            .method(Method::GET)
-            .uri("https://example.com/2")
-            .body(Body::empty())
-            .unwrap();
-        middleware
-            .handle(&mut request, &mut endpoint)
-            .await
-            .unwrap();
-        assert_eq!(endpoint.calls(), 2);
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
+            let mut request = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://example.com/2")
+                .body(Body::empty())
+                .unwrap();
+            middleware
+                .handle(&mut request, &mut endpoint)
+                .await
+                .unwrap();
+            assert_eq!(endpoint.calls(), 2);
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
 
-        let _ = shutdown.send(());
-        let _ = handle.await;
+            handle.cancel().await;
+        });
     }
 
     #[derive(Default)]
@@ -336,15 +336,9 @@ mod tests {
 
     async fn spawn_token_server(
         tokens: Vec<&'static str>,
-    ) -> std::io::Result<(
-        String,
-        oneshot::Sender<()>,
-        JoinHandle<()>,
-        Arc<AtomicUsize>,
-    )> {
+    ) -> std::io::Result<(String, JoinHandle<()>, Arc<AtomicUsize>)> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr().unwrap();
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let hits = Arc::new(AtomicUsize::new(0));
         let hit_counter = hits.clone();
         let tokens = Arc::new(Mutex::new(
@@ -354,23 +348,20 @@ mod tests {
                 .collect::<Vec<_>>(),
         ));
 
-        let server = tokio::spawn(async move {
+        let server = task::spawn(async move {
             loop {
-                tokio::select! {
-                    _ = &mut shutdown_rx => break,
-                    accepted = listener.accept() => {
-                        let Ok((socket, _)) = accepted else { break };
-                        let tokens = tokens.clone();
-                        let hit_counter = hit_counter.clone();
-                        tokio::spawn(async move {
-                            handle_token_request(socket, tokens, hit_counter).await;
-                        });
-                    }
-                }
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let tokens = tokens.clone();
+                let hit_counter = hit_counter.clone();
+                task::spawn(async move {
+                    handle_token_request(socket, tokens, hit_counter).await;
+                });
             }
         });
 
-        Ok((format!("http://{addr}"), shutdown_tx, server, hits))
+        Ok((format!("http://{addr}"), server, hits))
     }
 
     async fn handle_token_request(
@@ -395,6 +386,6 @@ mod tests {
             response_body
         );
         let _ = socket.write_all(response.as_bytes()).await;
-        let _ = socket.shutdown().await;
+        let _ = socket.close().await;
     }
 }

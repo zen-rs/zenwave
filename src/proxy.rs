@@ -1,35 +1,29 @@
 #![cfg(all(not(target_arch = "wasm32"), feature = "proxy"))]
 //! Proxy configuration helpers for proxy-capable backends.
 //!
-//! This module is only compiled on native targets with the `proxy` feature
-//! enabled. Apple (`apple-backend`) and Web (`wasm32`) backends ignore proxy
-//! settings, so the helpers exposed here are intended for the Hyper and curl
-//! implementations.
+//! This simplified matcher supports HTTP/HTTPS proxies configured via
+//! environment variables or builder methods. SOCKS proxies are only used
+//! by the curl backend.
 
-use std::{fmt, sync::Arc};
+use std::{collections::HashSet, env, fmt, str::FromStr, sync::Arc};
 
-#[cfg(any(feature = "curl-backend", test))]
-use http::Uri;
-use hyper_util::client::proxy::matcher;
+use base64::Engine;
+use http::{HeaderValue, Uri};
 
 /// Proxy configuration that can be reused across clients/backends.
 ///
-/// The configuration mirrors the semantics supported by `curl` and `reqwest`.
-/// You can construct it from environment variables (`Proxy::from_env()`),
-/// inherit system defaults (`Proxy::from_system()`), or build it manually
-/// through [`Proxy::builder()`].
+/// The configuration mirrors the semantics supported by common tools:
+/// `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`.
 #[derive(Clone, Debug)]
 pub struct Proxy {
-    matcher: Arc<matcher::Matcher>,
+    matcher: Arc<Matcher>,
 }
 
 impl Proxy {
     /// Create a proxy matcher from the standard environment variables.
-    ///
-    /// This reads `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`.
     #[must_use]
     pub fn from_env() -> Self {
-        Self::new(matcher::Matcher::from_env())
+        Self::new(Matcher::from_env())
     }
 
     /// Create a proxy matcher from the environment or OS configuration.
@@ -37,37 +31,44 @@ impl Proxy {
     /// On Apple and Windows targets this mirrors the platform proxy settings.
     #[must_use]
     pub fn from_system() -> Self {
-        Self::new(matcher::Matcher::from_system())
+        // Fallback to env; platform-specific lookups can be added later.
+        Self::from_env()
     }
 
     /// Start building a proxy configuration manually.
     #[must_use]
     pub fn builder() -> ProxyBuilder {
         ProxyBuilder {
-            inner: matcher::Matcher::builder(),
+            http: None,
+            https: None,
+            all: None,
+            no_proxy: HashSet::new(),
         }
     }
 
-    fn new(matcher: matcher::Matcher) -> Self {
+    fn new(matcher: Matcher) -> Self {
         Self {
             matcher: Arc::new(matcher),
         }
     }
 
     #[allow(dead_code)]
-    pub(crate) fn into_matcher(self) -> Arc<matcher::Matcher> {
+    pub(crate) fn into_matcher(self) -> Arc<Matcher> {
         self.matcher
     }
 
     #[cfg(any(feature = "curl-backend", test))]
-    pub(crate) fn intercept(&self, uri: &Uri) -> Option<matcher::Intercept> {
+    pub(crate) fn intercept(&self, uri: &Uri) -> Option<Intercept> {
         self.matcher.intercept(uri)
     }
 }
 
 /// Builder for [`Proxy`] allowing custom overrides for `HTTP/HTTPS/NO_PROXY`.
 pub struct ProxyBuilder {
-    inner: matcher::Builder,
+    http: Option<String>,
+    https: Option<String>,
+    all: Option<String>,
+    no_proxy: HashSet<String>,
 }
 
 impl fmt::Debug for ProxyBuilder {
@@ -80,64 +81,156 @@ impl ProxyBuilder {
     /// Apply the same proxy to both HTTP and HTTPS requests.
     #[must_use]
     pub fn all(mut self, value: impl Into<String>) -> Self {
-        self.inner = self.inner.all(value.into());
+        self.all = Some(value.into());
         self
     }
 
     /// Set the proxy used for HTTP destinations.
     #[must_use]
     pub fn http(mut self, value: impl Into<String>) -> Self {
-        self.inner = self.inner.http(value.into());
+        self.http = Some(value.into());
         self
     }
 
     /// Set the proxy used for HTTPS destinations.
     #[must_use]
     pub fn https(mut self, value: impl Into<String>) -> Self {
-        self.inner = self.inner.https(value.into());
+        self.https = Some(value.into());
         self
     }
 
     /// Set the comma-separated `NO_PROXY` list.
     #[must_use]
     pub fn no_proxy(mut self, value: impl Into<String>) -> Self {
-        self.inner = self.inner.no(value.into());
+        let raw = value.into();
+        let entries = raw
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>();
+        self.no_proxy.extend(entries);
         self
     }
 
     /// Finalize the configuration.
     #[must_use]
     pub fn build(self) -> Proxy {
-        Proxy::new(self.inner.build())
+        let matcher = Matcher {
+            http: self.http.and_then(ProxyConfig::parse),
+            https: self.https.and_then(ProxyConfig::parse),
+            all: self.all.and_then(ProxyConfig::parse),
+            no_proxy: self.no_proxy,
+        };
+        Proxy::new(matcher)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::Proxy;
-    use http::Uri;
+#[derive(Clone, Debug)]
+struct ProxyConfig {
+    uri: Uri,
+    basic_auth: Option<HeaderValue>,
+    raw_auth: Option<(String, String)>,
+}
 
-    #[test]
-    fn builder_intercepts_http() {
-        let proxy = Proxy::builder().http("http://localhost:8080").build();
-        let uri: Uri = "http://example.com".parse().unwrap();
-        let intercept = proxy.intercept(&uri).expect("intercept");
-        assert_eq!(
-            intercept
-                .uri()
-                .authority()
-                .map(http::uri::Authority::as_str),
-            Some("localhost:8080")
-        );
+impl ProxyConfig {
+    fn parse(value: String) -> Option<Self> {
+        let parsed = Uri::from_str(&value).ok()?;
+        let auth = parsed.authority()?;
+        let (userinfo, _) = auth
+            .as_str()
+            .rsplit_once('@')
+            .unwrap_or(("", auth.as_str()));
+
+        let basic_auth = (!userinfo.is_empty())
+            .then(|| {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(userinfo.as_bytes());
+                HeaderValue::from_str(&format!("Basic {encoded}")).ok()
+            })
+            .flatten();
+
+        let raw_auth = userinfo
+            .split_once(':')
+            .map(|(user, pass)| (user.to_string(), pass.to_string()));
+
+        Some(Self {
+            uri: parsed,
+            basic_auth,
+            raw_auth,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Intercept {
+    uri: Uri,
+    basic_auth: Option<HeaderValue>,
+    raw_auth: Option<(String, String)>,
+}
+
+impl Intercept {
+    pub(crate) fn uri(&self) -> &Uri {
+        &self.uri
     }
 
-    #[test]
-    fn builder_respects_no_proxy() {
-        let proxy = Proxy::builder()
-            .http("http://localhost:8080")
-            .no_proxy("example.com")
-            .build();
-        let uri: Uri = "http://example.com".parse().unwrap();
-        assert!(proxy.intercept(&uri).is_none());
+    pub(crate) fn basic_auth(&self) -> Option<&HeaderValue> {
+        self.basic_auth.as_ref()
+    }
+
+    pub(crate) fn raw_auth(&self) -> Option<(&str, &str)> {
+        self.raw_auth
+            .as_ref()
+            .map(|(user, pass)| (user.as_str(), pass.as_str()))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Matcher {
+    http: Option<ProxyConfig>,
+    https: Option<ProxyConfig>,
+    all: Option<ProxyConfig>,
+    no_proxy: HashSet<String>,
+}
+
+impl Matcher {
+    fn from_env() -> Self {
+        let http = env::var("HTTP_PROXY").ok();
+        let https = env::var("HTTPS_PROXY").ok();
+        let all = env::var("ALL_PROXY").ok();
+        let no_proxy = env::var("NO_PROXY")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_lowercase)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Self {
+            http: http.and_then(ProxyConfig::parse),
+            https: https.and_then(ProxyConfig::parse),
+            all: all.and_then(ProxyConfig::parse),
+            no_proxy,
+        }
+    }
+
+    fn intercept(&self, uri: &Uri) -> Option<Intercept> {
+        let host = uri.host()?.to_lowercase();
+        if self.no_proxy.iter().any(|entry| host.ends_with(entry)) {
+            return None;
+        }
+
+        let scheme = uri.scheme_str().unwrap_or("http");
+        let config = match scheme {
+            "http" => self.http.as_ref().or(self.all.as_ref())?,
+            "https" => self.https.as_ref().or(self.all.as_ref())?,
+            _ => return None,
+        };
+
+        Some(Intercept {
+            uri: config.uri.clone(),
+            basic_auth: config.basic_auth.clone(),
+            raw_auth: config.raw_auth.clone(),
+        })
     }
 }

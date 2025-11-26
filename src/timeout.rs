@@ -1,9 +1,9 @@
-//! Timeout middleware backed by the native-executor timer.
+//! Timeout middleware backed by a runtime-agnostic timer.
 //!
 //! This middleware cancels in-flight requests when the configured duration
-//! elapses and surfaces a `504 Gateway Timeout` error. It uses
-//! `native-executor`'s high precision timers so it works uniformly across
-//! Apple, Android, Web, and other targets (via the built-in polyfill).
+//! elapses and surfaces a `504 Gateway Timeout` error. It relies on
+//! `async-io`'s timers so it works uniformly across targets without pulling
+//! in a dedicated async runtime.
 
 use core::time::Duration;
 
@@ -11,7 +11,7 @@ use futures_util::{future::Either, pin_mut};
 use http_kit::{
     Endpoint, HttpError, Middleware, Request, Response, StatusCode, middleware::MiddlewareError,
 };
-use native_executor::timer::Timer;
+use async_io::Timer;
 use thiserror::Error;
 
 /// Middleware that fails requests exceeding the configured duration.
@@ -54,7 +54,7 @@ impl Middleware for Timeout {
 
         match futures_util::future::select(response_future, timeout_future).await {
             Either::Left((result, _)) => Ok(result.map_err(MiddlewareError::Endpoint)?),
-            Either::Right(((), _)) => Err(MiddlewareError::Middleware(TimeoutError)),
+            Either::Right((_, _)) => Err(MiddlewareError::Middleware(TimeoutError)),
         }
     }
 }
@@ -82,7 +82,7 @@ mod tests {
     impl Endpoint for SlowEndpoint {
         type Error = Infallible;
         async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
-            tokio::time::sleep(self.delay).await;
+            Timer::after(self.delay).await;
             let response = http::Response::builder()
                 .status(self.status)
                 .body(Body::empty())
@@ -91,8 +91,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn completes_before_timeout() {
+    #[test]
+    fn completes_before_timeout() {
         let mut middleware = Timeout::new(Duration::from_millis(50));
         let backend = SlowEndpoint {
             delay: Duration::from_millis(10),
@@ -100,16 +100,18 @@ mod tests {
         };
         let mut req = request();
 
-        let response = middleware
-            .handle(&mut req, backend)
-            .await
-            .expect("request should finish before timeout");
+        let response = async_io::block_on(async {
+            middleware
+                .handle(&mut req, backend)
+                .await
+                .expect("request should finish before timeout")
+        });
 
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn errors_after_timeout_expires() {
+    #[test]
+    fn errors_after_timeout_expires() {
         let mut middleware = Timeout::new(Duration::from_millis(5));
         let backend = SlowEndpoint {
             delay: Duration::from_millis(50),
@@ -117,10 +119,12 @@ mod tests {
         };
         let mut req = request();
 
-        let err = middleware
-            .handle(&mut req, backend)
-            .await
-            .expect_err("timeout should fire first");
+        let err = async_io::block_on(async {
+            middleware
+                .handle(&mut req, backend)
+                .await
+                .expect_err("timeout should fire first")
+        });
 
         assert_eq!(err.status(), Some(StatusCode::GATEWAY_TIMEOUT));
         assert!(err.to_string().contains("timed out"));

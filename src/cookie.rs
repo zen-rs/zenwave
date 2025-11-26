@@ -19,7 +19,7 @@ use {
         path::{Path, PathBuf},
         sync::{Arc, LazyLock},
     },
-    tokio::sync::Mutex as AsyncMutex,
+    async_lock::Mutex as AsyncMutex,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -310,33 +310,35 @@ mod tests {
     use http_kit::Body;
     use tempfile::tempdir;
 
-    #[tokio::test]
-    async fn persistent_store_roundtrip() {
+    #[test]
+    fn persistent_store_roundtrip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("cookies.json");
 
-        let mut store = CookieStore::persistent_with_path(path.clone());
-        let mut request = HttpRequest::builder()
-            .method(http_kit::Method::GET)
-            .uri("https://example.com")
-            .body(Body::empty())
-            .unwrap();
+        async_io::block_on(async {
+            let mut store = CookieStore::persistent_with_path(path.clone());
+            let mut request = HttpRequest::builder()
+                .method(http_kit::Method::GET)
+                .uri("https://example.com")
+                .body(Body::empty())
+                .unwrap();
 
-        let mut endpoint = SetCookieEndpoint;
-        store.handle(&mut request, &mut endpoint).await.unwrap();
+            let mut endpoint = SetCookieEndpoint;
+            store.handle(&mut request, &mut endpoint).await.unwrap();
 
-        let mut restored = CookieStore::persistent_with_path(path.clone());
-        let mut echo = RecordingEndpoint::default();
-        let mut request = HttpRequest::builder()
-            .method(http_kit::Method::GET)
-            .uri("https://example.com")
-            .body(Body::empty())
-            .unwrap();
-        restored.handle(&mut request, &mut echo).await.unwrap();
+            let mut restored = CookieStore::persistent_with_path(path.clone());
+            let mut echo = RecordingEndpoint::default();
+            let mut request = HttpRequest::builder()
+                .method(http_kit::Method::GET)
+                .uri("https://example.com")
+                .body(Body::empty())
+                .unwrap();
+            restored.handle(&mut request, &mut echo).await.unwrap();
 
-        let header = echo.last_cookie().expect("cookie header missing");
-        assert!(header.contains("session=abc"));
-        assert!(header.contains("theme=dark"));
+            let header = echo.last_cookie().expect("cookie header missing");
+            assert!(header.contains("session=abc"));
+            assert!(header.contains("theme=dark"));
+        });
     }
 
     struct SetCookieEndpoint;

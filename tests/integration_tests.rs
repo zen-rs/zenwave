@@ -18,7 +18,7 @@ fn endpoint(path: &str) -> String {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_real_world_api_request() {
     // Test with a real JSON API
     let response = get(endpoint("/json")).await.unwrap();
@@ -29,7 +29,7 @@ async fn test_real_world_api_request() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_user_agent_header() {
     let response = get(endpoint("/user-agent")).await.unwrap();
     let text = response.into_body().into_string().await.unwrap();
@@ -39,7 +39,7 @@ async fn test_user_agent_header() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_custom_headers() {
     let mut client = client();
     let response = client.get(endpoint("/headers")).await.unwrap();
@@ -50,7 +50,7 @@ async fn test_custom_headers() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_post_with_json_body() {
     let mut client = client();
     let request = client.method(Method::POST, endpoint("/post"));
@@ -63,7 +63,7 @@ async fn test_post_with_json_body() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_response_status_codes() {
     for status_code in [200, 201, 400, 401, 403, 404, 500, 502, 503] {
         let url = endpoint(&format!("/status/{status_code}"));
@@ -83,7 +83,7 @@ async fn test_response_status_codes() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_redirect_chain() {
     let client = client().follow_redirect();
     let mut client = client;
@@ -94,7 +94,7 @@ async fn test_redirect_chain() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_large_response() {
     // Test handling of larger responses
     let response = get(endpoint("/base64/aGVsbG8gd29ybGQ=")).await;
@@ -107,7 +107,7 @@ async fn test_large_response() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_gzip_compression() {
     // httpbin.org supports gzip compression
     let response = get(endpoint("/gzip")).await;
@@ -119,7 +119,7 @@ async fn test_gzip_compression() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_cookie_persistence() {
     let client = client().enable_cookie();
     let mut client = client;
@@ -138,7 +138,7 @@ async fn test_cookie_persistence() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_method_overrides() {
     let mut client = client();
 

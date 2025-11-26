@@ -309,8 +309,9 @@ mod tests {
         },
     };
 
-    #[tokio::test]
-    async fn serves_cached_response_until_expiration() {
+    #[test]
+    fn serves_cached_response_until_expiration() {
+        async_io::block_on(async {
         let backend = CountingEndpoint::new("hello", &[("cache-control", "max-age=60")]);
         let mut cache = Cache::new();
         let mut request = new_request();
@@ -320,15 +321,17 @@ mod tests {
         assert_eq!(body_text(response).await, "hello");
         assert_eq!(backend.calls(), 1);
 
-        let mut request = new_request();
-        let mut endpoint = backend.clone();
-        let response = cache.handle(&mut request, &mut endpoint).await.unwrap();
-        assert_eq!(body_text(response).await, "hello");
-        assert_eq!(backend.calls(), 1);
+            let mut request = new_request();
+            let mut endpoint = backend.clone();
+            let response = cache.handle(&mut request, &mut endpoint).await.unwrap();
+            assert_eq!(body_text(response).await, "hello");
+            assert_eq!(backend.calls(), 1);
+        });
     }
 
-    #[tokio::test]
-    async fn respects_no_store() {
+    #[test]
+    fn respects_no_store() {
+        async_io::block_on(async {
         let backend = CountingEndpoint::new("world", &[("cache-control", "no-store")]);
         let mut cache = Cache::new();
 
@@ -337,12 +340,14 @@ mod tests {
             let mut endpoint = backend.clone();
             let response = cache.handle(&mut request, &mut endpoint).await.unwrap();
             assert_eq!(body_text(response).await, "world");
-        }
-        assert_eq!(backend.calls(), 2);
+            }
+            assert_eq!(backend.calls(), 2);
+        });
     }
 
-    #[tokio::test]
-    async fn revalidates_using_etag() {
+    #[test]
+    fn revalidates_using_etag() {
+        async_io::block_on(async {
         let backend = ConditionalEndpoint::new();
         let mut cache = Cache::new();
 
@@ -352,12 +357,13 @@ mod tests {
         assert_eq!(body_text(response).await, "fresh");
         assert_eq!(backend.calls(), 1);
 
-        let mut request = new_request();
-        let mut endpoint = backend.clone();
-        let response = cache.handle(&mut request, &mut endpoint).await.unwrap();
-        assert_eq!(body_text(response).await, "fresh");
-        assert_eq!(backend.calls(), 2);
-        assert_eq!(backend.conditional_requests(), 1);
+            let mut request = new_request();
+            let mut endpoint = backend.clone();
+            let response = cache.handle(&mut request, &mut endpoint).await.unwrap();
+            assert_eq!(body_text(response).await, "fresh");
+            assert_eq!(backend.calls(), 2);
+            assert_eq!(backend.conditional_requests(), 1);
+        });
     }
 
     fn new_request() -> Request {

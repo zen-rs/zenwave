@@ -12,8 +12,8 @@ struct Todo {
     completed: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    async_io::block_on(async {
     // `zenwave::get` is perfect for one-off requests.
     let response = zenwave::get("https://jsonplaceholder.typicode.com/todos/1").await?;
     let todo: Todo = response.into_json().await?;
@@ -26,5 +26,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         completed = todo.completed
     );
 
-    Ok(())
+        Ok(())
+    })
 }

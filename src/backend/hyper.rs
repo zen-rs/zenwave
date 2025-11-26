@@ -1,98 +1,60 @@
-// Compile-time check: native-tls and rustls are mutually exclusive
-#[cfg(all(feature = "native-tls", feature = "rustls"))]
-compile_error!(
-    "Features `native-tls` and `rustls` are mutually exclusive. \
-     Please enable only one TLS backend."
-);
-
-use std::mem::replace;
-
+use async_io::block_on;
+use async_net::TcpStream;
+use core::future::Future;
+use executor_core::{AnyExecutor, Executor};
+use futures_io::{AsyncRead, AsyncWrite};
 use futures_util::TryStreamExt;
 use http::StatusCode;
 use http_body_util::BodyDataStream;
 use http_kit::{Endpoint, HttpError, Method, Request, Response};
 use hyper::http;
-use hyper_util::client::legacy::Client as HyperClient;
-use hyper_util::rt::TokioExecutor;
+use std::{
+    mem::replace,
+    pin::Pin,
+    task::{Context, Poll},
+    thread,
+};
 
-use crate::{ClientBackend, Proxy};
+use crate::ClientBackend;
 
-use self::proxy_support::ProxyConnector;
-
-// TLS connector types based on feature flags
-#[cfg(all(feature = "native-tls", not(feature = "rustls")))]
-use hyper_tls::HttpsConnector;
-
-#[cfg(all(feature = "rustls", not(feature = "native-tls")))]
-use hyper_rustls::HttpsConnector;
-
-// Type alias for the HTTPS connector with proxy support
-#[cfg(any(feature = "native-tls", feature = "rustls"))]
-type TlsConnector = HttpsConnector<ProxyConnector>;
-
-// Fallback type when no TLS feature is enabled (HTTP only)
-#[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-type TlsConnector = ProxyConnector;
-
-/// Hyper-based HTTP client backend.
-#[derive(Debug)]
+/// Hyper-based HTTP client backend powered by `async-io`/`async-net`.
+#[derive(Debug, Default)]
 pub struct HyperBackend {
-    client: HyperClient<TlsConnector, http_kit::Body>,
-}
-
-impl Default for HyperBackend {
-    fn default() -> Self {
-        Self::new()
-    }
+    executor: Option<AnyExecutor>,
 }
 
 impl HyperBackend {
     /// Create a new `HyperBackend`.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_proxy_impl(None)
+        Self { executor: None }
     }
 
-    /// Create a backend configured to honor the provided proxy matcher.
+    /// Create a `HyperBackend` that uses the provided executor for background tasks.
     #[must_use]
-    pub fn with_proxy(proxy: Proxy) -> Self {
-        Self::with_proxy_impl(Some(proxy))
+    pub fn with_executor(executor: impl Executor + 'static) -> Self {
+        Self {
+            executor: Some(AnyExecutor::new(executor)),
+        }
     }
 
-    /// Replace the internal client with one configured to use the supplied proxy.
-    #[must_use]
-    pub fn proxy(self, proxy: Proxy) -> Self {
-        Self::with_proxy(proxy)
-    }
-
-    fn with_proxy_impl(proxy: Option<Proxy>) -> Self {
-        let connector = ProxyConnector::from_proxy(proxy);
-
-        #[cfg(feature = "native-tls")]
-        let https = HttpsConnector::new_with_connector(connector);
-
-        #[cfg(feature = "rustls")]
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .expect("Failed to load native root certificates")
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .wrap_connector(connector);
-
-        #[cfg(any(feature = "native-tls", feature = "rustls"))]
-        let client = HyperClient::builder(TokioExecutor::new()).build(https);
-
-        #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-        let client = HyperClient::builder(TokioExecutor::new()).build(connector);
-
-        Self { client }
+    fn spawn_background(&self, fut: impl Future<Output = ()> + Send + 'static) {
+        if let Some(executor) = &self.executor {
+            executor.spawn(fut).detach();
+        } else {
+            thread::spawn(move || {
+                block_on(fut);
+            });
+        }
     }
 }
 
 #[derive(Debug)]
 pub enum HyperError {
-    Connection(hyper_util::client::legacy::Error),
+    Connection(hyper::Error),
+    Io(std::io::Error),
+    TlsNotAvailable,
+    InvalidUri(String),
     Remote {
         status: StatusCode,
         body: Option<String>,
@@ -104,6 +66,9 @@ impl core::fmt::Display for HyperError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Connection(err) => write!(f, "connection error: {}", err),
+            Self::Io(err) => write!(f, "io error: {}", err),
+            Self::TlsNotAvailable => write!(f, "TLS requested but no TLS feature enabled"),
+            Self::InvalidUri(uri) => write!(f, "invalid uri: {uri}"),
             Self::Remote { status, body, .. } => {
                 if let Some(body) = body {
                     write!(f, "remote error: {} - {}", status, body)
@@ -119,7 +84,10 @@ impl core::error::Error for HyperError {}
 
 impl HttpError for HyperError {
     fn status(&self) -> Option<StatusCode> {
-        None
+        match self {
+            Self::Remote { status, .. } => Some(*status),
+            _ => None,
+        }
     }
 }
 
@@ -133,11 +101,23 @@ impl Endpoint for HyperBackend {
             .unwrap();
         let request: http::Request<http_kit::Body> = replace(request, dummy_request);
 
-        let response = self
-            .client
-            .request(request)
+        let stream = connect(&request).await?;
+        let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
+            .handshake(stream)
             .await
-            .map_err(|error| HyperError::Connection(error))?;
+            .map_err(HyperError::Connection)?;
+
+        // Drive the connection in the background.
+        self.spawn_background(async move {
+            if let Err(err) = connection.await {
+                eprintln!("hyper connection error: {err}");
+            }
+        });
+
+        let response = sender
+            .send_request(request)
+            .await
+            .map_err(HyperError::Connection)?;
 
         let mut response = response.map(|body| {
             let stream = BodyDataStream::new(body);
@@ -150,7 +130,6 @@ impl Endpoint for HyperBackend {
         let is_error = response.status().is_client_error() || response.status().is_server_error();
 
         if is_error {
-            // Let's read the body to include it in the error response
             let error_msg: Option<String> = response
                 .body_mut()
                 .as_str()
@@ -170,173 +149,160 @@ impl Endpoint for HyperBackend {
 
 impl ClientBackend for HyperBackend {}
 
-mod proxy_support {
-    use std::{
-        error::Error as StdError,
-        fmt,
-        future::Future,
-        pin::Pin,
-        sync::Arc,
-        task::{Context, Poll},
+async fn connect(request: &http::Request<http_kit::Body>) -> Result<MaybeTlsStream, HyperError> {
+    let uri = request.uri();
+    let host = uri
+        .host()
+        .ok_or_else(|| HyperError::InvalidUri(uri.to_string()))?
+        .to_string();
+    let scheme = uri.scheme_str().unwrap_or("http");
+    let use_tls = match scheme {
+        "https" => true,
+        "http" => false,
+        other => return Err(HyperError::InvalidUri(other.to_string())),
     };
+    let port = uri.port_u16().unwrap_or(if use_tls { 443 } else { 80 });
 
-    use http::{Uri, header::HeaderValue};
-    use hyper_util::client::{
-        legacy::connect::{
-            HttpConnector,
-            proxy::{SocksV4, SocksV5, Tunnel},
-        },
-        proxy::matcher,
-    };
-    use tower_service::Service;
+    let stream = TcpStream::connect((host.as_str(), port))
+        .await
+        .map_err(HyperError::Io)?;
+    stream.set_nodelay(true).map_err(HyperError::Io)?;
 
-    use crate::proxy::Proxy;
-
-    type ConnectorResponse = <HttpConnector as Service<Uri>>::Response;
-    type ProxyFuture = Pin<Box<dyn Future<Output = Result<ConnectorResponse, ProxyError>> + Send>>;
-
-    #[derive(Clone, Debug)]
-    pub(super) struct ProxyConnector {
-        http: HttpConnector,
-        matcher: Option<Arc<matcher::Matcher>>,
-    }
-
-    impl ProxyConnector {
-        pub(super) fn from_proxy(proxy: Option<Proxy>) -> Self {
-            let matcher = proxy.map(crate::proxy::Proxy::into_matcher);
-            let mut http = HttpConnector::new();
-            http.enforce_http(false);
-
-            Self { http, matcher }
-        }
-    }
-
-    impl Service<Uri> for ProxyConnector {
-        type Response = ConnectorResponse;
-        type Error = ProxyError;
-        type Future = ProxyFuture;
-
-        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            self.http.poll_ready(cx).map_err(ProxyError::boxed)
-        }
-
-        fn call(&mut self, dst: Uri) -> Self::Future {
-            let matcher = self.matcher.clone();
-            let direct = self.http.clone();
-            let proxied = direct.clone();
-
-            Box::pin(async move {
-                if let Some(matcher) = matcher
-                    && let Some(intercept) = matcher.intercept(&dst)
-                {
-                    return connect_via_proxy(proxied, intercept, dst).await;
-                }
-
-                let mut connector = direct;
-                connector.call(dst).await.map_err(ProxyError::boxed)
-            })
-        }
-    }
-
-    async fn connect_via_proxy(
-        http: HttpConnector,
-        intercept: matcher::Intercept,
-        dst: Uri,
-    ) -> Result<ConnectorResponse, ProxyError> {
-        let proxy_uri = intercept.uri().clone();
-        let scheme = proxy_uri
-            .scheme_str()
-            .map_or_else(|| "http".into(), str::to_ascii_lowercase);
-        let basic_auth = intercept.basic_auth().cloned();
-        let raw_auth = intercept
-            .raw_auth()
-            .map(|(user, pass)| (user.to_owned(), pass.to_owned()));
-
-        match scheme.as_str() {
-            "http" | "https" => connect_http_tunnel(http, proxy_uri, basic_auth, dst).await,
-            "socks4" => connect_socks4(http, proxy_uri, dst, true).await,
-            "socks4a" => connect_socks4(http, proxy_uri, dst, false).await,
-            "socks5" => connect_socks5(http, proxy_uri, dst, raw_auth.clone(), true).await,
-            "socks5h" => connect_socks5(http, proxy_uri, dst, raw_auth, false).await,
-            other => Err(ProxyError::boxed(UnsupportedScheme {
-                scheme: other.to_owned(),
-            })),
-        }
-    }
-
-    async fn connect_http_tunnel(
-        http: HttpConnector,
-        proxy_uri: Uri,
-        auth: Option<HeaderValue>,
-        dst: Uri,
-    ) -> Result<ConnectorResponse, ProxyError> {
-        let mut connector = Tunnel::new(proxy_uri, http);
-        if let Some(header) = auth {
-            connector = connector.with_auth(header);
-        }
-        connector.call(dst).await.map_err(ProxyError::boxed)
-    }
-
-    async fn connect_socks4(
-        http: HttpConnector,
-        proxy_uri: Uri,
-        dst: Uri,
-        local_dns: bool,
-    ) -> Result<ConnectorResponse, ProxyError> {
-        let mut connector = SocksV4::new(proxy_uri, http);
-        connector = connector.local_dns(local_dns);
-        connector.call(dst).await.map_err(ProxyError::boxed)
-    }
-
-    async fn connect_socks5(
-        http: HttpConnector,
-        proxy_uri: Uri,
-        dst: Uri,
-        auth: Option<(String, String)>,
-        local_dns: bool,
-    ) -> Result<ConnectorResponse, ProxyError> {
-        let mut connector = SocksV5::new(proxy_uri, http);
-        connector = connector.local_dns(local_dns);
-        if let Some((username, password)) = auth {
-            connector = connector.with_auth(username, password);
-        }
-        connector.call(dst).await.map_err(ProxyError::boxed)
-    }
-
-    #[derive(Debug)]
-    pub(super) struct ProxyError(Box<dyn StdError + Send + Sync>);
-
-    impl ProxyError {
-        fn boxed<E>(err: E) -> Self
-        where
-            E: StdError + Send + Sync + 'static,
+    if use_tls {
+        #[cfg(feature = "native-tls")]
         {
-            Self(Box::new(err))
+            let connector = async_native_tls::TlsConnector::new();
+            let tls = connector
+                .connect(host.as_str(), stream)
+                .await
+                .map_err(|err| HyperError::Io(std::io::Error::other(err)))?;
+            return Ok(MaybeTlsStream::Native(tls));
+        }
+
+        #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+        {
+            use std::sync::Arc;
+
+            use futures_rustls::{
+                TlsConnector,
+                client::TlsStream as RustlsStream,
+                rustls::{self, pki_types::ServerName},
+            };
+
+            let root_store =
+                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+            let config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            let connector = TlsConnector::from(Arc::new(config));
+            let server_name = ServerName::try_from(host.clone())
+                .map_err(|err| HyperError::Io(std::io::Error::other(err)))?;
+
+            let stream: RustlsStream<TcpStream> = connector
+                .connect(server_name, stream)
+                .await
+                .map_err(|err| HyperError::Io(std::io::Error::other(err)))?;
+            return Ok(MaybeTlsStream::Rustls(stream));
+        }
+
+        #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
+        {
+            return Err(HyperError::TlsNotAvailable);
         }
     }
 
-    impl fmt::Display for ProxyError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "proxy error: {}", self.0)
+    Ok(MaybeTlsStream::Plain(stream))
+}
+
+enum MaybeTlsStream {
+    Plain(TcpStream),
+    #[cfg(feature = "native-tls")]
+    Native(async_native_tls::TlsStream<TcpStream>),
+    #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+    Rustls(futures_rustls::client::TlsStream<TcpStream>),
+}
+
+impl Unpin for MaybeTlsStream {}
+
+impl hyper::rt::Read for MaybeTlsStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let slice = unsafe { buf.as_mut() };
+        let bytes = unsafe { &mut *(slice as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]) };
+
+        let result = match &mut *self {
+            MaybeTlsStream::Plain(stream) => Pin::new(stream).poll_read(cx, bytes),
+            #[cfg(feature = "native-tls")]
+            MaybeTlsStream::Native(stream) => Pin::new(stream).poll_read(cx, bytes),
+            #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+            MaybeTlsStream::Rustls(stream) => Pin::new(stream).poll_read(cx, bytes),
+        };
+
+        match result {
+            Poll::Ready(Ok(n)) => {
+                unsafe { buf.advance(n) };
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl hyper::rt::Write for MaybeTlsStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match &mut *self {
+            MaybeTlsStream::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            #[cfg(feature = "native-tls")]
+            MaybeTlsStream::Native(stream) => Pin::new(stream).poll_write(cx, buf),
+            #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+            MaybeTlsStream::Rustls(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
-    impl StdError for ProxyError {
-        fn source(&self) -> Option<&(dyn StdError + 'static)> {
-            Some(&*self.0)
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            MaybeTlsStream::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(feature = "native-tls")]
+            MaybeTlsStream::Native(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+            MaybeTlsStream::Rustls(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
-    #[derive(Debug)]
-    struct UnsupportedScheme {
-        scheme: String,
-    }
-
-    impl fmt::Display for UnsupportedScheme {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "unsupported proxy scheme `{}`", self.scheme)
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            MaybeTlsStream::Plain(stream) => Pin::new(stream).poll_close(cx),
+            #[cfg(feature = "native-tls")]
+            MaybeTlsStream::Native(stream) => Pin::new(stream).poll_close(cx),
+            #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+            MaybeTlsStream::Rustls(stream) => Pin::new(stream).poll_close(cx),
         }
     }
 
-    impl StdError for UnsupportedScheme {}
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        match &mut *self {
+            MaybeTlsStream::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            #[cfg(feature = "native-tls")]
+            MaybeTlsStream::Native(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+            MaybeTlsStream::Rustls(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+        }
+    }
 }

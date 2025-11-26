@@ -4,7 +4,7 @@ use http_kit::Method;
 use zenwave::{Client, client};
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_get_method() {
     let mut client = client();
     let request_builder = client.get("https://httpbingo.org/get");
@@ -15,7 +15,7 @@ async fn test_client_get_method() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_post_method() {
     let mut client = client();
     let request_builder = client.post("https://httpbingo.org/post");
@@ -26,7 +26,7 @@ async fn test_client_post_method() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_put_method() {
     let mut client = client();
     let request_builder = client.put("https://httpbingo.org/put");
@@ -37,7 +37,7 @@ async fn test_client_put_method() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_delete_method() {
     let mut client = client();
     let request_builder = client.delete("https://httpbingo.org/delete");
@@ -48,7 +48,7 @@ async fn test_client_delete_method() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_method_generic() {
     let mut client = client();
     let request_builder = client.method(Method::GET, "https://httpbingo.org/get");
@@ -59,7 +59,7 @@ async fn test_client_method_generic() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_request_builder_string() {
     let mut client = client();
     let response_string = client.get("https://httpbingo.org/get").string().await;
@@ -70,7 +70,7 @@ async fn test_request_builder_string() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_request_builder_bytes() {
     let mut client = client();
     let response_bytes = client.get("https://httpbingo.org/get").bytes().await;
@@ -80,7 +80,7 @@ async fn test_request_builder_bytes() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_request_builder_json() {
     use serde_json::Value;
 
@@ -92,7 +92,7 @@ async fn test_request_builder_json() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_with_middleware() {
     let client = client().enable_cookie();
     let mut client = client;
@@ -107,7 +107,7 @@ async fn test_client_with_middleware() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_follow_redirect() {
     let client = client().follow_redirect();
     let mut client = client;
@@ -118,7 +118,7 @@ async fn test_client_follow_redirect() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_invalid_uri() {
     let mut client = client();
     let response = client.get("invalid-uri").await;

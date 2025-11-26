@@ -19,29 +19,30 @@ struct Message {
     message: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let token = std::env::var("ZENWAVE_TOKEN").unwrap_or_else(|_| "demo-token".into());
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    async_io::block_on(async {
+        let token = std::env::var("ZENWAVE_TOKEN").unwrap_or_else(|_| "demo-token".into());
 
-    // Compose the middleware you need.
-    let mut client = zenwave::client()
-        .follow_redirect()
-        .enable_cookie()
-        .bearer_auth(token);
+        // Compose the middleware you need.
+        let mut client = zenwave::client()
+            .follow_redirect()
+            .enable_cookie()
+            .bearer_auth(token);
 
-    let payload = MessageRequest {
-        message: "zenwave says hi!",
-    };
+        let payload = MessageRequest {
+            message: "zenwave says hi!",
+        };
 
-    let response: EchoResponse = client
-        .post("https://httpbin.org/post")
-        .header("x-request-id", "demo-request")
-        .json_body(&payload)
-        .json()
-        .await?;
+        let response: EchoResponse = client
+            .post("https://httpbin.org/post")
+            .header("x-request-id", "demo-request")
+            .json_body(&payload)
+            .json()
+            .await?;
 
-    println!("Server echoed '{}'", response.json.message);
-    println!("Request URL     : {}", response.url);
+        println!("Server echoed '{}'", response.json.message);
+        println!("Request URL     : {}", response.url);
 
-    Ok(())
+        Ok(())
+    })
 }

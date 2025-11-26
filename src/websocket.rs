@@ -152,87 +152,13 @@ mod native {
     use async_tungstenite::{WebSocketStream, tungstenite::Message as TungsteniteMessage};
     use futures_util::StreamExt;
     use http_kit::utils::{ByteStr, Bytes};
-    use tokio::net::TcpStream;
-    use tokio_util::compat::TokioAsyncReadCompatExt;
     use url::Url;
 
     use super::{WebSocketError, WebSocketMessage, serialize_payload};
 
-    // Define the stream type based on TLS feature
-    #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
-    type TlsStream = tokio_native_tls::TlsStream<TcpStream>;
+    type NativeSocket = WebSocketStream<async_tungstenite::async_std::ConnectStream>;
 
-    #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
-    type TlsStream = tokio_rustls::client::TlsStream<TcpStream>;
-
-    // WebSocket stream type that can be either plain TCP or TLS
-    #[cfg(any(feature = "native-tls", feature = "rustls"))]
-    enum MaybeTlsStream {
-        Plain(TcpStream),
-        Tls(TlsStream),
-    }
-
-    #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-    type MaybeTlsStream = TcpStream;
-
-    #[cfg(any(feature = "native-tls", feature = "rustls"))]
-    impl tokio::io::AsyncRead for MaybeTlsStream {
-        fn poll_read(
-            self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            match self.get_mut() {
-                Self::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
-                Self::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
-            }
-        }
-    }
-
-    #[cfg(any(feature = "native-tls", feature = "rustls"))]
-    impl tokio::io::AsyncWrite for MaybeTlsStream {
-        fn poll_write(
-            self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            match self.get_mut() {
-                Self::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
-                Self::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
-            }
-        }
-
-        fn poll_flush(
-            self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            match self.get_mut() {
-                Self::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
-                Self::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
-            }
-        }
-
-        fn poll_shutdown(
-            self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            match self.get_mut() {
-                Self::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
-                Self::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
-            }
-        }
-    }
-
-    // Use Compat wrapper to convert Tokio AsyncRead/AsyncWrite to futures AsyncRead/AsyncWrite
-    #[cfg(any(feature = "native-tls", feature = "rustls"))]
-    type CompatStream = tokio_util::compat::Compat<MaybeTlsStream>;
-
-    #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-    type CompatStream = tokio_util::compat::Compat<TcpStream>;
-
-    type NativeSocket = WebSocketStream<CompatStream>;
-
-    /// A websocket connection backed by Tokio + Tungstenite.
+    /// A websocket connection backed by async-io + Tungstenite.
     pub struct WebSocket {
         inner: NativeSocket,
     }
@@ -250,78 +176,12 @@ mod native {
     /// Returns an error if the URI is invalid or the connection attempt fails.
     pub async fn connect(uri: impl AsRef<str>) -> Result<WebSocket, WebSocketError> {
         let url = Url::parse(uri.as_ref())?;
-        let use_tls = match url.scheme() {
-            "ws" => false,
-            "wss" => true,
-            _ => {
-                return Err(WebSocketError::UnsupportedScheme(url.scheme().to_string()));
-            }
-        };
-
-        let host = url
-            .host_str()
-            .ok_or_else(|| WebSocketError::InvalidUri(url::ParseError::EmptyHost))?;
-        let port = url.port().unwrap_or(if use_tls { 443 } else { 80 });
-        let addr = format!("{host}:{port}");
-
-        let tcp_stream = TcpStream::connect(&addr)
-            .await
-            .map_err(|e| WebSocketError::ConnectionFailed(e.into()))?;
-
-        let stream = if use_tls {
-            #[cfg(feature = "native-tls")]
-            {
-                let connector = native_tls::TlsConnector::new()
-                    .map_err(|e| WebSocketError::ConnectionFailed(e.into()))?;
-                let connector = tokio_native_tls::TlsConnector::from(connector);
-                let tls_stream = connector
-                    .connect(host, tcp_stream)
-                    .await
-                    .map_err(|e| WebSocketError::ConnectionFailed(e.into()))?;
-                MaybeTlsStream::Tls(tls_stream).compat()
-            }
-
-            #[cfg(feature = "rustls")]
-            {
-                use std::sync::Arc;
-                use tokio_rustls::TlsConnector;
-
-                let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
-                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-                let config = tokio_rustls::rustls::ClientConfig::builder()
-                    .with_root_certificates(root_store)
-                    .with_no_client_auth();
-
-                let connector = TlsConnector::from(Arc::new(config));
-                let server_name = rustls_pki_types::ServerName::try_from(host.to_string())
-                    .map_err(|e| WebSocketError::ConnectionFailed(e.into()))?;
-                let tls_stream = connector
-                    .connect(server_name, tcp_stream)
-                    .await
-                    .map_err(|e| WebSocketError::ConnectionFailed(e.into()))?;
-                MaybeTlsStream::Tls(tls_stream).compat()
-            }
-
-            #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-            {
-                return Err(WebSocketError::UnsupportedScheme(
-                    "wss requires native-tls or rustls feature".to_string(),
-                ));
-            }
-        } else {
-            #[cfg(any(feature = "native-tls", feature = "rustls"))]
-            {
-                MaybeTlsStream::Plain(tcp_stream).compat()
-            }
-            #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-            {
-                tcp_stream.compat()
-            }
-        };
-
+        match url.scheme() {
+            "ws" | "wss" => {}
+            other => return Err(WebSocketError::UnsupportedScheme(other.to_string())),
+        }
         let request: String = url.into();
-        let (ws_stream, _) = async_tungstenite::client_async(request, stream)
+        let (ws_stream, _) = async_tungstenite::async_std::connect_async(request)
             .await
             .map_err(|e| WebSocketError::ConnectionFailed(Box::new(e)))?;
 

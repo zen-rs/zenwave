@@ -3,16 +3,16 @@ use std::{mem::replace, str};
 use anyhow::{Context, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use blocking::unblock;
 use curl::easy::{Easy2, Handler, List, ProxyType, ReadError, WriteError};
 use http::{
     HeaderMap, Method,
     header::{HeaderName, HeaderValue},
 };
 use http_kit::{Body, Endpoint, HttpError, Request, Response, StatusCode};
-use hyper_util::client::proxy::matcher;
 use thiserror::Error;
-use tokio::task;
 
+use crate::proxy::Intercept;
 use crate::{ClientBackend, Proxy};
 
 /// HTTP backend implemented with libcurl.
@@ -118,9 +118,7 @@ async fn execute(request: Request, proxy: Option<Proxy>) -> Result<Response, Cur
         proxy,
     };
 
-    let response = task::spawn_blocking(move || perform(prepared))
-        .await
-        .map_err(CurlError::bad_gateway)??;
+    let response = unblock(move || perform(prepared)).await?;
 
     Ok(response)
 }
@@ -226,7 +224,7 @@ fn apply_proxy(
     Ok(())
 }
 
-fn resolve_proxy(intercept: &matcher::Intercept) -> anyhow::Result<ResolvedProxy> {
+fn resolve_proxy(intercept: &Intercept) -> anyhow::Result<ResolvedProxy> {
     let scheme = intercept
         .uri()
         .scheme_str()

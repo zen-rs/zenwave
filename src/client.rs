@@ -14,7 +14,7 @@ use http_kit::{
 };
 use serde::de::DeserializeOwned;
 #[cfg(not(target_arch = "wasm32"))]
-use tokio::io::AsyncRead;
+use futures_io::AsyncRead;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod download;
@@ -173,7 +173,7 @@ impl<T: Client> RequestBuilder<'_, T> {
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
         use http_kit::header;
-        use tokio_util::io::ReaderStream;
+        use http_kit::utils::io::BufReader;
 
         if let Some(len) = length
             && let Ok(value) = header::HeaderValue::from_str(&len.to_string())
@@ -183,8 +183,10 @@ impl<T: Client> RequestBuilder<'_, T> {
                 .insert(header::CONTENT_LENGTH, value);
         }
 
-        let stream = ReaderStream::new(reader);
-        self.stream_body(stream)
+        let length_hint = length.and_then(|len| usize::try_from(len).ok());
+        let reader = BufReader::new(reader);
+        *self.request.body_mut() = http_kit::Body::from_reader(reader, length_hint);
+        self
     }
 
     /// Stream a file from disk as the request body without loading it into memory.
@@ -193,7 +195,7 @@ impl<T: Client> RequestBuilder<'_, T> {
         self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<Self, std::io::Error> {
-        use tokio::fs::File;
+        use async_fs::File;
 
         let file = File::open(path.as_ref()).await?;
         let metadata = file.metadata().await?;
@@ -240,88 +242,97 @@ mod tests {
     use http::Response;
     use std::{convert::Infallible, sync::Arc};
     use tempfile::tempdir;
-    use tokio::{fs, sync::Mutex};
+    use async_fs as fs;
+    use async_lock::Mutex;
 
-    #[tokio::test]
-    async fn download_to_path_resumes_existing_file() {
+    #[test]
+    fn download_to_path_resumes_existing_file() {
         let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
         let dir = tempdir().unwrap();
         let path = dir.path().join("download.bin");
-        fs::write(&path, &payload[..1024]).await.unwrap();
+        async_io::block_on(async {
+            fs::write(&path, &payload[..1024]).await.unwrap();
 
-        let mut client = FakeBackend::with_payload(payload.clone());
-        client
-            .get("http://example.com/file.bin")
-            .download_to_path(&path)
-            .await
-            .unwrap();
+            let mut client = FakeBackend::with_payload(payload.clone());
+            client
+                .get("http://example.com/file.bin")
+                .download_to_path(&path)
+                .await
+                .unwrap();
 
-        let final_bytes = fs::read(&path).await.unwrap();
-        assert_eq!(final_bytes, payload);
+            let final_bytes = fs::read(&path).await.unwrap();
+            assert_eq!(final_bytes, payload);
+        });
     }
 
-    #[tokio::test]
-    async fn download_to_path_restarts_when_range_is_not_supported() {
+    #[test]
+    fn download_to_path_restarts_when_range_is_not_supported() {
         let payload: Vec<u8> = (0..2048).map(|i| (i % 199) as u8).collect();
         let dir = tempdir().unwrap();
         let path = dir.path().join("download.bin");
-        fs::write(&path, &[1_u8, 2, 3, 4]).await.unwrap();
+        async_io::block_on(async {
+            fs::write(&path, &[1_u8, 2, 3, 4]).await.unwrap();
 
-        let mut client = FakeBackend::without_range(payload.clone());
-        client
-            .get("http://example.com/file.bin")
-            .download_to_path(&path)
-            .await
-            .unwrap();
+            let mut client = FakeBackend::without_range(payload.clone());
+            client
+                .get("http://example.com/file.bin")
+                .download_to_path(&path)
+                .await
+                .unwrap();
 
-        let final_bytes = fs::read(&path).await.unwrap();
-        assert_eq!(final_bytes, payload);
+            let final_bytes = fs::read(&path).await.unwrap();
+            assert_eq!(final_bytes, payload);
+        });
     }
 
-    #[tokio::test]
-    async fn file_body_streams_files_without_buffering() {
+    #[test]
+    fn file_body_streams_files_without_buffering() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("upload.bin");
         let payload: Vec<u8> = (0..2048)
             .map(|i| u8::try_from(i % 256).expect("value fits in u8"))
             .collect();
-        fs::write(&path, &payload).await.unwrap();
+        async_io::block_on(async {
+            fs::write(&path, &payload).await.unwrap();
 
-        let backend = RecordingBackend::default();
-        let recorded = backend.recorded.clone();
-        let mut client = backend;
+            let backend = RecordingBackend::default();
+            let recorded = backend.recorded.clone();
+            let mut client = backend;
 
-        client
-            .post("http://example.com/upload")
-            .file_body(&path)
-            .await
-            .unwrap()
-            .await
-            .unwrap();
+            client
+                .post("http://example.com/upload")
+                .file_body(&path)
+                .await
+                .unwrap()
+                .await
+                .unwrap();
 
-        let data = recorded.lock().await.clone();
-        assert_eq!(data, payload);
+            let data = recorded.lock().await.clone();
+            assert_eq!(data, payload);
+        });
     }
 
-    #[tokio::test]
-    async fn stream_body_uploads_chunks() {
+    #[test]
+    fn stream_body_uploads_chunks() {
         let backend = RecordingBackend::default();
         let recorded = backend.recorded.clone();
         let mut client = backend;
 
-        let stream = stream::iter(vec![
-            Ok::<_, std::io::Error>(Bytes::from_static(b"chunk-a")),
-            Ok(Bytes::from_static(b"chunk-b")),
-        ]);
+        async_io::block_on(async {
+            let stream = stream::iter(vec![
+                Ok::<_, std::io::Error>(Bytes::from_static(b"chunk-a")),
+                Ok(Bytes::from_static(b"chunk-b")),
+            ]);
 
-        client
-            .post("http://example.com/upload")
-            .stream_body(stream)
-            .await
-            .unwrap();
+            client
+                .post("http://example.com/upload")
+                .stream_body(stream)
+                .await
+                .unwrap();
 
-        let data = recorded.lock().await.clone();
-        assert_eq!(data, b"chunk-achunk-b");
+            let data = recorded.lock().await.clone();
+            assert_eq!(data, b"chunk-achunk-b");
+        });
     }
 
     #[derive(Clone)]

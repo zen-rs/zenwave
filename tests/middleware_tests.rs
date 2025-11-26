@@ -16,7 +16,7 @@ use zenwave::{
 };
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_cookie_store_middleware() {
     let client = client().enable_cookie();
     let mut client = client;
@@ -38,14 +38,14 @@ async fn test_cookie_store_middleware() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_cookie_store_creation() {
     let cookie_store = CookieStore::default();
     assert!(!format!("{cookie_store:?}").is_empty());
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_follow_redirect_middleware() {
     // Test with redirect middleware
     let client = client().follow_redirect();
@@ -59,7 +59,7 @@ async fn test_follow_redirect_middleware() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_follow_redirect_creation() {
     let base_client = client();
     let _redirect_client = FollowRedirect::new(base_client);
@@ -67,7 +67,7 @@ async fn test_follow_redirect_creation() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_follow_redirect_multiple_redirects() {
     let client = client().follow_redirect();
     let mut client = client;
@@ -80,7 +80,7 @@ async fn test_follow_redirect_multiple_redirects() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_with_multiple_middleware() {
     let client = client().follow_redirect().enable_cookie();
     let mut client = client;
@@ -97,7 +97,7 @@ async fn test_client_with_multiple_middleware() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_without_redirect_middleware() {
     // Without redirect middleware, should get redirect response
     let mut client = client();
@@ -109,7 +109,7 @@ async fn test_without_redirect_middleware() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_middleware_with_custom_middleware() {
     struct TestMiddleware;
 
@@ -153,7 +153,7 @@ struct SlowClient {
 impl Endpoint for SlowClient {
     type Error = Infallible;
     async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
-        tokio::time::sleep(self.delay).await;
+        async_std::task::sleep(self.delay).await;
         Ok(http::Response::builder()
             .status(self.status)
             .body(Body::empty())
@@ -190,7 +190,7 @@ impl Endpoint for CountingBackend {
 impl Client for CountingBackend {}
 
 #[cfg(not(target_arch = "wasm32"))]
-#[tokio::test]
+#[async_std::test]
 async fn test_timeout_middleware_success() {
     let mut client = SlowClient {
         delay: Duration::from_millis(20),
@@ -206,7 +206,7 @@ async fn test_timeout_middleware_success() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[tokio::test]
+#[async_std::test]
 async fn test_timeout_middleware_triggers_gateway_timeout() {
     let mut client = SlowClient {
         delay: Duration::from_millis(200),
@@ -227,7 +227,7 @@ async fn test_timeout_middleware_triggers_gateway_timeout() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_enable_cache_serves_cached_response() {
     let hits = Arc::new(AtomicUsize::new(0));
     let backend = CountingBackend::new(hits.clone());

@@ -4,11 +4,8 @@ use std::{
 };
 
 use futures_util::StreamExt;
-use http_kit::{BodyError, HttpError, StatusCode, header};
-use tokio::{
-    fs::OpenOptions,
-    io::{AsyncSeekExt, AsyncWriteExt},
-};
+use http_kit::{BodyError, HttpError, StatusCode, header, utils::{AsyncSeekExt, AsyncWriteExt}};
+use async_fs::OpenOptions;
 
 use super::RequestBuilder;
 
@@ -78,7 +75,7 @@ pub async fn download_to_path<T: crate::Client>(
 ) -> Result<DownloadReport, DownloadError<T::Error>> {
     let path_buf = path.as_ref().to_path_buf();
     let existing_len = if options.resume_existing {
-        match tokio::fs::metadata(&path_buf).await {
+        match async_fs::metadata(&path_buf).await {
             Ok(meta) => meta.len(),
             Err(err) if err.kind() == ErrorKind::NotFound => 0,
             Err(err) => {

@@ -1,5 +1,10 @@
 # Zenwave
 
+[![Crates.io](https://img.shields.io/crates/v/zenwave.svg)](https://crates.io/crates/zenwave)
+[![Documentation](https://docs.rs/zenwave/badge.svg)](https://docs.rs/zenwave)
+[![License](https://img.shields.io/crates/l/zenwave.svg)](LICENSE)
+[![CI](https://github.com/zen-rs/zenwave/actions/workflows/ci.yml/badge.svg)](https://github.com/zen-rs/zenwave/actions/workflows/ci.yml)
+
 Zenwave is an ergonomic, full-featured HTTP client framework for Rust. It exposes a modern,
 middleware-friendly API that works on both native targets (Tokio + Hyper on Linux/Windows, Apple's
 URLSession on iOS/tvOS/watchOS/macOS) and browser/Cloudflare Workers targets through the Fetch API.
@@ -24,7 +29,7 @@ URLSession on iOS/tvOS/watchOS/macOS) and browser/Cloudflare Workers targets thr
 ```rust
 use zenwave::{get, ResponseExt};
 
-#[tokio::main]
+#[async_std::main]
 async fn main() -> zenwave::Result<()> {
     let response = get("https://example.com/").await?;
     let text = response.into_string().await?;
@@ -69,7 +74,7 @@ struct MessageResponse {
     message: String,
 }
 
-#[tokio::main]
+#[async_std::main]
 async fn main() -> zenwave::Result<()> {
     let token = std::env::var("ZENWAVE_TOKEN").unwrap_or_else(|_| "demo-token".into());
 
@@ -180,7 +185,7 @@ Tokio so uploads backpressure naturally with the network stack.
 ```rust
 # async fn example() -> zenwave::Result<()> {
 use zenwave::client;
-use tokio::fs::File;
+use async_fs::File;
 
 let mut client = client();
 let response = client
@@ -266,7 +271,7 @@ The `zenwave::websocket` module offers a cross-platform WebSocket client that hi
 ```rust
 use zenwave::websocket::{self, WebSocketMessage};
 
-#[tokio::main]
+#[async_std::main]
 async fn main() -> zenwave::Result<()> {
     let mut socket = websocket::connect("wss://echo.websocket.events").await?;
     socket.send_text("hello").await?;
