@@ -39,6 +39,46 @@ impl HttpError for WebSocketError {
     }
 }
 
+/// Configuration applied when establishing a websocket connection.
+#[derive(Clone, Debug)]
+pub struct WebSocketConfig {
+    /// Maximum incoming websocket message size in bytes.
+    ///
+    /// Defaults to the underlying websocket client's default limit. Set to
+    /// `Some(n)` to enforce a custom cap or `None` to disable the limit.
+    pub max_message_size: Option<usize>,
+}
+
+impl Default for WebSocketConfig {
+    fn default() -> Self {
+        Self {
+            max_message_size: default_max_message_size(),
+        }
+    }
+}
+
+impl WebSocketConfig {
+    /// Override the maximum incoming websocket message size in bytes.
+    ///
+    /// `Some(n)` enforces a custom limit, `None` disables the cap, and omitting
+    /// this retains the underlying client's default limit.
+    #[must_use]
+    pub fn with_max_message_size(mut self, max_message_size: Option<usize>) -> Self {
+        self.max_message_size = max_message_size;
+        self
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn default_max_message_size() -> Option<usize> {
+    async_tungstenite::tungstenite::protocol::WebSocketConfig::default().max_message_size
+}
+
+#[cfg(target_arch = "wasm32")]
+fn default_max_message_size() -> Option<usize> {
+    None
+}
+
 impl WebSocketMessage {
     /// Construct a text message.
     #[must_use]
@@ -149,12 +189,15 @@ impl From<WebSocketMessage> for async_tungstenite::tungstenite::Message {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    use async_tungstenite::{WebSocketStream, tungstenite::Message as TungsteniteMessage};
+    use async_tungstenite::{
+        WebSocketStream,
+        tungstenite::{Message as TungsteniteMessage, protocol::WebSocketConfig as TungsteniteConfig},
+    };
     use futures_util::StreamExt;
     use http_kit::utils::{ByteStr, Bytes};
     use url::Url;
 
-    use super::{WebSocketError, WebSocketMessage, serialize_payload};
+    use super::{WebSocketConfig, WebSocketError, WebSocketMessage, serialize_payload};
 
     type NativeSocket = WebSocketStream<async_tungstenite::async_std::ConnectStream>;
 
@@ -175,13 +218,30 @@ mod native {
     ///
     /// Returns an error if the URI is invalid or the connection attempt fails.
     pub async fn connect(uri: impl AsRef<str>) -> Result<WebSocket, WebSocketError> {
+        connect_with_config(uri, WebSocketConfig::default()).await
+    }
+
+    /// Establish a websocket connection to the provided URI with custom configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the URI is invalid or the connection attempt fails.
+    pub async fn connect_with_config(
+        uri: impl AsRef<str>,
+        websocket_config: WebSocketConfig,
+    ) -> Result<WebSocket, WebSocketError> {
         let url = Url::parse(uri.as_ref())?;
         match url.scheme() {
             "ws" | "wss" => {}
             other => return Err(WebSocketError::UnsupportedScheme(other.to_string())),
         }
         let request: String = url.into();
-        let (ws_stream, _) = async_tungstenite::async_std::connect_async(request)
+        let mut config = TungsteniteConfig::default();
+        config.max_message_size = websocket_config.max_message_size;
+        let (ws_stream, _) = async_tungstenite::async_std::connect_async_with_config(
+            request,
+            Some(config),
+        )
             .await
             .map_err(|e| WebSocketError::ConnectionFailed(Box::new(e)))?;
 
@@ -287,7 +347,7 @@ mod wasm {
         BinaryType, CloseEvent, ErrorEvent, MessageEvent, WebSocket as BrowserWebSocket,
     };
 
-    use super::{WebSocketError, WebSocketMessage, serialize_payload};
+    use super::{WebSocketConfig, WebSocketError, WebSocketMessage, serialize_payload};
 
     type Result<T> = core::result::Result<T, WebSocketError>;
 
@@ -320,6 +380,18 @@ mod wasm {
     ///
     /// Returns an error if the browser reports an error or the connection fails.
     pub async fn connect(uri: impl AsRef<str>) -> Result<WebSocket> {
+        connect_with_config(uri, WebSocketConfig::default()).await
+    }
+
+    /// Establish a websocket connection from the browser environment using the provided config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the browser reports an error or the connection fails.
+    pub async fn connect_with_config(
+        uri: impl AsRef<str>,
+        _config: WebSocketConfig,
+    ) -> Result<WebSocket> {
         let socket = BrowserWebSocket::new(uri.as_ref())
             .map_err(|e| connection_failed(format_js_value(&e)))?;
         socket.set_binary_type(BinaryType::Arraybuffer);
@@ -501,7 +573,7 @@ mod wasm {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{WebSocket, connect};
+pub use native::{WebSocket, connect, connect_with_config};
 
 #[cfg(target_arch = "wasm32")]
-pub use wasm::{WebSocket, connect};
+pub use wasm::{WebSocket, connect, connect_with_config};

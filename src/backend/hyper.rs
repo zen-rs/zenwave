@@ -169,7 +169,15 @@ async fn connect(request: &http::Request<http_kit::Body>) -> Result<MaybeTlsStre
     stream.set_nodelay(true).map_err(HyperError::Io)?;
 
     if use_tls {
-        #[cfg(feature = "native-tls")]
+        // TLS selection logic:
+        // 1. When both native-tls and rustls are enabled (default-backend):
+        //    - On Apple platforms: use native-tls
+        //    - On other platforms: use rustls with system certificates
+        // 2. When only native-tls is enabled: use native-tls
+        // 3. When only rustls is enabled: use rustls with system certificates
+
+        // Case: Both TLS implementations available, Apple platform -> use native-tls
+        #[cfg(all(feature = "native-tls", feature = "rustls", target_vendor = "apple"))]
         {
             let connector = async_native_tls::TlsConnector::new();
             let tls = connector
@@ -179,31 +187,27 @@ async fn connect(request: &http::Request<http_kit::Body>) -> Result<MaybeTlsStre
             return Ok(MaybeTlsStream::Native(tls));
         }
 
-        #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+        // Case: Both TLS implementations available, non-Apple platform -> use rustls
+        #[cfg(all(feature = "native-tls", feature = "rustls", not(target_vendor = "apple")))]
         {
-            use std::sync::Arc;
+            return connect_rustls(host, stream).await;
+        }
 
-            use futures_rustls::{
-                TlsConnector,
-                client::TlsStream as RustlsStream,
-                rustls::{self, pki_types::ServerName},
-            };
-
-            let root_store =
-                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-            let config = rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
-            let connector = TlsConnector::from(Arc::new(config));
-            let server_name = ServerName::try_from(host.clone())
-                .map_err(|err| HyperError::Io(std::io::Error::other(err)))?;
-
-            let stream: RustlsStream<TcpStream> = connector
-                .connect(server_name, stream)
+        // Case: Only native-tls enabled
+        #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
+        {
+            let connector = async_native_tls::TlsConnector::new();
+            let tls = connector
+                .connect(host.as_str(), stream)
                 .await
                 .map_err(|err| HyperError::Io(std::io::Error::other(err)))?;
-            return Ok(MaybeTlsStream::Rustls(stream));
+            return Ok(MaybeTlsStream::Native(tls));
+        }
+
+        // Case: Only rustls enabled
+        #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+        {
+            return connect_rustls(host, stream).await;
         }
 
         #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
@@ -215,11 +219,53 @@ async fn connect(request: &http::Request<http_kit::Body>) -> Result<MaybeTlsStre
     Ok(MaybeTlsStream::Plain(stream))
 }
 
+/// Connect using rustls with system certificates.
+#[cfg(feature = "rustls")]
+#[allow(dead_code)] // Used on non-Apple platforms; unused on Apple when both TLS features enabled
+async fn connect_rustls(host: String, stream: TcpStream) -> Result<MaybeTlsStream, HyperError> {
+    use std::sync::Arc;
+
+    use futures_rustls::{
+        TlsConnector,
+        client::TlsStream as RustlsStream,
+        rustls::{self, pki_types::ServerName},
+    };
+
+    // Load system certificates
+    let mut root_store = rustls::RootCertStore::empty();
+
+    // Load system certificates (rustls-native-certs returns CertificateResult with certs and errors)
+    let cert_result = rustls_native_certs::load_native_certs();
+    for cert in cert_result.certs {
+        // Ignore invalid certificates, just skip them
+        let _ = root_store.add(cert);
+    }
+
+    // If no system certs were loaded, fall back to webpki roots
+    if root_store.is_empty() {
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name = ServerName::try_from(host.clone())
+        .map_err(|err| HyperError::Io(std::io::Error::other(err)))?;
+
+    let stream: RustlsStream<TcpStream> = connector
+        .connect(server_name, stream)
+        .await
+        .map_err(|err| HyperError::Io(std::io::Error::other(err)))?;
+    Ok(MaybeTlsStream::Rustls(stream))
+}
+
 enum MaybeTlsStream {
     Plain(TcpStream),
     #[cfg(feature = "native-tls")]
     Native(async_native_tls::TlsStream<TcpStream>),
-    #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+    #[cfg(feature = "rustls")]
+    #[allow(dead_code)] // Used on non-Apple platforms; unused on Apple when both TLS features enabled
     Rustls(futures_rustls::client::TlsStream<TcpStream>),
 }
 
@@ -238,7 +284,7 @@ impl hyper::rt::Read for MaybeTlsStream {
             MaybeTlsStream::Plain(stream) => Pin::new(stream).poll_read(cx, bytes),
             #[cfg(feature = "native-tls")]
             MaybeTlsStream::Native(stream) => Pin::new(stream).poll_read(cx, bytes),
-            #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+            #[cfg(feature = "rustls")]
             MaybeTlsStream::Rustls(stream) => Pin::new(stream).poll_read(cx, bytes),
         };
 
@@ -263,7 +309,7 @@ impl hyper::rt::Write for MaybeTlsStream {
             MaybeTlsStream::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(feature = "native-tls")]
             MaybeTlsStream::Native(stream) => Pin::new(stream).poll_write(cx, buf),
-            #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+            #[cfg(feature = "rustls")]
             MaybeTlsStream::Rustls(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
@@ -273,7 +319,7 @@ impl hyper::rt::Write for MaybeTlsStream {
             MaybeTlsStream::Plain(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(feature = "native-tls")]
             MaybeTlsStream::Native(stream) => Pin::new(stream).poll_flush(cx),
-            #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+            #[cfg(feature = "rustls")]
             MaybeTlsStream::Rustls(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
@@ -283,7 +329,7 @@ impl hyper::rt::Write for MaybeTlsStream {
             MaybeTlsStream::Plain(stream) => Pin::new(stream).poll_close(cx),
             #[cfg(feature = "native-tls")]
             MaybeTlsStream::Native(stream) => Pin::new(stream).poll_close(cx),
-            #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+            #[cfg(feature = "rustls")]
             MaybeTlsStream::Rustls(stream) => Pin::new(stream).poll_close(cx),
         }
     }
@@ -301,7 +347,7 @@ impl hyper::rt::Write for MaybeTlsStream {
             MaybeTlsStream::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
             #[cfg(feature = "native-tls")]
             MaybeTlsStream::Native(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
-            #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+            #[cfg(feature = "rustls")]
             MaybeTlsStream::Rustls(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
         }
     }

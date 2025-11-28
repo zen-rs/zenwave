@@ -25,13 +25,20 @@
 //! ## WASM (wasm32)
 //! On WebAssembly targets, Zenwave automatically uses the built-in web backend
 //! powered by the browser's Fetch API. No configuration is needed or available.
+//! **Note:** Explicitly selecting a backend on wasm32 will result in a compile error.
 //!
 //! ## Native Platforms
 //! On native platforms, Zenwave supports multiple HTTP client backends.
-//! By default, `hyper-backend` with `rustls` TLS is used.
 //!
+//! ### Default Backend (`default-backend` feature)
+//! The default configuration uses platform-specific TLS selection:
+//! - **Apple platforms (macOS/iOS):** hyper + native-tls (Security.framework)
+//! - **Other platforms:** hyper + rustls with system certificates
+//!
+//! ### Explicit Backend Selection
 //! Available backends (enable via Cargo features):
-//! - **`hyper-backend`** (default): Hyper with async-io. Supports `rustls` (default) or `native-tls`.
+//! - **`hyper-rustls`**: Hyper with rustls TLS (uses system certificates).
+//! - **`hyper-native-tls`**: Hyper with native TLS (OpenSSL, SChannel, or Security.framework).
 //! - **`curl-backend`**: libcurl-based backend with proxy support.
 //! - **`apple-backend`**: Apple's native NSURLSession (macOS/iOS only).
 //!
@@ -40,32 +47,43 @@
 //! # Use curl backend instead
 //! zenwave = { version = "*", default-features = false, features = ["curl-backend"] }
 //!
-//! # Use hyper with native-tls instead of rustls
-//! zenwave = { version = "*", default-features = false, features = ["hyper-backend", "native-tls"] }
+//! # Use hyper with native-tls explicitly
+//! zenwave = { version = "*", default-features = false, features = ["hyper-native-tls"] }
+//!
+//! # Use hyper with rustls explicitly
+//! zenwave = { version = "*", default-features = false, features = ["hyper-rustls"] }
 //! ```
 
 #![allow(clippy::multiple_crate_versions)]
 
-// Compile-time check: native-tls and rustls are mutually exclusive
-#[cfg(all(feature = "native-tls", feature = "rustls"))]
+// Compile-time check: native-tls and rustls are mutually exclusive,
+// UNLESS `default-backend` is enabled (which intentionally enables both for
+// platform-specific selection at compile time).
+#[cfg(all(
+    feature = "native-tls",
+    feature = "rustls",
+    not(feature = "default-backend")
+))]
 compile_error!(
     "Features `native-tls` and `rustls` are mutually exclusive. \
-     Please enable only one TLS backend."
+     Please enable only one TLS backend, or use `default-backend` for automatic platform selection."
 );
 
 // TLS features are only applicable to hyper-backend on native platforms.
-// Other backends (apple-backend, curl-backend, wasm32) have their own TLS implementations.
+// Other backends (apple-backend, curl-backend) have their own TLS implementations.
+// Note: wasm32 check is omitted here because TLS deps aren't even available on wasm32.
 #[cfg(all(
+    not(target_arch = "wasm32"),
     any(feature = "native-tls", feature = "rustls"),
+    not(feature = "hyper-backend"),
     any(
         all(target_vendor = "apple", feature = "apple-backend"),
-        feature = "curl-backend",
-        target_arch = "wasm32"
+        feature = "curl-backend"
     )
 ))]
 compile_error!(
     "The `native-tls` and `rustls` features only apply to `hyper-backend`. \
-     Your current backend (apple-backend, curl-backend, or wasm) has its own TLS implementation. \
+     Your current backend (apple-backend or curl-backend) has its own TLS implementation. \
      Please disable these TLS features."
 );
 

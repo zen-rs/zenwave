@@ -32,16 +32,31 @@ tempfile = "3.13"
 async-std = { version = "1.13", features = ["attributes"] }
 
 [features]
-# Default: hyper backend with rustls TLS on native platforms.
-# On wasm32, the built-in web backend is always used automatically.
+# Default: platform-dependent backend selection.
+# - On Apple platforms (macOS/iOS): hyper + native-tls
+# - On other native platforms: hyper + rustls with system certificates
+# - On wasm32: built-in web backend using Fetch API (automatic, no configuration needed)
 default = ["default-backend"]
 
-# Use the default backend configuration (hyper + rustls on native platforms).
-# This is a convenience feature that enables the recommended setup.
-default-backend = ["hyper-backend", "rustls"]
+# Default backend configuration with platform-dependent TLS selection.
+# On native platforms, both TLS implementations are included; the appropriate one
+# is selected at compile time based on the target platform.
+default-backend = ["hyper-backend", "native-tls", "rustls"]
 
-# TLS features - only one can be enabled at a time (native platforms only).
-# These features are mutually exclusive and only apply to hyper-backend.
+# Explicit backend selections (native platforms only).
+# On wasm32, using any of these will result in a compile error - the web backend
+# is always used automatically.
+#
+# hyper + native-tls: Uses the platform's native TLS (OpenSSL, SChannel, or Security.framework)
+hyper-native-tls = ["hyper-backend", "native-tls"]
+# hyper + rustls: Uses rustls with system certificates
+hyper-rustls = ["hyper-backend", "rustls"]
+# Apple's NSURLSession (macOS/iOS only)
+apple-backend = []
+# libcurl backend with proxy support
+curl-backend = ["dep:curl", "dep:blocking", "proxy"]
+
+# TLS implementations (internal features, prefer using hyper-native-tls or hyper-rustls)
 native-tls = ["dep:async-native-tls", "dep:native-tls"]
 rustls = [
     "dep:futures-rustls",
@@ -50,17 +65,14 @@ rustls = [
     "dep:rustls-native-certs",
 ]
 
-# Proxy support for hyper-backend and curl-backend (native platforms only).
-proxy = []
-
-# Backend selection (native platforms only, wasm32 always uses built-in web backend).
-# Users can choose one of these backends:
+# Core hyper backend (internal)
 hyper-backend = [
     "dep:hyper",
     "dep:http-body-util",
 ]
-apple-backend = []
-curl-backend = ["dep:curl", "dep:blocking", "proxy"]
+
+# Proxy support for hyper-backend and curl-backend (native platforms only).
+proxy = []
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-sys = { version = "0.3", features = [

@@ -100,3 +100,38 @@ compile_error!(
      Please enable one of: `hyper-backend` (recommended), `curl-backend`, or `apple-backend` (Apple platforms only). \
      The default feature set includes `hyper-backend` with `rustls` TLS."
 );
+
+// ============================================================================
+// Compile-time validation for wasm32: backend selection is NOT allowed
+// ============================================================================
+
+// Users cannot explicitly select backends on wasm32 - the web backend is always used.
+// These compile errors help catch misconfigurations early.
+
+#[cfg(all(target_arch = "wasm32", feature = "hyper-native-tls"))]
+compile_error!(
+    "Backend selection is not allowed on wasm32 targets. \
+     The web backend using the browser's Fetch API is always used automatically. \
+     Please remove the `hyper-native-tls` feature when targeting wasm32."
+);
+
+#[cfg(all(target_arch = "wasm32", feature = "hyper-rustls"))]
+compile_error!(
+    "Backend selection is not allowed on wasm32 targets. \
+     The web backend using the browser's Fetch API is always used automatically. \
+     Please remove the `hyper-rustls` feature when targeting wasm32."
+);
+
+#[cfg(all(target_arch = "wasm32", feature = "apple-backend"))]
+compile_error!(
+    "Backend selection is not allowed on wasm32 targets. \
+     The web backend using the browser's Fetch API is always used automatically. \
+     Please remove the `apple-backend` feature when targeting wasm32."
+);
+
+#[cfg(all(target_arch = "wasm32", feature = "curl-backend"))]
+compile_error!(
+    "Backend selection is not allowed on wasm32 targets. \
+     The web backend using the browser's Fetch API is always used automatically. \
+     Please remove the `curl-backend` feature when targeting wasm32."
+);
