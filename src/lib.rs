@@ -88,7 +88,6 @@ compile_error!(
 );
 
 pub mod backend;
-pub use backend::ClientBackend;
 use backend::DefaultBackend;
 pub use cache::Cache;
 pub use client::Client;

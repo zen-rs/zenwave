@@ -13,7 +13,7 @@ use http_kit::{Body, Endpoint, HttpError, Request, Response, StatusCode};
 use thiserror::Error;
 
 use crate::proxy::Intercept;
-use crate::{ClientBackend, Proxy};
+use crate::{Client, Proxy};
 
 /// HTTP backend implemented with libcurl.
 #[derive(Debug, Clone, Default)]
@@ -75,7 +75,7 @@ impl CurlBackend {
     }
 }
 
-impl ClientBackend for CurlBackend {}
+impl Client for CurlBackend {}
 
 impl Endpoint for CurlBackend {
     type Error = CurlError;

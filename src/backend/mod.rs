@@ -35,9 +35,6 @@ mod apple;
 #[cfg(all(target_vendor = "apple", feature = "apple-backend"))]
 pub use apple::AppleBackend;
 
-/// Trait for HTTP client backends.
-pub trait ClientBackend: http_kit::Endpoint + Default + 'static {}
-
 // ============================================================================
 // Default backend selection for native platforms (non-wasm32)
 // ============================================================================

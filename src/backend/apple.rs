@@ -11,7 +11,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-use crate::ClientBackend;
+use crate::Client;
 use anyhow::{Error, anyhow};
 use block::{Block, ConcreteBlock};
 use futures_channel::oneshot;
@@ -156,7 +156,7 @@ impl core::fmt::Debug for AppleBackend {
     }
 }
 
-impl ClientBackend for AppleBackend {}
+impl Client for AppleBackend {}
 
 #[derive(Debug)]
 struct SessionResponse {

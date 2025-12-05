@@ -2,7 +2,7 @@
 
 use http_kit::{Endpoint, Method};
 #[cfg(feature = "hyper-backend")]
-use zenwave::backend::{ClientBackend, HyperBackend};
+use zenwave::backend::HyperBackend;
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
@@ -81,15 +81,6 @@ async fn test_hyper_backend_invalid_uri() {
         .unwrap();
     let response = backend.respond(&mut request).await;
     assert!(response.is_err());
-}
-
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
-#[cfg(feature = "hyper-backend")]
-async fn test_hyper_backend_client_backend_trait() {
-    fn assert_client_backend<T: ClientBackend>(_: &T) {}
-    let backend = HyperBackend::new();
-    assert_client_backend(&backend);
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]

@@ -1,6 +1,7 @@
 #![allow(clippy::cast_sign_loss)]
 
 use core::{pin::Pin, time::Duration};
+use std::marker::PhantomData;
 use std::{fmt::Debug, future::Future};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -22,7 +23,6 @@ mod download;
 pub use download::{DownloadError, DownloadOptions, DownloadReport};
 
 use crate::{
-    ClientBackend,
     auth::{BasicAuth, BearerAuth},
     cache::Cache,
     cookie::CookieStore,
@@ -33,8 +33,9 @@ use crate::{
 /// Builder for HTTP requests using a Client.
 #[derive(Debug)]
 pub struct RequestBuilder<'a, T: Client> {
-    client: &'a mut T,
+    client: T,
     request: Request,
+    _marker: PhantomData<&'a mut T>,
 }
 
 impl<'a, T: Client> IntoFuture for RequestBuilder<'a, T> {
@@ -42,7 +43,7 @@ impl<'a, T: Client> IntoFuture for RequestBuilder<'a, T> {
 
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
 
-    fn into_future(self) -> Self::IntoFuture {
+    fn into_future(mut self) -> Self::IntoFuture {
         Box::pin(async move {
             let mut request = self.request;
             self.client.respond(&mut request).await
@@ -247,7 +248,6 @@ impl<T: Client> RequestBuilder<'_, T> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use crate::backend::ClientBackend;
     use async_fs as fs;
     use async_lock::Mutex;
     use futures_util::stream;
@@ -424,7 +424,7 @@ mod tests {
         }
     }
 
-    impl ClientBackend for FakeBackend {}
+    impl Client for FakeBackend {}
 
     #[derive(Clone, Default)]
     struct RecordingBackend {
@@ -451,7 +451,7 @@ mod tests {
         }
     }
 
-    impl ClientBackend for RecordingBackend {}
+    impl Client for RecordingBackend {}
 
     fn parse_range(request: &Request) -> usize {
         request
@@ -513,7 +513,7 @@ pub trait Client: Endpoint + Sized {
     }
 
     /// Create a request with the specified method and URI.
-    fn method<U>(&mut self, method: Method, uri: U) -> RequestBuilder<'_, Self>
+    fn method<U>(&mut self, method: Method, uri: U) -> RequestBuilder<'_, &mut Self>
     where
         U: TryInto<Uri>,
         U::Error: Debug,
@@ -528,11 +528,12 @@ pub trait Client: Endpoint + Sized {
         RequestBuilder {
             client: self,
             request,
+            _marker: PhantomData,
         }
     }
 
     /// Create a GET request.
-    fn get<U>(&mut self, uri: U) -> RequestBuilder<'_, Self>
+    fn get<U>(&mut self, uri: U) -> RequestBuilder<'_, &mut Self>
     where
         U: TryInto<Uri>,
         U::Error: Debug,
@@ -541,7 +542,7 @@ pub trait Client: Endpoint + Sized {
     }
 
     /// Create a POST request.
-    fn post<U>(&mut self, uri: U) -> RequestBuilder<'_, Self>
+    fn post<U>(&mut self, uri: U) -> RequestBuilder<'_, &mut Self>
     where
         U: TryInto<Uri>,
         U::Error: Debug,
@@ -550,16 +551,17 @@ pub trait Client: Endpoint + Sized {
     }
 
     /// Create a PUT request.
-    fn put<U>(&mut self, uri: U) -> RequestBuilder<'_, Self>
+    fn put<'a, U>(&mut self, uri: U) -> RequestBuilder<'_, &mut Self>
     where
         U: TryInto<Uri>,
         U::Error: Debug,
+        Self: 'a,
     {
         self.method(Method::PUT, uri)
     }
 
     /// Create a DELETE request.
-    fn delete<U>(&mut self, uri: U) -> RequestBuilder<'_, Self>
+    fn delete<U>(&mut self, uri: U) -> RequestBuilder<'_, &mut Self>
     where
         U: TryInto<Uri>,
         U::Error: Debug,
@@ -570,4 +572,4 @@ pub trait Client: Endpoint + Sized {
 
 impl<C: Client, M: Middleware> Client for WithMiddleware<C, M> {}
 
-impl<T: ClientBackend> Client for T {}
+impl<T: Client> Client for &mut T {}

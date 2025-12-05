@@ -15,7 +15,7 @@ use std::{
     thread,
 };
 
-use crate::ClientBackend;
+use crate::Client;
 
 /// Hyper-based HTTP client backend powered by `async-io`/`async-net`.
 #[derive(Debug, Default)]
@@ -156,7 +156,7 @@ impl Endpoint for HyperBackend {
     }
 }
 
-impl ClientBackend for HyperBackend {}
+impl Client for HyperBackend {}
 
 async fn connect(request: &http::Request<http_kit::Body>) -> Result<MaybeTlsStream, HyperError> {
     let uri = request.uri();
@@ -197,7 +197,11 @@ async fn connect(request: &http::Request<http_kit::Body>) -> Result<MaybeTlsStre
         }
 
         // Case: Both TLS implementations available, non-Apple platform -> use rustls
-        #[cfg(all(feature = "native-tls", feature = "rustls", not(target_vendor = "apple")))]
+        #[cfg(all(
+            feature = "native-tls",
+            feature = "rustls",
+            not(target_vendor = "apple")
+        ))]
         {
             return connect_rustls(host, stream).await;
         }
@@ -274,7 +278,8 @@ enum MaybeTlsStream {
     #[cfg(feature = "native-tls")]
     Native(async_native_tls::TlsStream<TcpStream>),
     #[cfg(feature = "rustls")]
-    #[allow(dead_code)] // Used on non-Apple platforms; unused on Apple when both TLS features enabled
+    #[allow(dead_code)]
+    // Used on non-Apple platforms; unused on Apple when both TLS features enabled
     Rustls(Box<futures_rustls::client::TlsStream<TcpStream>>),
 }
 
