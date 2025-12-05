@@ -67,11 +67,23 @@ impl Default for WebSocketConfig {
 impl WebSocketConfig {
     /// Override the maximum incoming websocket message size in bytes.
     ///
-    /// `Some(n)` enforces a custom limit, `None` disables the cap, and omitting
-    /// this retains the underlying client's default limit.
+    /// `None` means no limit.
+    ///
+    /// Defaults to 64 MiB.
     #[must_use]
     pub const fn with_max_message_size(mut self, max_message_size: Option<usize>) -> Self {
         self.max_message_size = max_message_size;
+        self
+    }
+
+    /// Override the maximum incoming websocket frame size in bytes.
+    ///
+    /// `None` means no limit.
+    ///
+    /// Defaults to 16 MiB.
+    #[must_use]
+    pub const fn with_max_frame_size(mut self, max_frame_size: Option<usize>) -> Self {
+        self.max_frame_size = max_frame_size;
         self
     }
 }
