@@ -41,18 +41,25 @@ impl HttpError for WebSocketError {
 
 /// Configuration applied when establishing a websocket connection.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct WebSocketConfig {
     /// Maximum incoming websocket message size in bytes.
-    ///
-    /// Defaults to the underlying websocket client's default limit. Set to
-    /// `Some(n)` to enforce a custom cap or `None` to disable the limit.
+    /// `None` means no limit.
     pub max_message_size: Option<usize>,
+
+    /// Maximum incoming websocket frame size in bytes.
+    /// `None` means no limit.
+    pub max_frame_size: Option<usize>,
 }
+
+const DEFAULT_MAX_MESSAGE_SIZE: Option<usize> = Some(64 << 20);
+const DEFAULT_MAX_FRAME_SIZE: Option<usize> = Some(16 << 20);
 
 impl Default for WebSocketConfig {
     fn default() -> Self {
         Self {
-            max_message_size: default_max_message_size(),
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
         }
     }
 }
@@ -67,16 +74,6 @@ impl WebSocketConfig {
         self.max_message_size = max_message_size;
         self
     }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn default_max_message_size() -> Option<usize> {
-    async_tungstenite::tungstenite::protocol::WebSocketConfig::default().max_message_size
-}
-
-#[cfg(target_arch = "wasm32")]
-fn default_max_message_size() -> Option<usize> {
-    None
 }
 
 impl WebSocketMessage {
@@ -191,7 +188,9 @@ impl From<WebSocketMessage> for async_tungstenite::tungstenite::Message {
 mod native {
     use async_tungstenite::{
         WebSocketStream,
-        tungstenite::{Message as TungsteniteMessage, protocol::WebSocketConfig as TungsteniteConfig},
+        tungstenite::{
+            Message as TungsteniteMessage, protocol::WebSocketConfig as TungsteniteConfig,
+        },
     };
     use futures_util::StreamExt;
     use http_kit::utils::{ByteStr, Bytes};
@@ -238,12 +237,11 @@ mod native {
         let request: String = url.into();
         let mut config = TungsteniteConfig::default();
         config.max_message_size = websocket_config.max_message_size;
-        let (ws_stream, _) = async_tungstenite::async_std::connect_async_with_config(
-            request,
-            Some(config),
-        )
-            .await
-            .map_err(|e| WebSocketError::ConnectionFailed(Box::new(e)))?;
+        config.max_frame_size = websocket_config.max_frame_size;
+        let (ws_stream, _) =
+            async_tungstenite::async_std::connect_async_with_config(request, Some(config))
+                .await
+                .map_err(|e| WebSocketError::ConnectionFailed(Box::new(e)))?;
 
         Ok(WebSocket { inner: ws_stream })
     }
