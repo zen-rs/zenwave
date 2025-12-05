@@ -16,7 +16,7 @@
 //! - **`hyper-backend`** (default): Uses hyper with async-io/async-net. Supports
 //!   both `rustls` (default) and `native-tls` for TLS.
 //! - **`curl-backend`**: Uses libcurl via the `curl` crate. Includes proxy support.
-//! - **`apple-backend`**: Uses Apple's native NSURLSession (macOS/iOS only).
+//! - **`apple-backend`**: Uses Apple's native `NSURLSession` (macOS/iOS only).
 //!
 //! The default configuration uses `hyper-backend` with `rustls` TLS.
 
@@ -42,7 +42,7 @@ pub trait ClientBackend: http_kit::Endpoint + Default + 'static {}
 // Default backend selection for native platforms (non-wasm32)
 // ============================================================================
 
-/// The default HTTP client backend: Apple's NSURLSession.
+/// The default HTTP client backend: Apple's `NSURLSession`.
 /// This is selected when `apple-backend` feature is enabled on Apple platforms.
 #[cfg(all(
     not(target_arch = "wasm32"),

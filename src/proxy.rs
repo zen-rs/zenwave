@@ -116,9 +116,9 @@ impl ProxyBuilder {
     #[must_use]
     pub fn build(self) -> Proxy {
         let matcher = Matcher {
-            http: self.http.and_then(ProxyConfig::parse),
-            https: self.https.and_then(ProxyConfig::parse),
-            all: self.all.and_then(ProxyConfig::parse),
+            http: self.http.as_deref().and_then(ProxyConfig::parse),
+            https: self.https.as_deref().and_then(ProxyConfig::parse),
+            all: self.all.as_deref().and_then(ProxyConfig::parse),
             no_proxy: self.no_proxy,
         };
         Proxy::new(matcher)
@@ -133,8 +133,8 @@ struct ProxyConfig {
 }
 
 impl ProxyConfig {
-    fn parse(value: String) -> Option<Self> {
-        let parsed = Uri::from_str(&value).ok()?;
+    fn parse(value: &str) -> Option<Self> {
+        let parsed = Uri::from_str(value).ok()?;
         let auth = parsed.authority()?;
         let (userinfo, _) = auth
             .as_str()
@@ -168,11 +168,11 @@ pub(crate) struct Intercept {
 }
 
 impl Intercept {
-    pub(crate) fn uri(&self) -> &Uri {
+    pub(crate) const fn uri(&self) -> &Uri {
         &self.uri
     }
 
-    pub(crate) fn basic_auth(&self) -> Option<&HeaderValue> {
+    pub(crate) const fn basic_auth(&self) -> Option<&HeaderValue> {
         self.basic_auth.as_ref()
     }
 
@@ -207,9 +207,9 @@ impl Matcher {
             .unwrap_or_default();
 
         Self {
-            http: http.and_then(ProxyConfig::parse),
-            https: https.and_then(ProxyConfig::parse),
-            all: all.and_then(ProxyConfig::parse),
+            http: http.as_deref().and_then(ProxyConfig::parse),
+            https: https.as_deref().and_then(ProxyConfig::parse),
+            all: all.as_deref().and_then(ProxyConfig::parse),
             no_proxy,
         }
     }

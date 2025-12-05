@@ -26,7 +26,7 @@ pub struct HyperBackend {
 impl HyperBackend {
     /// Create a new `HyperBackend`.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { executor: None }
     }
 
@@ -65,15 +65,15 @@ pub enum HyperError {
 impl core::fmt::Display for HyperError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Connection(err) => write!(f, "connection error: {}", err),
-            Self::Io(err) => write!(f, "io error: {}", err),
+            Self::Connection(err) => write!(f, "connection error: {err}"),
+            Self::Io(err) => write!(f, "io error: {err}"),
             Self::TlsNotAvailable => write!(f, "TLS requested but no TLS feature enabled"),
             Self::InvalidUri(uri) => write!(f, "invalid uri: {uri}"),
             Self::Remote { status, body, .. } => {
                 if let Some(body) = body {
-                    write!(f, "remote error: {} - {}", status, body)
+                    write!(f, "remote error: {status} - {body}")
                 } else {
-                    write!(f, "remote error: {}", status)
+                    write!(f, "remote error: {status}")
                 }
             }
         }
@@ -99,7 +99,16 @@ impl Endpoint for HyperBackend {
             .uri("/")
             .body(http_kit::Body::empty())
             .unwrap();
-        let request: http::Request<http_kit::Body> = replace(request, dummy_request);
+        let mut request: http::Request<http_kit::Body> = replace(request, dummy_request);
+
+        // Ensure Host header is present (required by hyper 1.0 / HTTP 1.1)
+        if request.headers().get(http::header::HOST).is_none() {
+            if let Some(authority) = request.uri().authority() {
+                if let Ok(value) = http::header::HeaderValue::from_str(authority.as_str()) {
+                    request.headers_mut().insert(http::header::HOST, value);
+                }
+            }
+        }
 
         let stream = connect(&request).await?;
         let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
@@ -135,7 +144,7 @@ impl Endpoint for HyperBackend {
                 .as_str()
                 .await
                 .ok()
-                .map(|s| s.to_owned());
+                .map(std::borrow::ToOwned::to_owned);
             return Err(HyperError::Remote {
                 status: response.status(),
                 body: error_msg,
@@ -257,7 +266,7 @@ async fn connect_rustls(host: String, stream: TcpStream) -> Result<MaybeTlsStrea
         .connect(server_name, stream)
         .await
         .map_err(|err| HyperError::Io(std::io::Error::other(err)))?;
-    Ok(MaybeTlsStream::Rustls(stream))
+    Ok(MaybeTlsStream::Rustls(Box::new(stream)))
 }
 
 enum MaybeTlsStream {
@@ -266,7 +275,7 @@ enum MaybeTlsStream {
     Native(async_native_tls::TlsStream<TcpStream>),
     #[cfg(feature = "rustls")]
     #[allow(dead_code)] // Used on non-Apple platforms; unused on Apple when both TLS features enabled
-    Rustls(futures_rustls::client::TlsStream<TcpStream>),
+    Rustls(Box<futures_rustls::client::TlsStream<TcpStream>>),
 }
 
 impl Unpin for MaybeTlsStream {}
@@ -278,14 +287,14 @@ impl hyper::rt::Read for MaybeTlsStream {
         mut buf: hyper::rt::ReadBufCursor<'_>,
     ) -> Poll<std::io::Result<()>> {
         let slice = unsafe { buf.as_mut() };
-        let bytes = unsafe { &mut *(slice as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]) };
+        let bytes = unsafe { &mut *(std::ptr::from_mut(slice) as *mut [u8]) };
 
         let result = match &mut *self {
-            MaybeTlsStream::Plain(stream) => Pin::new(stream).poll_read(cx, bytes),
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, bytes),
             #[cfg(feature = "native-tls")]
-            MaybeTlsStream::Native(stream) => Pin::new(stream).poll_read(cx, bytes),
+            Self::Native(stream) => Pin::new(stream).poll_read(cx, bytes),
             #[cfg(feature = "rustls")]
-            MaybeTlsStream::Rustls(stream) => Pin::new(stream).poll_read(cx, bytes),
+            Self::Rustls(stream) => Pin::new(stream).poll_read(cx, bytes),
         };
 
         match result {
@@ -306,31 +315,31 @@ impl hyper::rt::Write for MaybeTlsStream {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         match &mut *self {
-            MaybeTlsStream::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(feature = "native-tls")]
-            MaybeTlsStream::Native(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Native(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(feature = "rustls")]
-            MaybeTlsStream::Rustls(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Rustls(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match &mut *self {
-            MaybeTlsStream::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(feature = "native-tls")]
-            MaybeTlsStream::Native(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Native(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(feature = "rustls")]
-            MaybeTlsStream::Rustls(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Rustls(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match &mut *self {
-            MaybeTlsStream::Plain(stream) => Pin::new(stream).poll_close(cx),
+            Self::Plain(stream) => Pin::new(stream).poll_close(cx),
             #[cfg(feature = "native-tls")]
-            MaybeTlsStream::Native(stream) => Pin::new(stream).poll_close(cx),
+            Self::Native(stream) => Pin::new(stream).poll_close(cx),
             #[cfg(feature = "rustls")]
-            MaybeTlsStream::Rustls(stream) => Pin::new(stream).poll_close(cx),
+            Self::Rustls(stream) => Pin::new(stream).poll_close(cx),
         }
     }
 
@@ -344,11 +353,11 @@ impl hyper::rt::Write for MaybeTlsStream {
         bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<std::io::Result<usize>> {
         match &mut *self {
-            MaybeTlsStream::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Self::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
             #[cfg(feature = "native-tls")]
-            MaybeTlsStream::Native(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Self::Native(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
             #[cfg(feature = "rustls")]
-            MaybeTlsStream::Rustls(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Self::Rustls(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
         }
     }
 }

@@ -31,7 +31,7 @@ pub enum CurlError {
     Remote {
         status: StatusCode,
         body: Option<String>,
-        raw_response: Response,
+        raw_response: Box<Response>,
     },
 }
 
@@ -182,7 +182,7 @@ fn perform(request: PreparedRequest) -> Result<Response, CurlError> {
         return Err(CurlError::Remote {
             status,
             body: error_body,
-            raw_response: http_response,
+            raw_response: Box::new(http_response),
         });
     }
 

@@ -50,7 +50,7 @@ pub enum AppleError {
     Remote {
         status: StatusCode,
         body: Option<String>,
-        raw_response: Response,
+        raw_response: Box<Response>,
     },
 }
 
@@ -225,11 +225,11 @@ async fn send_with_url_session(
             .as_str()
             .await
             .ok()
-            .map(|text| text.to_owned());
+            .map(std::borrow::ToOwned::to_owned);
         return Err(AppleError::Remote {
             status,
             body,
-            raw_response: http_response,
+            raw_response: Box::new(http_response),
         });
     }
 

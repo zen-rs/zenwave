@@ -38,9 +38,9 @@
 //! ### Explicit Backend Selection
 //! Available backends (enable via Cargo features):
 //! - **`hyper-rustls`**: Hyper with rustls TLS (uses system certificates).
-//! - **`hyper-native-tls`**: Hyper with native TLS (OpenSSL, SChannel, or Security.framework).
+//! - **`hyper-native-tls`**: Hyper with native TLS (OpenSSL, `SChannel`, or Security.framework).
 //! - **`curl-backend`**: libcurl-based backend with proxy support.
-//! - **`apple-backend`**: Apple's native NSURLSession (macOS/iOS only).
+//! - **`apple-backend`**: Apple's native `NSURLSession` (macOS/iOS only).
 //!
 //! To use a different backend, disable default features and enable your choice:
 //! ```toml

@@ -3,6 +3,8 @@
 use core::{pin::Pin, time::Duration};
 use std::{fmt::Debug, future::Future};
 
+#[cfg(not(target_arch = "wasm32"))]
+use futures_io::AsyncRead;
 use futures_util::{Stream, StreamExt};
 use http::{HeaderName, HeaderValue, header};
 use http_kit::StatusCode;
@@ -13,8 +15,6 @@ use http_kit::{
     utils::{ByteStr, Bytes},
 };
 use serde::de::DeserializeOwned;
-#[cfg(not(target_arch = "wasm32"))]
-use futures_io::AsyncRead;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod download;
@@ -172,8 +172,8 @@ impl<T: Client> RequestBuilder<'_, T> {
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
+        use futures_util::io::AsyncReadExt;
         use http_kit::header;
-        use http_kit::utils::io::BufReader;
 
         if let Some(len) = length
             && let Ok(value) = header::HeaderValue::from_str(&len.to_string())
@@ -183,9 +183,19 @@ impl<T: Client> RequestBuilder<'_, T> {
                 .insert(header::CONTENT_LENGTH, value);
         }
 
-        let length_hint = length.and_then(|len| usize::try_from(len).ok());
-        let reader = BufReader::new(reader);
-        *self.request.body_mut() = http_kit::Body::from_reader(reader, length_hint);
+        let stream = futures_util::stream::unfold(reader, |mut reader| async move {
+            let mut buf = vec![0u8; 8192];
+            match reader.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(n) => {
+                    buf.truncate(n);
+                    Some((Ok::<_, std::io::Error>(Bytes::from(buf)), reader))
+                }
+                Err(e) => Some((Err(e), reader)),
+            }
+        });
+
+        *self.request.body_mut() = http_kit::Body::from_stream(stream);
         self
     }
 
@@ -238,12 +248,12 @@ impl<T: Client> RequestBuilder<'_, T> {
 mod tests {
     use super::*;
     use crate::backend::ClientBackend;
+    use async_fs as fs;
+    use async_lock::Mutex;
     use futures_util::stream;
     use http::Response;
     use std::{convert::Infallible, sync::Arc};
     use tempfile::tempdir;
-    use async_fs as fs;
-    use async_lock::Mutex;
 
     #[test]
     fn download_to_path_resumes_existing_file() {

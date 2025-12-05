@@ -137,6 +137,7 @@ required-features = ["hyper-backend"]
 [lints]
 rust.missing_docs = "warn"
 rust.missing_debug_implementations = "warn"
+rust.unexpected_cfgs = "allow"
 clippy.all = "warn"
 clippy.style = "warn"
 clippy.correctness = "warn"

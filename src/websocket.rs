@@ -63,7 +63,7 @@ impl WebSocketConfig {
     /// `Some(n)` enforces a custom limit, `None` disables the cap, and omitting
     /// this retains the underlying client's default limit.
     #[must_use]
-    pub fn with_max_message_size(mut self, max_message_size: Option<usize>) -> Self {
+    pub const fn with_max_message_size(mut self, max_message_size: Option<usize>) -> Self {
         self.max_message_size = max_message_size;
         self
     }
