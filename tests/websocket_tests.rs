@@ -1,6 +1,5 @@
 #![cfg(not(target_arch = "wasm32"))]
 #![allow(missing_docs)]
-
 use std::{
     env,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -18,10 +17,10 @@ fn public_echo_servers() -> Vec<String> {
     }
 
     vec![
-        "wss://echo.websocket.events".to_string(),
         "wss://ws.ifelse.io".to_string(),
         // Public demo channel; messages are echoed back to sender.
         "wss://echo.piesocket.com/v3/channel_1?api_key=demo&notify_self=1".to_string(),
+        "wss://echo.websocket.events".to_string(),
     ]
 }
 
