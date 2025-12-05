@@ -20,7 +20,6 @@ fn public_echo_servers() -> Vec<String> {
         "wss://ws.ifelse.io".to_string(),
         // Public demo channel; messages are echoed back to sender.
         "wss://echo.piesocket.com/v3/channel_1?api_key=demo&notify_self=1".to_string(),
-        "wss://echo.websocket.events".to_string(),
     ]
 }
 
