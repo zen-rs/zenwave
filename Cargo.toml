@@ -10,14 +10,14 @@ keywords = ["http", "client", "async", "networking", "middleware"]
 categories = ["network-programming", "web-programming::http-client"]
 
 [dependencies]
-http-kit = { git = "https://github.com/zen-rs/http-kit"}
+http-kit = "0.3"
 serde = { version = "1.0", default-features = false, features = ["derive"]}
 serde_json = "1.0"
 base64 = "0.22"
 url = "2.5"
 futures-util = "0.3"
 futures-channel = "0.3"
-thiserror = "1.0"
+thiserror = "2.0"
 futures-io = "0.3"
 async-lock = "3.4"
 anyhow = "1.0.100"
@@ -109,10 +109,10 @@ futures-rustls = { version = "0.26", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = { version = "0.8", optional = true }
 native-tls = { version = "0.2", optional = true }
-webpki-roots = { version = "0.26", optional = true }
+webpki-roots = { version = "1.0", optional = true }
 async-tungstenite = { version = "0.32.0", default-features = false, features = ["async-std-runtime", "async-tls"] }
 async-fs = { version = "2.2.0", default-features = false }
-dirs = "5.0"
+dirs = "6.0"
 once_cell = "1.19"
 time = "0.3"
 tower-service = "0.3"

@@ -1,5 +1,9 @@
 name: CI
 
+permissions:
+  contents: read
+  id-token: write
+
 on:
   push:
     branches: ["**"]
@@ -56,23 +60,32 @@ jobs:
       - run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v4
         with:
-          files: lcov.info
+          use_oidc: true
           fail_ci_if_error: true
+
   typos:
     name: Typos
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-ubuntu
       - uses: crate-ci/typos@master
 
   audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      name: Security Audit
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+        - uses: Swatinem/rust-cache@v2
+          with:
+            shared-key: ci-ubuntu
+        - name: Generate Lockfile
+          run: cargo generate-lockfile
+        - uses: rustsec/audit-check@v2
+          with:
+            token: ${{ secrets.GITHUB_TOKEN }}
 
   unused-deps:
     name: Unused Dependencies
