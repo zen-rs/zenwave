@@ -89,6 +89,82 @@ async fn websocket_respects_max_message_size_config() {
 }
 
 #[async_std::test]
+async fn websocket_binary_roundtrip() {
+    let listener = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("skipping websocket_binary_roundtrip: {err}");
+            return;
+        }
+    };
+    let addr = listener.local_addr().unwrap();
+
+    let server = async_std::task::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        if let Some(Ok(message)) = ws.next().await {
+            match message {
+                Message::Binary(payload) => {
+                    assert_eq!(payload, vec![1, 2, 3, 4]);
+                    ws.send(Message::Binary(payload)).await.unwrap();
+                }
+                other => panic!("expected binary frame, got {other:?}"),
+            }
+        }
+    });
+
+    let mut client = zenwave::websocket::connect(format!("ws://{addr}"))
+        .await
+        .unwrap();
+    client.send_binary(vec![1_u8, 2, 3, 4]).await.unwrap();
+
+    let response = client.recv().await.unwrap();
+    let bytes = response.unwrap();
+    assert_eq!(bytes.as_bytes(), Some(&[1_u8, 2, 3, 4][..]));
+
+    client.close().await.unwrap();
+    server.await;
+}
+
+#[async_std::test]
+async fn websocket_handles_server_ping() {
+    let listener = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("skipping websocket_handles_server_ping: {err}");
+            return;
+        }
+    };
+    let addr = listener.local_addr().unwrap();
+
+    let server = async_std::task::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        ws.send(Message::Ping(b"are you there?".to_vec().into()))
+            .await
+            .unwrap();
+        ws.send(Message::Text("pong-after-ping".into()))
+            .await
+            .unwrap();
+        let _ = ws.close(None).await;
+    });
+
+    let mut client = zenwave::websocket::connect(format!("ws://{addr}"))
+        .await
+        .unwrap();
+
+    let message = timeout(Duration::from_secs(5), async { client.recv().await })
+        .await
+        .expect("timeout waiting for server message")
+        .expect("websocket read failed")
+        .expect("websocket closed before payload");
+    assert_eq!(message.as_text(), Some("pong-after-ping"));
+
+    client.close().await.unwrap();
+    server.await;
+}
+
+#[async_std::test]
 async fn websocket_public_echo_service_roundtrip() {
     let payload = format!(
         "zenwave-public-echo-{}",
