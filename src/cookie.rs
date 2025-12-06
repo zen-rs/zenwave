@@ -59,6 +59,22 @@ impl HttpError for CookieError {
     }
 }
 
+// Convert CookieError to unified zenwave::Error
+impl From<CookieError> for crate::Error {
+    fn from(err: CookieError) -> Self {
+        use crate::error::CookieErrorKind;
+
+        let kind = match err {
+            CookieError::FailToLoadCookiesFromDisk(e) => CookieErrorKind::LoadFailed(e),
+            CookieError::FailToParseCookiesFromDisk(e) => CookieErrorKind::ParseFailed(e),
+            CookieError::FailToPersistCookiesToDisk(e) => CookieErrorKind::PersistFailed(e),
+            CookieError::InvalidCookieHeader => CookieErrorKind::InvalidHeader,
+        };
+
+        crate::Error::Cookie(kind)
+    }
+}
+
 impl Default for CookieStore {
     fn default() -> Self {
         Self {

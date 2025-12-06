@@ -11,7 +11,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-use crate::Client;
+use crate::{Client, error::HttpErrorResponse};
 use anyhow::{Error, anyhow};
 use block::{Block, ConcreteBlock};
 use futures_channel::oneshot;
@@ -71,6 +71,34 @@ impl HttpError for AppleError {
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Remote { status, .. } => *status,
         })
+    }
+}
+
+// Convert AppleError to unified zenwave::Error
+impl From<AppleError> for crate::Error {
+    fn from(err: AppleError) -> Self {
+        match err {
+            AppleError::BadRequest(e) => crate::Error::InvalidRequest(e.to_string()),
+            AppleError::BadGateway(e) => {
+                // Convert anyhow::Error to std::io::Error to satisfy trait bounds
+                let io_err = std::io::Error::new(std::io::ErrorKind::Other, e);
+                crate::Error::Transport(Box::new(io_err))
+            }
+            AppleError::Remote { status, body, raw_response } => {
+                crate::Error::Http {
+                    status,
+                    message: body.clone().unwrap_or_else(|| {
+                        status.canonical_reason()
+                            .unwrap_or("Unknown error")
+                            .to_string()
+                    }),
+                    response: HttpErrorResponse {
+                        response: *raw_response,
+                        body_text: body,
+                    },
+                }
+            }
+        }
     }
 }
 
@@ -143,10 +171,10 @@ impl Drop for AppleBackend {
 }
 
 impl Endpoint for AppleBackend {
-    type Error = AppleError;
+    type Error = crate::Error;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         let handle = self.handle;
-        send_with_url_session(handle, request).await
+        send_with_url_session(handle, request).await.map_err(Into::into)
     }
 }
 

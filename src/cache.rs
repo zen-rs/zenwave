@@ -140,6 +140,15 @@ pub enum CacheError {
     BodyError(#[from] http_kit::BodyError),
 }
 
+// Convert CacheError to unified zenwave::Error
+impl From<CacheError> for crate::Error {
+    fn from(err: CacheError) -> Self {
+        match err {
+            CacheError::BodyError(e) => crate::Error::BodyParse(e),
+        }
+    }
+}
+
 impl HttpError for CacheError {
     fn status(&self) -> Option<StatusCode> {
         None

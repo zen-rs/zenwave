@@ -6,8 +6,7 @@ use zenwave::{Client, client};
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_bearer_auth_middleware() {
-    let client = client().bearer_auth("test-token-123");
-    let mut client = client;
+    let mut client = client().bearer_auth("test-token-123");
 
     // Test that the Bearer token is sent in the Authorization header
     let response = client.get("https://httpbin.org/bearer").await;
@@ -35,8 +34,7 @@ async fn test_bearer_auth_request_builder() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_basic_auth_middleware() {
-    let client = client().basic_auth("testuser", Some("testpass"));
-    let mut client = client;
+    let mut client = client().basic_auth("testuser", Some("testpass"));
 
     // Test Basic auth with username and password
     let response = client
@@ -136,8 +134,7 @@ async fn test_basic_auth_encoding() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_multiple_auth_requests() {
-    let client = client().bearer_auth("persistent-token");
-    let mut client = client;
+    let mut client = client().bearer_auth("persistent-token");
 
     // Multiple requests should all use the same Bearer token
     for _ in 0..3 {
@@ -153,11 +150,10 @@ async fn test_multiple_auth_requests() {
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_auth_with_other_middleware() {
     // Test auth combined with other middleware
-    let client = client()
+    let mut client = client()
         .bearer_auth("combined-token")
         .enable_cookie()
         .follow_redirect();
-    let mut client = client;
 
     let response = client.get("https://httpbingo.org/headers").await;
     assert!(response.is_ok());
@@ -168,8 +164,7 @@ async fn test_auth_with_other_middleware() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_override_auth_per_request() {
-    let client = client().bearer_auth("default-token");
-    let mut client = client;
+    let mut client = client().bearer_auth("default-token");
 
     // The per-request auth should override the middleware auth
     let response = client

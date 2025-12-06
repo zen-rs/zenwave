@@ -97,11 +97,15 @@ pub use oauth2::OAuth2ClientCredentials;
 pub mod auth;
 pub mod cache;
 pub mod cookie;
+pub mod error;
 pub mod oauth2;
 pub mod timeout;
 
 mod client;
 pub mod redirect;
+
+// Re-export the unified error type
+pub use error::Error;
 
 mod ext;
 /// Multipart/form-data utilities.

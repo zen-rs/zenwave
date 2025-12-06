@@ -5,7 +5,7 @@ use zenwave::websocket::{self, WebSocketMessage};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     async_io::block_on(async {
         // Public echo servers are great for demos.
-        let mut socket = websocket::connect("wss://echo.websocket.events").await?;
+        let socket = websocket::connect("wss://echo.websocket.events").await?;
 
         socket.send_text("hello from zenwave").await?;
 

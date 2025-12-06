@@ -79,7 +79,7 @@ async fn main() -> zenwave::Result<()> {
     let token = std::env::var("ZENWAVE_TOKEN").unwrap_or_else(|_| "demo-token".into());
 
     // Compose only the middleware you need.
-    let mut client = zenwave::client()
+    let client = zenwave::client()
         .timeout(Duration::from_secs(2))
         .enable_cache()
         .with(OAuth2ClientCredentials::new(
@@ -124,7 +124,7 @@ use zenwave::{self, Proxy};
 fn main() {
     // Inherit proxy settings from the environment (`*_PROXY` / `NO_PROXY`).
     let proxy = Proxy::from_env();
-    let mut client = zenwave::client_with_proxy(proxy);
+    let client = zenwave::client_with_proxy(proxy);
 
     // Or build one manually. Supports http, socks4, socks4a, socks5, and socks5h schemes.
     let custom = Proxy::builder()
@@ -155,7 +155,7 @@ bytes, so interrupted transfers can resume without starting from scratch.
 use zenwave::Client;
 
 # async fn example() -> zenwave::Result<()> {
-let mut client = zenwave::client();
+let client = zenwave::client();
 let report = client
     .get("https://example.com/big.iso")
     .download_to_path("big.iso")
@@ -345,7 +345,7 @@ other backends have their own TLS implementations.
 # Use curl backend instead of hyper
 zenwave = { version = "0.1.0", default-features = false, features = ["curl-backend"] }
 
-# Use hyper with native-tls instead of rustls  
+# Use hyper with native-tls instead of rustls
 zenwave = { version = "0.1.0", default-features = false, features = ["hyper-backend", "native-tls"] }
 
 # Use Apple's native URLSession on macOS/iOS

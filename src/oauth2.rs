@@ -53,6 +53,26 @@ impl<T: HttpError> From<T> for OAuth2Error<T> {
     }
 }
 
+// Convert OAuth2Error to unified zenwave::Error
+impl<H> From<OAuth2Error<H>> for crate::Error
+where
+    H: HttpError + Into<crate::Error>,
+{
+    fn from(err: OAuth2Error<H>) -> Self {
+        use crate::error::OAuth2ErrorKind;
+
+        match err {
+            OAuth2Error::Transport(e) => e.into(),
+            OAuth2Error::Upstream { status, message } => {
+                crate::Error::OAuth2(OAuth2ErrorKind::TokenEndpointError { status, message })
+            }
+            OAuth2Error::InvalidResponse(e) => {
+                crate::Error::OAuth2(OAuth2ErrorKind::InvalidTokenResponse(e.to_string()))
+            }
+        }
+    }
+}
+
 /// Middleware implementing the `OAuth2` client credentials flow.
 ///
 /// It lazily acquires an access token from the configured token endpoint and automatically adds the

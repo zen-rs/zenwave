@@ -85,8 +85,7 @@ async fn test_response_status_codes() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_redirect_chain() {
-    let client = client().follow_redirect();
-    let mut client = client;
+    let mut client = client().follow_redirect();
 
     // Test a redirect chain
     let response = client.get(endpoint("/redirect/5")).await.unwrap();
@@ -121,8 +120,7 @@ async fn test_gzip_compression() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_cookie_persistence() {
-    let client = client().enable_cookie();
-    let mut client = client;
+    let mut client = client().enable_cookie();
 
     // Set a cookie
     let _response = client

@@ -55,7 +55,7 @@ async fn websocket_echo_roundtrip() {
         }
     });
 
-    let mut client = zenwave::websocket::connect(format!("ws://{addr}"))
+    let client = zenwave::websocket::connect(format!("ws://{addr}"))
         .await
         .unwrap();
     client.send_text("hello world").await.unwrap();
@@ -99,7 +99,7 @@ async fn websocket_split_roundtrip() {
 
     send_task.await;
     let message = recv_task.await.unwrap();
-    assert_eq!(message.unwrap().as_text(), Some("hello world"));
+    assert_eq!(message.as_text(), Some("hello world"));
 
     let _ = sender.close().await;
     server.await;
@@ -125,7 +125,7 @@ async fn websocket_respects_max_message_size_config() {
     });
 
     let config = WebSocketConfig::default().with_max_message_size(Some(1024));
-    let mut client = zenwave::websocket::connect_with_config(format!("ws://{addr}"), config)
+    let client = zenwave::websocket::connect_with_config(format!("ws://{addr}"), config)
         .await
         .unwrap();
 
@@ -163,7 +163,7 @@ async fn websocket_binary_roundtrip() {
         }
     });
 
-    let mut client = zenwave::websocket::connect(format!("ws://{addr}"))
+    let client = zenwave::websocket::connect(format!("ws://{addr}"))
         .await
         .unwrap();
     client.send_binary(vec![1_u8, 2, 3, 4]).await.unwrap();
@@ -199,7 +199,7 @@ async fn websocket_handles_server_ping() {
         let _ = ws.close(None).await;
     });
 
-    let mut client = zenwave::websocket::connect(format!("ws://{addr}"))
+    let client = zenwave::websocket::connect(format!("ws://{addr}"))
         .await
         .unwrap();
 
@@ -288,7 +288,7 @@ async fn websocket_accepts_64mb_message_by_default() {
         let _ = ws.close(None).await;
     });
 
-    let mut client = zenwave::websocket::connect(format!("ws://{addr}"))
+    let client = zenwave::websocket::connect(format!("ws://{addr}"))
         .await
         .unwrap();
 
@@ -322,7 +322,7 @@ async fn websocket_rejects_128mb_message_by_default() {
         let _ = ws.close(None).await;
     });
 
-    let mut client = zenwave::websocket::connect(format!("ws://{addr}"))
+    let client = zenwave::websocket::connect(format!("ws://{addr}"))
         .await
         .unwrap();
 
@@ -339,7 +339,7 @@ async fn websocket_rejects_128mb_message_by_default() {
 }
 
 async fn attempt_public_echo(url: &str, payload: &str) -> Result<(), String> {
-    let mut client = zenwave::websocket::connect(url)
+    let client = zenwave::websocket::connect(url)
         .await
         .map_err(|err| format!("connect error: {err}"))?;
 

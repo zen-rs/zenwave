@@ -13,7 +13,7 @@ use http_kit::{Body, Endpoint, HttpError, Request, Response, StatusCode};
 use thiserror::Error;
 
 use crate::proxy::Intercept;
-use crate::{Client, Proxy};
+use crate::{Client, Proxy, error::HttpErrorResponse};
 
 /// HTTP backend implemented with libcurl.
 #[derive(Debug, Clone, Default)]
@@ -55,6 +55,34 @@ impl CurlError {
     }
 }
 
+// Convert CurlError to unified zenwave::Error
+impl From<CurlError> for crate::Error {
+    fn from(err: CurlError) -> Self {
+        match err {
+            CurlError::BadRequest(e) => crate::Error::InvalidRequest(e.to_string()),
+            CurlError::BadGateway(e) => {
+                // Convert anyhow::Error to std::io::Error to satisfy trait bounds
+                let io_err = std::io::Error::new(std::io::ErrorKind::Other, e);
+                crate::Error::Transport(Box::new(io_err))
+            }
+            CurlError::Remote { status, body, raw_response } => {
+                crate::Error::Http {
+                    status,
+                    message: body.clone().unwrap_or_else(|| {
+                        status.canonical_reason()
+                            .unwrap_or("Unknown error")
+                            .to_string()
+                    }),
+                    response: HttpErrorResponse {
+                        response: *raw_response,
+                        body_text: body,
+                    },
+                }
+            }
+        }
+    }
+}
+
 impl CurlBackend {
     /// Create a new backend without proxy configuration.
     #[must_use]
@@ -78,7 +106,7 @@ impl CurlBackend {
 impl Client for CurlBackend {}
 
 impl Endpoint for CurlBackend {
-    type Error = CurlError;
+    type Error = crate::Error;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         let dummy_request = http::Request::builder()
             .method(Method::GET)
@@ -86,7 +114,7 @@ impl Endpoint for CurlBackend {
             .body(Body::empty())
             .expect("building dummy request failed");
         let request = replace(request, dummy_request);
-        execute(request, self.proxy.clone()).await
+        execute(request, self.proxy.clone()).await.map_err(Into::into)
     }
 }
 

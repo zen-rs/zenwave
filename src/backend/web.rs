@@ -19,6 +19,7 @@ use web_sys::{
 };
 
 use super::ClientBackend;
+use crate::error::HttpErrorResponse;
 /// HTTP client backend for browser environments using `fetch`.
 pub struct WebBackend {
     window: SingleThreaded<Window>,
@@ -63,6 +64,29 @@ impl HttpError for WebError {
             Self::Transport { status, .. } => *status,
             Self::Remote { status, .. } => *status,
         })
+    }
+}
+
+// Convert WebError to unified zenwave::Error
+impl From<WebError> for crate::Error {
+    fn from(err: WebError) -> Self {
+        match err {
+            WebError::Transport { source, .. } => crate::Error::Transport(Box::new(source)),
+            WebError::Remote { status, body, raw_response } => {
+                crate::Error::Http {
+                    status,
+                    message: body.clone().unwrap_or_else(|| {
+                        status.canonical_reason()
+                            .unwrap_or("Unknown error")
+                            .to_string()
+                    }),
+                    response: HttpErrorResponse {
+                        response: raw_response,
+                        body_text: body,
+                    },
+                }
+            }
+        }
     }
 }
 
@@ -125,12 +149,12 @@ impl Default for WebBackend {
 }
 
 impl Endpoint for WebBackend {
-    type Error = WebError;
+    type Error = crate::Error;
     async fn respond(
         &mut self,
         request: &mut http_kit::Request,
-    ) -> Result<http_kit::Response, WebError> {
-        fetch(&self.window, request).await
+    ) -> Result<http_kit::Response, Self::Error> {
+        fetch(&self.window, request).await.map_err(Into::into)
     }
 }
 

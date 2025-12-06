@@ -48,6 +48,13 @@ impl HttpError for TimeoutError {
     }
 }
 
+// Convert TimeoutError to unified zenwave::Error
+impl From<TimeoutError> for crate::Error {
+    fn from(_: TimeoutError) -> Self {
+        crate::Error::Timeout
+    }
+}
+
 impl Middleware for Timeout {
     type Error = TimeoutError;
     async fn handle<E: Endpoint>(

@@ -8,9 +8,8 @@ use std::{fmt::Debug, future::Future};
 use futures_io::AsyncRead;
 use futures_util::{Stream, StreamExt};
 use http::{HeaderName, HeaderValue, header};
-use http_kit::StatusCode;
 use http_kit::{
-    Endpoint, HttpError, Method, Middleware, Request, Response, Uri,
+    Endpoint, Method, Middleware, Request, Response, Uri,
     endpoint::WithMiddleware,
     sse::SseStream,
     utils::{ByteStr, Bytes},
@@ -51,26 +50,7 @@ impl<'a, T: Client> IntoFuture for RequestBuilder<'a, T> {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum ClientError<T: HttpError> {
-    #[error("Request error: {0}")]
-    Remote(T),
-
-    #[error("Invalid response body: {0}")]
-    InvalidBody(#[from] http_kit::BodyError),
-}
-
-impl<T> HttpError for ClientError<T>
-where
-    T: HttpError,
-{
-    fn status(&self) -> Option<StatusCode> {
-        match self {
-            Self::Remote(err) => err.status(),
-            Self::InvalidBody(_) => None,
-        }
-    }
-}
+// ClientError has been removed - all errors now use zenwave::Error
 
 impl<T: Client> RequestBuilder<'_, T> {
     pub fn bearer_auth(mut self, token: impl Into<String>) -> Self {
@@ -100,36 +80,6 @@ impl<T: Client> RequestBuilder<'_, T> {
             .headers_mut()
             .insert(http_kit::header::AUTHORIZATION, auth_value.parse().unwrap());
         self
-    }
-
-    pub async fn json<Res: DeserializeOwned>(self) -> Result<Res, ClientError<T::Error>> {
-        let response = self.await.map_err(ClientError::Remote)?;
-        let mut body = response.into_body();
-        Ok(body.into_json().await?)
-    }
-
-    pub async fn string(self) -> Result<ByteStr, ClientError<T::Error>> {
-        let response = self.await.map_err(ClientError::Remote)?;
-        let body = response.into_body();
-        Ok(body.into_string().await?)
-    }
-
-    pub async fn bytes(self) -> Result<Bytes, ClientError<T::Error>> {
-        let response = self.await.map_err(ClientError::Remote)?;
-        let body = response.into_body();
-        Ok(body.into_bytes().await?)
-    }
-
-    pub async fn form<Res: DeserializeOwned>(self) -> Result<Res, ClientError<T::Error>> {
-        let response = self.await.map_err(ClientError::Remote)?;
-        let mut body = response.into_body();
-        Ok(body.into_form().await?)
-    }
-
-    pub async fn sse(self) -> Result<SseStream, ClientError<T::Error>> {
-        let response = self.await.map_err(ClientError::Remote)?;
-        let body = response.into_body();
-        Ok(body.into_sse())
     }
 
     pub fn header(
@@ -245,6 +195,39 @@ impl<T: Client> RequestBuilder<'_, T> {
     }
 }
 
+// Consuming methods when T::Error is already zenwave::Error
+impl<T: Client<Error = crate::Error>> RequestBuilder<'_, T> {
+    pub async fn json<Res: DeserializeOwned>(self) -> Result<Res, crate::Error> {
+        let response = self.await?;
+        let mut body = response.into_body();
+        Ok(body.into_json().await?)
+    }
+
+    pub async fn string(self) -> Result<ByteStr, crate::Error> {
+        let response = self.await?;
+        let body = response.into_body();
+        Ok(body.into_string().await?)
+    }
+
+    pub async fn bytes(self) -> Result<Bytes, crate::Error> {
+        let response = self.await?;
+        let body = response.into_body();
+        Ok(body.into_bytes().await?)
+    }
+
+    pub async fn form<Res: DeserializeOwned>(self) -> Result<Res, crate::Error> {
+        let response = self.await?;
+        let mut body = response.into_body();
+        Ok(body.into_form().await?)
+    }
+
+    pub async fn sse(self) -> Result<SseStream, crate::Error> {
+        let response = self.await?;
+        let body = response.into_body();
+        Ok(body.into_sse())
+    }
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
@@ -252,6 +235,7 @@ mod tests {
     use async_lock::Mutex;
     use futures_util::stream;
     use http::Response;
+    use http_kit::StatusCode;
     use std::{convert::Infallible, sync::Arc};
     use tempfile::tempdir;
 

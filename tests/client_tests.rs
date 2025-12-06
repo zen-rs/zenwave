@@ -94,8 +94,7 @@ async fn test_request_builder_json() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_with_middleware() {
-    let client = client().enable_cookie();
-    let mut client = client;
+    let mut client = client().enable_cookie();
     let response = client
         .get("https://httpbin.org/cookies/set/test/value")
         .await;
@@ -109,8 +108,7 @@ async fn test_client_with_middleware() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_follow_redirect() {
-    let client = client().follow_redirect();
-    let mut client = client;
+    let mut client = client().follow_redirect();
     let response = client.get("https://httpbin.org/redirect/1").await;
     assert!(response.is_ok());
     let response = response.unwrap();

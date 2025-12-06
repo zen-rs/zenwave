@@ -39,6 +39,28 @@ impl HttpError for WebSocketError {
     }
 }
 
+// Convert WebSocketError to unified zenwave::Error
+impl From<WebSocketError> for crate::Error {
+    fn from(err: WebSocketError) -> Self {
+        use crate::error::WebSocketErrorKind;
+
+        match err {
+            WebSocketError::FailToEncodePayload(e) => {
+                crate::Error::WebSocket(WebSocketErrorKind::EncodeFailed(e))
+            }
+            WebSocketError::UnsupportedScheme(s) => {
+                crate::Error::WebSocket(WebSocketErrorKind::UnsupportedScheme(s))
+            }
+            WebSocketError::InvalidUri(e) => {
+                crate::Error::InvalidUri(e.to_string())
+            }
+            WebSocketError::ConnectionFailed(e) => {
+                crate::Error::WebSocket(WebSocketErrorKind::ConnectionFailed(e.to_string()))
+            }
+        }
+    }
+}
+
 /// Configuration applied when establishing a websocket connection.
 #[derive(Clone, Debug)]
 #[non_exhaustive]

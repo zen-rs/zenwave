@@ -15,7 +15,7 @@ use std::{
     thread,
 };
 
-use crate::Client;
+use crate::{Client, error::HttpErrorResponse};
 
 /// Hyper-based HTTP client backend powered by `async-io`/`async-net`.
 #[derive(Debug, Default)]
@@ -91,8 +91,36 @@ impl HttpError for HyperError {
     }
 }
 
+// Convert HyperError to unified zenwave::Error
+impl From<HyperError> for crate::Error {
+    fn from(err: HyperError) -> Self {
+        match err {
+            HyperError::Remote { status, body, raw_response } => {
+                crate::Error::Http {
+                    status,
+                    message: body.clone().unwrap_or_else(|| {
+                        status.canonical_reason()
+                            .unwrap_or("Unknown error")
+                            .to_string()
+                    }),
+                    response: HttpErrorResponse {
+                        response: raw_response,
+                        body_text: body,
+                    },
+                }
+            }
+            HyperError::Connection(e) => crate::Error::Transport(Box::new(e)),
+            HyperError::Io(e) => crate::Error::Io(e),
+            HyperError::TlsNotAvailable => crate::Error::Tls(Box::new(
+                std::io::Error::new(std::io::ErrorKind::Other, "TLS not available")
+            )),
+            HyperError::InvalidUri(uri) => crate::Error::InvalidUri(uri),
+        }
+    }
+}
+
 impl Endpoint for HyperBackend {
-    type Error = HyperError;
+    type Error = crate::Error;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         let dummy_request = http::Request::builder()
             .method(Method::GET)
@@ -149,7 +177,8 @@ impl Endpoint for HyperBackend {
                 status: response.status(),
                 body: error_msg,
                 raw_response: response,
-            });
+            }
+            .into());
         }
 
         Ok(response)

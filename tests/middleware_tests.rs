@@ -18,8 +18,7 @@ use zenwave::{
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_cookie_store_middleware() {
-    let client = client().enable_cookie();
-    let mut client = client;
+    let mut client = client().enable_cookie();
 
     // First request to set a cookie
     let response = client
@@ -48,8 +47,7 @@ async fn test_cookie_store_creation() {
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_follow_redirect_middleware() {
     // Test with redirect middleware
-    let client = client().follow_redirect();
-    let mut client = client;
+    let mut client = client().follow_redirect();
 
     // This should follow the redirect and return the final response
     let response = client.get("https://httpbin.org/redirect/1").await;
@@ -69,8 +67,7 @@ async fn test_follow_redirect_creation() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_follow_redirect_multiple_redirects() {
-    let client = client().follow_redirect();
-    let mut client = client;
+    let mut client = client().follow_redirect();
 
     // Test multiple redirects
     let response = client.get("https://httpbin.org/redirect/3").await;
@@ -82,8 +79,7 @@ async fn test_follow_redirect_multiple_redirects() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_with_multiple_middleware() {
-    let client = client().follow_redirect().enable_cookie();
-    let mut client = client;
+    let mut client = client().follow_redirect().enable_cookie();
 
     // Test that both middleware work together
     let response = client
@@ -130,8 +126,7 @@ async fn test_middleware_with_custom_middleware() {
         }
     }
 
-    let client = client().with(TestMiddleware);
-    let mut client = client;
+    let mut client = client().with(TestMiddleware);
 
     let response = client.get("https://httpbin.org/headers").await;
     assert!(response.is_ok());

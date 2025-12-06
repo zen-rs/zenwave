@@ -1,7 +1,7 @@
 //! A custom client example demonstrating middleware composition.
 
 use serde::{Deserialize, Serialize};
-use zenwave::{self, Client};
+use zenwave::{self, Client, ResponseExt};
 
 #[derive(Serialize)]
 struct MessageRequest<'a> {
@@ -37,7 +37,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .post("https://httpbin.org/post")
             .header("x-request-id", "demo-request")
             .json_body(&payload)
-            .json()
+            .await?
+            .into_json()
             .await?;
 
         println!("Server echoed '{}'", response.json.message);
