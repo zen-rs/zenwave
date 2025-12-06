@@ -59,23 +59,17 @@ impl<H: HttpError> HttpError for FollowRedirectError<H> {
 // Convert FollowRedirectError to unified zenwave::Error
 impl<H> From<FollowRedirectError<H>> for crate::Error
 where
-    H: HttpError + Into<crate::Error>,
+    H: HttpError + Into<Self>,
 {
     fn from(err: FollowRedirectError<H>) -> Self {
         match err {
             FollowRedirectError::InvalidUrl(_) => {
-                crate::Error::InvalidUri("Invalid redirect URL".to_string())
+                Self::InvalidUri("Invalid redirect URL".to_string())
             }
             FollowRedirectError::RemoteError(e) => e.into(),
-            FollowRedirectError::TooManyRedirects => {
-                crate::Error::TooManyRedirects { max: 10 }
-            }
-            FollowRedirectError::MissingLocationHeader => {
-                crate::Error::InvalidRedirectLocation
-            }
-            FollowRedirectError::InvalidLocationHeader => {
-                crate::Error::InvalidRedirectLocation
-            }
+            FollowRedirectError::TooManyRedirects => Self::TooManyRedirects { max: 10 },
+            FollowRedirectError::MissingLocationHeader
+            | FollowRedirectError::InvalidLocationHeader => Self::InvalidRedirectLocation,
         }
     }
 }

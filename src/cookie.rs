@@ -71,7 +71,7 @@ impl From<CookieError> for crate::Error {
             CookieError::InvalidCookieHeader => CookieErrorKind::InvalidHeader,
         };
 
-        crate::Error::Cookie(kind)
+        Self::Cookie(kind)
     }
 }
 

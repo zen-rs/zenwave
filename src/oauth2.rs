@@ -56,7 +56,7 @@ impl<T: HttpError> From<T> for OAuth2Error<T> {
 // Convert OAuth2Error to unified zenwave::Error
 impl<H> From<OAuth2Error<H>> for crate::Error
 where
-    H: HttpError + Into<crate::Error>,
+    H: HttpError + Into<Self>,
 {
     fn from(err: OAuth2Error<H>) -> Self {
         use crate::error::OAuth2ErrorKind;
@@ -64,10 +64,10 @@ where
         match err {
             OAuth2Error::Transport(e) => e.into(),
             OAuth2Error::Upstream { status, message } => {
-                crate::Error::OAuth2(OAuth2ErrorKind::TokenEndpointError { status, message })
+                Self::OAuth2(OAuth2ErrorKind::TokenEndpointError { status, message })
             }
             OAuth2Error::InvalidResponse(e) => {
-                crate::Error::OAuth2(OAuth2ErrorKind::InvalidTokenResponse(e.to_string()))
+                Self::OAuth2(OAuth2ErrorKind::InvalidTokenResponse(e.to_string()))
             }
         }
     }

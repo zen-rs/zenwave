@@ -50,6 +50,7 @@ impl HyperBackend {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum HyperError {
     Connection(hyper::Error),
     Io(std::io::Error),
@@ -95,26 +96,29 @@ impl HttpError for HyperError {
 impl From<HyperError> for crate::Error {
     fn from(err: HyperError) -> Self {
         match err {
-            HyperError::Remote { status, body, raw_response } => {
-                crate::Error::Http {
-                    status,
-                    message: body.clone().unwrap_or_else(|| {
-                        status.canonical_reason()
-                            .unwrap_or("Unknown error")
-                            .to_string()
-                    }),
-                    response: HttpErrorResponse {
-                        response: raw_response,
-                        body_text: body,
-                    },
-                }
+            HyperError::Remote {
+                status,
+                body,
+                raw_response,
+            } => Self::Http {
+                status,
+                message: body.clone().unwrap_or_else(|| {
+                    status
+                        .canonical_reason()
+                        .unwrap_or("Unknown error")
+                        .to_string()
+                }),
+                response: HttpErrorResponse {
+                    response: raw_response,
+                    body_text: body,
+                },
+            },
+            HyperError::Connection(e) => Self::Transport(Box::new(e)),
+            HyperError::Io(e) => Self::Io(e),
+            HyperError::TlsNotAvailable => {
+                Self::Tls(Box::new(std::io::Error::other("TLS not available")))
             }
-            HyperError::Connection(e) => crate::Error::Transport(Box::new(e)),
-            HyperError::Io(e) => crate::Error::Io(e),
-            HyperError::TlsNotAvailable => crate::Error::Tls(Box::new(
-                std::io::Error::new(std::io::ErrorKind::Other, "TLS not available")
-            )),
-            HyperError::InvalidUri(uri) => crate::Error::InvalidUri(uri),
+            HyperError::InvalidUri(uri) => Self::InvalidUri(uri),
         }
     }
 }
@@ -130,12 +134,11 @@ impl Endpoint for HyperBackend {
         let mut request: http::Request<http_kit::Body> = replace(request, dummy_request);
 
         // Ensure Host header is present (required by hyper 1.0 / HTTP 1.1)
-        if request.headers().get(http::header::HOST).is_none() {
-            if let Some(authority) = request.uri().authority() {
-                if let Ok(value) = http::header::HeaderValue::from_str(authority.as_str()) {
-                    request.headers_mut().insert(http::header::HOST, value);
-                }
-            }
+        if request.headers().get(http::header::HOST).is_none()
+            && let Some(authority) = request.uri().authority()
+            && let Ok(value) = http::header::HeaderValue::from_str(authority.as_str())
+        {
+            request.headers_mut().insert(http::header::HOST, value);
         }
 
         let stream = connect(&request).await?;

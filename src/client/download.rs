@@ -41,7 +41,7 @@ impl<E: HttpError> HttpError for DownloadError<E> {
 // Convert DownloadError to unified zenwave::Error
 impl<E> From<DownloadError<E>> for crate::Error
 where
-    E: HttpError + Into<crate::Error>,
+    E: HttpError + Into<Self>,
 {
     fn from(err: DownloadError<E>) -> Self {
         use crate::error::DownloadErrorKind;
@@ -49,13 +49,13 @@ where
         match err {
             DownloadError::Remote(e) => e.into(),
             DownloadError::Body(e) => {
-                crate::Error::Download(DownloadErrorKind::BodyRead(e.to_string()))
+                Self::Download(DownloadErrorKind::BodyRead(e.to_string()))
             }
             DownloadError::Io(e) => {
-                crate::Error::Download(DownloadErrorKind::FileSystem(e))
+                Self::Download(DownloadErrorKind::FileSystem(e))
             }
             DownloadError::Upstream(status) => {
-                crate::Error::Download(DownloadErrorKind::UpstreamError(status))
+                Self::Download(DownloadErrorKind::UpstreamError(status))
             }
         }
     }

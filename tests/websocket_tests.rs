@@ -297,7 +297,7 @@ async fn websocket_accepts_64mb_message_by_default() {
         .expect("timeout waiting for 64MB payload")
         .expect("websocket read failed")
         .expect("websocket closed before payload");
-    assert_eq!(message.as_bytes().map(|b| b.len()), Some(64 * MB));
+    assert_eq!(message.as_bytes().map(<[u8]>::len), Some(64 * MB));
 
     client.close().await.unwrap();
     server.await;

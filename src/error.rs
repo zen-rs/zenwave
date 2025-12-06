@@ -16,6 +16,7 @@ use thiserror::Error;
 
 /// Unified error type for all zenwave operations.
 #[derive(Debug, Error)]
+#[allow(clippy::large_enum_variant)]
 pub enum Error {
     /// HTTP server returned an error response (4xx/5xx status code).
     ///
@@ -72,7 +73,7 @@ pub enum Error {
     #[error("cookie error: {0}")]
     Cookie(#[from] CookieErrorKind),
 
-    /// OAuth2 authentication error.
+    /// `OAuth2` authentication error.
     #[error("OAuth2 error: {0}")]
     OAuth2(#[from] OAuth2ErrorKind),
 
@@ -136,7 +137,7 @@ pub enum CookieErrorKind {
 /// OAuth2-related errors.
 #[derive(Debug, Error)]
 pub enum OAuth2ErrorKind {
-    /// Failed to fetch OAuth2 token.
+    /// Failed to fetch `OAuth2` token.
     #[error("failed to fetch token: {0}")]
     TokenFetchFailed(String),
 
@@ -188,12 +189,12 @@ pub enum WebSocketErrorKind {
 
 impl Error {
     /// Check if this is a network transport error.
-    pub fn is_network_error(&self) -> bool {
+    pub const fn is_network_error(&self) -> bool {
         matches!(self, Self::Transport(_) | Self::Tls(_))
     }
 
     /// Check if this is a timeout error.
-    pub fn is_timeout(&self) -> bool {
+    pub const fn is_timeout(&self) -> bool {
         matches!(self, Self::Timeout)
     }
 
@@ -208,7 +209,7 @@ impl Error {
     }
 
     /// Check if this is a redirect-related error.
-    pub fn is_redirect_error(&self) -> bool {
+    pub const fn is_redirect_error(&self) -> bool {
         matches!(
             self,
             Self::TooManyRedirects { .. } | Self::InvalidRedirectLocation
@@ -216,7 +217,7 @@ impl Error {
     }
 
     /// Check if this is a request construction error.
-    pub fn is_request_error(&self) -> bool {
+    pub const fn is_request_error(&self) -> bool {
         matches!(self, Self::InvalidRequest(_) | Self::InvalidUri(_))
     }
 
@@ -229,7 +230,7 @@ impl Error {
     }
 
     /// Get the full HTTP response (if this is an HTTP error).
-    pub fn response(&self) -> Option<&Response> {
+    pub const fn response(&self) -> Option<&Response> {
         match self {
             Self::Http { response, .. } => Some(&response.response),
             _ => None,
@@ -276,7 +277,7 @@ impl Error {
     /// Get the error category/kind.
     ///
     /// Useful for logging and monitoring.
-    pub fn kind(&self) -> ErrorKind {
+    pub const fn kind(&self) -> ErrorKind {
         match self {
             Self::Http { .. } => ErrorKind::Http,
             Self::Transport(_) => ErrorKind::Transport,
@@ -316,7 +317,7 @@ pub enum ErrorKind {
     BodyParse,
     /// Cookie management error
     Cookie,
-    /// OAuth2 authentication error
+    /// `OAuth2` authentication error
     OAuth2,
     /// Download error
     Download,
@@ -352,10 +353,10 @@ impl std::fmt::Display for ErrorKind {
 impl http_kit::HttpError for Error {
     fn status(&self) -> Option<StatusCode> {
         match self {
-            Self::Http { status, .. } => Some(*status),
             Self::Timeout => Some(StatusCode::GATEWAY_TIMEOUT),
-            Self::OAuth2(OAuth2ErrorKind::TokenEndpointError { status, .. }) => Some(*status),
-            Self::Download(DownloadErrorKind::UpstreamError(status)) => Some(*status),
+            Self::Http { status, .. }
+            | Self::OAuth2(OAuth2ErrorKind::TokenEndpointError { status, .. })
+            | Self::Download(DownloadErrorKind::UpstreamError(status)) => Some(*status),
             _ => None,
         }
     }
@@ -364,8 +365,8 @@ impl http_kit::HttpError for Error {
 // Generic conversion from MiddlewareError to Error
 impl<E, M> From<http_kit::middleware::MiddlewareError<E, M>> for Error
 where
-    E: Into<Error>,
-    M: Into<Error>,
+    E: Into<Self>,
+    M: Into<Self>,
 {
     fn from(err: http_kit::middleware::MiddlewareError<E, M>) -> Self {
         match err {

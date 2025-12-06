@@ -46,16 +46,16 @@ impl From<WebSocketError> for crate::Error {
 
         match err {
             WebSocketError::FailToEncodePayload(e) => {
-                crate::Error::WebSocket(WebSocketErrorKind::EncodeFailed(e))
+                Self::WebSocket(WebSocketErrorKind::EncodeFailed(e))
             }
             WebSocketError::UnsupportedScheme(s) => {
-                crate::Error::WebSocket(WebSocketErrorKind::UnsupportedScheme(s))
+                Self::WebSocket(WebSocketErrorKind::UnsupportedScheme(s))
             }
             WebSocketError::InvalidUri(e) => {
-                crate::Error::InvalidUri(e.to_string())
+                Self::InvalidUri(e.to_string())
             }
             WebSocketError::ConnectionFailed(e) => {
-                crate::Error::WebSocket(WebSocketErrorKind::ConnectionFailed(e.to_string()))
+                Self::WebSocket(WebSocketErrorKind::ConnectionFailed(e.to_string()))
             }
         }
     }

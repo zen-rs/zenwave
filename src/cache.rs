@@ -144,7 +144,7 @@ pub enum CacheError {
 impl From<CacheError> for crate::Error {
     fn from(err: CacheError) -> Self {
         match err {
-            CacheError::BodyError(e) => crate::Error::BodyParse(e),
+            CacheError::BodyError(e) => Self::BodyParse(e),
         }
     }
 }
