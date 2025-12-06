@@ -150,8 +150,10 @@ impl From<CacheError> for crate::Error {
 }
 
 impl HttpError for CacheError {
-    fn status(&self) -> Option<StatusCode> {
-        None
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::BodyError(_) => StatusCode::BAD_REQUEST,
+        }
     }
 }
 

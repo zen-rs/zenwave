@@ -43,8 +43,8 @@ impl Timeout {
 pub struct TimeoutError;
 
 impl HttpError for TimeoutError {
-    fn status(&self) -> Option<StatusCode> {
-        Some(StatusCode::GATEWAY_TIMEOUT)
+    fn status(&self) -> StatusCode {
+        StatusCode::GATEWAY_TIMEOUT
     }
 }
 
@@ -173,7 +173,7 @@ mod tests {
                 .expect_err("timeout should fire first")
         });
 
-        assert_eq!(err.status(), Some(StatusCode::GATEWAY_TIMEOUT));
+        assert_eq!(err.status(), StatusCode::GATEWAY_TIMEOUT);
         assert!(err.to_string().contains("timed out"));
     }
 }

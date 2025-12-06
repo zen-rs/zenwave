@@ -84,10 +84,10 @@ impl core::fmt::Display for HyperError {
 impl core::error::Error for HyperError {}
 
 impl HttpError for HyperError {
-    fn status(&self) -> Option<StatusCode> {
+    fn status(&self) -> StatusCode {
         match self {
-            Self::Remote { status, .. } => Some(*status),
-            _ => None,
+            Self::Remote { status, .. } => *status,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }

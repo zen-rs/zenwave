@@ -48,10 +48,10 @@ pub enum FollowRedirectError<H: HttpError> {
 }
 
 impl<H: HttpError> HttpError for FollowRedirectError<H> {
-    fn status(&self) -> Option<StatusCode> {
+    fn status(&self) -> StatusCode {
         match self {
             Self::RemoteError(err) => err.status(),
-            _ => None,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }

@@ -2,10 +2,10 @@
 
 use crate::header;
 use crate::{Endpoint, Middleware, Request, Response};
+use http_kit::HttpError;
 use http_kit::cookie::{Cookie, CookieJar};
 use http_kit::header::HeaderValue;
 use http_kit::middleware::MiddlewareError;
-use http_kit::{HttpError, StatusCode};
 #[cfg(not(target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
 
@@ -53,11 +53,7 @@ pub enum CookieError {
     #[error("Invalid cookie header")]
     InvalidCookieHeader,
 }
-impl HttpError for CookieError {
-    fn status(&self) -> Option<StatusCode> {
-        None
-    }
-}
+impl HttpError for CookieError {}
 
 // Convert CookieError to unified zenwave::Error
 impl From<CookieError> for crate::Error {
@@ -323,7 +319,7 @@ mod tests {
     use std::convert::Infallible;
 
     use super::*;
-    use http::{Request as HttpRequest, Response as HttpResponse};
+    use http::{Request as HttpRequest, Response as HttpResponse, StatusCode};
     use http_kit::Body;
     use tempfile::tempdir;
 

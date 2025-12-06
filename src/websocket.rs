@@ -34,8 +34,11 @@ pub enum WebSocketError {
 }
 
 impl HttpError for WebSocketError {
-    fn status(&self) -> Option<StatusCode> {
-        None
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::ConnectionFailed(_) => StatusCode::BAD_GATEWAY,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
     }
 }
 

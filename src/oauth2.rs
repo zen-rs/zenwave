@@ -38,11 +38,11 @@ pub enum OAuth2Error<H: HttpError> {
 }
 
 impl<H: HttpError> HttpError for OAuth2Error<H> {
-    fn status(&self) -> Option<StatusCode> {
+    fn status(&self) -> StatusCode {
         match self {
             Self::Transport(err) => err.status(),
-            Self::Upstream { status, .. } => Some(*status),
-            Self::InvalidResponse(_) => Some(StatusCode::BAD_GATEWAY),
+            Self::Upstream { status, .. } => *status,
+            Self::InvalidResponse(_) => StatusCode::BAD_GATEWAY,
         }
     }
 }

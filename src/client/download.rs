@@ -28,12 +28,12 @@ pub enum DownloadError<E: HttpError> {
 }
 
 impl<E: HttpError> HttpError for DownloadError<E> {
-    fn status(&self) -> Option<StatusCode> {
+    fn status(&self) -> StatusCode {
         match self {
             Self::Remote(err) => err.status(),
-            Self::Body(_) => Some(StatusCode::BAD_GATEWAY),
-            Self::Io(_) => Some(StatusCode::INTERNAL_SERVER_ERROR),
-            Self::Upstream(status) => Some(*status),
+            Self::Body(_) => StatusCode::BAD_GATEWAY,
+            Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Upstream(status) => *status,
         }
     }
 }
@@ -48,12 +48,8 @@ where
 
         match err {
             DownloadError::Remote(e) => e.into(),
-            DownloadError::Body(e) => {
-                Self::Download(DownloadErrorKind::BodyRead(e.to_string()))
-            }
-            DownloadError::Io(e) => {
-                Self::Download(DownloadErrorKind::FileSystem(e))
-            }
+            DownloadError::Body(e) => Self::Download(DownloadErrorKind::BodyRead(e.to_string())),
+            DownloadError::Io(e) => Self::Download(DownloadErrorKind::FileSystem(e)),
             DownloadError::Upstream(status) => {
                 Self::Download(DownloadErrorKind::UpstreamError(status))
             }

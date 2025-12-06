@@ -351,13 +351,13 @@ impl std::fmt::Display for ErrorKind {
 
 // Implement http_kit::HttpError trait for Error
 impl http_kit::HttpError for Error {
-    fn status(&self) -> Option<StatusCode> {
+    fn status(&self) -> StatusCode {
         match self {
-            Self::Timeout => Some(StatusCode::GATEWAY_TIMEOUT),
+            Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
             Self::Http { status, .. }
             | Self::OAuth2(OAuth2ErrorKind::TokenEndpointError { status, .. })
-            | Self::Download(DownloadErrorKind::UpstreamError(status)) => Some(*status),
-            _ => None,
+            | Self::Download(DownloadErrorKind::UpstreamError(status)) => *status,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }

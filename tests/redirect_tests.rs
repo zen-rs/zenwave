@@ -38,11 +38,7 @@ enum MockError {
     Exhausted,
 }
 
-impl HttpError for MockError {
-    fn status(&self) -> Option<StatusCode> {
-        None
-    }
-}
+impl HttpError for MockError {}
 
 impl MockClient {
     fn with_responses(responses: Vec<Response>) -> Self {

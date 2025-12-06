@@ -214,7 +214,7 @@ async fn test_timeout_middleware_triggers_gateway_timeout() {
         .await
         .expect_err("timeout should trigger before slow backend responds");
 
-    assert_eq!(err.status(), Some(StatusCode::GATEWAY_TIMEOUT));
+    assert_eq!(err.status(), StatusCode::GATEWAY_TIMEOUT);
     assert!(
         err.to_string().contains("timed out"),
         "error message should mention timeout"
