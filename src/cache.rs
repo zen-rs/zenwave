@@ -312,14 +312,14 @@ mod tests {
     #[test]
     fn serves_cached_response_until_expiration() {
         async_io::block_on(async {
-        let backend = CountingEndpoint::new("hello", &[("cache-control", "max-age=60")]);
-        let mut cache = Cache::new();
-        let mut request = new_request();
-        let mut endpoint = backend.clone();
+            let backend = CountingEndpoint::new("hello", &[("cache-control", "max-age=60")]);
+            let mut cache = Cache::new();
+            let mut request = new_request();
+            let mut endpoint = backend.clone();
 
-        let response = cache.handle(&mut request, &mut endpoint).await.unwrap();
-        assert_eq!(body_text(response).await, "hello");
-        assert_eq!(backend.calls(), 1);
+            let response = cache.handle(&mut request, &mut endpoint).await.unwrap();
+            assert_eq!(body_text(response).await, "hello");
+            assert_eq!(backend.calls(), 1);
 
             let mut request = new_request();
             let mut endpoint = backend.clone();
@@ -332,14 +332,14 @@ mod tests {
     #[test]
     fn respects_no_store() {
         async_io::block_on(async {
-        let backend = CountingEndpoint::new("world", &[("cache-control", "no-store")]);
-        let mut cache = Cache::new();
+            let backend = CountingEndpoint::new("world", &[("cache-control", "no-store")]);
+            let mut cache = Cache::new();
 
-        for _ in 0..2 {
-            let mut request = new_request();
-            let mut endpoint = backend.clone();
-            let response = cache.handle(&mut request, &mut endpoint).await.unwrap();
-            assert_eq!(body_text(response).await, "world");
+            for _ in 0..2 {
+                let mut request = new_request();
+                let mut endpoint = backend.clone();
+                let response = cache.handle(&mut request, &mut endpoint).await.unwrap();
+                assert_eq!(body_text(response).await, "world");
             }
             assert_eq!(backend.calls(), 2);
         });
@@ -348,14 +348,14 @@ mod tests {
     #[test]
     fn revalidates_using_etag() {
         async_io::block_on(async {
-        let backend = ConditionalEndpoint::new();
-        let mut cache = Cache::new();
+            let backend = ConditionalEndpoint::new();
+            let mut cache = Cache::new();
 
-        let mut request = new_request();
-        let mut endpoint = backend.clone();
-        let response = cache.handle(&mut request, &mut endpoint).await.unwrap();
-        assert_eq!(body_text(response).await, "fresh");
-        assert_eq!(backend.calls(), 1);
+            let mut request = new_request();
+            let mut endpoint = backend.clone();
+            let response = cache.handle(&mut request, &mut endpoint).await.unwrap();
+            assert_eq!(body_text(response).await, "fresh");
+            assert_eq!(backend.calls(), 1);
 
             let mut request = new_request();
             let mut endpoint = backend.clone();

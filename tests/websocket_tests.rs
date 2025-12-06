@@ -67,6 +67,45 @@ async fn websocket_echo_roundtrip() {
 }
 
 #[async_std::test]
+async fn websocket_split_roundtrip() {
+    let listener = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("skipping websocket_split_roundtrip: {err}");
+            return;
+        }
+    };
+    let addr = listener.local_addr().unwrap();
+
+    let server = async_std::task::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        if let Some(Ok(Message::Text(text))) = ws.next().await {
+            ws.send(Message::Text(text)).await.unwrap();
+            let _ = ws.close(None).await;
+        }
+    });
+
+    let client = zenwave::websocket::connect(format!("ws://{addr}"))
+        .await
+        .unwrap();
+    let (sender, receiver) = client.split();
+
+    let send_task = async_std::task::spawn({
+        let sender = sender.clone();
+        async move { sender.send_text("hello world").await.unwrap() }
+    });
+    let recv_task = async_std::task::spawn(async move { receiver.recv().await.unwrap() });
+
+    send_task.await;
+    let message = recv_task.await.unwrap();
+    assert_eq!(message.unwrap().as_text(), Some("hello world"));
+
+    let _ = sender.close().await;
+    server.await;
+}
+
+#[async_std::test]
 async fn websocket_respects_max_message_size_config() {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,

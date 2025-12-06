@@ -162,21 +162,17 @@ fn fetch(
             let value = value
                 .to_str()
                 .map_err(|e| WebError::new(StatusCode::BAD_REQUEST, e))?;
-            headers
-                .set(name.as_str(), value)
-                .map_err(|err| WebError::new(
-                    StatusCode::BAD_REQUEST,
-                    anyhow!(format_js_value(&err)),
-                ))?;
+            headers.set(name.as_str(), value).map_err(|err| {
+                WebError::new(StatusCode::BAD_REQUEST, anyhow!(format_js_value(&err)))
+            })?;
         }
         request_init.set_headers(headers.as_ref());
 
         let uri = request.uri().to_string();
         let fetch_request = web_sys::Request::new_with_str_and_init(uri.as_str(), &request_init)
-            .map_err(|err| WebError::new(
-                StatusCode::BAD_REQUEST,
-                anyhow!(format_js_value(&err)),
-            ))?;
+            .map_err(|err| {
+                WebError::new(StatusCode::BAD_REQUEST, anyhow!(format_js_value(&err)))
+            })?;
 
         let promise = window.fetch_with_request(&fetch_request);
         let fut = SingleThreaded(JsFuture::from(promise));
@@ -195,10 +191,7 @@ fn fetch(
         let mut headers = http_kit::header::HeaderMap::new();
         for pair in response.headers().entries() {
             let pair = pair.map_err(|err| {
-                WebError::new(
-                    StatusCode::BAD_GATEWAY,
-                    anyhow!(format_js_value(&err)),
-                )
+                WebError::new(StatusCode::BAD_GATEWAY, anyhow!(format_js_value(&err)))
             })?;
             let entry: js_sys::Array = pair.dyn_into().map_err(|_| {
                 WebError::new(

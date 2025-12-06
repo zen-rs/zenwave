@@ -284,6 +284,19 @@ async fn main() -> zenwave::Result<()> {
 }
 ```
 
+You can also split a connection to drive sending and receiving from different tasks:
+
+```rust
+let socket = websocket::connect("wss://echo.websocket.events").await?;
+let (sender, receiver) = socket.split();
+
+// `send` serializes to JSON by default; use `send_text` for raw text frames.
+sender.send(&MyPayload { message: "hello" }).await?;
+if let Some(reply) = receiver.recv().await? {
+    println!("Got reply: {:?}", reply);
+}
+```
+
 ## Installation
 
 Add Zenwave to your `Cargo.toml`. The default configuration uses the Hyper backend with rustls TLS:

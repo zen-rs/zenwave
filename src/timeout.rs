@@ -5,23 +5,23 @@
 //! `async-io`'s timers so it works uniformly across targets without pulling
 //! in a dedicated async runtime.
 
+use core::time::Duration;
 #[cfg(target_arch = "wasm32")]
 use core::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
-use core::time::Duration;
 
+#[cfg(not(target_arch = "wasm32"))]
+use async_io::Timer;
 use futures_util::{future::Either, pin_mut};
+#[cfg(target_arch = "wasm32")]
+use gloo_timers::future::TimeoutFuture;
 use http_kit::{
     Endpoint, HttpError, Middleware, Request, Response, StatusCode, middleware::MiddlewareError,
 };
 use thiserror::Error;
-#[cfg(target_arch = "wasm32")]
-use gloo_timers::future::TimeoutFuture;
-#[cfg(not(target_arch = "wasm32"))]
-use async_io::Timer;
 
 /// Middleware that fails requests exceeding the configured duration.
 #[derive(Debug, Clone, Copy)]
@@ -71,10 +71,7 @@ impl Middleware for Timeout {
 #[cfg(target_arch = "wasm32")]
 fn timeout_future(duration: Duration) -> SingleThreaded<TimeoutFuture> {
     // gloo expects milliseconds as u32; saturate to avoid overflow for long durations.
-    let millis = duration
-        .as_millis()
-        .try_into()
-        .unwrap_or(u32::MAX);
+    let millis = duration.as_millis().try_into().unwrap_or(u32::MAX);
     SingleThreaded(TimeoutFuture::new(millis))
 }
 

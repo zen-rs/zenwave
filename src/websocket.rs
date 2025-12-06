@@ -183,43 +183,71 @@ where
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl From<WebSocketMessage> for async_tungstenite::tungstenite::Message {
-    fn from(value: WebSocketMessage) -> Self {
-        match value {
-            WebSocketMessage::Text(text) => Self::Text(unsafe {
-                use async_tungstenite::tungstenite::Utf8Bytes;
-
-                Utf8Bytes::from_bytes_unchecked(text.into_bytes())
-            }),
-            WebSocketMessage::Binary(bytes) => Self::Binary(bytes),
-        }
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 mod native {
+    use async_lock::Mutex;
     use async_tungstenite::{
-        WebSocketStream,
+        WebSocketReceiver as AsyncReceiver, WebSocketSender as AsyncSender, WebSocketStream,
         tungstenite::{
-            Message as TungsteniteMessage, protocol::WebSocketConfig as TungsteniteConfig,
+            Message as TungsteniteMessage, Utf8Bytes,
+            protocol::WebSocketConfig as TungsteniteConfig,
         },
     };
     use futures_util::StreamExt;
     use http_kit::utils::{ByteStr, Bytes};
+    use std::{fmt, sync::Arc};
     use url::Url;
 
     use super::{WebSocketConfig, WebSocketError, WebSocketMessage, serialize_payload};
 
     type NativeSocket = WebSocketStream<async_tungstenite::async_std::ConnectStream>;
+    type NativeSender = AsyncSender<async_tungstenite::async_std::ConnectStream>;
+    type NativeReceiver = AsyncReceiver<async_tungstenite::async_std::ConnectStream>;
+
+    #[derive(Debug)]
+    struct SharedSocket {
+        sender: Mutex<NativeSender>,
+        receiver: Mutex<NativeReceiver>,
+    }
 
     /// A websocket connection backed by async-io + Tungstenite.
     pub struct WebSocket {
-        inner: NativeSocket,
+        sender: WebSocketSender,
+        receiver: WebSocketReceiver,
     }
 
-    impl core::fmt::Debug for WebSocket {
-        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    impl fmt::Debug for WebSocket {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("WebSocket").finish()
+        }
+    }
+
+    /// Sending half of a websocket connection.
+    pub struct WebSocketSender {
+        inner: Arc<SharedSocket>,
+    }
+
+    impl fmt::Debug for WebSocketSender {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("WebSocketSender").finish()
+        }
+    }
+
+    impl Clone for WebSocketSender {
+        fn clone(&self) -> Self {
+            Self {
+                inner: Arc::clone(&self.inner),
+            }
+        }
+    }
+
+    /// Receiving half of a websocket connection.
+    pub struct WebSocketReceiver {
+        inner: Arc<SharedSocket>,
+    }
+
+    impl fmt::Debug for WebSocketReceiver {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("WebSocketReceiver").finish()
         }
     }
 
@@ -255,17 +283,32 @@ mod native {
                 .await
                 .map_err(|e| WebSocketError::ConnectionFailed(Box::new(e)))?;
 
-        Ok(WebSocket { inner: ws_stream })
+        Ok(WebSocket::from_socket(ws_stream))
     }
 
     impl WebSocket {
+        fn from_socket(socket: NativeSocket) -> Self {
+            let (sender, receiver) = socket.split();
+            let shared = Arc::new(SharedSocket {
+                sender: Mutex::new(sender),
+                receiver: Mutex::new(receiver),
+            });
+
+            Self {
+                sender: WebSocketSender {
+                    inner: Arc::clone(&shared),
+                },
+                receiver: WebSocketReceiver { inner: shared },
+            }
+        }
+
         /// Send a websocket message serialized as JSON.
         ///
         /// # Errors
         ///
         /// Returns an error if serialization fails or when the underlying socket cannot
         /// write the resulting frame.
-        pub async fn send<T>(&mut self, value: T) -> Result<(), WebSocketError>
+        pub async fn send<T>(&self, value: T) -> Result<(), WebSocketError>
         where
             T: serde::Serialize,
         {
@@ -278,7 +321,65 @@ mod native {
         /// # Errors
         ///
         /// Returns an error when the underlying socket cannot write the frame.
-        pub async fn send_text(&mut self, text: impl Into<String>) -> Result<(), WebSocketError> {
+        pub async fn send_text(&self, text: impl Into<String>) -> Result<(), WebSocketError> {
+            self.sender.send_text(text).await
+        }
+
+        /// Send a binary websocket message.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the underlying socket cannot write the frame.
+        pub async fn send_binary(&self, bytes: impl Into<Bytes>) -> Result<(), WebSocketError> {
+            self.sender.send_binary(bytes).await
+        }
+
+        /// Receive the next websocket message.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the underlying socket cannot read the next frame.
+        pub async fn recv(&self) -> Result<Option<WebSocketMessage>, WebSocketError> {
+            self.receiver.recv().await
+        }
+
+        /// Close the websocket connection gracefully.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the close frame cannot be sent.
+        pub async fn close(self) -> Result<(), WebSocketError> {
+            self.sender.close().await
+        }
+
+        /// Split the websocket into sending and receiving halves.
+        #[must_use]
+        pub fn split(self) -> (WebSocketSender, WebSocketReceiver) {
+            (self.sender, self.receiver)
+        }
+    }
+
+    impl WebSocketSender {
+        /// Send a websocket message serialized as JSON.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if serialization fails or when the underlying socket cannot
+        /// write the resulting frame.
+        pub async fn send<T>(&self, value: T) -> Result<(), WebSocketError>
+        where
+            T: serde::Serialize,
+        {
+            let payload = serialize_payload(&value)?;
+            self.send_text(payload).await
+        }
+
+        /// Send a text websocket message.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the underlying socket cannot write the frame.
+        pub async fn send_text(&self, text: impl Into<String>) -> Result<(), WebSocketError> {
             self.send_message(WebSocketMessage::text(text)).await
         }
 
@@ -287,24 +388,49 @@ mod native {
         /// # Errors
         ///
         /// Returns an error when the underlying socket cannot write the frame.
-        pub async fn send_binary(&mut self, bytes: impl Into<Bytes>) -> Result<(), WebSocketError> {
+        pub async fn send_binary(&self, bytes: impl Into<Bytes>) -> Result<(), WebSocketError> {
             self.send_message(WebSocketMessage::binary(bytes)).await
         }
 
-        async fn send_message(&mut self, message: WebSocketMessage) -> Result<(), WebSocketError> {
-            self.inner
-                .send(message.into())
+        async fn send_message(&self, message: WebSocketMessage) -> Result<(), WebSocketError> {
+            let mut sender = self.inner.sender.lock().await;
+            sender
+                .send(to_tungstenite_message(message))
                 .await
                 .map_err(|e| WebSocketError::ConnectionFailed(Box::new(e)))
         }
 
+        /// Close the websocket connection gracefully.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the close frame cannot be sent.
+        pub async fn close(&self) -> Result<(), WebSocketError> {
+            let mut sender = self.inner.sender.lock().await;
+            sender
+                .close(None)
+                .await
+                .map_err(|e| WebSocketError::ConnectionFailed(Box::new(e)))
+        }
+    }
+
+    impl WebSocketReceiver {
         /// Receive the next websocket message.
         ///
         /// # Errors
         ///
         /// Returns an error when the underlying socket cannot read the next frame.
-        pub async fn recv(&mut self) -> Result<Option<WebSocketMessage>, WebSocketError> {
-            while let Some(message) = self.inner.next().await {
+        pub async fn recv(&self) -> Result<Option<WebSocketMessage>, WebSocketError> {
+            loop {
+                let message = {
+                    let mut receiver = self.inner.receiver.lock().await;
+                    receiver.next().await
+                };
+
+                let Some(message) = message else {
+                    return Ok(None);
+                };
+
                 let message = message.map_err(|e| WebSocketError::ConnectionFailed(Box::new(e)))?;
 
                 match message {
@@ -318,36 +444,37 @@ mod native {
                     }
                     TungsteniteMessage::Close(_) => return Ok(None),
                     TungsteniteMessage::Ping(payload) => {
-                        self.inner
-                            .send(TungsteniteMessage::Pong(payload))
-                            .await
-                            .map_err(|e| WebSocketError::ConnectionFailed(Box::new(e)))?;
+                        self.respond_pong(payload).await?;
                     }
                     TungsteniteMessage::Pong(_) | TungsteniteMessage::Frame(_) => {}
                 }
             }
-
-            Ok(None)
         }
 
-        /// Close the websocket connection gracefully.
-        ///
-        /// # Errors
-        ///
-        /// Returns an error when the close frame cannot be sent.
-        pub async fn close(mut self) -> Result<(), WebSocketError> {
-            self.inner
-                .close(None)
+        async fn respond_pong(&self, payload: Bytes) -> Result<(), WebSocketError> {
+            let mut sender = self.inner.sender.lock().await;
+            sender
+                .send(TungsteniteMessage::Pong(payload))
                 .await
                 .map_err(|e| WebSocketError::ConnectionFailed(Box::new(e)))
+        }
+    }
+
+    fn to_tungstenite_message(value: WebSocketMessage) -> TungsteniteMessage {
+        match value {
+            WebSocketMessage::Text(text) => TungsteniteMessage::Text(unsafe {
+                Utf8Bytes::from_bytes_unchecked(text.into_bytes())
+            }),
+            WebSocketMessage::Binary(bytes) => TungsteniteMessage::Binary(bytes),
         }
     }
 }
 
 #[cfg(target_arch = "wasm32")]
 mod wasm {
-    use std::{cell::RefCell, fmt, rc::Rc};
+    use std::{cell::RefCell, fmt, rc::Rc, sync::Arc};
 
+    use async_lock::Mutex;
     use futures_channel::{mpsc, oneshot};
     use futures_util::StreamExt;
     use http_kit::utils::Bytes;
@@ -369,18 +496,52 @@ mod wasm {
 
     /// Browser/wasm websocket connection backed by `web_sys`.
     pub struct WebSocket {
+        sender: WebSocketSender,
+        receiver: WebSocketReceiver,
+    }
+
+    impl fmt::Debug for WebSocket {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("WebSocket").finish()
+        }
+    }
+
+    #[derive(Debug)]
+    struct SharedSocket {
         socket: BrowserWebSocket,
-        receiver: mpsc::UnboundedReceiver<WsEvent>,
+        receiver: Mutex<mpsc::UnboundedReceiver<WsEvent>>,
         _on_message: Closure<dyn FnMut(MessageEvent)>,
         _on_error: Closure<dyn FnMut(ErrorEvent)>,
         _on_close: Closure<dyn FnMut(CloseEvent)>,
     }
 
-    impl fmt::Debug for WebSocket {
+    /// Sending half of a websocket connection.
+    pub struct WebSocketSender {
+        inner: Arc<SharedSocket>,
+    }
+
+    impl fmt::Debug for WebSocketSender {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("WebSocket")
-                .field("ready_state", &self.socket.ready_state())
-                .finish()
+            f.debug_struct("WebSocketSender").finish()
+        }
+    }
+
+    impl Clone for WebSocketSender {
+        fn clone(&self) -> Self {
+            Self {
+                inner: Arc::clone(&self.inner),
+            }
+        }
+    }
+
+    /// Receiving half of a websocket connection.
+    pub struct WebSocketReceiver {
+        inner: Arc<SharedSocket>,
+    }
+
+    impl fmt::Debug for WebSocketReceiver {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("WebSocketReceiver").finish()
         }
     }
 
@@ -490,12 +651,19 @@ mod wasm {
             }
         }
 
-        Ok(WebSocket {
+        let shared = Arc::new(SharedSocket {
             socket,
-            receiver: event_rx,
+            receiver: Mutex::new(event_rx),
             _on_message: on_message,
             _on_error: on_error,
             _on_close: on_close,
+        });
+
+        Ok(WebSocket {
+            sender: WebSocketSender {
+                inner: Arc::clone(&shared),
+            },
+            receiver: WebSocketReceiver { inner: shared },
         })
     }
 
@@ -505,7 +673,7 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if serialization fails or the browser cannot queue the frame.
-        pub async fn send<T>(&mut self, value: T) -> Result<()>
+        pub async fn send<T>(&self, value: T) -> Result<()>
         where
             T: serde::Serialize,
         {
@@ -518,8 +686,8 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if the browser fails to queue the frame.
-        pub async fn send_text(&mut self, text: impl Into<String>) -> Result<()> {
-            self.send_message(WebSocketMessage::text(text)).await
+        pub async fn send_text(&self, text: impl Into<String>) -> Result<()> {
+            self.sender.send_text(text).await
         }
 
         /// Send a binary websocket message.
@@ -527,22 +695,8 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if the browser fails to queue the frame.
-        pub async fn send_binary(&mut self, bytes: impl Into<Bytes>) -> Result<()> {
-            self.send_message(WebSocketMessage::binary(bytes)).await
-        }
-
-        async fn send_message(&mut self, message: WebSocketMessage) -> Result<()> {
-            match message {
-                WebSocketMessage::Text(text) => self
-                    .socket
-                    .send_with_str(&text)
-                    .map_err(|e| connection_failed(format_js_value(&e)))?,
-                WebSocketMessage::Binary(bytes) => self
-                    .socket
-                    .send_with_u8_array(&bytes)
-                    .map_err(|e| connection_failed(format_js_value(&e)))?,
-            }
-            Ok(())
+        pub async fn send_binary(&self, bytes: impl Into<Bytes>) -> Result<()> {
+            self.sender.send_binary(bytes).await
         }
 
         /// Receive the next websocket message.
@@ -550,12 +704,8 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if the websocket reports an error event.
-        pub async fn recv(&mut self) -> Result<Option<WebSocketMessage>> {
-            match self.receiver.next().await {
-                Some(WsEvent::Message(message)) => Ok(Some(message)),
-                Some(WsEvent::Closed) | None => Ok(None),
-                Some(WsEvent::Error(message)) => Err(connection_failed(message)),
-            }
+        pub async fn recv(&self) -> Result<Option<WebSocketMessage>> {
+            self.receiver.recv().await
         }
 
         /// Close the websocket connection gracefully.
@@ -564,9 +714,90 @@ mod wasm {
         ///
         /// Returns an error if the browser refuses to close the socket.
         pub async fn close(self) -> Result<()> {
-            self.socket
+            self.sender.close().await
+        }
+
+        /// Split the websocket into sending and receiving halves.
+        #[must_use]
+        pub fn split(self) -> (WebSocketSender, WebSocketReceiver) {
+            (self.sender, self.receiver)
+        }
+    }
+
+    impl WebSocketSender {
+        /// Send a websocket message serialized as JSON.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if serialization fails or the browser cannot queue the frame.
+        pub async fn send<T>(&self, value: T) -> Result<()>
+        where
+            T: serde::Serialize,
+        {
+            let payload = serialize_payload(&value)?;
+            self.send_text(payload).await
+        }
+
+        /// Send a text websocket message.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if the browser fails to queue the frame.
+        pub async fn send_text(&self, text: impl Into<String>) -> Result<()> {
+            self.send_message(WebSocketMessage::text(text)).await
+        }
+
+        /// Send a binary websocket message.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if the browser fails to queue the frame.
+        pub async fn send_binary(&self, bytes: impl Into<Bytes>) -> Result<()> {
+            self.send_message(WebSocketMessage::binary(bytes)).await
+        }
+
+        async fn send_message(&self, message: WebSocketMessage) -> Result<()> {
+            match message {
+                WebSocketMessage::Text(text) => self
+                    .inner
+                    .socket
+                    .send_with_str(&text)
+                    .map_err(|e| connection_failed(format_js_value(&e)))?,
+                WebSocketMessage::Binary(bytes) => self
+                    .inner
+                    .socket
+                    .send_with_u8_array(&bytes)
+                    .map_err(|e| connection_failed(format_js_value(&e)))?,
+            }
+            Ok(())
+        }
+
+        /// Close the websocket connection gracefully.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if the browser refuses to close the socket.
+        pub async fn close(&self) -> Result<()> {
+            self.inner
+                .socket
                 .close()
                 .map_err(|e| connection_failed(format_js_value(&e)))
+        }
+    }
+
+    impl WebSocketReceiver {
+        /// Receive the next websocket message.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if the websocket reports an error event.
+        pub async fn recv(&self) -> Result<Option<WebSocketMessage>> {
+            let mut receiver = self.inner.receiver.lock().await;
+            match receiver.next().await {
+                Some(WsEvent::Message(message)) => Ok(Some(message)),
+                Some(WsEvent::Closed) | None => Ok(None),
+                Some(WsEvent::Error(message)) => Err(connection_failed(message)),
+            }
         }
     }
 
@@ -583,7 +814,7 @@ mod wasm {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{WebSocket, connect, connect_with_config};
+pub use native::{WebSocket, WebSocketReceiver, WebSocketSender, connect, connect_with_config};
 
 #[cfg(target_arch = "wasm32")]
-pub use wasm::{WebSocket, connect, connect_with_config};
+pub use wasm::{WebSocket, WebSocketReceiver, WebSocketSender, connect, connect_with_config};

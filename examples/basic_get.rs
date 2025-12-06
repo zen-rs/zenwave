@@ -14,17 +14,17 @@ struct Todo {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     async_io::block_on(async {
-    // `zenwave::get` is perfect for one-off requests.
-    let response = zenwave::get("https://jsonplaceholder.typicode.com/todos/1").await?;
-    let todo: Todo = response.into_json().await?;
+        // `zenwave::get` is perfect for one-off requests.
+        let response = zenwave::get("https://jsonplaceholder.typicode.com/todos/1").await?;
+        let todo: Todo = response.into_json().await?;
 
-    println!(
-        "Todo #{id} for user #{user}: {title} (completed: {completed})",
-        id = todo.id,
-        user = todo.user_id,
-        title = todo.title,
-        completed = todo.completed
-    );
+        println!(
+            "Todo #{id} for user #{user}: {title} (completed: {completed})",
+            id = todo.id,
+            user = todo.user_id,
+            title = todo.title,
+            completed = todo.completed
+        );
 
         Ok(())
     })

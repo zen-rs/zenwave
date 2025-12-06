@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(not(target_arch = "wasm32"))]
 use {
-    async_fs, serde_json,
+    async_fs,
+    async_lock::Mutex as AsyncMutex,
+    serde_json,
     std::{
         collections::HashMap,
         convert::TryFrom,
@@ -19,7 +21,6 @@ use {
         path::{Path, PathBuf},
         sync::{Arc, LazyLock},
     },
-    async_lock::Mutex as AsyncMutex,
 };
 
 #[cfg(not(target_arch = "wasm32"))]

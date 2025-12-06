@@ -3,9 +3,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use futures_util::StreamExt;
-use http_kit::{BodyError, HttpError, StatusCode, header, utils::{AsyncSeekExt, AsyncWriteExt}};
 use async_fs::OpenOptions;
+use futures_util::StreamExt;
+use http_kit::{
+    BodyError, HttpError, StatusCode, header,
+    utils::{AsyncSeekExt, AsyncWriteExt},
+};
 
 use super::RequestBuilder;
 
