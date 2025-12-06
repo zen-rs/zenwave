@@ -1,17 +1,7 @@
-use http_kit::{
-    HttpError, StatusCode,
-    utils::{ByteStr, Bytes},
-};
-use serde::Serialize;
+pub use http_kit::ws::*;
 
-/// Message transmitted over a websocket connection.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WebSocketMessage {
-    /// UTF-8 text payload.
-    Text(ByteStr),
-    /// Binary payload.
-    Binary(Bytes),
-}
+use http_kit::{HttpError, StatusCode};
+use serde::Serialize;
 
 /// Errors returned by websocket operations.
 #[derive(Debug, thiserror::Error)]
@@ -108,92 +98,6 @@ impl WebSocketConfig {
     pub const fn with_max_frame_size(mut self, max_frame_size: Option<usize>) -> Self {
         self.max_frame_size = max_frame_size;
         self
-    }
-}
-
-impl WebSocketMessage {
-    /// Construct a text message.
-    #[must_use]
-    pub fn text(value: impl Into<ByteStr>) -> Self {
-        Self::Text(value.into())
-    }
-
-    /// Construct a binary message.
-    #[must_use]
-    pub fn binary(value: impl Into<Bytes>) -> Self {
-        Self::Binary(value.into())
-    }
-
-    /// Returns the payload as text when possible.
-    #[must_use]
-    pub fn as_text(&self) -> Option<&str> {
-        match self {
-            Self::Text(text) => Some(text),
-            Self::Binary(_) => None,
-        }
-    }
-
-    /// Returns the payload as raw bytes when possible.
-    #[must_use]
-    pub fn as_bytes(&self) -> Option<&[u8]> {
-        match self {
-            Self::Text(_) => None,
-            Self::Binary(bytes) => Some(bytes),
-        }
-    }
-
-    /// Converts the payload into owned text when possible.
-    #[must_use]
-    pub fn into_text(self) -> Option<ByteStr> {
-        match self {
-            Self::Text(text) => Some(text),
-            Self::Binary(_) => None,
-        }
-    }
-
-    /// Converts the payload into owned bytes when possible.
-    #[must_use]
-    pub fn into_bytes(self) -> Option<Bytes> {
-        match self {
-            Self::Text(_) => None,
-            Self::Binary(bytes) => Some(bytes),
-        }
-    }
-}
-
-impl From<String> for WebSocketMessage {
-    fn from(value: String) -> Self {
-        Self::Text(value.into())
-    }
-}
-
-impl From<ByteStr> for WebSocketMessage {
-    fn from(value: ByteStr) -> Self {
-        Self::Text(value)
-    }
-}
-
-impl From<&str> for WebSocketMessage {
-    fn from(value: &str) -> Self {
-        Self::Text(value.to_owned().into())
-    }
-}
-
-impl From<Bytes> for WebSocketMessage {
-    fn from(value: Bytes) -> Self {
-        Self::Binary(value)
-    }
-}
-
-impl From<Vec<u8>> for WebSocketMessage {
-    fn from(value: Vec<u8>) -> Self {
-        Self::Binary(value.into())
-    }
-}
-
-impl From<&[u8]> for WebSocketMessage {
-    fn from(value: &[u8]) -> Self {
-        Self::Binary(value.to_vec().into())
     }
 }
 
