@@ -7,8 +7,20 @@ use std::{
 
 use async_net::TcpListener;
 use async_std::future::timeout;
-use async_tungstenite::{accept_async, tungstenite::Message};
-use futures_util::StreamExt;
+use async_tungstenite::{
+    accept_async,
+    tungstenite::{
+        Message,
+        protocol::frame::{
+            Frame,
+            coding::{Data as OpData, OpCode},
+        },
+    },
+};
+use futures_util::{
+    StreamExt,
+    io::{AsyncRead, AsyncWrite},
+};
 use zenwave::websocket::{WebSocketConfig, WebSocketError};
 
 fn public_echo_servers() -> Vec<String> {
@@ -187,6 +199,104 @@ async fn websocket_public_echo_service_roundtrip() {
     eprintln!(
         "skipping websocket_public_echo_service_roundtrip: all public endpoints failed ({last_error:?})"
     );
+}
+
+async fn send_fragmented_binary<S>(
+    ws: &mut async_tungstenite::WebSocketStream<S>,
+    payload: &[u8],
+    chunk_size: usize,
+) -> async_tungstenite::tungstenite::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut offset = 0;
+    let mut first = true;
+
+    while offset < payload.len() {
+        let end = (offset + chunk_size).min(payload.len());
+        let opcode = if first {
+            OpCode::Data(OpData::Binary)
+        } else {
+            OpCode::Data(OpData::Continue)
+        };
+        let frame = Frame::message(payload[offset..end].to_vec(), opcode, end == payload.len());
+        ws.send(Message::Frame(frame)).await?;
+
+        first = false;
+        offset = end;
+    }
+    Ok(())
+}
+
+const MB: usize = 1024 * 1024;
+
+#[async_std::test]
+async fn websocket_accepts_64mb_message_by_default() {
+    let listener = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("skipping websocket_accepts_64mb_message_by_default: {err}");
+            return;
+        }
+    };
+    let addr = listener.local_addr().unwrap();
+
+    let server = async_std::task::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        let payload = vec![0x42u8; 64 * MB];
+        let _ = send_fragmented_binary(&mut ws, &payload, 8 * MB).await;
+        let _ = ws.close(None).await;
+    });
+
+    let mut client = zenwave::websocket::connect(format!("ws://{addr}"))
+        .await
+        .unwrap();
+
+    let message = timeout(Duration::from_secs(30), async { client.recv().await })
+        .await
+        .expect("timeout waiting for 64MB payload")
+        .expect("websocket read failed")
+        .expect("websocket closed before payload");
+    assert_eq!(message.as_bytes().map(|b| b.len()), Some(64 * MB));
+
+    client.close().await.unwrap();
+    server.await;
+}
+
+#[async_std::test]
+async fn websocket_rejects_128mb_message_by_default() {
+    let listener = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("skipping websocket_rejects_128mb_message_by_default: {err}");
+            return;
+        }
+    };
+    let addr = listener.local_addr().unwrap();
+
+    let server = async_std::task::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        let payload = vec![0x24u8; 128 * MB];
+        let _ = send_fragmented_binary(&mut ws, &payload, 8 * MB).await;
+        let _ = ws.close(None).await;
+    });
+
+    let mut client = zenwave::websocket::connect(format!("ws://{addr}"))
+        .await
+        .unwrap();
+
+    match timeout(Duration::from_secs(30), async { client.recv().await })
+        .await
+        .expect("timeout waiting for 128MB payload")
+    {
+        Err(WebSocketError::ConnectionFailed(_)) => {}
+        other => panic!("expected connection failure for oversized frame, got {other:?}"),
+    }
+
+    let _ = client.close().await;
+    server.await;
 }
 
 async fn attempt_public_echo(url: &str, payload: &str) -> Result<(), String> {
