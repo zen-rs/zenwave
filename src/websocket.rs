@@ -51,9 +51,7 @@ impl From<WebSocketError> for crate::Error {
             WebSocketError::UnsupportedScheme(s) => {
                 Self::WebSocket(WebSocketErrorKind::UnsupportedScheme(s))
             }
-            WebSocketError::InvalidUri(e) => {
-                Self::InvalidUri(e.to_string())
-            }
+            WebSocketError::InvalidUri(e) => Self::InvalidUri(e.to_string()),
             WebSocketError::ConnectionFailed(e) => {
                 Self::WebSocket(WebSocketErrorKind::ConnectionFailed(e.to_string()))
             }
