@@ -13,6 +13,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match message {
                 WebSocketMessage::Text(text) => println!("Received text: {text}"),
                 WebSocketMessage::Binary(bytes) => println!("Received {} bytes", bytes.len()),
+                WebSocketMessage::Ping(_) => println!("Received ping"),
+                WebSocketMessage::Pong(_) => println!("Received pong"),
+                WebSocketMessage::Close => println!("Received close"),
             }
         } else {
             println!("Server closed the connection");

@@ -393,6 +393,9 @@ mod native {
                 Utf8Bytes::from_bytes_unchecked(text.into_bytes())
             }),
             WebSocketMessage::Binary(bytes) => TungsteniteMessage::Binary(bytes),
+            WebSocketMessage::Ping(bytes) => TungsteniteMessage::Ping(bytes),
+            WebSocketMessage::Pong(bytes) => TungsteniteMessage::Pong(bytes),
+            WebSocketMessage::Close => TungsteniteMessage::Close(None),
         }
     }
 }
