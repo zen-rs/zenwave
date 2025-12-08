@@ -36,12 +36,12 @@ pub enum CurlError {
 }
 
 impl HttpError for CurlError {
-    fn status(&self) -> Option<StatusCode> {
-        Some(match self {
+    fn status(&self) -> StatusCode {
+        match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Remote { status, .. } => *status,
-        })
+        }
     }
 }
 
@@ -65,20 +65,23 @@ impl From<CurlError> for crate::Error {
                 let io_err = std::io::Error::new(std::io::ErrorKind::Other, e);
                 crate::Error::Transport(Box::new(io_err))
             }
-            CurlError::Remote { status, body, raw_response } => {
-                crate::Error::Http {
-                    status,
-                    message: body.clone().unwrap_or_else(|| {
-                        status.canonical_reason()
-                            .unwrap_or("Unknown error")
-                            .to_string()
-                    }),
-                    response: HttpErrorResponse {
-                        response: *raw_response,
-                        body_text: body,
-                    },
-                }
-            }
+            CurlError::Remote {
+                status,
+                body,
+                raw_response,
+            } => crate::Error::Http {
+                status,
+                message: body.clone().unwrap_or_else(|| {
+                    status
+                        .canonical_reason()
+                        .unwrap_or("Unknown error")
+                        .to_string()
+                }),
+                response: HttpErrorResponse {
+                    response: *raw_response,
+                    body_text: body,
+                },
+            },
         }
     }
 }
@@ -114,7 +117,9 @@ impl Endpoint for CurlBackend {
             .body(Body::empty())
             .expect("building dummy request failed");
         let request = replace(request, dummy_request);
-        execute(request, self.proxy.clone()).await.map_err(Into::into)
+        execute(request, self.proxy.clone())
+            .await
+            .map_err(Into::into)
     }
 }
 

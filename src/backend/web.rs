@@ -59,11 +59,11 @@ impl WebError {
 }
 
 impl HttpError for WebError {
-    fn status(&self) -> Option<StatusCode> {
-        Some(match self {
+    fn status(&self) -> StatusCode {
+        match self {
             Self::Transport { status, .. } => *status,
             Self::Remote { status, .. } => *status,
-        })
+        }
     }
 }
 
@@ -72,20 +72,23 @@ impl From<WebError> for crate::Error {
     fn from(err: WebError) -> Self {
         match err {
             WebError::Transport { source, .. } => crate::Error::Transport(Box::new(source)),
-            WebError::Remote { status, body, raw_response } => {
-                crate::Error::Http {
-                    status,
-                    message: body.clone().unwrap_or_else(|| {
-                        status.canonical_reason()
-                            .unwrap_or("Unknown error")
-                            .to_string()
-                    }),
-                    response: HttpErrorResponse {
-                        response: raw_response,
-                        body_text: body,
-                    },
-                }
-            }
+            WebError::Remote {
+                status,
+                body,
+                raw_response,
+            } => crate::Error::Http {
+                status,
+                message: body.clone().unwrap_or_else(|| {
+                    status
+                        .canonical_reason()
+                        .unwrap_or("Unknown error")
+                        .to_string()
+                }),
+                response: HttpErrorResponse {
+                    response: raw_response,
+                    body_text: body,
+                },
+            },
         }
     }
 }

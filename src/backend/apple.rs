@@ -65,12 +65,12 @@ impl AppleError {
 }
 
 impl HttpError for AppleError {
-    fn status(&self) -> Option<StatusCode> {
-        Some(match self {
+    fn status(&self) -> StatusCode {
+        match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Remote { status, .. } => *status,
-        })
+        }
     }
 }
 
@@ -84,20 +84,23 @@ impl From<AppleError> for crate::Error {
                 let io_err = std::io::Error::new(std::io::ErrorKind::Other, e);
                 crate::Error::Transport(Box::new(io_err))
             }
-            AppleError::Remote { status, body, raw_response } => {
-                crate::Error::Http {
-                    status,
-                    message: body.clone().unwrap_or_else(|| {
-                        status.canonical_reason()
-                            .unwrap_or("Unknown error")
-                            .to_string()
-                    }),
-                    response: HttpErrorResponse {
-                        response: *raw_response,
-                        body_text: body,
-                    },
-                }
-            }
+            AppleError::Remote {
+                status,
+                body,
+                raw_response,
+            } => crate::Error::Http {
+                status,
+                message: body.clone().unwrap_or_else(|| {
+                    status
+                        .canonical_reason()
+                        .unwrap_or("Unknown error")
+                        .to_string()
+                }),
+                response: HttpErrorResponse {
+                    response: *raw_response,
+                    body_text: body,
+                },
+            },
         }
     }
 }
@@ -174,7 +177,9 @@ impl Endpoint for AppleBackend {
     type Error = crate::Error;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         let handle = self.handle;
-        send_with_url_session(handle, request).await.map_err(Into::into)
+        send_with_url_session(handle, request)
+            .await
+            .map_err(Into::into)
     }
 }
 
