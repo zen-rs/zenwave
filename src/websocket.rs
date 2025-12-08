@@ -248,7 +248,7 @@ mod native {
         /// # Errors
         ///
         /// Returns an error when the underlying socket cannot write the frame.
-        pub async fn send_text(&self, text: impl Into<String>) -> Result<(), WebSocketError> {
+        pub async fn send_text(&self, text: impl Into<ByteStr>) -> Result<(), WebSocketError> {
             self.sender.send_text(text).await
         }
 
@@ -306,7 +306,7 @@ mod native {
         /// # Errors
         ///
         /// Returns an error when the underlying socket cannot write the frame.
-        pub async fn send_text(&self, text: impl Into<String>) -> Result<(), WebSocketError> {
+        pub async fn send_text(&self, text: impl Into<ByteStr>) -> Result<(), WebSocketError> {
             self.send_message(WebSocketMessage::text(text)).await
         }
 
@@ -407,7 +407,7 @@ mod wasm {
     use async_lock::Mutex;
     use futures_channel::{mpsc, oneshot};
     use futures_util::StreamExt;
-    use http_kit::utils::Bytes;
+    use http_kit::utils::{ByteStr, Bytes};
     use std::io;
     use wasm_bindgen::{JsCast, JsValue, closure::Closure};
     use web_sys::{
@@ -616,7 +616,7 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if the browser fails to queue the frame.
-        pub async fn send_text(&self, text: impl Into<String>) -> Result<()> {
+        pub async fn send_text(&self, text: impl Into<ByteStr>) -> Result<()> {
             self.sender.send_text(text).await
         }
 
@@ -673,7 +673,7 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if the browser fails to queue the frame.
-        pub async fn send_text(&self, text: impl Into<String>) -> Result<()> {
+        pub async fn send_text(&self, text: impl Into<ByteStr>) -> Result<()> {
             self.send_message(WebSocketMessage::text(text)).await
         }
 
@@ -731,7 +731,7 @@ mod wasm {
         }
     }
 
-    fn connection_failed(message: impl Into<String>) -> WebSocketError {
+    fn connection_failed(message: impl Into<ByteStr>) -> WebSocketError {
         WebSocketError::ConnectionFailed(Box::new(io::Error::new(
             io::ErrorKind::Other,
             message.into(),

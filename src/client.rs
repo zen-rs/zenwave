@@ -26,6 +26,7 @@ use crate::{
     cache::Cache,
     cookie::CookieStore,
     redirect::FollowRedirect,
+    retry::Retry,
     timeout::Timeout,
 };
 
@@ -459,6 +460,11 @@ pub trait Client: Endpoint + Sized {
     /// Enable automatic redirect following.
     fn follow_redirect(self) -> impl Client {
         FollowRedirect::new(self)
+    }
+
+    /// Enable automatic retry of failed requests.
+    fn retry(self, max_retries: usize) -> Retry<Self> {
+        Retry::new(self, max_retries)
     }
 
     /// Enable HTTP caching middleware.

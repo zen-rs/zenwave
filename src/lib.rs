@@ -103,6 +103,7 @@ pub mod timeout;
 
 mod client;
 pub mod redirect;
+pub mod retry;
 
 // Re-export the unified error type
 pub use error::Error;
