@@ -1,6 +1,8 @@
 //! Tests for error handling in Zenwave
 
 use http_kit::Method;
+mod common;
+use common::httpbin_uri;
 use zenwave::{Client, client, get};
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
@@ -38,7 +40,7 @@ async fn test_unreachable_host_error() {
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_timeout_behavior() {
     // Test with a very slow endpoint
-    let result = get("https://httpbin.org/delay/1").await;
+    let result = get(httpbin_uri("/delay/1")).await;
     // This should succeed but take some time
     assert!(result.is_ok());
 }
@@ -50,14 +52,14 @@ async fn test_json_parsing_error() {
 
     let mut client = client();
     // Get plain text and try to parse as JSON
-    let result: Result<Value, _> = client.get("https://httpbin.org/html").json().await;
+    let result: Result<Value, _> = client.get(httpbin_uri("/html")).json().await;
     assert!(result.is_err());
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_404_not_found() {
-    let result = get("https://httpbin.org/status/404").await;
+    let result = get(httpbin_uri("/status/404")).await;
     assert!(result.is_err(), "expected 404 to surface as error");
     let error = result.unwrap_err();
     let description = format!("{error}");
@@ -70,7 +72,7 @@ async fn test_404_not_found() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_500_server_error() {
-    let result = get("https://httpbin.org/status/500").await;
+    let result = get(httpbin_uri("/status/500")).await;
     assert!(result.is_err(), "expected 500 to surface as error");
     let error = result.unwrap_err();
     let description = format!("{error}");
@@ -95,7 +97,7 @@ async fn test_method_construction_with_invalid_uri() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_empty_response_handling() {
-    let result = get("https://httpbin.org/status/204").await;
+    let result = get(httpbin_uri("/status/204")).await;
     assert!(result.is_ok());
     let response = result.unwrap();
     assert_eq!(response.status().as_u16(), 204);

@@ -1,4 +1,4 @@
-#![cfg(not(target_arch = "wasm32"))]
+#![cfg(all(not(target_arch = "wasm32"), feature = "ws"))]
 #![allow(missing_docs)]
 use std::{
     env,

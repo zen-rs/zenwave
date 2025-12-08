@@ -244,6 +244,7 @@ impl Error {
     /// # Example
     /// ```no_run
     /// use serde::Deserialize;
+    /// use zenwave::Client;
     ///
     /// #[derive(Deserialize)]
     /// struct ApiError {
@@ -252,7 +253,7 @@ impl Error {
     /// }
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let client = zenwave::client();
+    /// # let mut client = zenwave::client();
     /// match client.get("https://api.example.com/data").await {
     ///     Err(e) => {
     ///         if let Some(api_err) = e.deserialize_http_error::<ApiError>() {

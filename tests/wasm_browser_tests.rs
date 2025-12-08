@@ -2,7 +2,11 @@
 //! Browser-based integration tests for the WASM backend.
 
 #[cfg(target_arch = "wasm32")]
+mod common;
+
+#[cfg(target_arch = "wasm32")]
 mod wasm_tests {
+    use common::httpbin_uri;
     use serde_json::Value;
     use zenwave::{Client, client, get};
 
@@ -13,7 +17,7 @@ mod wasm_tests {
     /// Ensure a simple GET request works end-to-end in the browser.
     #[wasm_bindgen_test]
     async fn wasm_get_smoke_test() {
-        let response = get("https://httpbin.org/json").await.unwrap();
+        let response = get(httpbin_uri("/json")).await.unwrap();
         assert!(response.status().is_success());
 
         let json: Value = response.into_body().into_json().await.unwrap();
@@ -26,7 +30,7 @@ mod wasm_tests {
         let mut client = client();
 
         let response = client
-            .request("GET", "https://httpbin.org/headers")
+            .request("GET", httpbin_uri("/headers"))
             .header("X-Test", "wasm")
             .send()
             .await

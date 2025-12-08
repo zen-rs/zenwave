@@ -7,7 +7,7 @@
 //! - Bearer and Basic authentication
 //! - Powerful middleware system (Add features you need!)
 //! - Streaming body transfer
-//! - Cross-platform websocket client
+//! - Cross-platform websocket client (optional `ws` feature, enabled by default)
 //!
 //! # Quick start
 //! ```rust,no_run
@@ -113,7 +113,8 @@ mod ext;
 pub mod multipart;
 #[cfg(all(not(target_arch = "wasm32"), feature = "proxy"))]
 pub mod proxy;
-/// Websocket utilities.
+/// Websocket utilities (requires the `ws` feature).
+#[cfg(feature = "ws")]
 pub mod websocket;
 
 pub use ext::ResponseExt;

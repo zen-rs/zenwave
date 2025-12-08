@@ -15,6 +15,9 @@ use zenwave::{
     Body, Client, Endpoint, HttpError, Middleware, Request, Response, StatusCode, client,
 };
 
+mod common;
+use common::httpbin_uri;
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_cookie_store_middleware() {
@@ -22,12 +25,12 @@ async fn test_cookie_store_middleware() {
 
     // First request to set a cookie
     let response = client
-        .get("https://httpbin.org/cookies/set/test/value")
+        .get(httpbin_uri("/cookies/set/test/value"))
         .await;
     assert!(response.is_ok());
 
     // Second request should include the cookie
-    let response = client.get("https://httpbin.org/cookies").await;
+    let response = client.get(httpbin_uri("/cookies")).await;
     assert!(response.is_ok());
 
     let response = response.unwrap();
@@ -50,7 +53,7 @@ async fn test_follow_redirect_middleware() {
     let mut client = client().follow_redirect();
 
     // This should follow the redirect and return the final response
-    let response = client.get("https://httpbin.org/redirect/1").await;
+    let response = client.get(httpbin_uri("/redirect/1")).await;
     assert!(response.is_ok());
     let response = response.unwrap();
     assert!(response.status().is_success());
@@ -70,7 +73,7 @@ async fn test_follow_redirect_multiple_redirects() {
     let mut client = client().follow_redirect();
 
     // Test multiple redirects
-    let response = client.get("https://httpbin.org/redirect/3").await;
+    let response = client.get(httpbin_uri("/redirect/3")).await;
     assert!(response.is_ok());
     let response = response.unwrap();
     assert!(response.status().is_success());
@@ -83,12 +86,12 @@ async fn test_client_with_multiple_middleware() {
 
     // Test that both middleware work together
     let response = client
-        .get("https://httpbin.org/redirect-to?url=/cookies/set/test/redirect")
+        .get(httpbin_uri("/redirect-to?url=/cookies/set/test/redirect"))
         .await;
     assert!(response.is_ok());
 
     // Verify cookie was set after redirect
-    let response2 = client.get("https://httpbin.org/cookies").await;
+    let response2 = client.get(httpbin_uri("/cookies")).await;
     assert!(response2.is_ok());
 }
 
@@ -97,7 +100,7 @@ async fn test_client_with_multiple_middleware() {
 async fn test_without_redirect_middleware() {
     // Without redirect middleware, should get redirect response
     let mut client = client();
-    let response = client.get("https://httpbin.org/redirect/1").await;
+    let response = client.get(httpbin_uri("/redirect/1")).await;
     assert!(response.is_ok());
     let response = response.unwrap();
     // Should be a redirect status code, not success
@@ -128,7 +131,7 @@ async fn test_middleware_with_custom_middleware() {
 
     let mut client = client().with(TestMiddleware);
 
-    let response = client.get("https://httpbin.org/headers").await;
+    let response = client.get(httpbin_uri("/headers")).await;
     assert!(response.is_ok());
 
     let response = response.unwrap();

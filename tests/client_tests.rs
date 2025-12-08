@@ -1,13 +1,15 @@
 //! Tests for client functionality
 
 use http_kit::Method;
+mod common;
+use common::httpbin_uri;
 use zenwave::{Client, client};
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_get_method() {
     let mut client = client();
-    let request_builder = client.get("https://httpbingo.org/get");
+    let request_builder = client.get(httpbin_uri("/get"));
     let response = request_builder.await;
     assert!(response.is_ok());
     let response = response.unwrap();
@@ -18,7 +20,7 @@ async fn test_client_get_method() {
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_post_method() {
     let mut client = client();
-    let request_builder = client.post("https://httpbingo.org/post");
+    let request_builder = client.post(httpbin_uri("/post"));
     let response = request_builder.await;
     assert!(response.is_ok());
     let response = response.unwrap();
@@ -29,7 +31,7 @@ async fn test_client_post_method() {
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_put_method() {
     let mut client = client();
-    let request_builder = client.put("https://httpbingo.org/put");
+    let request_builder = client.put(httpbin_uri("/put"));
     let response = request_builder.await;
     assert!(response.is_ok());
     let response = response.unwrap();
@@ -40,7 +42,7 @@ async fn test_client_put_method() {
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_delete_method() {
     let mut client = client();
-    let request_builder = client.delete("https://httpbingo.org/delete");
+    let request_builder = client.delete(httpbin_uri("/delete"));
     let response = request_builder.await;
     assert!(response.is_ok());
     let response = response.unwrap();
@@ -51,7 +53,7 @@ async fn test_client_delete_method() {
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_method_generic() {
     let mut client = client();
-    let request_builder = client.method(Method::GET, "https://httpbingo.org/get");
+    let request_builder = client.method(Method::GET, httpbin_uri("/get"));
     let response = request_builder.await;
     assert!(response.is_ok());
     let response = response.unwrap();
@@ -62,18 +64,18 @@ async fn test_client_method_generic() {
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_request_builder_string() {
     let mut client = client();
-    let response_string = client.get("https://httpbingo.org/get").string().await;
+    let response_string = client.get(httpbin_uri("/get")).string().await;
     assert!(response_string.is_ok());
     let string = response_string.unwrap();
     assert!(!string.is_empty());
-    assert!(string.contains("httpbingo"));
+    assert!(string.contains("httpbin"));
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_request_builder_bytes() {
     let mut client = client();
-    let response_bytes = client.get("https://httpbingo.org/get").bytes().await;
+    let response_bytes = client.get(httpbin_uri("/get")).bytes().await;
     assert!(response_bytes.is_ok());
     let bytes = response_bytes.unwrap();
     assert!(!bytes.is_empty());
@@ -85,7 +87,7 @@ async fn test_request_builder_json() {
     use serde_json::Value;
 
     let mut client = client();
-    let response_json: Result<Value, _> = client.get("https://httpbingo.org/json").json().await;
+    let response_json: Result<Value, _> = client.get(httpbin_uri("/json")).json().await;
     assert!(response_json.is_ok());
     let json = response_json.unwrap();
     assert!(json.is_object());
@@ -96,12 +98,12 @@ async fn test_request_builder_json() {
 async fn test_client_with_middleware() {
     let mut client = client().enable_cookie();
     let response = client
-        .get("https://httpbin.org/cookies/set/test/value")
+        .get(httpbin_uri("/cookies/set/test/value"))
         .await;
     assert!(response.is_ok());
 
     // Follow up request should include cookie
-    let response2 = client.get("https://httpbin.org/cookies").await;
+    let response2 = client.get(httpbin_uri("/cookies")).await;
     assert!(response2.is_ok());
 }
 
@@ -109,7 +111,7 @@ async fn test_client_with_middleware() {
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_follow_redirect() {
     let mut client = client().follow_redirect();
-    let response = client.get("https://httpbin.org/redirect/1").await;
+    let response = client.get(httpbin_uri("/redirect/1")).await;
     assert!(response.is_ok());
     let response = response.unwrap();
     assert!(response.status().is_success());

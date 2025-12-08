@@ -4,6 +4,9 @@ use http_kit::{Endpoint, Method};
 #[cfg(feature = "hyper-backend")]
 use zenwave::backend::HyperBackend;
 
+mod common;
+use common::httpbin_uri;
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 #[cfg(feature = "hyper-backend")]
@@ -28,7 +31,7 @@ async fn test_hyper_backend_get_request() {
     let mut backend = HyperBackend::new();
     let mut request = http::Request::builder()
         .method(Method::GET)
-        .uri("https://httpbin.org/get")
+        .uri(httpbin_uri("/get"))
         .body(http_kit::Body::empty())
         .unwrap();
     let response = backend.respond(&mut request).await;
@@ -44,7 +47,7 @@ async fn test_hyper_backend_post_request() {
     let mut backend = HyperBackend::new();
     let mut request = http::Request::builder()
         .method(Method::POST)
-        .uri("https://httpbin.org/post")
+        .uri(httpbin_uri("/post"))
         .body(http_kit::Body::empty())
         .unwrap();
     let response = backend.respond(&mut request).await;
@@ -60,7 +63,7 @@ async fn test_hyper_backend_https_request() {
     let mut backend = HyperBackend::new();
     let mut request = http::Request::builder()
         .method(Method::GET)
-        .uri("https://httpbin.org/get")
+        .uri(httpbin_uri("/get"))
         .body(http_kit::Body::empty())
         .unwrap();
     let response = backend.respond(&mut request).await;
@@ -90,7 +93,7 @@ async fn test_hyper_backend_http_error_returns_err() {
     let mut backend = HyperBackend::new();
     let mut request = http::Request::builder()
         .method(Method::GET)
-        .uri("https://httpbin.org/status/404")
+        .uri(httpbin_uri("/status/404"))
         .body(http_kit::Body::empty())
         .unwrap();
 
@@ -110,7 +113,7 @@ async fn test_curl_backend_http_error_returns_err() {
     let mut backend = CurlBackend::new();
     let mut request = http::Request::builder()
         .method(Method::GET)
-        .uri("https://httpbin.org/status/500")
+        .uri(httpbin_uri("/status/500"))
         .body(http_kit::Body::empty())
         .unwrap();
 

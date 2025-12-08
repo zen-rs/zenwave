@@ -1,20 +1,12 @@
 //! Integration tests for Zenwave using real HTTP requests.
 
-use std::env;
-
+mod common;
+use common::httpbin_uri;
 use serde_json::Value;
 use zenwave::{Client, Method, client, get};
 
-fn base_url() -> String {
-    env::var("ZENWAVE_TEST_BASE_URL").unwrap_or_else(|_| "https://httpbingo.org".to_string())
-}
-
 fn endpoint(path: &str) -> String {
-    format!(
-        "{}/{}",
-        base_url().trim_end_matches('/'),
-        path.trim_start_matches('/')
-    )
+    httpbin_uri(path)
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
@@ -108,7 +100,7 @@ async fn test_large_response() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_gzip_compression() {
-    // httpbin.org supports gzip compression
+    // Local test server advertises gzip support
     let response = get(endpoint("/gzip")).await;
     assert!(response.is_ok());
     let response = response.unwrap();
@@ -124,12 +116,12 @@ async fn test_cookie_persistence() {
 
     // Set a cookie
     let _response = client
-        .get("https://httpbin.org/cookies/set/test/cookievalue")
+        .get(endpoint("/cookies/set/test/cookievalue"))
         .await
         .unwrap();
 
     // Verify cookie is sent in subsequent request
-    let response = client.get("https://httpbin.org/cookies").await.unwrap();
+    let response = client.get(endpoint("/cookies")).await.unwrap();
     let body = response.into_body().into_string().await.unwrap();
     assert!(body.contains("test"));
     assert!(body.contains("cookievalue"));
