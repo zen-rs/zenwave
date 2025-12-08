@@ -24,9 +24,7 @@ async fn test_cookie_store_middleware() {
     let mut client = client().enable_cookie();
 
     // First request to set a cookie
-    let response = client
-        .get(httpbin_uri("/cookies/set/test/value"))
-        .await;
+    let response = client.get(httpbin_uri("/cookies/set/test/value")).await;
     assert!(response.is_ok());
 
     // Second request should include the cookie
