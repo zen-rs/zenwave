@@ -59,31 +59,6 @@ jobs:
       - name: wasm-pack test
         run: bash scripts/test-wasm.sh ${{ matrix.browser }}
 
-  wasm-macos:
-    name: wasm-pack (macOS Safari)
-    runs-on: macos-latest
-    # safaridriver has known issues binding ports in GitHub Actions
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
-        with:
-            shared-key: test-wasm
-
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-
-      - name: Add wasm target
-        run: rustup target add wasm32-unknown-unknown
-
-      - name: Enable safaridriver
-        run: sudo safaridriver --enable
-
-      - name: wasm-pack test (Safari)
-        run: bash scripts/test-wasm.sh safari
-
   apple-backend:
     name: Apple backend (macOS)
     runs-on: macos-latest
