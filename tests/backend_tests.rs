@@ -1,7 +1,7 @@
 //! Tests for backend implementations
 
 #[cfg(any(feature = "hyper-backend", feature = "curl-backend"))]
-use http_kit::Method;
+use http_kit::{Endpoint, Method};
 #[cfg(feature = "hyper-backend")]
 use zenwave::backend::HyperBackend;
 
