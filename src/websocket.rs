@@ -698,6 +698,16 @@ mod wasm {
                     .socket
                     .send_with_u8_array(&bytes)
                     .map_err(|e| connection_failed(format_js_value(&e)))?,
+                WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_) => {
+                    // Browser WebSocket API doesn't expose ping/pong frames
+                    // They are handled automatically by the browser
+                }
+                WebSocketMessage::Close => {
+                    self.inner
+                        .socket
+                        .close()
+                        .map_err(|e| connection_failed(format_js_value(&e)))?;
+                }
             }
             Ok(())
         }
@@ -734,7 +744,7 @@ mod wasm {
     fn connection_failed(message: impl Into<ByteStr>) -> WebSocketError {
         WebSocketError::ConnectionFailed(Box::new(io::Error::new(
             io::ErrorKind::Other,
-            message.into(),
+            message.into().to_string(),
         )))
     }
 

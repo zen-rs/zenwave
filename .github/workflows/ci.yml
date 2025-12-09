@@ -37,32 +37,21 @@ jobs:
         include:
           - name: Linux
             os: ubuntu-latest
-            target: ""
             features: "--all-features"
+            targets: "--all-targets"
           - name: macOS + Apple backend
             os: macos-latest
-            target: ""
             features: "--no-default-features --features apple-backend"
-          - name: WASM
-            os: ubuntu-latest
-            target: wasm32-unknown-unknown
-            features: ""
+            targets: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: clippy
-          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: clippy-${{ matrix.name }}
-      - name: Run clippy
-        run: |
-          TARGET_FLAG=""
-          if [ -n "${{ matrix.target }}" ]; then
-            TARGET_FLAG="--target ${{ matrix.target }}"
-          fi
-          cargo clippy $TARGET_FLAG ${{ matrix.features }} -- -D warnings
+      - run: cargo clippy ${{ matrix.targets }} ${{ matrix.features }} -- -D warnings
 
   wasm:
     name: WASM

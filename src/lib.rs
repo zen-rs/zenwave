@@ -130,13 +130,13 @@ pub fn client() -> DefaultBackend {
 
 /// Construct the default backend configured with a proxy matcher.
 ///
-/// This helper only exists when the default backend is proxy-capable (Hyper or
-/// curl). Apple (`apple-backend`) and Web (`wasm32`) targets do not compile this
-/// API because their backends ignore proxy settings.
+/// This helper only exists when the default backend is curl-backend, which
+/// supports proxy configuration. Other backends do not support this API.
 #[cfg(all(
     not(target_arch = "wasm32"),
-    feature = "proxy",
-    not(all(target_vendor = "apple", feature = "apple-backend"))
+    feature = "curl-backend",
+    not(all(target_vendor = "apple", feature = "apple-backend")),
+    not(feature = "hyper-backend")
 ))]
 #[must_use]
 #[allow(clippy::missing_const_for_fn)]
