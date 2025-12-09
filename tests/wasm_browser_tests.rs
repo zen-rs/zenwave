@@ -45,7 +45,12 @@ mod wasm_tests {
         let x_test = headers
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case("x-test"))
-            .and_then(|(_, value)| value.as_str());
+            .and_then(|(_, value)| {
+                // httpbingo.org returns arrays, httpbin.org returns strings
+                value
+                    .as_str()
+                    .or_else(|| value.as_array().and_then(|arr| arr.first()?.as_str()))
+            });
         assert_eq!(x_test, Some("wasm"));
     }
 }

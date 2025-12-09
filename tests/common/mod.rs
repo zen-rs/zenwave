@@ -263,11 +263,7 @@ mod local {
     }
 
     pub fn httpbin_uri(path: &str) -> String {
-        format!(
-            "{}/{}",
-            httpbin_base(),
-            path.trim_start_matches('/')
-        )
+        format!("{}/{}", httpbin_base(), path.trim_start_matches('/'))
     }
 }
 
