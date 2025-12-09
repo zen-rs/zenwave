@@ -131,10 +131,11 @@ jobs:
         with:
           shared-key: ci-ubuntu
       - uses: taiki-e/install-action@cargo-hack
-      # Skip features that don't work standalone (proxy, native-tls, rustls require a backend)
-      # Skip apple-backend (requires macOS)
-      - run: cargo hack check --each-feature --no-dev-deps --skip apple-backend,proxy,native-tls,rustls
-      - run: cargo hack check --feature-powerset --no-dev-deps --skip apple-backend,proxy,native-tls,rustls --depth 2
+      # Test that each backend compiles independently with default TLS
+      - run: cargo hack check --no-dev-deps --feature-powerset --features hyper-backend,native-tls,rustls --depth 2
+      - run: cargo check --no-default-features --features curl-backend
+      - run: cargo check --no-default-features --features hyper-backend,native-tls
+      - run: cargo check --no-default-features --features hyper-backend,rustls
 
   test:
     name: Test

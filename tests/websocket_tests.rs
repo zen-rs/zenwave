@@ -210,7 +210,8 @@ async fn websocket_handles_server_ping() {
         .expect("websocket closed before payload");
     assert_eq!(message.as_text(), Some("pong-after-ping"));
 
-    client.close().await.unwrap();
+    // Server may have already closed the connection, so ignore close errors
+    let _ = client.close().await;
     server.await;
 }
 
