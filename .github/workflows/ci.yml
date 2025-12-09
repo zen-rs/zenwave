@@ -3,6 +3,7 @@ name: CI
 permissions:
   contents: read
   id-token: write
+  checks: write
 
 on:
   push:
@@ -130,8 +131,10 @@ jobs:
         with:
           shared-key: ci-ubuntu
       - uses: taiki-e/install-action@cargo-hack
-      - run: cargo hack check --each-feature --no-dev-deps
-      - run: cargo hack check --feature-powerset --no-dev-deps
+      # Skip features that don't work standalone (proxy, native-tls, rustls require a backend)
+      # Skip apple-backend (requires macOS)
+      - run: cargo hack check --each-feature --no-dev-deps --skip apple-backend,proxy,native-tls,rustls
+      - run: cargo hack check --feature-powerset --no-dev-deps --skip apple-backend,proxy,native-tls,rustls --depth 2
 
   test:
     name: Test

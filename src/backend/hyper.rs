@@ -308,6 +308,8 @@ async fn connect_rustls(host: String, stream: TcpStream) -> Result<MaybeTlsStrea
 enum MaybeTlsStream {
     Plain(TcpStream),
     #[cfg(feature = "native-tls")]
+    #[allow(dead_code)]
+    // Used on Apple platforms; unused on non-Apple when both TLS features enabled
     Native(async_native_tls::TlsStream<TcpStream>),
     #[cfg(feature = "rustls")]
     #[allow(dead_code)]
