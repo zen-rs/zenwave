@@ -1,5 +1,5 @@
-#![cfg(all(not(target_arch = "wasm32"), feature = "ws"))]
 #![allow(missing_docs)]
+#![cfg(all(not(target_arch = "wasm32"), feature = "ws"))]
 use std::{
     env,
     time::{Duration, SystemTime, UNIX_EPOCH},

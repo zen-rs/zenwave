@@ -1,10 +1,13 @@
 //! Tests for backend implementations
 
-use http_kit::{Endpoint, Method};
+#[cfg(any(feature = "hyper-backend", feature = "curl-backend"))]
+use http_kit::Method;
 #[cfg(feature = "hyper-backend")]
 use zenwave::backend::HyperBackend;
 
+#[cfg(any(feature = "hyper-backend", feature = "curl-backend"))]
 mod common;
+#[cfg(any(feature = "hyper-backend", feature = "curl-backend"))]
 use common::httpbin_uri;
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
