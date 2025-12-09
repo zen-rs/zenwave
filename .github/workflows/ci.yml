@@ -130,12 +130,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-ubuntu
-      - uses: taiki-e/install-action@cargo-hack
-      # Test that each backend compiles independently with default TLS
-      - run: cargo hack check --no-dev-deps --feature-powerset --features hyper-backend,native-tls,rustls --depth 2
+      # Test valid backend + TLS combinations
       - run: cargo check --no-default-features --features curl-backend
       - run: cargo check --no-default-features --features hyper-backend,native-tls
       - run: cargo check --no-default-features --features hyper-backend,rustls
+      - run: cargo check --no-default-features --features hyper-backend,native-tls,ws
+      - run: cargo check --no-default-features --features hyper-backend,rustls,ws
 
   test:
     name: Test
