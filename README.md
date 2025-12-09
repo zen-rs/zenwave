@@ -1,9 +1,11 @@
 # Zenwave
 
-[![Crates.io](https://img.shields.io/crates/v/zenwave.svg)](https://crates.io/crates/zenwave)
+[![crates.io](https://img.shields.io/crates/v/zenwave.svg)](https://crates.io/crates/zenwave)
 [![Documentation](https://docs.rs/zenwave/badge.svg)](https://docs.rs/zenwave)
 [![License](https://img.shields.io/crates/l/zenwave.svg)](LICENSE)
-[![CI](https://github.com/zen-rs/zenwave/actions/workflows/ci.yml/badge.svg)](https://github.com/zen-rs/zenwave/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/codecov/c/github/zen-rs/zenwave?logo=codecov)](https://app.codecov.io/gh/zen-rs/zenwave)
+
+
 
 Zenwave is an ergonomic, full-featured HTTP client framework for Rust. It exposes a modern,
 middleware-friendly API that works on both native targets (Tokio + Hyper on Linux/Windows, Apple's
