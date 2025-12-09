@@ -42,8 +42,6 @@ jobs:
   wasm-linux:
     name: wasm-pack (Linux - ${{ matrix.browser }})
     runs-on: ubuntu-latest
-    # WASM browser tests require network access to httpbin.org which is flaky in CI
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -64,8 +62,6 @@ jobs:
   wasm-macos:
     name: wasm-pack (macOS Safari)
     runs-on: macos-latest
-    # Safari driver is flaky in CI environments
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
