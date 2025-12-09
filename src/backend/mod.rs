@@ -1,7 +1,8 @@
-//! HTTP client backends.
+//! Platform-specific HTTP client backends.
 //!
-//! This module defines the `ClientBackend` trait and provides
-//! default implementations for different platforms.
+//! This module exposes backend implementations for each supported target and
+//! picks a [`DefaultBackend`] alias based on the current platform and enabled
+//! Cargo features.
 //!
 //! # Backend Selection
 //!

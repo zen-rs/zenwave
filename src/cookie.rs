@@ -120,6 +120,7 @@ impl CookieStore {
         Ok(())
     }
 
+    #[allow(unused_variables)]
     async fn finalize(&self, updated: bool) -> Result<(), CookieError> {
         #[cfg(not(target_arch = "wasm32"))]
         {

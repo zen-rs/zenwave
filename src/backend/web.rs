@@ -6,11 +6,11 @@ use core::{
     task::{Context, Poll},
 };
 
-use anyhow::anyhow;
 use http_kit::{
     BodyError, Endpoint, HttpError, StatusCode,
     utils::{Stream, StreamExt},
 };
+use std::error::Error as StdError;
 use std::io;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -18,8 +18,7 @@ use web_sys::{
     wasm_bindgen::{JsCast, JsValue},
 };
 
-use super::ClientBackend;
-use crate::error::HttpErrorResponse;
+use crate::{Client, error::HttpErrorResponse};
 /// HTTP client backend for browser environments using `fetch`.
 pub struct WebBackend {
     window: SingleThreaded<Window>,
@@ -30,7 +29,7 @@ pub enum WebError {
     #[error("{source}")]
     Transport {
         #[source]
-        source: anyhow::Error,
+        source: Box<dyn StdError + Send + Sync>,
         status: StatusCode,
     },
     #[error("remote error: {status}")]
@@ -42,9 +41,9 @@ pub enum WebError {
 }
 
 impl WebError {
-    fn new(status: StatusCode, error: impl Into<anyhow::Error>) -> Self {
+    fn new(status: StatusCode, error: impl StdError + Send + Sync + 'static) -> Self {
         Self::Transport {
-            source: error.into(),
+            source: Box::new(error),
             status,
         }
     }
@@ -71,7 +70,7 @@ impl HttpError for WebError {
 impl From<WebError> for crate::Error {
     fn from(err: WebError) -> Self {
         match err {
-            WebError::Transport { source, .. } => crate::Error::Transport(Box::new(source)),
+            WebError::Transport { source, .. } => crate::Error::Transport(source),
             WebError::Remote {
                 status,
                 body,
@@ -190,7 +189,10 @@ fn fetch(
                 .to_str()
                 .map_err(|e| WebError::new(StatusCode::BAD_REQUEST, e))?;
             headers.set(name.as_str(), value).map_err(|err| {
-                WebError::new(StatusCode::BAD_REQUEST, anyhow!(format_js_value(&err)))
+                WebError::new(
+                    StatusCode::BAD_REQUEST,
+                    transport_error(format_js_value(&err)),
+                )
             })?;
         }
         request_init.set_headers(headers.as_ref());
@@ -198,18 +200,26 @@ fn fetch(
         let uri = request.uri().to_string();
         let fetch_request = web_sys::Request::new_with_str_and_init(uri.as_str(), &request_init)
             .map_err(|err| {
-                WebError::new(StatusCode::BAD_REQUEST, anyhow!(format_js_value(&err)))
+                WebError::new(
+                    StatusCode::BAD_REQUEST,
+                    transport_error(format_js_value(&err)),
+                )
             })?;
 
         let promise = window.fetch_with_request(&fetch_request);
         let fut = SingleThreaded(JsFuture::from(promise));
         let response = fut
             .await
-            .map_err(|e| WebError::new(StatusCode::BAD_GATEWAY, anyhow!(format_js_value(&e))))?;
+            .map_err(|e| {
+                WebError::new(
+                    StatusCode::BAD_GATEWAY,
+                    transport_error(format_js_value(&e)),
+                )
+            })?;
         let response: web_sys::Response = response.dyn_into().map_err(|_| {
             WebError::new(
                 StatusCode::BAD_GATEWAY,
-                anyhow!("Failed to cast to Response"),
+                transport_error("Failed to cast to Response"),
             )
         })?;
 
@@ -218,24 +228,27 @@ fn fetch(
         let mut headers = http_kit::header::HeaderMap::new();
         for pair in response.headers().entries() {
             let pair = pair.map_err(|err| {
-                WebError::new(StatusCode::BAD_GATEWAY, anyhow!(format_js_value(&err)))
+                WebError::new(
+                    StatusCode::BAD_GATEWAY,
+                    transport_error(format_js_value(&err)),
+                )
             })?;
             let entry: js_sys::Array = pair.dyn_into().map_err(|_| {
                 WebError::new(
                     StatusCode::BAD_GATEWAY,
-                    anyhow!("Failed to cast header entry to Array"),
+                    transport_error("Failed to cast header entry to Array"),
                 )
             })?;
             let name = entry.get(0).as_string().ok_or_else(|| {
                 WebError::new(
                     StatusCode::BAD_GATEWAY,
-                    anyhow!("Failed to read header name"),
+                    transport_error("Failed to read header name"),
                 )
             })?;
             let value = entry.get(1).as_string().ok_or_else(|| {
                 WebError::new(
                     StatusCode::BAD_GATEWAY,
-                    anyhow!("Failed to read header value"),
+                    transport_error("Failed to read header value"),
                 )
             })?;
             headers.insert(
@@ -294,4 +307,8 @@ fn format_js_value(value: &JsValue) -> String {
     value.as_string().unwrap_or_else(|| format!("{value:?}"))
 }
 
-impl ClientBackend for WebBackend {}
+fn transport_error(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, message.into())
+}
+
+impl Client for WebBackend {}

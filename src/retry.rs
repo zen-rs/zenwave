@@ -1,6 +1,12 @@
 //! Middleware for retrying failed HTTP requests.
 
 use core::time::Duration;
+#[cfg(target_arch = "wasm32")]
+use core::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use http_kit::{Endpoint, Request, Response};
 
 use crate::client::Client;
@@ -23,6 +29,24 @@ pub struct Retry<C: Client> {
     max_retries: usize,
     min_delay: Duration,
     max_delay: Duration,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct SingleThreaded<T>(T);
+
+// wasm targets are single-threaded, so it is safe to mark the wrapper as Send.
+#[cfg(target_arch = "wasm32")]
+unsafe impl<T> Send for SingleThreaded<T> {}
+
+#[cfg(target_arch = "wasm32")]
+impl<T: Future> Future for SingleThreaded<T> {
+    type Output = T::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: SingleThreaded<T> is a newtype wrapper; we never move the inner future.
+        let this = unsafe { self.get_unchecked_mut() };
+        unsafe { Pin::new_unchecked(&mut this.0).poll(cx) }
+    }
 }
 
 impl<C: Client> Retry<C> {
@@ -76,7 +100,10 @@ impl<C: Client> Endpoint for Retry<C> {
                     async_io::Timer::after(delay).await;
 
                     #[cfg(target_arch = "wasm32")]
-                    gloo_timers::future::TimeoutFuture::new(delay.as_millis() as u32).await;
+                    SingleThreaded(gloo_timers::future::TimeoutFuture::new(
+                        delay.as_millis() as u32,
+                    ))
+                    .await;
                 }
             }
         }

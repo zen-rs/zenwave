@@ -6,9 +6,9 @@ mod common;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_tests {
-    use common::httpbin_uri;
     use serde_json::Value;
-    use zenwave::{Client, client, get};
+    use zenwave::{Client, Method, client, get};
+    use super::common::httpbin_uri;
 
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -30,9 +30,8 @@ mod wasm_tests {
         let mut client = client();
 
         let response = client
-            .request("GET", httpbin_uri("/headers"))
+            .method(Method::GET, httpbin_uri("/headers"))
             .header("X-Test", "wasm")
-            .send()
             .await
             .unwrap();
         assert!(response.status().is_success());
@@ -43,9 +42,10 @@ mod wasm_tests {
             .expect("headers present")
             .as_object()
             .expect("headers object");
-        assert_eq!(
-            headers.get("X-Test").map(Value::as_str).flatten(),
-            Some("wasm")
-        );
+        let x_test = headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("x-test"))
+            .and_then(|(_, value)| value.as_str());
+        assert_eq!(x_test, Some("wasm"));
     }
 }

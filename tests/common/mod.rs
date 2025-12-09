@@ -254,6 +254,10 @@ mod local {
 mod local {
     /// On wasm, use an override if provided, otherwise fall back to the public httpbin.
     pub fn httpbin_base() -> String {
+        if let Some(base) = option_env!("ZENWAVE_TEST_BASE_URL") {
+            return base.trim_end_matches('/').to_string();
+        }
+
         std::env::var("ZENWAVE_TEST_BASE_URL").unwrap_or_else(|_| "https://httpbin.org".to_string())
     }
 
