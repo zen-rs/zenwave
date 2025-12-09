@@ -208,14 +208,12 @@ fn fetch(
 
         let promise = window.fetch_with_request(&fetch_request);
         let fut = SingleThreaded(JsFuture::from(promise));
-        let response = fut
-            .await
-            .map_err(|e| {
-                WebError::new(
-                    StatusCode::BAD_GATEWAY,
-                    transport_error(format_js_value(&e)),
-                )
-            })?;
+        let response = fut.await.map_err(|e| {
+            WebError::new(
+                StatusCode::BAD_GATEWAY,
+                transport_error(format_js_value(&e)),
+            )
+        })?;
         let response: web_sys::Response = response.dyn_into().map_err(|_| {
             WebError::new(
                 StatusCode::BAD_GATEWAY,

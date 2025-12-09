@@ -78,17 +78,16 @@ impl HttpError for AppleError {
 impl From<AppleError> for crate::Error {
     fn from(err: AppleError) -> Self {
         match err {
-            AppleError::BadRequest(e) => crate::Error::InvalidRequest(e.to_string()),
+            AppleError::BadRequest(e) => Self::InvalidRequest(e.to_string()),
             AppleError::BadGateway(e) => {
-                // Convert anyhow::Error to std::io::Error to satisfy trait bounds
-                let io_err = std::io::Error::new(std::io::ErrorKind::Other, e);
-                crate::Error::Transport(Box::new(io_err))
+                let io_err = std::io::Error::other(e);
+                Self::Transport(Box::new(io_err))
             }
             AppleError::Remote {
                 status,
                 body,
                 raw_response,
-            } => crate::Error::Http {
+            } => Self::Http {
                 status,
                 message: body.clone().unwrap_or_else(|| {
                     status

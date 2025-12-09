@@ -6,9 +6,9 @@ mod common;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_tests {
+    use super::common::httpbin_uri;
     use serde_json::Value;
     use zenwave::{Client, Method, client, get};
-    use super::common::httpbin_uri;
 
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 

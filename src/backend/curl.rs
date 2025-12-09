@@ -59,17 +59,16 @@ impl CurlError {
 impl From<CurlError> for crate::Error {
     fn from(err: CurlError) -> Self {
         match err {
-            CurlError::BadRequest(e) => crate::Error::InvalidRequest(e.to_string()),
+            CurlError::BadRequest(e) => Self::InvalidRequest(e.to_string()),
             CurlError::BadGateway(e) => {
-                // Convert anyhow::Error to std::io::Error to satisfy trait bounds
-                let io_err = std::io::Error::new(std::io::ErrorKind::Other, e);
-                crate::Error::Transport(Box::new(io_err))
+                let io_err = std::io::Error::other(e);
+                Self::Transport(Box::new(io_err))
             }
             CurlError::Remote {
                 status,
                 body,
                 raw_response,
-            } => crate::Error::Http {
+            } => Self::Http {
                 status,
                 message: body.clone().unwrap_or_else(|| {
                     status

@@ -135,7 +135,7 @@ required-features = ["hyper-backend"]
 
 [[example]]
 name = "websocket_echo"
-required-features = ["hyper-backend"]
+required-features = ["hyper-backend", "ws"]
 
 [lints]
 rust.missing_docs = "warn"
