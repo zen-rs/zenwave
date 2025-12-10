@@ -242,14 +242,4 @@ jobs:
           arch: x86_64
           target: google_apis
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
-          script: |
-            # Find and run test binaries
-            for binary in target/x86_64-linux-android/debug/deps/zenwave-*; do
-              if [ -f "$binary" ] && [ -x "$binary" ] && [[ ! "$binary" == *.d ]]; then
-                name=$(basename "$binary")
-                echo "Running test: $name"
-                adb push "$binary" /data/local/tmp/"$name"
-                adb shell chmod +x /data/local/tmp/"$name"
-                adb shell "/data/local/tmp/$name --test-threads=1" || true
-              fi
-            done
+          script: bash scripts/test-android-emulator.sh
