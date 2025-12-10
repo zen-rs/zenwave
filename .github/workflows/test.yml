@@ -78,8 +78,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          [aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android]
+        include:
+          - target: aarch64-linux-android
+            cc: aarch64-linux-android24-clang
+            cxx: aarch64-linux-android24-clang++
+          - target: armv7-linux-androideabi
+            cc: armv7a-linux-androideabi24-clang
+            cxx: armv7a-linux-androideabi24-clang++
+          - target: x86_64-linux-android
+            cc: x86_64-linux-android24-clang
+            cxx: x86_64-linux-android24-clang++
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -96,7 +104,15 @@ jobs:
           add-to-path: true
       - name: Set up Android toolchain env
         run: |
-          echo "ANDROID_NDK=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
-          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+          NDK=${{ steps.setup-ndk.outputs.ndk-path }}
+          TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin
+          echo "ANDROID_NDK=$NDK" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$NDK" >> $GITHUB_ENV
+          echo "$TOOLCHAIN" >> $GITHUB_PATH
+          # Set target-specific compiler env vars
+          TARGET_UNDERSCORE=$(echo "${{ matrix.target }}" | tr '-' '_')
+          echo "CC_${TARGET_UNDERSCORE}=$TOOLCHAIN/${{ matrix.cc }}" >> $GITHUB_ENV
+          echo "CXX_${TARGET_UNDERSCORE}=$TOOLCHAIN/${{ matrix.cxx }}" >> $GITHUB_ENV
+          echo "AR_${TARGET_UNDERSCORE}=$TOOLCHAIN/llvm-ar" >> $GITHUB_ENV
       - name: Check Android build
         run: cargo check --target ${{ matrix.target }}

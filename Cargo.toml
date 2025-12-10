@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Lexo Liu<me@lexo.cool>"]
 repository = "https://github.com/zen-rs/zenwave"
-description = "Ergonomic HTTP client framework."
+description = "Write once, fetch anywhere"
 license = "MIT"
-keywords = ["http", "client", "async", "networking", "middleware"]
-categories = ["network-programming", "web-programming::http-client"]
+keywords = ["http", "client", "wasm", "fetch", "websocket"]
+categories = ["network-programming", "web-programming::http-client", "wasm"]
 
 [dependencies]
 http-kit = "0.4"

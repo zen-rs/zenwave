@@ -5,26 +5,15 @@
 [![License](https://img.shields.io/crates/l/zenwave.svg)](LICENSE)
 [![Coverage](https://img.shields.io/codecov/c/github/zen-rs/zenwave?logo=codecov)](https://app.codecov.io/gh/zen-rs/zenwave)
 
+Zenwave is an ergonomic HTTP client framework for Rust with a unified API across native and WebAssembly targets.
 
+## Features
 
-Zenwave is an ergonomic, full-featured HTTP client framework for Rust. It exposes a modern,
-middleware-friendly API that works on both native targets (Tokio + Hyper on Linux/Windows, Apple's
-URLSession on iOS/tvOS/watchOS/macOS) and browser/Cloudflare Workers targets through the Fetch API.
-
-## Why Zenwave?
-
-- **Ergonomic requests** – convenience helpers (`get`, `post`, …) and a fluent `RequestBuilder`.
-- **Opt-in middleware** – add redirect following, cookie storage, OAuth2 refresh, or redirects only when you
-  need it.
-- **Streaming bodies** – handle large uploads/downloads or upgrade to SSE without buffering.
-- **HTTP caching** – drop-in middleware honors `Cache-Control`, `Expires`, `ETag`, and
-  `Last-Modified` to avoid redundant network hops.
-- **Native timers** – enforce per-request deadlines with high-precision timers on every supported
-  platform via a simple `.timeout(...)` helper.
-- **Proxy aware** – honor `HTTP(S)_PROXY`/`NO_PROXY` or define custom SOCKS/HTTP proxies when using the Hyper or curl backends.
-- **WebSocket ready** – one API that works natively and in WASM.
-- **Pluggable backends** – Hyper on general native targets, URLSession on Apple platforms, libcurl
-  when you want small binaries, and Fetch on wasm, all behind the same `zenwave::client()` interface.
+- **Cross-platform** - Same API on Linux, Windows, macOS, iOS, Android, and browsers/Workers
+- **Pluggable backends** - Hyper (default), Apple URLSession, libcurl, or browser Fetch API
+- **Composable middleware** - Timeout, retry, caching, cookies, redirects, OAuth2
+- **WebSocket support** - Unified WebSocket client for native and browser
+- **Streaming** - Upload/download large files without buffering (native only)
 
 ## Quick Start
 
@@ -33,331 +22,256 @@ use zenwave::{get, ResponseExt};
 
 #[async_std::main]
 async fn main() -> zenwave::Result<()> {
-    let response = get("https://example.com/").await?;
+    let response = get("https://httpbin.org/get").await?;
     let text = response.into_string().await?;
     println!("{text}");
     Ok(())
 }
 ```
 
-The `ResponseExt` trait provides the `into_string`, `into_json`, `into_bytes`, and `into_sse` helpers
-you will see throughout the API.
-
-## Examples
-
-Run the shipped samples with `cargo run --example <name>`:
-
-- `basic_get` – one-off GET request parsed into a typed response.
-- `custom_client` – compose middleware, send JSON, and read a typed response body.
-- `websocket_echo` – connect to a public echo server using the cross-platform WebSocket client.
-
-Feel free to copy these examples as starting points for your own projects.
-
-## Building richer clients
-
-```rust
-use std::time::Duration;
-
-use serde::{Deserialize, Serialize};
-use zenwave::{self, Cache, Client, OAuth2ClientCredentials};
-
-#[derive(Serialize)]
-struct MessageRequest<'a> {
-    message: &'a str,
-}
-
-#[derive(Deserialize)]
-struct EchoResponse {
-    json: MessageResponse,
-}
-
-#[derive(Deserialize)]
-struct MessageResponse {
-    message: String,
-}
-
-#[async_std::main]
-async fn main() -> zenwave::Result<()> {
-    let token = std::env::var("ZENWAVE_TOKEN").unwrap_or_else(|_| "demo-token".into());
-
-    // Compose only the middleware you need.
-    let client = zenwave::client()
-        .timeout(Duration::from_secs(2))
-        .enable_cache()
-        .with(OAuth2ClientCredentials::new(
-            "https://auth.example.com/token",
-            "client-id",
-            "client-secret",
-        ))
-        .follow_redirect()
-        .enable_cookie()
-        .bearer_auth(token);
-
-    let echo: EchoResponse = client
-        .post("https://httpbin.org/post")
-        .header("x-request-id", "demo-request")
-        .json_body(&MessageRequest { message: "hello" })?
-        .json()
-        .await?;
-
-    println!("{}", echo.json.message);
-    Ok(())
-}
-```
-
-You can also call `.basic_auth` or `.with(custom_middleware)` to plug in your own behavior. Every
-request builder supports `.header`, `.bearer_auth`, `.basic_auth`, `.json_body`, `.bytes_body`, and
-body readers (`.json()`, `.string()`, `.bytes()`, `.form()`, `.sse()`).
-
-Timeouts are middleware too. Calling `.timeout(Duration::from_secs(2))` wraps the client in a
-native-executor-backed timer so every subsequent request automatically fails with a
-`504 Gateway Timeout` when the deadline is exceeded.
-
-## Proxy configuration (native Hyper / curl backends)
-
-Zenwave can route requests through HTTP or SOCKS proxies by reading the
-standard `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` variables or
-by constructing a matcher manually. Both the Hyper and libcurl-native backends
-honor the same configuration:
-
-```rust
-use zenwave::{self, Proxy};
-
-fn main() {
-    // Inherit proxy settings from the environment (`*_PROXY` / `NO_PROXY`).
-    let proxy = Proxy::from_env();
-    let client = zenwave::client_with_proxy(proxy);
-
-    // Or build one manually. Supports http, socks4, socks4a, socks5, and socks5h schemes.
-    let custom = Proxy::builder()
-        .http("http://corp-proxy:8080")
-        .no_proxy("internal.example.com")
-        .build();
-    let mut custom_client = zenwave::client_with_proxy(custom);
-
-    // Clients returned by `zenwave::client()` can also be swapped afterwards:
-    let mut swapped = zenwave::client().proxy(Proxy::from_system());
-}
-```
-
-Only the Hyper and curl backends currently honor proxies. HTTP CONNECT proxies
-(`http://` / `https://`) and SOCKS4/5 proxies (`socks4[a]`, `socks5[h]`) are supported.
-The Apple (`apple-backend`) and Web (`wasm32`) backends do not expose proxy
-APIs, so helper functions such as `client_with_proxy` or `.proxy(...)` are not
-compiled when those backends are selected as the default.
-
-## Large downloads with resume
-
-Native targets get an ergonomic helper for writing large responses to disk without buffering into
-memory. Any request builder can call `download_to_path` to stream the body into a file. When the
-file already exists Zenwave automatically issues a `Range` request and appends only the missing
-bytes, so interrupted transfers can resume without starting from scratch.
-
-```rust
-use zenwave::Client;
-
-# async fn example() -> zenwave::Result<()> {
-let client = zenwave::client();
-let report = client
-    .get("https://example.com/big.iso")
-    .download_to_path("big.iso")
-    .await?;
-
-println!(
-    "Resumed from {} bytes and wrote {} bytes ({} total)",
-    report.resumed_from,
-    report.bytes_written,
-    report.total_bytes()
-);
-# Ok(())
-# }
-```
-
-If you need to opt out of resume logic you can call `download_to_path_with` and pass
-`DownloadOptions { resume_existing: false }`. Both methods return a `DownloadReport` so you can log
-how much data was appended and what now resides on disk. This helper is currently available on
-non-wasm targets where direct filesystem access exists.
-
-## Streaming uploads
-
-Use `file_body` to upload large files directly from disk without buffering, `reader_body` to wrap
-any `AsyncRead`, or `stream_body` to hook up custom chunk producers. Each helper integrates with
-Tokio so uploads backpressure naturally with the network stack.
-
-```rust
-# async fn example() -> zenwave::Result<()> {
-use zenwave::client;
-use async_fs::File;
-
-let mut client = client();
-let response = client
-    .post("https://example.com/upload")
-    .file_body("video.mp4")
-    .await?
-    .await?;
-assert!(response.status().is_success());
-
-let mut stream_client = client();
-let file = File::open("log.txt").await?;
-let response = stream_client
-    .post("https://example.com/logs")
-    .reader_body(file, None)
-    .await?;
-assert!(response.status().is_success());
-# Ok(())
-# }
-```
-
-## HTTP cache middleware
-
-Call `.enable_cache()` to enable RFC-compliant client-side caching. The middleware caches
-successful GET responses when permitted by `Cache-Control`/`Expires`, automatically injects
-validators for stale entries (`If-None-Match`, `If-Modified-Since`), and serves `304 Not Modified`
-responses straight from memory. Requests with `Authorization` headers are skipped unless the
-response explicitly declares itself `public`. Because it is implemented as middleware you can keep
-it for native builds only or combine it with other layers as needed.
-
-## Persistent cookie store
-
-Call `.enable_persistent_cookie()` to transparently load and save cookies between runs on native
-targets. Zenwave automatically picks a cache file under your platform's local data directory using
-the name `zenwave_cookie_store_<crate_name>.json`, so crates only share cookies with themselves by
-default. You can also fully control the path via `CookieStore::persistent_with_path` if you want to
-sync cookies across binaries.
-
-## OAuth2 client credentials
-
-Use `OAuth2ClientCredentials::new(token_url, client_id, client_secret)` to automatically obtain and
-refresh bearer tokens. The middleware performs the client credentials flow against the configured
-token endpoint, caches responses until they near expiration, and injects the `Authorization` header
-for every outgoing request. Call `.with_scope("scope1 scope2")` or `.with_audience("api")` if your
-provider requires additional parameters.
-
-## Web & Cloudflare Workers
-
-Zenwave targets both `wasm32` and native platforms. On wasm it relies on `web_sys::Request`/`Fetch`,
-so it works in browsers and Cloudflare Workers without extra glue code. The API is identical, so
-sharing code between targets is straightforward.
-
-## Android
-
-Zenwave supports Android targets using rustls with aws-lc-rs. Cross-compilation requires the Android NDK.
-See the [Android build guide](docs/android.md) for detailed setup instructions.
-
-## Apple platforms
-
-By default Apple targets (iOS, iPadOS, tvOS, watchOS, macOS) also use the Hyper backend. There is an
-experimental `apple-backend` feature that swaps Hyper out for `URLSession`, which satisfies
-watchOS/App Store restrictions but currently auto-follows redirects and auto-manages cookies. The
-two middleware tests that asserted “no redirect / no automatic cookies” are skipped whenever the
-`apple-backend` feature is enabled. Until the URLSession backend is stabilized, we recommend keeping
-the default Hyper backend on Apple. If you still want to opt in:
-
-```toml
-zenwave = { version = "0.1.1", features = ["apple-backend"] }
-```
-
-## Curl backend
-
-Many Linux distributions (and some embedded platforms) ship a system libcurl. Zenwave can reuse it
-to avoid bundling Hyper/OpenSSL and shrink your binary. Disable the default features and enable the
-curl backend:
+## Installation
 
 ```toml
 [dependencies]
-zenwave = { version = "0.1.1", default-features = false, features = ["curl-backend"] }
+zenwave = "0.1.1"
 ```
 
-You still get the same middleware API; the only difference is which backend transports the bytes.
+## Backends
 
-## WebSocket support
+Zenwave provides multiple HTTP backends. The backend is selected at compile time.
 
-The `zenwave::websocket` module offers a cross-platform WebSocket client that hides the details of
-`async-tungstenite` or `web_sys::WebSocket`. Connecting to an endpoint looks like:
+| Backend | Platforms | TLS | Proxy | Notes |
+|---------|-----------|-----|-------|-------|
+| **hyper** (default) | All native | rustls or native-tls | Yes | Recommended for most use cases |
+| **curl** | All native | System libcurl | Yes | Smaller binaries on systems with libcurl |
+| **apple** | macOS, iOS | Security.framework | No | Native Apple networking (experimental) |
+| **web** | wasm32 | Browser | No | Automatic on wasm32, uses Fetch API |
+
+### Backend Selection
+
+```toml
+# Default: Hyper with rustls
+zenwave = "0.1.1"
+
+# Hyper with platform-native TLS (OpenSSL/Security.framework/SChannel)
+zenwave = { version = "0.1.1", default-features = false, features = ["hyper-native-tls", "ws"] }
+
+# libcurl backend
+zenwave = { version = "0.1.1", default-features = false, features = ["curl-backend"] }
+
+# Apple URLSession (macOS/iOS only, experimental)
+zenwave = { version = "0.1.1", default-features = false, features = ["apple-backend"] }
+```
+
+On wasm32 targets, the web backend is always used automatically regardless of feature flags.
+
+## Platform Support
+
+### Native Platforms (Linux, Windows, macOS, Android, iOS)
+
+Full feature support with the hyper backend:
+
+- HTTP/HTTPS requests with configurable TLS
+- Proxy support (HTTP CONNECT, SOCKS4/5)
+- Persistent cookie storage
+- File uploads/downloads with streaming
+- Download resume via Range requests
+- WebSocket with TLS
+
+### Android
+
+Requires Android NDK for cross-compilation. See the [Android build guide](docs/android.md).
+
+```bash
+# Set environment and build
+export ANDROID_NDK=$HOME/Library/Android/sdk/ndk/29.0.14206865
+cargo build --target aarch64-linux-android
+```
+
+### Browser (wasm32)
+
+Uses the browser's native Fetch API:
+
+| Feature | Available | Notes |
+|---------|-----------|-------|
+| HTTP/HTTPS | Yes | Browser handles TLS |
+| Cookies | Browser-managed | Cannot access HttpOnly cookies from code |
+| Proxy | No | Browser security restriction |
+| File I/O | No | No filesystem access |
+| WebSocket | Yes | Uses browser's WebSocket API |
+
+**Limitations**: Cross-origin requests are subject to CORS. The server must send appropriate `Access-Control-*` headers or the browser will block the response. This cannot be bypassed from client code.
+
+### Cloudflare Workers (wasm32)
+
+Uses the Workers Fetch API. Workers run server-side, so there are no CORS restrictions:
+
+| Feature | Available | Notes |
+|---------|-----------|-------|
+| HTTP/HTTPS | Yes | Workers runtime handles TLS |
+| Cookies | Yes | In-memory cookie jar (no persistent storage) |
+| Proxy | No | Not supported by Workers runtime |
+| File I/O | No | Use Workers KV or R2 instead |
+| WebSocket | Yes | Via Workers WebSocket API |
+
+## Middleware
+
+Compose middleware to add functionality:
+
+```rust
+use std::time::Duration;
+use zenwave::{client, OAuth2ClientCredentials};
+
+let client = client()
+    .timeout(Duration::from_secs(30))   // Per-request timeout
+    .retry(3)                            // Retry transport errors (not HTTP errors)
+    .follow_redirect()                   // Follow up to 10 redirects
+    .enable_cache()                      // RFC-compliant HTTP caching
+    .enable_cookie()                     // In-memory cookie jar
+    .bearer_auth("token")                // Authorization header
+    .with(OAuth2ClientCredentials::new(  // Auto-refresh OAuth2 tokens
+        "https://auth.example.com/token",
+        "client-id",
+        "client-secret",
+    ));
+```
+
+### Available Middleware
+
+| Middleware | Method | Description |
+|------------|--------|-------------|
+| Timeout | `.timeout(duration)` | Fails with 504 if exceeded |
+| Retry | `.retry(max)` | Retries on transport errors only |
+| Redirect | `.follow_redirect()` | Follows up to 10 redirects |
+| Cache | `.enable_cache()` | Honors Cache-Control, ETag, etc. |
+| Cookies | `.enable_cookie()` | In-memory cookie jar |
+| Persistent Cookies | `.enable_persistent_cookie()` | Saves to disk (native only) |
+| Bearer Auth | `.bearer_auth(token)` | Sets Authorization header |
+| Basic Auth | `.basic_auth(user, pass)` | Sets Authorization header |
+| OAuth2 | `.with(OAuth2ClientCredentials)` | Auto-refreshes tokens |
+| Custom | `.with(middleware)` | Your own middleware |
+
+## Request Building
+
+```rust
+use zenwave::client;
+
+let client = client();
+
+// JSON request/response
+let response: MyResponse = client
+    .post("https://api.example.com/data")
+    .header("X-Request-ID", "abc123")
+    .bearer_auth("token")
+    .json_body(&MyRequest { field: "value" })?
+    .json()
+    .await?;
+
+// Form data
+let response = client
+    .post("https://example.com/form")
+    .form_body(&[("key", "value")])?
+    .await?;
+
+// Raw bytes
+let response = client
+    .post("https://example.com/upload")
+    .bytes_body(vec![1, 2, 3])
+    .await?;
+```
+
+### File Operations (Native Only)
+
+```rust
+// Stream file upload without buffering
+client
+    .post("https://example.com/upload")
+    .file_body("large-file.zip")
+    .await?
+    .await?;
+
+// Download with automatic resume
+let report = client
+    .get("https://example.com/large-file.iso")
+    .download_to_path("large-file.iso")
+    .await?;
+
+println!("Downloaded {} bytes", report.bytes_written);
+```
+
+## Proxy Support (Native Only)
+
+```rust
+use zenwave::{client_with_proxy, Proxy};
+
+// From environment (HTTP_PROXY, HTTPS_PROXY, NO_PROXY)
+let client = client_with_proxy(Proxy::from_env());
+
+// Manual configuration
+let proxy = Proxy::builder()
+    .http("http://proxy:8080")
+    .https("http://proxy:8080")
+    .no_proxy("localhost,*.internal.com")
+    .build();
+let client = client_with_proxy(proxy);
+```
+
+Supports HTTP CONNECT and SOCKS4/4a/5/5h proxies. Only available with hyper and curl backends.
+
+## WebSocket
+
+Cross-platform WebSocket client:
 
 ```rust
 use zenwave::websocket::{self, WebSocketMessage};
 
-#[async_std::main]
-async fn main() -> zenwave::Result<()> {
-    let mut socket = websocket::connect("wss://echo.websocket.events").await?;
-    socket.send_text("hello").await?;
+let socket = websocket::connect("wss://echo.websocket.events").await?;
 
-    if let Some(WebSocketMessage::Text(text)) = socket.recv().await? {
-        println!("Received: {text}");
-    }
+socket.send_text("hello").await?;
 
-    socket.close().await
+if let Some(WebSocketMessage::Text(text)) = socket.recv().await? {
+    println!("Received: {text}");
 }
+
+socket.close().await?;
 ```
 
-You can also split a connection to drive sending and receiving from different tasks:
+Split for concurrent send/receive:
 
 ```rust
-let socket = websocket::connect("wss://echo.websocket.events").await?;
 let (sender, receiver) = socket.split();
 
-// `send` serializes to JSON by default; use `send_text` for raw text frames.
-sender.send(&MyPayload { message: "hello" }).await?;
-if let Some(reply) = receiver.recv().await? {
-    println!("Got reply: {:?}", reply);
+// Send from one task
+sender.send_text("message").await?;
+
+// Receive from another
+while let Some(msg) = receiver.recv().await? {
+    println!("{:?}", msg);
 }
 ```
 
-## Installation
+## Feature Flags
 
-Add Zenwave to your `Cargo.toml`. The default configuration uses the Hyper backend with rustls TLS:
+| Feature | Description |
+|---------|-------------|
+| `default` | `hyper-backend` + `rustls` + `ws` |
+| `hyper-backend` | Hyper HTTP client |
+| `rustls` | Pure Rust TLS (default, good for cross-compilation) |
+| `native-tls` | Platform TLS (OpenSSL/Security.framework/SChannel) |
+| `hyper-native-tls` | Shorthand for `hyper-backend` + `native-tls` |
+| `hyper-rustls` | Shorthand for `hyper-backend` + `rustls` |
+| `curl-backend` | libcurl-based backend |
+| `apple-backend` | Apple URLSession (experimental) |
+| `ws` | WebSocket support |
+| `proxy` | Proxy support (auto-enabled with curl-backend) |
 
-```toml
-[dependencies]
-zenwave = { version = "0.1.1" }
-```
+## Examples
 
-For browser/Workers builds, no special configuration is needed - Zenwave automatically uses the
-built-in web backend (Fetch API) on wasm32 targets:
+Run examples with `cargo run --example <name>`:
 
-```toml
-# For wasm32 targets, default features are ignored and the web backend is used automatically
-zenwave = { version = "0.1.1" }
-```
-
-### Feature flags
-
-#### Backend Selection (native platforms only)
-
-On wasm32 targets, the built-in web backend is always used automatically. No backend selection
-is needed or available.
-
-On native platforms, you can choose from:
-
-- `hyper-backend` (default) – Hyper with async-io/async-net. The recommended choice for most use cases.
-- `curl-backend` – libcurl-based backend with built-in proxy support. Good for platforms with system libcurl.
-- `apple-backend` – experimental URLSession backend for Apple platforms (macOS/iOS).
-
-#### TLS Selection (hyper-backend only)
-
-- `rustls` (default) – pure-Rust TLS implementation. Cross-platform and secure.
-- `native-tls` – uses the platform's native TLS (OpenSSL on Linux, Secure Transport on macOS, SChannel on Windows).
-
-Only one TLS feature can be enabled at a time. These features only apply to `hyper-backend`;
-other backends have their own TLS implementations.
-
-#### Other Features
-
-- `proxy` – enables proxy support (automatically enabled with `curl-backend`).
-
-### Example configurations
-
-```toml
-# Use curl backend instead of hyper
-zenwave = { version = "0.1.1", default-features = false, features = ["curl-backend"] }
-
-# Use hyper with native-tls instead of rustls
-zenwave = { version = "0.1.1", default-features = false, features = ["hyper-backend", "native-tls"] }
-
-# Use Apple's native URLSession on macOS/iOS
-zenwave = { version = "0.1.1", default-features = false, features = ["apple-backend"] }
-```
+- `basic_get` - Simple GET request
+- `custom_client` - Middleware composition and JSON
+- `websocket_echo` - WebSocket echo client
 
 ## License
 
