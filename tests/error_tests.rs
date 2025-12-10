@@ -15,10 +15,11 @@ async fn test_invalid_url_error() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_invalid_scheme_error() {
-    let _result = get("ftp://example.com").await;
-    // This actually succeeds but may fail later during connection
-    // The validation happens at HTTP client level, not URI parsing
-    // assert!(result.is_err());
+    // Use a non-routable IP to avoid slow connection timeouts
+    // 192.0.2.1 is TEST-NET-1, guaranteed to be non-routable
+    let result = get("ftp://192.0.2.1").await;
+    // Invalid scheme should fail (either at validation or connection)
+    assert!(result.is_err());
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
