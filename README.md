@@ -33,7 +33,7 @@ async fn main() -> zenwave::Result<()> {
 
 ```toml
 [dependencies]
-zenwave = "0.1.1"
+zenwave = "0.2"
 ```
 
 ## Backends
@@ -44,23 +44,24 @@ Zenwave provides multiple HTTP backends. The backend is selected at compile time
 |---------|-----------|-----|-------|-------|
 | **hyper** (default) | All native | rustls or native-tls | Yes | Recommended for most use cases |
 | **curl** | All native | System libcurl | Yes | Smaller binaries on systems with libcurl |
-| **apple** | macOS, iOS | Security.framework | No | Native Apple networking (experimental) |
-| **web** | wasm32 | Browser | No | Automatic on wasm32, uses Fetch API |
+| **apple** | Apple platform(iOS, macOS, etc.) | Security.framework | No | Native Apple networking (experimental) |
+| **web** | wasm32 | Browser | No | Automatic on wasm32, uses Fetch API, enforced CORS striction |
+| **web** | wasm32 | Serverless | No | Automatic on wasm32, uses Fetch API, no CORS striction|
 
 ### Backend Selection
 
 ```toml
 # Default: Hyper with rustls
-zenwave = "0.1.1"
+zenwave = "0.2"
 
 # Hyper with platform-native TLS (OpenSSL/Security.framework/SChannel)
-zenwave = { version = "0.1.1", default-features = false, features = ["hyper-native-tls", "ws"] }
+zenwave = { version = "0.2", default-features = false, features = ["hyper-native-tls", "ws"] }
 
 # libcurl backend
-zenwave = { version = "0.1.1", default-features = false, features = ["curl-backend"] }
+zenwave = { version = "0.2", default-features = false, features = ["curl-backend"] }
 
 # Apple URLSession (macOS/iOS only, experimental)
-zenwave = { version = "0.1.1", default-features = false, features = ["apple-backend"] }
+zenwave = { version = "0.2", default-features = false, features = ["apple-backend"] }
 ```
 
 On wasm32 targets, the web backend is always used automatically regardless of feature flags.

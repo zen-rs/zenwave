@@ -7,6 +7,46 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ============================================
+  # Tier 1: Hyper Backend with Both TLS Variants
+  # ============================================
+
+  hyper-rustls:
+    name: Hyper + Rustls (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.os }}-hyper-rustls
+      - name: Run hyper-rustls tests
+        run: cargo test --no-default-features --features hyper-rustls --workspace
+
+  hyper-native-tls:
+    name: Hyper + Native TLS (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.os }}-hyper-native-tls
+      - name: Run hyper-native-tls tests
+        run: cargo test --no-default-features --features hyper-native-tls --workspace
+
+  # ============================================
+  # Tier 2: Other Backends
+  # ============================================
+
   curl-backend:
     name: Curl backend (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -19,28 +59,48 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: test-${{ matrix.os }}
+          shared-key: test-${{ matrix.os }}-curl
       - name: Run curl backend tests
         run: cargo test --no-default-features --features curl-backend --workspace
 
-  hyper-backend:
-    name: Hyper backend (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+  apple-backend:
+    name: Apple backend (macOS)
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: test-${{ matrix.os }}
-      - name: Run hyper backend tests
-        run: cargo test --no-default-features --features hyper-backend --workspace
+          shared-key: test-macos-apple
+      - name: Run apple backend suite
+        run: bash scripts/test-apple.sh
 
-  wasm-linux:
-    name: wasm-pack (Linux - ${{ matrix.browser }})
+  # ============================================
+  # Tier 3: WebSocket Tests
+  # ============================================
+
+  websocket:
+    name: WebSocket (${{ matrix.tls }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tls: [hyper-rustls, hyper-native-tls]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-ubuntu-ws-${{ matrix.tls }}
+      - name: Run WebSocket tests
+        run: cargo test --no-default-features --features ${{ matrix.tls }},ws --workspace -- websocket
+
+  # ============================================
+  # Tier 4: WASM Tests
+  # ============================================
+
+  wasm-http:
+    name: WASM HTTP (${{ matrix.browser }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -51,7 +111,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: test-wasm
+          shared-key: test-wasm-http
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - name: Add wasm target
@@ -59,21 +119,32 @@ jobs:
       - name: wasm-pack test
         run: bash scripts/test-wasm.sh ${{ matrix.browser }}
 
-  apple-backend:
-    name: Apple backend (macOS)
-    runs-on: macos-latest
+  wasm-websocket:
+    name: WASM WebSocket (${{ matrix.browser }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chrome, firefox]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: test-macos
+          shared-key: test-wasm-ws
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+      - name: wasm-pack WebSocket test
+        run: bash scripts/test-wasm.sh ${{ matrix.browser }} ws
 
-      - name: Run apple backend suite
-        run: bash scripts/test-apple.sh
+  # ============================================
+  # Tier 5: Android
+  # ============================================
 
-  android:
-    name: Android (${{ matrix.target }})
+  android-build:
+    name: Android Build (${{ matrix.target }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -116,3 +187,56 @@ jobs:
           echo "AR_${TARGET_UNDERSCORE}=$TOOLCHAIN/llvm-ar" >> $GITHUB_ENV
       - name: Check Android build
         run: cargo check --target ${{ matrix.target }}
+
+  android-emulator:
+    name: Android Emulator Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-android-emulator
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          add-to-path: true
+      - name: Set up Android toolchain env
+        run: |
+          NDK=${{ steps.setup-ndk.outputs.ndk-path }}
+          TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin
+          echo "ANDROID_NDK=$NDK" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$NDK" >> $GITHUB_ENV
+          echo "$TOOLCHAIN" >> $GITHUB_PATH
+          echo "CC_x86_64_linux_android=$TOOLCHAIN/x86_64-linux-android24-clang" >> $GITHUB_ENV
+          echo "CXX_x86_64_linux_android=$TOOLCHAIN/x86_64-linux-android24-clang++" >> $GITHUB_ENV
+          echo "AR_x86_64_linux_android=$TOOLCHAIN/llvm-ar" >> $GITHUB_ENV
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Build test binaries
+        run: cargo test --no-default-features --features hyper-rustls --target x86_64-linux-android --no-run
+      - name: Run tests on emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 29
+          arch: x86_64
+          target: google_apis
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: |
+            # Find and run test binaries
+            for binary in target/x86_64-linux-android/debug/deps/zenwave-*; do
+              if [ -f "$binary" ] && [ -x "$binary" ] && [[ ! "$binary" == *.d ]]; then
+                name=$(basename "$binary")
+                echo "Running test: $name"
+                adb push "$binary" /data/local/tmp/"$name"
+                adb shell chmod +x /data/local/tmp/"$name"
+                adb shell "/data/local/tmp/$name --test-threads=1" || true
+              fi
+            done
