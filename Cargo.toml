@@ -32,16 +32,15 @@ async-std = { version = "1.13", features = ["attributes"] }
 tiny_http = "0.12"
 
 [features]
-# Default: platform-dependent backend selection.
-# - On Apple platforms (macOS/iOS): hyper + native-tls
-# - On other native platforms: hyper + rustls with system certificates
-# - On wasm32: built-in web backend using Fetch API (automatic, no configuration needed)
+# Default: hyper backend with rustls (aws-lc-rs).
+# - Pure Rust TLS, works on all platforms with proper toolchain
+# - For Android: requires NDK setup (set ANDROID_NDK env var)
+# - For Apple: consider using `hyper-native-tls` for better performance
+# - For wasm32: built-in web backend using Fetch API (automatic)
 default = ["default-backend", "ws"]
 
-# Default backend configuration with platform-dependent TLS selection.
-# On native platforms, both TLS implementations are included; the appropriate one
-# is selected at compile time based on the target platform.
-default-backend = ["hyper-backend", "native-tls", "rustls"]
+# Default backend uses rustls with aws-lc-rs crypto provider.
+default-backend = ["hyper-backend", "rustls"]
 
 # Explicit backend selections (native platforms only).
 # On wasm32, using any of these will result in a compile error - the web backend
@@ -56,10 +55,14 @@ apple-backend = []
 # libcurl backend with proxy support
 curl-backend = ["dep:curl", "dep:blocking", "proxy"]
 # Websocket support (async-tungstenite on native, web-sys WebSocket on wasm)
+# TLS for WebSocket follows the selected TLS backend (native-tls or rustls)
 ws = ["dep:async-tungstenite"]
 
 # TLS implementations (internal features, prefer using hyper-native-tls or hyper-rustls)
-native-tls = ["dep:async-native-tls", "dep:native-tls"]
+# native-tls: Uses platform TLS (OpenSSL on Linux/Android, Security.framework on Apple, SChannel on Windows)
+native-tls = ["dep:async-native-tls", "dep:native-tls", "async-tungstenite?/async-native-tls"]
+# rustls: Pure Rust TLS with aws-lc-rs crypto provider (good for cross-compilation including Android)
+# Note: WebSocket TLS with rustls requires manual TLS wrapping (async-tls is stuck on old rustls)
 rustls = [
     "dep:futures-rustls",
     "dep:rustls",
@@ -108,11 +111,11 @@ hyper = { version = "1.8", default-features = false, features = ["client", "http
 http-body-util = { version = "0.1.3", optional = true }
 async-native-tls = { version = "0.5.0", optional = true, default-features = false, features = ["runtime-async-std"] }
 futures-rustls = { version = "0.26", optional = true }
-rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12"] }
 rustls-native-certs = { version = "0.8", optional = true }
 native-tls = { version = "0.2", optional = true }
 webpki-roots = { version = "1.0", optional = true }
-async-tungstenite = { version = "0.32.0", default-features = false, features = ["async-std-runtime", "async-tls"], optional = true }
+async-tungstenite = { version = "0.32.0", default-features = false, features = ["async-std-runtime"], optional = true }
 async-fs = { version = "2.2.0", default-features = false }
 dirs = "6.0"
 once_cell = "1.19"

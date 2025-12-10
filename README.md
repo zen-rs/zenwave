@@ -239,6 +239,11 @@ Zenwave targets both `wasm32` and native platforms. On wasm it relies on `web_sy
 so it works in browsers and Cloudflare Workers without extra glue code. The API is identical, so
 sharing code between targets is straightforward.
 
+## Android
+
+Zenwave supports Android targets using rustls with aws-lc-rs. Cross-compilation requires the Android NDK.
+See the [Android build guide](docs/android.md) for detailed setup instructions.
+
 ## Apple platforms
 
 By default Apple targets (iOS, iPadOS, tvOS, watchOS, macOS) also use the Hyper backend. There is an
@@ -249,7 +254,7 @@ two middleware tests that asserted “no redirect / no automatic cookies” are 
 the default Hyper backend on Apple. If you still want to opt in:
 
 ```toml
-zenwave = { version = "0.1.0", features = ["apple-backend"] }
+zenwave = { version = "0.1.1", features = ["apple-backend"] }
 ```
 
 ## Curl backend
@@ -260,7 +265,7 @@ curl backend:
 
 ```toml
 [dependencies]
-zenwave = { version = "0.1.0", default-features = false, features = ["curl-backend"] }
+zenwave = { version = "0.1.1", default-features = false, features = ["curl-backend"] }
 ```
 
 You still get the same middleware API; the only difference is which backend transports the bytes.
@@ -305,7 +310,7 @@ Add Zenwave to your `Cargo.toml`. The default configuration uses the Hyper backe
 
 ```toml
 [dependencies]
-zenwave = { version = "0.1.0" }
+zenwave = { version = "0.1.1" }
 ```
 
 For browser/Workers builds, no special configuration is needed - Zenwave automatically uses the
@@ -313,7 +318,7 @@ built-in web backend (Fetch API) on wasm32 targets:
 
 ```toml
 # For wasm32 targets, default features are ignored and the web backend is used automatically
-zenwave = { version = "0.1.0" }
+zenwave = { version = "0.1.1" }
 ```
 
 ### Feature flags
@@ -345,13 +350,13 @@ other backends have their own TLS implementations.
 
 ```toml
 # Use curl backend instead of hyper
-zenwave = { version = "0.1.0", default-features = false, features = ["curl-backend"] }
+zenwave = { version = "0.1.1", default-features = false, features = ["curl-backend"] }
 
 # Use hyper with native-tls instead of rustls
-zenwave = { version = "0.1.0", default-features = false, features = ["hyper-backend", "native-tls"] }
+zenwave = { version = "0.1.1", default-features = false, features = ["hyper-backend", "native-tls"] }
 
 # Use Apple's native URLSession on macOS/iOS
-zenwave = { version = "0.1.0", default-features = false, features = ["apple-backend"] }
+zenwave = { version = "0.1.1", default-features = false, features = ["apple-backend"] }
 ```
 
 ## License

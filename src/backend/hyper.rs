@@ -210,35 +210,15 @@ async fn connect(request: &http::Request<http_kit::Body>) -> Result<MaybeTlsStre
     stream.set_nodelay(true).map_err(HyperError::Io)?;
 
     if use_tls {
-        // TLS selection logic:
-        // 1. When both native-tls and rustls are enabled (default-backend):
-        //    - On Apple platforms: use native-tls
-        //    - On other platforms: use rustls with system certificates
-        // 2. When only native-tls is enabled: use native-tls
-        // 3. When only rustls is enabled: use rustls with system certificates
+        // TLS backend selection (user chooses via features, rustls is default):
+        // - rustls: Pure Rust TLS with aws-lc-rs (default, good for cross-compilation)
+        // - native-tls: Platform TLS (Security.framework/SChannel/OpenSSL)
 
-        // Case: Both TLS implementations available, Apple platform -> use native-tls
-        #[cfg(all(feature = "native-tls", feature = "rustls", target_vendor = "apple"))]
-        {
-            let connector = async_native_tls::TlsConnector::new();
-            let tls = connector
-                .connect(host.as_str(), stream)
-                .await
-                .map_err(|err| HyperError::Io(std::io::Error::other(err)))?;
-            return Ok(MaybeTlsStream::Native(tls));
-        }
-
-        // Case: Both TLS implementations available, non-Apple platform -> use rustls
-        #[cfg(all(
-            feature = "native-tls",
-            feature = "rustls",
-            not(target_vendor = "apple")
-        ))]
+        #[cfg(feature = "rustls")]
         {
             return connect_rustls(host, stream).await;
         }
 
-        // Case: Only native-tls enabled
         #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
         {
             let connector = async_native_tls::TlsConnector::new();
@@ -247,12 +227,6 @@ async fn connect(request: &http::Request<http_kit::Body>) -> Result<MaybeTlsStre
                 .await
                 .map_err(|err| HyperError::Io(std::io::Error::other(err)))?;
             return Ok(MaybeTlsStream::Native(tls));
-        }
-
-        // Case: Only rustls enabled
-        #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
-        {
-            return connect_rustls(host, stream).await;
         }
 
         #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
