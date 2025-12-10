@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/zen-rs/zenwave/compare/v0.1.0...v0.2.0) - 2025-12-10
+
+### Fixed
+
+- Remove wasm-pack job for macOS Safari due to known issues
+
+### Other
+
+- Add Android emulator test script
+- Add disk cleanup step and fix invalid scheme test
+- Configure cargo to use NDK linker for Android
+- Extend CI with TLS backends, WASM, Android
+- Improve Android CI toolchain setup and README
+- Update TLS backend selection and Android support
+- release v0.1.0
+
 ## [0.1.0](https://github.com/zen-rs/zenwave/releases/tag/v0.1.0) - 2025-12-09
 
 ### Added
