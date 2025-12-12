@@ -52,55 +52,6 @@ impl From<WebSocketError> for crate::Error {
     }
 }
 
-/// Configuration applied when establishing a websocket connection.
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct WebSocketConfig {
-    /// Maximum incoming websocket message size in bytes.
-    /// `None` means no limit.
-    pub max_message_size: Option<usize>,
-
-    /// Maximum incoming websocket frame size in bytes.
-    /// `None` means no limit.
-    pub max_frame_size: Option<usize>,
-}
-
-const DEFAULT_MAX_MESSAGE_SIZE: Option<usize> = Some(64 << 20);
-const DEFAULT_MAX_FRAME_SIZE: Option<usize> = Some(16 << 20);
-
-impl Default for WebSocketConfig {
-    fn default() -> Self {
-        Self {
-            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
-        }
-    }
-}
-
-impl WebSocketConfig {
-    /// Override the maximum incoming websocket message size in bytes.
-    ///
-    /// `None` means no limit.
-    ///
-    /// Defaults to 64 MiB.
-    #[must_use]
-    pub const fn with_max_message_size(mut self, max_message_size: Option<usize>) -> Self {
-        self.max_message_size = max_message_size;
-        self
-    }
-
-    /// Override the maximum incoming websocket frame size in bytes.
-    ///
-    /// `None` means no limit.
-    ///
-    /// Defaults to 16 MiB.
-    #[must_use]
-    pub const fn with_max_frame_size(mut self, max_frame_size: Option<usize>) -> Self {
-        self.max_frame_size = max_frame_size;
-        self
-    }
-}
-
 #[allow(clippy::result_large_err)]
 fn serialize_payload<T>(value: &T) -> Result<String, WebSocketError>
 where
