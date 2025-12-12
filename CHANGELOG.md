@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/zen-rs/zenwave/compare/v0.2.0...v0.3.0) - 2025-12-12
+
+### Other
+
+- Remove WebSocketConfig and defaults
+
 ## [0.2.0](https://github.com/zen-rs/zenwave/compare/v0.1.0...v0.2.0) - 2025-12-10
 
 ### Fixed
