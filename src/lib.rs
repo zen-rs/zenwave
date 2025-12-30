@@ -155,7 +155,7 @@ where
     U::Error: core::fmt::Debug,
 {
     let mut client = DefaultBackend::default();
-    client.method(Method::GET, uri).await
+    client.method(Method::GET, uri)?.await
 }
 
 /// Send a POST request to the specified URI using the default client backend.
@@ -168,7 +168,7 @@ where
     U::Error: core::fmt::Debug,
 {
     let mut client = DefaultBackend::default();
-    client.method(Method::POST, uri).await
+    client.method(Method::POST, uri)?.await
 }
 
 /// Send a PUT request to the specified URI using the default client backend.
@@ -181,7 +181,7 @@ where
     U::Error: core::fmt::Debug,
 {
     let mut client = DefaultBackend::default();
-    client.method(Method::PUT, uri).await
+    client.method(Method::PUT, uri)?.await
 }
 
 /// Send a DELETE request to the specified URI using the default client backend.
@@ -194,5 +194,5 @@ where
     U::Error: core::fmt::Debug,
 {
     let mut client = DefaultBackend::default();
-    client.method(Method::DELETE, uri).await
+    client.method(Method::DELETE, uri)?.await
 }

@@ -54,19 +54,22 @@ impl<'a, T: Client> IntoFuture for RequestBuilder<'a, T> {
 // ClientError has been removed - all errors now use zenwave::Error
 
 impl<T: Client> RequestBuilder<'_, T> {
-    pub fn bearer_auth(mut self, token: impl Into<String>) -> Self {
+    pub fn bearer_auth(mut self, token: impl Into<String>) -> Result<Self, crate::Error> {
         let auth_value = format!("Bearer {}", token.into());
+        let header_value = auth_value.parse().map_err(|err| {
+            crate::Error::InvalidRequest(format!("invalid bearer auth header: {err}"))
+        })?;
         self.request
             .headers_mut()
-            .insert(http_kit::header::AUTHORIZATION, auth_value.parse().unwrap());
-        self
+            .insert(http_kit::header::AUTHORIZATION, header_value);
+        Ok(self)
     }
 
     pub fn basic_auth(
         mut self,
         username: impl Into<String>,
         password: Option<impl Into<String>>,
-    ) -> Self {
+    ) -> Result<Self, crate::Error> {
         use base64::Engine;
 
         let credentials = match password {
@@ -77,30 +80,40 @@ impl<T: Client> RequestBuilder<'_, T> {
         let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
         let auth_value = format!("Basic {encoded}");
 
+        let header_value = auth_value.parse().map_err(|err| {
+            crate::Error::InvalidRequest(format!("invalid basic auth header: {err}"))
+        })?;
+
         self.request
             .headers_mut()
-            .insert(http_kit::header::AUTHORIZATION, auth_value.parse().unwrap());
-        self
+            .insert(http_kit::header::AUTHORIZATION, header_value);
+        Ok(self)
     }
 
     pub fn header(
         mut self,
         name: impl TryInto<HeaderName, Error: Debug>,
         value: impl TryInto<HeaderValue, Error: Debug>,
-    ) -> Self {
-        let header_name: http_kit::header::HeaderName = name.try_into().unwrap();
-        let header_value: http_kit::header::HeaderValue = value.try_into().unwrap();
+    ) -> Result<Self, crate::Error> {
+        let header_name: http_kit::header::HeaderName = name
+            .try_into()
+            .map_err(|err| crate::Error::InvalidRequest(format!("invalid header name: {err:?}")))?;
+        let header_value: http_kit::header::HeaderValue = value.try_into().map_err(|err| {
+            crate::Error::InvalidRequest(format!("invalid header value: {err:?}"))
+        })?;
         self.request.headers_mut().insert(header_name, header_value);
-        self
+        Ok(self)
     }
 
     /// Set a JSON-encoded body for the request.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the body cannot be serialized to JSON.
-    pub fn json_body<B: serde::Serialize>(mut self, body: &B) -> Self {
-        let json = serde_json::to_string(body).expect("failed to serialize JSON body");
+    /// Returns an error if the body cannot be serialized to JSON.
+    pub fn json_body<B: serde::Serialize>(mut self, body: &B) -> Result<Self, crate::Error> {
+        let json = serde_json::to_string(body).map_err(|err| {
+            crate::Error::InvalidRequest(format!("failed to serialize JSON body: {err}"))
+        })?;
 
         // Set the body directly
         *self.request.body_mut() = http_kit::Body::from(json);
@@ -110,7 +123,7 @@ impl<T: Client> RequestBuilder<'_, T> {
         let json_type = HeaderValue::from_static("application/json");
         self.request.headers_mut().insert(content_type, json_type);
 
-        self
+        Ok(self)
     }
 
     pub fn bytes_body(mut self, bytes: Vec<u8>) -> Self {
@@ -251,6 +264,7 @@ mod tests {
             let mut client = FakeBackend::with_payload(payload.clone());
             client
                 .get("http://example.com/file.bin")
+                .unwrap()
                 .download_to_path(&path)
                 .await
                 .unwrap();
@@ -271,6 +285,7 @@ mod tests {
             let mut client = FakeBackend::without_range(payload.clone());
             client
                 .get("http://example.com/file.bin")
+                .unwrap()
                 .download_to_path(&path)
                 .await
                 .unwrap();
@@ -296,6 +311,7 @@ mod tests {
 
             client
                 .post("http://example.com/upload")
+                .unwrap()
                 .file_body(&path)
                 .await
                 .unwrap()
@@ -321,6 +337,7 @@ mod tests {
 
             client
                 .post("http://example.com/upload")
+                .unwrap()
                 .stream_body(stream)
                 .await
                 .unwrap();
@@ -503,27 +520,29 @@ pub trait Client: Endpoint + Sized {
     }
 
     /// Create a request with the specified method and URI.
-    fn method<U>(&mut self, method: Method, uri: U) -> RequestBuilder<'_, &mut Self>
+    fn method<U>(&mut self, method: Method, uri: U) -> Result<RequestBuilder<'_, &mut Self>, crate::Error>
     where
         U: TryInto<Uri>,
         U::Error: Debug,
     {
-        let uri = uri.try_into().unwrap();
+        let uri = uri
+            .try_into()
+            .map_err(|err| crate::Error::InvalidUri(format!("{err:?}")))?;
         let request = http::Request::builder()
             .method(method)
             .uri(uri)
             .body(http_kit::Body::empty())
-            .unwrap();
+            .map_err(|err| crate::Error::InvalidRequest(err.to_string()))?;
 
-        RequestBuilder {
+        Ok(RequestBuilder {
             client: self,
             request,
             _marker: PhantomData,
-        }
+        })
     }
 
     /// Create a GET request.
-    fn get<U>(&mut self, uri: U) -> RequestBuilder<'_, &mut Self>
+    fn get<U>(&mut self, uri: U) -> Result<RequestBuilder<'_, &mut Self>, crate::Error>
     where
         U: TryInto<Uri>,
         U::Error: Debug,
@@ -532,7 +551,7 @@ pub trait Client: Endpoint + Sized {
     }
 
     /// Create a POST request.
-    fn post<U>(&mut self, uri: U) -> RequestBuilder<'_, &mut Self>
+    fn post<U>(&mut self, uri: U) -> Result<RequestBuilder<'_, &mut Self>, crate::Error>
     where
         U: TryInto<Uri>,
         U::Error: Debug,
@@ -541,7 +560,7 @@ pub trait Client: Endpoint + Sized {
     }
 
     /// Create a PUT request.
-    fn put<'a, U>(&mut self, uri: U) -> RequestBuilder<'_, &mut Self>
+    fn put<'a, U>(&mut self, uri: U) -> Result<RequestBuilder<'_, &mut Self>, crate::Error>
     where
         U: TryInto<Uri>,
         U::Error: Debug,
@@ -551,7 +570,7 @@ pub trait Client: Endpoint + Sized {
     }
 
     /// Create a DELETE request.
-    fn delete<U>(&mut self, uri: U) -> RequestBuilder<'_, &mut Self>
+    fn delete<U>(&mut self, uri: U) -> Result<RequestBuilder<'_, &mut Self>, crate::Error>
     where
         U: TryInto<Uri>,
         U::Error: Debug,

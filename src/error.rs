@@ -254,7 +254,7 @@ impl Error {
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// # let mut client = zenwave::client();
-    /// match client.get("https://api.example.com/data").await {
+    /// match client.get("https://api.example.com/data")?.await {
     ///     Err(e) => {
     ///         if let Some(api_err) = e.deserialize_http_error::<ApiError>() {
     ///             println!("API error: {} - {}", api_err.code, api_err.message);

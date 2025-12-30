@@ -26,7 +26,7 @@ async fn test_invalid_scheme_error() {
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_invalid_url_error() {
     let mut client = client();
-    let result = client.get("not-a-valid-url").await;
+    let result = client.get("not-a-valid-url").unwrap().await;
     assert!(result.is_err());
 }
 
@@ -53,7 +53,7 @@ async fn test_json_parsing_error() {
 
     let mut client = client();
     // Get plain text and try to parse as JSON
-    let result: Result<Value, _> = client.get(httpbin_uri("/html")).json().await;
+    let result: Result<Value, _> = client.get(httpbin_uri("/html")).unwrap().json().await;
     assert!(result.is_err());
 }
 
@@ -88,10 +88,8 @@ async fn test_500_server_error() {
 async fn test_method_construction_with_invalid_uri() {
     // Empty string causes panic in request construction
     // This is a validation issue in http-kit, so we expect a panic
-    let result = std::panic::catch_unwind(|| {
-        let mut client = client();
-        let _request_builder = client.method(Method::GET, "");
-    });
+    let mut client = client();
+    let result = client.method(Method::GET, "");
     assert!(result.is_err());
 }
 
@@ -108,4 +106,13 @@ async fn test_empty_response_handling() {
     assert!(body.is_ok());
     let body_str = body.unwrap();
     assert!(body_str.is_empty());
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+async fn test_invalid_header_rejected() {
+    let mut client = client();
+    let builder = client.get(httpbin_uri("/get")).unwrap();
+    let result = builder.header("bad\nheader", "value");
+    assert!(result.is_err());
 }

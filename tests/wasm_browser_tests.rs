@@ -31,7 +31,9 @@ mod wasm_tests {
 
         let response = client
             .method(Method::GET, httpbin_uri("/headers"))
+            .unwrap()
             .header("X-Test", "wasm")
+            .unwrap()
             .await
             .unwrap();
         assert!(response.status().is_success());

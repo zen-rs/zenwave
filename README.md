@@ -161,22 +161,22 @@ let client = client();
 
 // JSON request/response
 let response: MyResponse = client
-    .post("https://api.example.com/data")
-    .header("X-Request-ID", "abc123")
-    .bearer_auth("token")
+    .post("https://api.example.com/data")?
+    .header("X-Request-ID", "abc123")?
+    .bearer_auth("token")?
     .json_body(&MyRequest { field: "value" })?
     .json()
     .await?;
 
 // Form data
 let response = client
-    .post("https://example.com/form")
+    .post("https://example.com/form")?
     .form_body(&[("key", "value")])?
     .await?;
 
 // Raw bytes
 let response = client
-    .post("https://example.com/upload")
+    .post("https://example.com/upload")?
     .bytes_body(vec![1, 2, 3])
     .await?;
 ```
@@ -186,14 +186,14 @@ let response = client
 ```rust
 // Stream file upload without buffering
 client
-    .post("https://example.com/upload")
+    .post("https://example.com/upload")?
     .file_body("large-file.zip")
     .await?
     .await?;
 
 // Download with automatic resume
 let report = client
-    .get("https://example.com/large-file.iso")
+    .get("https://example.com/large-file.iso")?
     .download_to_path("large-file.iso")
     .await?;
 

@@ -1,8 +1,37 @@
 //! Authentication middlewares for HTTP requests.
 
-use std::convert::Infallible;
+use http_kit::{Endpoint, HttpError, Middleware, Request, Response, StatusCode, header, middleware::MiddlewareError};
 
-use http_kit::{Endpoint, Middleware, Request, Response, header, middleware::MiddlewareError};
+/// Errors that can occur while adding Authorization headers.
+#[derive(Debug, thiserror::Error)]
+pub enum AuthError {
+    /// Authorization header value was invalid.
+    #[error("invalid authorization header")]
+    InvalidHeader,
+}
+
+impl HttpError for AuthError {
+    fn status(&self) -> StatusCode {
+        StatusCode::BAD_REQUEST
+    }
+}
+
+impl From<AuthError> for crate::Error {
+    fn from(_: AuthError) -> Self {
+        Self::InvalidRequest("invalid authorization header".to_string())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AuthHeaderSuppressed;
+
+pub(crate) fn auth_header_suppressed(request: &Request) -> bool {
+    request.extensions().get::<AuthHeaderSuppressed>().is_some()
+}
+
+pub(crate) fn suppress_auth_header(request: &mut Request) {
+    request.extensions_mut().insert(AuthHeaderSuppressed);
+}
 
 /// Middleware for Bearer Token Authentication.
 /// Adds an `Authorization: Bearer <token>` header to requests.
@@ -21,18 +50,23 @@ impl BearerAuth {
 }
 
 impl Middleware for BearerAuth {
-    type Error = Infallible;
+    type Error = AuthError;
     async fn handle<E: Endpoint>(
         &mut self,
         request: &mut Request,
         mut next: E,
     ) -> Result<Response, http_kit::middleware::MiddlewareError<E::Error, Self::Error>> {
         // Only add auth header if one isn't already present
-        if !request.headers().contains_key(header::AUTHORIZATION) {
+        if !request.headers().contains_key(header::AUTHORIZATION)
+            && !auth_header_suppressed(request)
+        {
             let auth_value = format!("Bearer {}", self.token);
+            let header_value = auth_value
+                .parse()
+                .map_err(|_| MiddlewareError::Middleware(AuthError::InvalidHeader))?;
             request
                 .headers_mut()
-                .insert(header::AUTHORIZATION, auth_value.parse().unwrap());
+                .insert(header::AUTHORIZATION, header_value);
         }
 
         next.respond(request)
@@ -60,14 +94,16 @@ impl BasicAuth {
 }
 
 impl Middleware for BasicAuth {
-    type Error = Infallible;
+    type Error = AuthError;
     async fn handle<E: Endpoint>(
         &mut self,
         request: &mut Request,
         mut next: E,
     ) -> Result<Response, http_kit::middleware::MiddlewareError<E::Error, Self::Error>> {
         // Only add auth header if one isn't already present
-        if !request.headers().contains_key(header::AUTHORIZATION) {
+        if !request.headers().contains_key(header::AUTHORIZATION)
+            && !auth_header_suppressed(request)
+        {
             use base64::Engine;
 
             let credentials = match &self.password {
@@ -78,9 +114,12 @@ impl Middleware for BasicAuth {
             let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
             let auth_value = format!("Basic {encoded}");
 
+            let header_value = auth_value
+                .parse()
+                .map_err(|_| MiddlewareError::Middleware(AuthError::InvalidHeader))?;
             request
                 .headers_mut()
-                .insert(header::AUTHORIZATION, auth_value.parse().unwrap());
+                .insert(header::AUTHORIZATION, header_value);
         }
 
         next.respond(request)

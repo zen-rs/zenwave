@@ -19,6 +19,7 @@ struct SeenRequest {
     uri: String,
     custom_header: Option<String>,
     authorization: Option<String>,
+    body: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -59,6 +60,14 @@ impl MockClient {
 impl Endpoint for MockClient {
     type Error = MockError;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+        let body_bytes = match request.body_mut().take() {
+            Ok(body) => body
+                .into_bytes()
+                .await
+                .unwrap_or_else(|_| http_kit::utils::Bytes::new())
+                .to_vec(),
+            Err(_) => Vec::new(),
+        };
         let mut state = self.state.lock().unwrap();
         state.seen.push(SeenRequest {
             method: request.method().clone(),
@@ -73,6 +82,7 @@ impl Endpoint for MockClient {
                 .get("authorization")
                 .and_then(|value| value.to_str().ok())
                 .map(ToOwned::to_owned),
+            body: body_bytes,
         });
 
         state.responses.pop_front().ok_or(MockError::Exhausted)
@@ -157,4 +167,58 @@ async fn follow_redirect_strips_sensitive_headers_on_host_change() {
     );
     assert_eq!(state.seen[1].uri, "https://example.net/next");
     drop(state);
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+async fn follow_redirect_preserves_body_on_temporary_redirect() {
+    let mock = MockClient::with_responses(vec![
+        redirect_response(StatusCode::TEMPORARY_REDIRECT, "https://example.com/next"),
+        ok_response(),
+    ]);
+    let state = mock.state();
+    let mut client = FollowRedirect::new(mock);
+
+    let mut request = http::Request::builder()
+        .method(Method::POST)
+        .uri("https://example.com/start")
+        .header("x-test", "keep-me")
+        .body(Body::from("payload"))
+        .unwrap();
+
+    client.respond(&mut request).await.unwrap();
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.seen.len(), 2);
+    assert_eq!(state.seen[0].method, Method::POST);
+    assert_eq!(state.seen[1].method, Method::POST);
+    assert_eq!(state.seen[0].body, b"payload");
+    assert_eq!(state.seen[1].body, b"payload");
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+async fn follow_redirect_suppresses_auth_with_middleware_on_host_change() {
+    let mock = MockClient::with_responses(vec![
+        redirect_response(StatusCode::MOVED_PERMANENTLY, "https://example.net/next"),
+        ok_response(),
+    ]);
+    let state = mock.state();
+    let mut client = mock.bearer_auth("secret").follow_redirect();
+
+    let mut request = http::Request::builder()
+        .method(Method::GET)
+        .uri("https://example.com/private")
+        .body(Body::empty())
+        .unwrap();
+
+    client.respond(&mut request).await.unwrap();
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.seen.len(), 2);
+    assert_eq!(state.seen[0].authorization.as_deref(), Some("Bearer secret"));
+    assert!(
+        state.seen[1].authorization.is_none(),
+        "authorization header should stay suppressed on cross-host redirect"
+    );
 }

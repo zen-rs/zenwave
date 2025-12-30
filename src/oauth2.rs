@@ -13,6 +13,7 @@ use serde::Deserialize;
 use url::form_urlencoded::Serializer;
 
 use crate::{Client, DefaultBackend, client};
+use crate::auth::auth_header_suppressed;
 
 type TokenError = OAuth2Error<<DefaultBackend as Endpoint>::Error>;
 
@@ -35,6 +36,10 @@ pub enum OAuth2Error<H: HttpError> {
     /// The token response body could not be parsed.
     #[error("invalid token response: {0}")]
     InvalidResponse(BodyError),
+
+    /// Failed to build the Authorization header from the fetched token.
+    #[error("invalid bearer token header")]
+    InvalidHeader,
 }
 
 impl<H: HttpError> HttpError for OAuth2Error<H> {
@@ -43,6 +48,7 @@ impl<H: HttpError> HttpError for OAuth2Error<H> {
             Self::Transport(err) => err.status(),
             Self::Upstream { status, .. } => *status,
             Self::InvalidResponse(_) => StatusCode::BAD_GATEWAY,
+            Self::InvalidHeader => StatusCode::BAD_REQUEST,
         }
     }
 }
@@ -68,6 +74,11 @@ where
             }
             OAuth2Error::InvalidResponse(e) => {
                 Self::OAuth2(OAuth2ErrorKind::InvalidTokenResponse(e.to_string()))
+            }
+            OAuth2Error::InvalidHeader => {
+                Self::OAuth2(OAuth2ErrorKind::InvalidTokenResponse(
+                    "invalid bearer token header".to_string(),
+                ))
             }
         }
     }
@@ -173,11 +184,11 @@ impl OAuth2ClientCredentials {
         let body = self.build_body();
         let mut client = client();
         let response = client
-            .post(&self.config.token_url)
+            .post(&self.config.token_url)?
             .header(
                 header::CONTENT_TYPE.as_str(),
                 "application/x-www-form-urlencoded",
-            )
+            )?
             .bytes_body(body.into_bytes())
             .await?;
 
@@ -234,7 +245,9 @@ impl Middleware for OAuth2ClientCredentials {
         request: &mut Request,
         mut next: E,
     ) -> Result<Response, http_kit::middleware::MiddlewareError<E::Error, Self::Error>> {
-        if !request.headers().contains_key(header::AUTHORIZATION) {
+        if !request.headers().contains_key(header::AUTHORIZATION)
+            && !auth_header_suppressed(request)
+        {
             let token = self
                 .ensure_token()
                 .await
@@ -244,7 +257,7 @@ impl Middleware for OAuth2ClientCredentials {
                 header::AUTHORIZATION,
                 header_value
                     .parse()
-                    .expect("Fail to create a bearer header"),
+                    .map_err(|_| MiddlewareError::Middleware(OAuth2Error::InvalidHeader))?,
             );
         }
 

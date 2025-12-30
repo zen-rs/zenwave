@@ -24,11 +24,11 @@ async fn test_cookie_store_middleware() {
     let mut client = client().enable_cookie();
 
     // First request to set a cookie
-    let response = client.get(httpbin_uri("/cookies/set/test/value")).await;
+    let response = client.get(httpbin_uri("/cookies/set/test/value")).unwrap().await;
     assert!(response.is_ok());
 
     // Second request should include the cookie
-    let response = client.get(httpbin_uri("/cookies")).await;
+    let response = client.get(httpbin_uri("/cookies")).unwrap().await;
     assert!(response.is_ok());
 
     let response = response.unwrap();
@@ -51,7 +51,7 @@ async fn test_follow_redirect_middleware() {
     let mut client = client().follow_redirect();
 
     // This should follow the redirect and return the final response
-    let response = client.get(httpbin_uri("/redirect/1")).await;
+    let response = client.get(httpbin_uri("/redirect/1")).unwrap().await;
     assert!(response.is_ok());
     let response = response.unwrap();
     assert!(response.status().is_success());
@@ -71,7 +71,7 @@ async fn test_follow_redirect_multiple_redirects() {
     let mut client = client().follow_redirect();
 
     // Test multiple redirects
-    let response = client.get(httpbin_uri("/redirect/3")).await;
+    let response = client.get(httpbin_uri("/redirect/3")).unwrap().await;
     assert!(response.is_ok());
     let response = response.unwrap();
     assert!(response.status().is_success());
@@ -85,11 +85,12 @@ async fn test_client_with_multiple_middleware() {
     // Test that both middleware work together
     let response = client
         .get(httpbin_uri("/redirect-to?url=/cookies/set/test/redirect"))
+        .unwrap()
         .await;
     assert!(response.is_ok());
 
     // Verify cookie was set after redirect
-    let response2 = client.get(httpbin_uri("/cookies")).await;
+    let response2 = client.get(httpbin_uri("/cookies")).unwrap().await;
     assert!(response2.is_ok());
 }
 
@@ -98,7 +99,7 @@ async fn test_client_with_multiple_middleware() {
 async fn test_without_redirect_middleware() {
     // Without redirect middleware, should get redirect response
     let mut client = client();
-    let response = client.get(httpbin_uri("/redirect/1")).await;
+    let response = client.get(httpbin_uri("/redirect/1")).unwrap().await;
     assert!(response.is_ok());
     let response = response.unwrap();
     // Should be a redirect status code, not success
@@ -129,7 +130,7 @@ async fn test_middleware_with_custom_middleware() {
 
     let mut client = client().with(TestMiddleware);
 
-    let response = client.get(httpbin_uri("/headers")).await;
+    let response = client.get(httpbin_uri("/headers")).unwrap().await;
     assert!(response.is_ok());
 
     let response = response.unwrap();
@@ -196,6 +197,7 @@ async fn test_timeout_middleware_success() {
 
     let response = client
         .get("https://example.com")
+        .unwrap()
         .await
         .expect("request should complete before timeout");
     assert_eq!(response.status(), StatusCode::OK);
@@ -212,6 +214,7 @@ async fn test_timeout_middleware_triggers_gateway_timeout() {
 
     let err = client
         .get("https://example.com")
+        .unwrap()
         .await
         .expect_err("timeout should trigger before slow backend responds");
 
@@ -231,12 +234,14 @@ async fn test_enable_cache_serves_cached_response() {
 
     let first = client
         .get("https://example.com/cache")
+        .unwrap()
         .await
         .expect("initial request should succeed");
     let first_body = first.into_body().into_string().await.unwrap();
 
     let second = client
         .get("https://example.com/cache")
+        .unwrap()
         .await
         .expect("cached request should succeed");
     let second_body = second.into_body().into_string().await.unwrap();

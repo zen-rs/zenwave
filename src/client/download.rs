@@ -17,6 +17,9 @@ pub enum DownloadError<E: HttpError> {
     #[error("request error: {0}")]
     Remote(#[source] E),
 
+    #[error("invalid request: {0}")]
+    Request(String),
+
     #[error("failed to read response body: {0}")]
     Body(#[source] BodyError),
 
@@ -31,6 +34,7 @@ impl<E: HttpError> HttpError for DownloadError<E> {
     fn status(&self) -> StatusCode {
         match self {
             Self::Remote(err) => err.status(),
+            Self::Request(_) => StatusCode::BAD_REQUEST,
             Self::Body(_) => StatusCode::BAD_GATEWAY,
             Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Upstream(status) => *status,
@@ -48,6 +52,7 @@ where
 
         match err {
             DownloadError::Remote(e) => e.into(),
+            DownloadError::Request(msg) => Self::InvalidRequest(msg),
             DownloadError::Body(e) => Self::Download(DownloadErrorKind::BodyRead(e.to_string())),
             DownloadError::Io(e) => Self::Download(DownloadErrorKind::FileSystem(e)),
             DownloadError::Upstream(status) => {
@@ -110,7 +115,9 @@ pub async fn download_to_path<T: crate::Client>(
 
     if existing_len > 0 {
         let value = format!("bytes={existing_len}-");
-        builder = builder.header(header::RANGE.as_str(), value);
+        builder = builder
+            .header(header::RANGE.as_str(), value)
+            .map_err(|err| DownloadError::Request(err.to_string()))?;
     }
 
     let response = builder.await.map_err(DownloadError::Remote)?;
