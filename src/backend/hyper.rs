@@ -133,6 +133,14 @@ impl Endpoint for HyperBackend {
             .unwrap();
         let mut request: http::Request<http_kit::Body> = replace(request, dummy_request);
 
+        // Debug: log request details
+        eprintln!(
+            "[zenwave] HyperBackend: method={} uri={} headers={:?}",
+            request.method(),
+            request.uri(),
+            request.headers()
+        );
+
         // Ensure Host header is present (required by hyper 1.0 / HTTP 1.1)
         if request.headers().get(http::header::HOST).is_none()
             && let Some(authority) = request.uri().authority()
