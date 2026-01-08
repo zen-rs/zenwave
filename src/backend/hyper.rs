@@ -96,6 +96,14 @@ impl Endpoint for HyperBackend {
             .unwrap();
         let request: http::Request<http_kit::Body> = replace(request, dummy_request);
 
+        // Debug: log request details
+        tracing::debug!(
+            method = %request.method(),
+            uri = %request.uri(),
+            headers = ?request.headers(),
+            "HyperBackend sending request"
+        );
+
         let response = self
             .client
             .request(request)
