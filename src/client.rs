@@ -54,6 +54,44 @@ impl<'a, T: Client> IntoFuture for RequestBuilder<'a, T> {
 // ClientError has been removed - all errors now use zenwave::Error
 
 impl<T: Client> RequestBuilder<'_, T> {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn set_content_length_if_known(&mut self, len: Option<u64>) {
+        if let Some(len) = len {
+            let has_len = self.request.headers().contains_key(header::CONTENT_LENGTH);
+            let has_te = self.request.headers().contains_key(header::TRANSFER_ENCODING);
+            if has_len || has_te {
+                return;
+            }
+
+            if let Ok(value) = HeaderValue::from_str(&len.to_string()) {
+                self.request
+                    .headers_mut()
+                    .insert(header::CONTENT_LENGTH, value);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn set_content_length_if_known(&mut self, _len: Option<u64>) {}
+
+    fn set_body_with_len(&mut self, body: http_kit::Body) {
+        let len = body.len().and_then(|len| u64::try_from(len).ok());
+
+        // Set Content-Type from body's mime if not already set
+        if !self.request.headers().contains_key(header::CONTENT_TYPE) {
+            if let Some(mime) = body.mime() {
+                if let Ok(value) = HeaderValue::from_str(mime.as_ref()) {
+                    self.request
+                        .headers_mut()
+                        .insert(header::CONTENT_TYPE, value);
+                }
+            }
+        }
+
+        *self.request.body_mut() = body;
+        self.set_content_length_if_known(len);
+    }
+
     pub fn bearer_auth(mut self, token: impl Into<String>) -> Result<Self, crate::Error> {
         let auth_value = format!("Bearer {}", token.into());
         let header_value = auth_value.parse().map_err(|err| {
@@ -115,8 +153,8 @@ impl<T: Client> RequestBuilder<'_, T> {
             crate::Error::InvalidRequest(format!("failed to serialize JSON body: {err}"))
         })?;
 
-        // Set the body directly
-        *self.request.body_mut() = http_kit::Body::from(json);
+        // Set the body and add content-length when available.
+        self.set_body_with_len(http_kit::Body::from(json));
 
         // Add content-type header
         let content_type = header::CONTENT_TYPE;
@@ -127,7 +165,7 @@ impl<T: Client> RequestBuilder<'_, T> {
     }
 
     pub fn bytes_body(mut self, bytes: Vec<u8>) -> Self {
-        *self.request.body_mut() = http_kit::Body::from(bytes);
+        self.set_body_with_len(http_kit::Body::from(bytes));
         self
     }
 
@@ -138,15 +176,8 @@ impl<T: Client> RequestBuilder<'_, T> {
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
         use futures_util::io::AsyncReadExt;
-        use http_kit::header;
 
-        if let Some(len) = length
-            && let Ok(value) = header::HeaderValue::from_str(&len.to_string())
-        {
-            self.request
-                .headers_mut()
-                .insert(header::CONTENT_LENGTH, value);
-        }
+        self.set_content_length_if_known(length);
 
         let stream = futures_util::stream::unfold(reader, |mut reader| async move {
             let mut buf = vec![0u8; 8192];

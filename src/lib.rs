@@ -105,8 +105,8 @@ mod client;
 pub mod redirect;
 pub mod retry;
 
-// Re-export the unified error type
-pub use error::Error;
+// Re-export the unified error type and result alias
+pub use error::{Error, Result};
 
 mod ext;
 /// Multipart/form-data utilities.
@@ -149,7 +149,7 @@ pub fn client_with_proxy(proxy: Proxy) -> DefaultBackend {
 ///
 /// # Errors
 /// If the request fails, an error is returned.
-pub async fn get<U>(uri: U) -> Result<Response, <DefaultBackend as Endpoint>::Error>
+pub async fn get<U>(uri: U) -> Result<Response>
 where
     U: TryInto<Uri>,
     U::Error: core::fmt::Debug,
@@ -162,7 +162,7 @@ where
 ///
 /// # Errors
 /// If the request fails, an error is returned.
-pub async fn post<U>(uri: U) -> Result<Response, <DefaultBackend as Endpoint>::Error>
+pub async fn post<U>(uri: U) -> Result<Response>
 where
     U: TryInto<Uri>,
     U::Error: core::fmt::Debug,
@@ -175,7 +175,7 @@ where
 ///
 /// # Errors
 /// If the request fails, an error is returned.
-pub async fn put<U>(uri: U) -> Result<Response, <DefaultBackend as Endpoint>::Error>
+pub async fn put<U>(uri: U) -> Result<Response>
 where
     U: TryInto<Uri>,
     U::Error: core::fmt::Debug,
@@ -188,7 +188,7 @@ where
 ///
 /// # Errors
 /// If the request fails, an error is returned.
-pub async fn delete<U>(uri: U) -> Result<Response, <DefaultBackend as Endpoint>::Error>
+pub async fn delete<U>(uri: U) -> Result<Response>
 where
     U: TryInto<Uri>,
     U::Error: core::fmt::Debug,

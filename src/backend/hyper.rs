@@ -141,6 +141,20 @@ impl Endpoint for HyperBackend {
             request.headers_mut().insert(http::header::HOST, value);
         }
 
+        // Debug: log request details
+        let body_hint = match request.body().is_empty() {
+            Some(true) => "confirmed empty",
+            Some(false) => "confirmed has content",
+            None => "unknown (streaming)",
+        };
+        tracing::debug!(
+            method = %request.method(),
+            uri = %request.uri(),
+            headers = ?request.headers(),
+            body = body_hint,
+            "HyperBackend sending request"
+        );
+
         let stream = connect(&request).await?;
         let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
             .handshake(stream)

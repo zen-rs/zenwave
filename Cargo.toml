@@ -18,6 +18,7 @@ url = "2.5"
 futures-util = { version = "0.3", features = ["io", "sink"] }
 futures-channel = "0.3"
 thiserror = "2.0"
+tracing = "0.1"
 futures-io = "0.3"
 async-lock = "3.4"
 anyhow = "1.0.100"

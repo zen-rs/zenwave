@@ -11,6 +11,9 @@
 //! rich helper methods for error classification and handling.
 
 use http_kit::{BodyError, Response, StatusCode};
+
+/// Result type for zenwave operations.
+pub type Result<T> = std::result::Result<T, Error>;
 use std::error::Error as StdError;
 use thiserror::Error;
 
