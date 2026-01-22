@@ -7,8 +7,8 @@ use http_kit::{
 };
 use url::Url;
 
-use crate::{Body, Request, Response, StatusCode, client::Client};
 use crate::auth::suppress_auth_header;
+use crate::{Body, Request, Response, StatusCode, client::Client};
 use http_kit::utils::Bytes;
 
 /// Middleware that follows HTTP redirects.

@@ -7,10 +7,10 @@ use core::{
     pin::Pin,
     task::{Context, Poll},
 };
-use http_kit::{Endpoint, Request, Response};
-use http_kit::utils::Bytes;
 use http::HeaderMap;
 use http::Version;
+use http_kit::utils::Bytes;
+use http_kit::{Endpoint, Request, Response};
 
 use crate::client::Client;
 

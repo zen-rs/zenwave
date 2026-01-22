@@ -30,6 +30,9 @@ use crate::{
     timeout::Timeout,
 };
 
+const DEFAULT_ACCEPT: &str = "*/*";
+const DEFAULT_USER_AGENT: &str = concat!("zenwave/", env!("CARGO_PKG_VERSION"));
+
 /// Builder for HTTP requests using a Client.
 #[derive(Debug)]
 pub struct RequestBuilder<'a, T: Client> {
@@ -58,7 +61,10 @@ impl<T: Client> RequestBuilder<'_, T> {
     fn set_content_length_if_known(&mut self, len: Option<u64>) {
         if let Some(len) = len {
             let has_len = self.request.headers().contains_key(header::CONTENT_LENGTH);
-            let has_te = self.request.headers().contains_key(header::TRANSFER_ENCODING);
+            let has_te = self
+                .request
+                .headers()
+                .contains_key(header::TRANSFER_ENCODING);
             if has_len || has_te {
                 return;
             }
@@ -551,7 +557,11 @@ pub trait Client: Endpoint + Sized {
     }
 
     /// Create a request with the specified method and URI.
-    fn method<U>(&mut self, method: Method, uri: U) -> Result<RequestBuilder<'_, &mut Self>, crate::Error>
+    fn method<U>(
+        &mut self,
+        method: Method,
+        uri: U,
+    ) -> Result<RequestBuilder<'_, &mut Self>, crate::Error>
     where
         U: TryInto<Uri>,
         U::Error: Debug,
@@ -564,6 +574,21 @@ pub trait Client: Endpoint + Sized {
             .uri(uri)
             .body(http_kit::Body::empty())
             .map_err(|err| crate::Error::InvalidRequest(err.to_string()))?;
+        let mut request = request;
+
+        if !request.headers().contains_key(header::ACCEPT) {
+            request
+                .headers_mut()
+                .insert(header::ACCEPT, HeaderValue::from_static(DEFAULT_ACCEPT));
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if !request.headers().contains_key(header::USER_AGENT) {
+            request.headers_mut().insert(
+                header::USER_AGENT,
+                HeaderValue::from_static(DEFAULT_USER_AGENT),
+            );
+        }
 
         Ok(RequestBuilder {
             client: self,

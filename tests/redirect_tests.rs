@@ -216,7 +216,10 @@ async fn follow_redirect_suppresses_auth_with_middleware_on_host_change() {
 
     let state = state.lock().unwrap();
     assert_eq!(state.seen.len(), 2);
-    assert_eq!(state.seen[0].authorization.as_deref(), Some("Bearer secret"));
+    assert_eq!(
+        state.seen[0].authorization.as_deref(),
+        Some("Bearer secret")
+    );
     assert!(
         state.seen[1].authorization.is_none(),
         "authorization header should stay suppressed on cross-host redirect"

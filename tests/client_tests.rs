@@ -97,7 +97,10 @@ async fn test_request_builder_json() {
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_with_middleware() {
     let mut client = client().enable_cookie();
-    let response = client.get(httpbin_uri("/cookies/set/test/value")).unwrap().await;
+    let response = client
+        .get(httpbin_uri("/cookies/set/test/value"))
+        .unwrap()
+        .await;
     assert!(response.is_ok());
 
     // Follow up request should include cookie

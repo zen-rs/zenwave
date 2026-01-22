@@ -1,3 +1,4 @@
+use crate::{Client, error::HttpErrorResponse};
 use async_io::block_on;
 use async_net::TcpStream;
 use core::future::Future;
@@ -14,8 +15,6 @@ use std::{
     task::{Context, Poll},
     thread,
 };
-
-use crate::{Client, error::HttpErrorResponse};
 
 /// Hyper-based HTTP client backend powered by `async-io`/`async-net`.
 #[derive(Debug, Default)]
@@ -240,7 +239,7 @@ async fn connect(request: &http::Request<http_kit::Body>) -> Result<MaybeTlsStre
                 .connect(host.as_str(), stream)
                 .await
                 .map_err(|err| HyperError::Io(std::io::Error::other(err)))?;
-            return Ok(MaybeTlsStream::Native(tls));
+            return Ok(MaybeTlsStream::new(MaybeTlsStreamInner::Native(tls)));
         }
 
         #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
@@ -249,7 +248,7 @@ async fn connect(request: &http::Request<http_kit::Body>) -> Result<MaybeTlsStre
         }
     }
 
-    Ok(MaybeTlsStream::Plain(stream))
+    Ok(MaybeTlsStream::new(MaybeTlsStreamInner::Plain(stream)))
 }
 
 /// Connect using rustls with system certificates.
@@ -290,10 +289,26 @@ async fn connect_rustls(host: String, stream: TcpStream) -> Result<MaybeTlsStrea
         .connect(server_name, stream)
         .await
         .map_err(|err| HyperError::Io(std::io::Error::other(err)))?;
-    Ok(MaybeTlsStream::Rustls(Box::new(stream)))
+    Ok(MaybeTlsStream::new(MaybeTlsStreamInner::Rustls(Box::new(
+        stream,
+    ))))
 }
 
-enum MaybeTlsStream {
+struct MaybeTlsStream {
+    inner: MaybeTlsStreamInner,
+    read_buf: Vec<u8>,
+}
+
+impl MaybeTlsStream {
+    fn new(inner: MaybeTlsStreamInner) -> Self {
+        Self {
+            inner,
+            read_buf: Vec::new(),
+        }
+    }
+}
+
+enum MaybeTlsStreamInner {
     Plain(TcpStream),
     #[cfg(feature = "native-tls")]
     #[allow(dead_code)]
@@ -313,20 +328,30 @@ impl hyper::rt::Read for MaybeTlsStream {
         cx: &mut Context<'_>,
         mut buf: hyper::rt::ReadBufCursor<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let slice = unsafe { buf.as_mut() };
-        let bytes = unsafe { &mut *(std::ptr::from_mut(slice) as *mut [u8]) };
+        let this = self.as_mut().get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
 
-        let result = match &mut *self {
-            Self::Plain(stream) => Pin::new(stream).poll_read(cx, bytes),
+        let max = buf.remaining();
+        if this.read_buf.len() < max {
+            this.read_buf.resize(max, 0);
+        }
+        let bytes = &mut this.read_buf[..max];
+
+        let result = match &mut this.inner {
+            MaybeTlsStreamInner::Plain(stream) => Pin::new(stream).poll_read(cx, bytes),
             #[cfg(feature = "native-tls")]
-            Self::Native(stream) => Pin::new(stream).poll_read(cx, bytes),
+            MaybeTlsStreamInner::Native(stream) => Pin::new(stream).poll_read(cx, bytes),
             #[cfg(feature = "rustls")]
-            Self::Rustls(stream) => Pin::new(stream).poll_read(cx, bytes),
+            MaybeTlsStreamInner::Rustls(stream) => Pin::new(stream).poll_read(cx, bytes),
         };
 
         match result {
             Poll::Ready(Ok(n)) => {
-                unsafe { buf.advance(n) };
+                if n > 0 {
+                    buf.put_slice(&bytes[..n]);
+                }
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
@@ -341,32 +366,35 @@ impl hyper::rt::Write for MaybeTlsStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        match &mut *self {
-            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+        let this = self.as_mut().get_mut();
+        match &mut this.inner {
+            MaybeTlsStreamInner::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(feature = "native-tls")]
-            Self::Native(stream) => Pin::new(stream).poll_write(cx, buf),
+            MaybeTlsStreamInner::Native(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(feature = "rustls")]
-            Self::Rustls(stream) => Pin::new(stream).poll_write(cx, buf),
+            MaybeTlsStreamInner::Rustls(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match &mut *self {
-            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+        let this = self.as_mut().get_mut();
+        match &mut this.inner {
+            MaybeTlsStreamInner::Plain(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(feature = "native-tls")]
-            Self::Native(stream) => Pin::new(stream).poll_flush(cx),
+            MaybeTlsStreamInner::Native(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(feature = "rustls")]
-            Self::Rustls(stream) => Pin::new(stream).poll_flush(cx),
+            MaybeTlsStreamInner::Rustls(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match &mut *self {
-            Self::Plain(stream) => Pin::new(stream).poll_close(cx),
+        let this = self.as_mut().get_mut();
+        match &mut this.inner {
+            MaybeTlsStreamInner::Plain(stream) => Pin::new(stream).poll_close(cx),
             #[cfg(feature = "native-tls")]
-            Self::Native(stream) => Pin::new(stream).poll_close(cx),
+            MaybeTlsStreamInner::Native(stream) => Pin::new(stream).poll_close(cx),
             #[cfg(feature = "rustls")]
-            Self::Rustls(stream) => Pin::new(stream).poll_close(cx),
+            MaybeTlsStreamInner::Rustls(stream) => Pin::new(stream).poll_close(cx),
         }
     }
 
@@ -379,12 +407,13 @@ impl hyper::rt::Write for MaybeTlsStream {
         cx: &mut Context<'_>,
         bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<std::io::Result<usize>> {
-        match &mut *self {
-            Self::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+        let this = self.as_mut().get_mut();
+        match &mut this.inner {
+            MaybeTlsStreamInner::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
             #[cfg(feature = "native-tls")]
-            Self::Native(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            MaybeTlsStreamInner::Native(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
             #[cfg(feature = "rustls")]
-            Self::Rustls(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            MaybeTlsStreamInner::Rustls(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
         }
     }
 }

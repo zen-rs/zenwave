@@ -1,6 +1,9 @@
 //! Authentication middlewares for HTTP requests.
 
-use http_kit::{Endpoint, HttpError, Middleware, Request, Response, StatusCode, header, middleware::MiddlewareError};
+use http_kit::{
+    Endpoint, HttpError, Middleware, Request, Response, StatusCode, header,
+    middleware::MiddlewareError,
+};
 
 /// Errors that can occur while adding Authorization headers.
 #[derive(Debug, thiserror::Error)]

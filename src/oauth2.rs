@@ -12,8 +12,8 @@ use http_kit::{
 use serde::Deserialize;
 use url::form_urlencoded::Serializer;
 
-use crate::{Client, DefaultBackend, client};
 use crate::auth::auth_header_suppressed;
+use crate::{Client, DefaultBackend, client};
 
 type TokenError = OAuth2Error<<DefaultBackend as Endpoint>::Error>;
 
@@ -75,11 +75,9 @@ where
             OAuth2Error::InvalidResponse(e) => {
                 Self::OAuth2(OAuth2ErrorKind::InvalidTokenResponse(e.to_string()))
             }
-            OAuth2Error::InvalidHeader => {
-                Self::OAuth2(OAuth2ErrorKind::InvalidTokenResponse(
-                    "invalid bearer token header".to_string(),
-                ))
-            }
+            OAuth2Error::InvalidHeader => Self::OAuth2(OAuth2ErrorKind::InvalidTokenResponse(
+                "invalid bearer token header".to_string(),
+            )),
         }
     }
 }

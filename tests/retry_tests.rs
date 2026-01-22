@@ -184,10 +184,7 @@ async fn retry_middleware_gives_up_after_max_retries() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn retry_replays_request_body() {
-    let mock = BodyClient::with_results(vec![
-        Err(MockError::NetworkError),
-        Ok(ok_response()),
-    ]);
+    let mock = BodyClient::with_results(vec![Err(MockError::NetworkError), Ok(ok_response())]);
     let state = mock.state();
 
     let mut client = mock
