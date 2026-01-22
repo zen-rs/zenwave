@@ -5,6 +5,7 @@ use std::{
 
 use async_fs::OpenOptions;
 use futures_util::StreamExt;
+use http::HeaderValue;
 use http_kit::{
     BodyError, HttpError, StatusCode, header,
     utils::{AsyncSeekExt, AsyncWriteExt},
@@ -122,6 +123,7 @@ pub async fn download_to_path<T: crate::Client>(
 
     let response = builder.await.map_err(DownloadError::Remote)?;
     let status = response.status();
+    let headers = response.headers().clone();
     let mut body = response.into_body();
 
     if !(status.is_success() || status == StatusCode::PARTIAL_CONTENT) {
@@ -130,18 +132,31 @@ pub async fn download_to_path<T: crate::Client>(
 
     let mut resumed_from = 0_u64;
     let mut file = if existing_len > 0 && status == StatusCode::PARTIAL_CONTENT {
-        resumed_from = existing_len;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&path_buf)
-            .await
-            .map_err(DownloadError::Io)?;
-        file.seek(SeekFrom::Start(existing_len))
-            .await
-            .map_err(DownloadError::Io)?;
-        file
+        let content_range_start = headers
+            .get(header::CONTENT_RANGE)
+            .and_then(parse_content_range_start);
+        if content_range_start == Some(existing_len) {
+            resumed_from = existing_len;
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&path_buf)
+                .await
+                .map_err(DownloadError::Io)?;
+            file.seek(SeekFrom::Start(existing_len))
+                .await
+                .map_err(DownloadError::Io)?;
+            file
+        } else {
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path_buf)
+                .await
+                .map_err(DownloadError::Io)?
+        }
     } else {
         OpenOptions::new()
             .create(true)
@@ -165,4 +180,16 @@ pub async fn download_to_path<T: crate::Client>(
         resumed_from,
         bytes_written,
     })
+}
+
+fn parse_content_range_start(value: &HeaderValue) -> Option<u64> {
+    let text = value.to_str().ok()?;
+    let mut parts = text.split_whitespace();
+    let unit = parts.next()?;
+    if unit != "bytes" {
+        return None;
+    }
+    let range = parts.next()?;
+    let (start, _) = range.split_once('-')?;
+    start.parse::<u64>().ok()
 }

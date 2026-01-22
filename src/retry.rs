@@ -114,7 +114,7 @@ where
 
                     #[cfg(target_arch = "wasm32")]
                     SingleThreaded(gloo_timers::future::TimeoutFuture::new(
-                        delay.as_millis() as u32
+                        delay.as_millis().try_into().unwrap_or(u32::MAX)
                     ))
                     .await;
                 }

@@ -3,7 +3,7 @@
 use crate::header;
 use crate::{Endpoint, Middleware, Request, Response};
 use http_kit::HttpError;
-use http_kit::cookie::{Cookie, CookieJar};
+use http_kit::cookie::Cookie;
 use http_kit::header::HeaderValue;
 use http_kit::middleware::MiddlewareError;
 #[cfg(not(target_arch = "wasm32"))]
@@ -23,13 +23,12 @@ use {
     },
 };
 
-#[cfg(not(target_arch = "wasm32"))]
 use time::OffsetDateTime;
 
 /// Middleware for managing cookies in HTTP requests and responses.
 #[derive(Debug)]
 pub struct CookieStore {
-    store: CookieJar,
+    store: Vec<StoredCookie>,
     #[cfg(not(target_arch = "wasm32"))]
     persistence: Option<Persistence>,
 }
@@ -74,7 +73,7 @@ impl From<CookieError> for crate::Error {
 impl Default for CookieStore {
     fn default() -> Self {
         Self {
-            store: CookieJar::new(),
+            store: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             persistence: None,
         }
@@ -93,7 +92,7 @@ impl CookieStore {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn persistent_with_path(path: impl Into<PathBuf>) -> Self {
         Self {
-            store: CookieJar::new(),
+            store: Vec::new(),
             persistence: Some(Persistence::new(path.into())),
         }
     }
@@ -147,8 +146,11 @@ impl CookieStore {
         if !data.is_empty() {
             let cookies: Vec<PersistedCookie> =
                 serde_json::from_slice(&data).map_err(CookieError::FailToParseCookiesFromDisk)?;
+            let now = OffsetDateTime::now_utc();
             for stored in cookies {
-                self.store.add(stored.into_cookie());
+                if let Some(cookie) = stored.into_cookie(now) {
+                    self.store.push(cookie);
+                }
             }
         }
 
@@ -163,7 +165,7 @@ impl CookieStore {
         let snapshot: Vec<PersistedCookie> = self
             .store
             .iter()
-            .map(|cookie| PersistedCookie::from_cookie(cookie.clone()))
+            .filter_map(PersistedCookie::from_cookie)
             .collect();
         let data = serde_json::to_vec(&snapshot).expect("failed to serialize cookies to JSON"); // Safety: Serialization should not fail.
 
@@ -194,18 +196,15 @@ impl Middleware for CookieStore {
     ) -> Result<Response, http_kit::middleware::MiddlewareError<E::Error, Self::Error>> {
         self.prepare().await.map_err(MiddlewareError::Middleware)?;
 
-        let cookie_header = self
-            .store
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(";");
-
-        request.headers_mut().insert(
-            header::COOKIE,
-            HeaderValue::from_maybe_shared(cookie_header)
-                .map_err(|_| MiddlewareError::Middleware(CookieError::InvalidCookieHeader))?,
-        );
+        if !request.headers().contains_key(header::COOKIE) {
+            let now = OffsetDateTime::now_utc();
+            self.store.retain(|cookie| !cookie.is_expired(now));
+            if let Some(header_value) = build_cookie_header(&self.store, request, now)
+                .map_err(|_| MiddlewareError::Middleware(CookieError::InvalidCookieHeader))?
+            {
+                request.headers_mut().insert(header::COOKIE, header_value);
+            }
+        }
 
         let res = next
             .respond(request)
@@ -213,6 +212,7 @@ impl Middleware for CookieStore {
             .map_err(MiddlewareError::Endpoint)?;
 
         let mut updated = false;
+        let now = OffsetDateTime::now_utc();
         for set_cookie in res.headers().get_all(header::SET_COOKIE) {
             let set_cookie = set_cookie
                 .to_str()
@@ -220,8 +220,11 @@ impl Middleware for CookieStore {
             let cookie = set_cookie
                 .parse::<Cookie>()
                 .map_err(|_| MiddlewareError::Middleware(CookieError::InvalidCookieHeader))?;
-            self.store.add(cookie);
-            updated = true;
+            if apply_set_cookie(&mut self.store, request, cookie, now)
+                .map_err(|_| MiddlewareError::Middleware(CookieError::InvalidCookieHeader))?
+            {
+                updated = true;
+            }
         }
         self.finalize(updated)
             .await
@@ -229,6 +232,199 @@ impl Middleware for CookieStore {
         Ok(res)
     }
 }
+
+#[derive(Debug, Clone)]
+struct StoredCookie {
+    cookie: Cookie<'static>,
+    domain: String,
+    path: String,
+    host_only: bool,
+    expires_at: Option<OffsetDateTime>,
+    secure: bool,
+    http_only: bool,
+}
+
+impl StoredCookie {
+    fn name(&self) -> &str {
+        self.cookie.name()
+    }
+
+    fn is_expired(&self, now: OffsetDateTime) -> bool {
+        self.expires_at.is_some_and(|expiry| expiry <= now)
+    }
+
+    fn matches(&self, host: &str, path: &str, is_secure: bool) -> bool {
+        if self.secure && !is_secure {
+            return false;
+        }
+
+        if self.host_only {
+            if host != self.domain {
+                return false;
+            }
+        } else if !domain_matches(host, &self.domain) {
+            return false;
+        }
+
+        path_matches(&self.path, path)
+    }
+}
+
+fn apply_set_cookie(
+    store: &mut Vec<StoredCookie>,
+    request: &Request,
+    cookie: Cookie<'static>,
+    now: OffsetDateTime,
+) -> Result<bool, CookieError> {
+    let Some(host) = request.uri().host() else {
+        return Ok(false);
+    };
+    let host = host.to_ascii_lowercase();
+    let scheme = request.uri().scheme_str().unwrap_or("http");
+    let is_secure_request = scheme.eq_ignore_ascii_case("https");
+
+    let secure = cookie.secure().unwrap_or(false);
+    if secure && !is_secure_request {
+        return Ok(false);
+    }
+
+    let domain_attr = cookie.domain().map(|domain| domain.to_ascii_lowercase());
+    if let Some(domain) = domain_attr.as_ref()
+        && !domain_matches(&host, domain)
+    {
+        return Ok(false);
+    }
+
+    let host_only = domain_attr.is_none();
+    let domain = domain_attr.unwrap_or_else(|| host.clone());
+
+    let mut path = cookie
+        .path()
+        .map(str::to_string)
+        .unwrap_or_else(|| default_path(request.uri().path()));
+    if !path.starts_with('/') {
+        path.insert(0, '/');
+    }
+
+    let expires_at = compute_expiration(&cookie, now);
+    if expires_at.is_some_and(|expiry| expiry <= now) {
+        remove_cookie(store, cookie.name(), &domain, &path, host_only);
+        return Ok(true);
+    }
+
+    let http_only = cookie.http_only().unwrap_or(false);
+    let stored = StoredCookie {
+        cookie: cookie.into_owned(),
+        domain,
+        path,
+        host_only,
+        expires_at,
+        secure,
+        http_only,
+    };
+
+    remove_cookie(store, stored.name(), &stored.domain, &stored.path, stored.host_only);
+    store.push(stored);
+    Ok(true)
+}
+
+fn remove_cookie(store: &mut Vec<StoredCookie>, name: &str, domain: &str, path: &str, host_only: bool) {
+    store.retain(|stored| {
+        !(stored.name() == name
+            && stored.domain == domain
+            && stored.path == path
+            && stored.host_only == host_only)
+    });
+}
+
+fn build_cookie_header(
+    store: &[StoredCookie],
+    request: &Request,
+    now: OffsetDateTime,
+) -> Result<Option<HeaderValue>, CookieError> {
+    let Some(host) = request.uri().host() else {
+        return Ok(None);
+    };
+    let host = host.to_ascii_lowercase();
+    let scheme = request.uri().scheme_str().unwrap_or("http");
+    let is_secure_request = scheme.eq_ignore_ascii_case("https");
+    let path = request.uri().path();
+
+    let mut cookies = store
+        .iter()
+        .filter(|cookie| !cookie.is_expired(now))
+        .filter(|cookie| cookie.matches(&host, path, is_secure_request))
+        .collect::<Vec<_>>();
+
+    if cookies.is_empty() {
+        return Ok(None);
+    }
+
+    cookies.sort_by_key(|cookie| std::cmp::Reverse(cookie.path.len()));
+    let value = cookies
+        .into_iter()
+        .map(|cookie| cookie.cookie.stripped().to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    let header = HeaderValue::from_str(&value).map_err(|_| CookieError::InvalidCookieHeader)?;
+    Ok(Some(header))
+}
+
+fn default_path(request_path: &str) -> String {
+    if !request_path.starts_with('/') {
+        return "/".to_string();
+    }
+
+    if let Some(idx) = request_path.rfind('/') {
+        if idx == 0 {
+            return "/".to_string();
+        }
+        return request_path[..idx].to_string();
+    }
+
+    "/".to_string()
+}
+
+fn path_matches(cookie_path: &str, request_path: &str) -> bool {
+    if cookie_path == "/" {
+        return true;
+    }
+
+    if !request_path.starts_with(cookie_path) {
+        return false;
+    }
+
+    if cookie_path.ends_with('/') {
+        return true;
+    }
+
+    request_path.len() == cookie_path.len()
+        || request_path[cookie_path.len()..].starts_with('/')
+}
+
+fn domain_matches(host: &str, domain: &str) -> bool {
+    if host == domain {
+        return true;
+    }
+    host.ends_with(&format!(".{domain}"))
+}
+
+fn compute_expiration(cookie: &Cookie<'static>, now: OffsetDateTime) -> Option<OffsetDateTime> {
+    if let Some(max_age) = cookie.max_age() {
+        if max_age.is_positive() {
+            return Some(now + max_age);
+        }
+        return Some(now);
+    }
+
+    cookie.expires_datetime()
+}
+
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
@@ -260,8 +456,9 @@ fn default_cookie_path() -> Option<PathBuf> {
 struct PersistedCookie {
     name: String,
     value: String,
-    domain: Option<String>,
-    path: Option<String>,
+    domain: String,
+    path: String,
+    host_only: bool,
     secure: bool,
     http_only: bool,
     expires: Option<i128>,
@@ -269,37 +466,56 @@ struct PersistedCookie {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl PersistedCookie {
-    fn from_cookie(cookie: Cookie<'_>) -> Self {
-        let owned = cookie.into_owned();
-        Self {
-            name: owned.name().to_string(),
-            value: owned.value().to_string(),
-            domain: owned.domain().map(ToString::to_string),
-            path: owned.path().map(ToString::to_string),
-            secure: owned.secure().unwrap_or(false),
-            http_only: owned.http_only().unwrap_or(false),
-            expires: owned
-                .expires_datetime()
-                .map(|dt| i128::from(dt.unix_timestamp())),
-        }
+    fn from_cookie(cookie: &StoredCookie) -> Option<Self> {
+        let expires = cookie
+            .expires_at
+            .and_then(|dt| i64::try_from(dt.unix_timestamp()).ok())
+            .map(i128::from);
+
+        Some(Self {
+            name: cookie.cookie.name().to_string(),
+            value: cookie.cookie.value().to_string(),
+            domain: cookie.domain.clone(),
+            path: cookie.path.clone(),
+            host_only: cookie.host_only,
+            secure: cookie.secure,
+            http_only: cookie.http_only,
+            expires,
+        })
     }
 
-    fn into_cookie(self) -> Cookie<'static> {
-        let mut builder = Cookie::build((self.name, self.value));
-        if let Some(domain) = self.domain {
-            builder = builder.domain(domain);
+    fn into_cookie(self, now: OffsetDateTime) -> Option<StoredCookie> {
+        let mut builder = Cookie::build((self.name, self.value))
+            .path(self.path.clone())
+            .secure(self.secure)
+            .http_only(self.http_only);
+        if !self.host_only {
+            builder = builder.domain(self.domain.clone());
         }
-        if let Some(path) = self.path {
-            builder = builder.path(path);
-        }
-        builder = builder.secure(self.secure).http_only(self.http_only);
-        if let Some(timestamp) = self.expires
+
+        let expires_at = if let Some(timestamp) = self.expires
             && let Ok(secs) = i64::try_from(timestamp)
             && let Ok(datetime) = OffsetDateTime::from_unix_timestamp(secs)
         {
             builder = builder.expires(datetime);
+            Some(datetime)
+        } else {
+            None
+        };
+
+        if expires_at.is_some_and(|expiry| expiry <= now) {
+            return None;
         }
-        builder.build()
+
+        Some(StoredCookie {
+            cookie: builder.build(),
+            domain: self.domain,
+            path: self.path,
+            host_only: self.host_only,
+            expires_at,
+            secure: self.secure,
+            http_only: self.http_only,
+        })
     }
 }
 
@@ -352,6 +568,84 @@ mod tests {
             let header = echo.last_cookie().expect("cookie header missing");
             assert!(header.contains("session=abc"));
             assert!(header.contains("theme=dark"));
+        });
+    }
+
+    #[test]
+    fn filters_cookie_domain_path_and_secure() {
+        async_io::block_on(async {
+            let mut store = CookieStore::default();
+            let now = OffsetDateTime::now_utc();
+            let base_request = HttpRequest::builder()
+                .method(http_kit::Method::GET)
+                .uri("https://example.com/account/login")
+                .body(Body::empty())
+                .unwrap();
+
+            apply_set_cookie(
+                &mut store.store,
+                &base_request,
+                "id=one; Path=/account".parse().unwrap(),
+                now,
+            )
+            .unwrap();
+            apply_set_cookie(
+                &mut store.store,
+                &base_request,
+                "secure=ok; Path=/; Secure".parse().unwrap(),
+                now,
+            )
+            .unwrap();
+            apply_set_cookie(
+                &mut store.store,
+                &base_request,
+                "domain=wide; Domain=example.com; Path=/".parse().unwrap(),
+                now,
+            )
+            .unwrap();
+
+            let request = HttpRequest::builder()
+                .method(http_kit::Method::GET)
+                .uri("https://example.com/account/profile")
+                .body(Body::empty())
+                .unwrap();
+            let header = build_cookie_header(&store.store, &request, now)
+                .unwrap()
+                .expect("cookie header missing")
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(header.contains("id=one"));
+            assert!(header.contains("secure=ok"));
+            assert!(header.contains("domain=wide"));
+
+            let request = HttpRequest::builder()
+                .method(http_kit::Method::GET)
+                .uri("http://example.com/account")
+                .body(Body::empty())
+                .unwrap();
+            let header = build_cookie_header(&store.store, &request, now)
+                .unwrap()
+                .expect("cookie header missing")
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(header.contains("id=one"));
+            assert!(!header.contains("secure=ok"));
+
+            let request = HttpRequest::builder()
+                .method(http_kit::Method::GET)
+                .uri("https://sub.example.com/account")
+                .body(Body::empty())
+                .unwrap();
+            let header = build_cookie_header(&store.store, &request, now)
+                .unwrap()
+                .expect("cookie header missing")
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(!header.contains("id=one"));
+            assert!(header.contains("domain=wide"));
         });
     }
 
