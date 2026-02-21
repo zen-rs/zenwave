@@ -85,16 +85,19 @@ async fn test_follow_redirect_multiple_redirects() {
 async fn test_client_with_multiple_middleware() {
     let mut client = client().follow_redirect().enable_cookie();
 
-    // Test that both middleware work together
+    // The redirect response sets a cookie. This verifies middleware added
+    // after follow_redirect still observes intermediate 3xx responses.
     let response = client
-        .get(httpbin_uri("/redirect-to?url=/cookies/set/test/redirect"))
+        .get(httpbin_uri("/redirect-with-cookie?url=/get"))
         .unwrap()
         .await;
     assert!(response.is_ok());
 
-    // Verify cookie was set after redirect
+    // Verify cookie was set during redirect and sent later.
     let response2 = client.get(httpbin_uri("/cookies")).unwrap().await;
     assert!(response2.is_ok());
+    let body = response2.unwrap().into_body().into_string().await.unwrap();
+    assert!(body.contains("redirected=value"), "cookie header: {body}");
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]

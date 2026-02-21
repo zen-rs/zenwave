@@ -206,6 +206,7 @@ impl Middleware for CookieStore {
             }
         }
 
+        let request_uri = request.uri().clone();
         let res = next
             .respond(request)
             .await
@@ -220,7 +221,7 @@ impl Middleware for CookieStore {
             let cookie = set_cookie
                 .parse::<Cookie>()
                 .map_err(|_| MiddlewareError::Middleware(CookieError::InvalidCookieHeader))?;
-            if apply_set_cookie(&mut self.store, request, cookie, now)
+            if apply_set_cookie(&mut self.store, &request_uri, cookie, now)
                 .map_err(|_| MiddlewareError::Middleware(CookieError::InvalidCookieHeader))?
             {
                 updated = true;
@@ -272,15 +273,15 @@ impl StoredCookie {
 
 fn apply_set_cookie(
     store: &mut Vec<StoredCookie>,
-    request: &Request,
+    request_uri: &http::Uri,
     cookie: Cookie<'static>,
     now: OffsetDateTime,
 ) -> Result<bool, CookieError> {
-    let Some(host) = request.uri().host() else {
+    let Some(host) = request_uri.host() else {
         return Ok(false);
     };
     let host = host.to_ascii_lowercase();
-    let scheme = request.uri().scheme_str().unwrap_or("http");
+    let scheme = request_uri.scheme_str().unwrap_or("http");
     let is_secure_request = scheme.eq_ignore_ascii_case("https");
 
     let secure = cookie.secure().unwrap_or(false);
@@ -301,7 +302,7 @@ fn apply_set_cookie(
     let mut path = cookie
         .path()
         .map(str::to_string)
-        .unwrap_or_else(|| default_path(request.uri().path()));
+        .unwrap_or_else(|| default_path(request_uri.path()));
     if !path.starts_with('/') {
         path.insert(0, '/');
     }
@@ -323,12 +324,24 @@ fn apply_set_cookie(
         http_only,
     };
 
-    remove_cookie(store, stored.name(), &stored.domain, &stored.path, stored.host_only);
+    remove_cookie(
+        store,
+        stored.name(),
+        &stored.domain,
+        &stored.path,
+        stored.host_only,
+    );
     store.push(stored);
     Ok(true)
 }
 
-fn remove_cookie(store: &mut Vec<StoredCookie>, name: &str, domain: &str, path: &str, host_only: bool) {
+fn remove_cookie(
+    store: &mut Vec<StoredCookie>,
+    name: &str,
+    domain: &str,
+    path: &str,
+    host_only: bool,
+) {
     store.retain(|stored| {
         !(stored.name() == name
             && stored.domain == domain
@@ -403,8 +416,7 @@ fn path_matches(cookie_path: &str, request_path: &str) -> bool {
         return true;
     }
 
-    request_path.len() == cookie_path.len()
-        || request_path[cookie_path.len()..].starts_with('/')
+    request_path.len() == cookie_path.len() || request_path[cookie_path.len()..].starts_with('/')
 }
 
 fn domain_matches(host: &str, domain: &str) -> bool {
@@ -424,7 +436,6 @@ fn compute_expiration(cookie: &Cookie<'static>, now: OffsetDateTime) -> Option<O
 
     cookie.expires_datetime()
 }
-
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
@@ -584,21 +595,21 @@ mod tests {
 
             apply_set_cookie(
                 &mut store.store,
-                &base_request,
+                base_request.uri(),
                 "id=one; Path=/account".parse().unwrap(),
                 now,
             )
             .unwrap();
             apply_set_cookie(
                 &mut store.store,
-                &base_request,
+                base_request.uri(),
                 "secure=ok; Path=/; Secure".parse().unwrap(),
                 now,
             )
             .unwrap();
             apply_set_cookie(
                 &mut store.store,
-                &base_request,
+                base_request.uri(),
                 "domain=wide; Domain=example.com; Path=/".parse().unwrap(),
                 now,
             )
@@ -649,6 +660,32 @@ mod tests {
         });
     }
 
+    #[test]
+    fn stores_cookie_when_endpoint_replaces_request() {
+        async_io::block_on(async {
+            let mut store = CookieStore::default();
+            let mut request = HttpRequest::builder()
+                .method(http_kit::Method::GET)
+                .uri("https://example.com/cookies/set/session/abc")
+                .body(Body::empty())
+                .unwrap();
+
+            let mut endpoint = ReplacingSetCookieEndpoint;
+            store.handle(&mut request, &mut endpoint).await.unwrap();
+
+            let mut echo = RecordingEndpoint::default();
+            let mut request = HttpRequest::builder()
+                .method(http_kit::Method::GET)
+                .uri("https://example.com/cookies")
+                .body(Body::empty())
+                .unwrap();
+            store.handle(&mut request, &mut echo).await.unwrap();
+
+            let header = echo.last_cookie().expect("cookie header missing");
+            assert!(header.contains("session=abc"));
+        });
+    }
+
     struct SetCookieEndpoint;
 
     impl Endpoint for SetCookieEndpoint {
@@ -658,6 +695,26 @@ mod tests {
                 .status(StatusCode::OK)
                 .header(header::SET_COOKIE, "session=abc; Path=/")
                 .header(header::SET_COOKIE, "theme=dark; Path=/")
+                .body(Body::empty())
+                .unwrap())
+        }
+    }
+
+    struct ReplacingSetCookieEndpoint;
+
+    impl Endpoint for ReplacingSetCookieEndpoint {
+        type Error = Infallible;
+        async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+            let dummy_request = HttpRequest::builder()
+                .method(http_kit::Method::GET)
+                .uri("/")
+                .body(Body::empty())
+                .unwrap();
+            let _ = std::mem::replace(request, dummy_request);
+
+            Ok(HttpResponse::builder()
+                .status(StatusCode::OK)
+                .header(header::SET_COOKIE, "session=abc; Path=/")
                 .body(Body::empty())
                 .unwrap())
         }

@@ -150,6 +150,9 @@ mod local {
                 if path == "/redirect-to" {
                     return handle_redirect_to(&query);
                 }
+                if path == "/redirect-with-cookie" {
+                    return handle_redirect_with_cookie(&query);
+                }
                 text_response(StatusCode(404), format!("no route for {path}"))
             }
         }
@@ -173,7 +176,7 @@ mod local {
         let mut parts = path.split('/');
         let name = parts.next().unwrap_or_default();
         let value = parts.next().unwrap_or_default();
-        let header = Header::from_bytes("Set-Cookie", format!("{name}={value}")).unwrap();
+        let header = Header::from_bytes("Set-Cookie", format!("{name}={value}; Path=/")).unwrap();
         text_response(StatusCode(200), "cookie set").with_header(header)
     }
 
@@ -217,6 +220,20 @@ mod local {
             .find(|(key, _)| key == "url")
             .map_or("/", |(_, value)| value.as_str());
         redirect_response(target)
+    }
+
+    fn handle_redirect_with_cookie(query: &[(String, String)]) -> Response<Cursor<Vec<u8>>> {
+        let target = query
+            .iter()
+            .find(|(key, _)| key == "url")
+            .map_or("/", |(_, value)| value.as_str());
+        let cookie = query
+            .iter()
+            .find(|(key, _)| key == "cookie")
+            .map_or("redirected=value", |(_, value)| value.as_str());
+        let set_cookie_header =
+            Header::from_bytes("Set-Cookie", format!("{cookie}; Path=/")).unwrap();
+        redirect_response(target).with_header(set_cookie_header)
     }
 
     fn redirect_response(location: &str) -> Response<Cursor<Vec<u8>>> {

@@ -8,7 +8,7 @@ use http_kit::{
 use url::Url;
 
 use crate::auth::suppress_auth_header;
-use crate::{Body, Request, Response, StatusCode, client::Client};
+use crate::{Body, Middleware, Request, Response, StatusCode, client::Client};
 use http_kit::utils::Bytes;
 
 /// Middleware that follows HTTP redirects.
@@ -17,7 +17,11 @@ pub struct FollowRedirect<C: Client> {
     client: C,
 }
 
-impl<C: Client> Client for FollowRedirect<C> {}
+impl<C: Client> Client for FollowRedirect<C> {
+    fn with(self, middleware: impl Middleware) -> impl Client {
+        FollowRedirect::new(self.client.with(middleware))
+    }
+}
 
 impl<C: Client> FollowRedirect<C> {
     /// Create a new `FollowRedirect` middleware wrapping the given client.

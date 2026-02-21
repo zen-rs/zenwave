@@ -103,11 +103,7 @@ impl ProxyBuilder {
     #[must_use]
     pub fn no_proxy(mut self, value: impl Into<String>) -> Self {
         let raw = value.into();
-        let entries = raw
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .map(str::to_lowercase)
-            .collect::<Vec<_>>();
+        let entries = parse_no_proxy_entries(&raw).into_iter().collect::<Vec<_>>();
         self.no_proxy.extend(entries);
         self
     }
@@ -193,17 +189,18 @@ pub(crate) struct Matcher {
 
 impl Matcher {
     fn from_env() -> Self {
-        let http = env::var("HTTP_PROXY").ok();
-        let https = env::var("HTTPS_PROXY").ok();
-        let all = env::var("ALL_PROXY").ok();
-        let no_proxy = env::var("NO_PROXY")
-            .ok()
-            .map(|v| {
-                v.split(',')
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_lowercase)
-                    .collect()
-            })
+        Self::from_var_reader(|key| env::var(key).ok())
+    }
+
+    fn from_var_reader<F>(mut read_var: F) -> Self
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let http = first_var(&["HTTP_PROXY", "http_proxy"], &mut read_var);
+        let https = first_var(&["HTTPS_PROXY", "https_proxy"], &mut read_var);
+        let all = first_var(&["ALL_PROXY", "all_proxy"], &mut read_var);
+        let no_proxy = first_var(&["NO_PROXY", "no_proxy"], &mut read_var)
+            .map(|value| parse_no_proxy_entries(&value))
             .unwrap_or_default();
 
         Self {
@@ -216,7 +213,11 @@ impl Matcher {
 
     fn intercept(&self, uri: &Uri) -> Option<Intercept> {
         let host = uri.host()?.to_lowercase();
-        if self.no_proxy.iter().any(|entry| no_proxy_matches(&host, entry)) {
+        if self
+            .no_proxy
+            .iter()
+            .any(|entry| no_proxy_matches(&host, entry))
+        {
             return None;
         }
 
@@ -261,4 +262,52 @@ fn no_proxy_matches(host: &str, entry: &str) -> bool {
     }
 
     host.ends_with(&format!(".{entry}"))
+}
+
+fn parse_no_proxy_entries(raw: &str) -> HashSet<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+fn first_var<F>(keys: &[&str], read_var: &mut F) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    keys.iter()
+        .find_map(|key| read_var(key))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[test]
+    fn matcher_reads_lowercase_proxy_env_vars() {
+        let vars = HashMap::from([
+            ("http_proxy", "http://localhost:8080".to_string()),
+            ("no_proxy", "example.com".to_string()),
+        ]);
+        let matcher = Matcher::from_var_reader(|key| vars.get(key).cloned());
+
+        let bypass_uri: Uri = "http://api.example.com/path".parse().expect("valid URI");
+        assert!(
+            matcher.intercept(&bypass_uri).is_none(),
+            "expected lowercase no_proxy to bypass proxy"
+        );
+
+        let uri: Uri = "http://example.net/data".parse().expect("valid URI");
+        let intercept = matcher
+            .intercept(&uri)
+            .expect("expected lowercase http_proxy to be respected");
+        let proxy = intercept.uri();
+        assert_eq!(proxy.host(), Some("localhost"));
+        assert_eq!(proxy.port_u16(), Some(8080));
+    }
 }

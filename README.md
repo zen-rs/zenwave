@@ -42,7 +42,7 @@ Zenwave provides multiple HTTP backends. The backend is selected at compile time
 
 | Backend | Platforms | TLS | Proxy | Notes |
 |---------|-----------|-----|-------|-------|
-| **hyper** (default) | All native | rustls or native-tls | Yes | Recommended for most use cases |
+| **hyper** (default) | All native | rustls or native-tls | No | Recommended for most use cases |
 | **curl** | All native | System libcurl | Yes | Smaller binaries on systems with libcurl |
 | **apple** | Apple platform(iOS, macOS, etc.) | Security.framework | No | Native Apple networking (experimental) |
 | **web** | wasm32 | Browser | No | Automatic on wasm32, uses Fetch API, enforced CORS striction |
@@ -73,11 +73,12 @@ On wasm32 targets, the web backend is always used automatically regardless of fe
 Full feature support with the hyper backend:
 
 - HTTP/HTTPS requests with configurable TLS
-- Proxy support (HTTP CONNECT, SOCKS4/5)
 - Persistent cookie storage
 - File uploads/downloads with streaming
 - Download resume via Range requests
 - WebSocket with TLS
+
+Proxy support (HTTP CONNECT, SOCKS4/5) is currently available with the curl backend.
 
 ### Android
 
@@ -200,12 +201,14 @@ let report = client
 println!("Downloaded {} bytes", report.bytes_written);
 ```
 
-## Proxy Support (Native Only)
+## Proxy Support (Native Only, curl backend)
+
+Enable the `curl-backend` feature to use this API.
 
 ```rust
 use zenwave::{client_with_proxy, Proxy};
 
-// From environment (HTTP_PROXY, HTTPS_PROXY, NO_PROXY)
+// From environment (HTTP_PROXY/http_proxy, HTTPS_PROXY/https_proxy, NO_PROXY/no_proxy)
 let client = client_with_proxy(Proxy::from_env());
 
 // Manual configuration
@@ -217,7 +220,7 @@ let proxy = Proxy::builder()
 let client = client_with_proxy(proxy);
 ```
 
-Supports HTTP CONNECT and SOCKS4/4a/5/5h proxies. Only available with hyper and curl backends.
+Supports HTTP CONNECT and SOCKS4/4a/5/5h proxies. Currently available only with the curl backend.
 
 ## WebSocket
 

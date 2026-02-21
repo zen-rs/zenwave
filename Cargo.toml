@@ -25,6 +25,7 @@ anyhow = "1.0.100"
 js-sys = "0.3.82"
 http = "1.3.1"
 httpdate = "1.0"
+time = "0.3"
 
 [dev-dependencies]
 serde_json = "1.0"
@@ -42,6 +43,10 @@ default = ["default-backend", "ws"]
 
 # Default backend uses rustls with aws-lc-rs crypto provider.
 default-backend = ["hyper-backend", "rustls"]
+
+# Backward-compatibility alias only.
+# Wasm backend selection is automatic on wasm32 targets; this feature does nothing.
+wasm = []
 
 # Explicit backend selections (native platforms only).
 # On wasm32, using any of these will result in a compile error - the web backend
@@ -98,6 +103,7 @@ wasm-streams = "0.4.2"
 wasm-bindgen = "0.2.105"
 wasm-bindgen-futures = "0.4.55"
 gloo-timers = { version = "0.3", features = ["futures"] }
+time = { version = "0.3", features = ["wasm-bindgen"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
@@ -120,7 +126,6 @@ async-tungstenite = { version = "0.32.0", default-features = false, features = [
 async-fs = { version = "2.2.0", default-features = false }
 dirs = "6.0"
 once_cell = "1.19"
-time = "0.3"
 tower-service = "0.3"
 
 [target.'cfg(target_vendor = "apple")'.dependencies]

@@ -16,9 +16,9 @@ use crate::client::Client;
 
 /// Middleware that retries failed requests.
 ///
-/// This middleware automatically retries requests that fail with a transport error
-/// (e.g., connection timeout, DNS error). It does *not* retry requests that receive
-/// a valid HTTP response, even if the status code indicates an error (e.g., 500 or 503).
+/// This middleware automatically retries requests that fail with a transport, TLS,
+/// or timeout error. It does *not* retry requests that receive a valid HTTP response,
+/// even if the status code indicates an error (e.g., 500 or 503).
 ///
 /// # Warning
 ///
@@ -100,9 +100,14 @@ where
             match self.client.respond(request).await {
                 Ok(response) => return Ok(response),
                 Err(err) => {
+                    let err: crate::Error = err.into();
+                    if !is_retryable_error(&err) {
+                        return Err(err);
+                    }
+
                     attempts += 1;
                     if attempts > self.max_retries {
-                        return Err(err.into());
+                        return Err(err);
                     }
 
                     // Simple exponential backoff
@@ -114,13 +119,17 @@ where
 
                     #[cfg(target_arch = "wasm32")]
                     SingleThreaded(gloo_timers::future::TimeoutFuture::new(
-                        delay.as_millis().try_into().unwrap_or(u32::MAX)
+                        delay.as_millis().try_into().unwrap_or(u32::MAX),
                     ))
                     .await;
                 }
             }
         }
     }
+}
+
+fn is_retryable_error(err: &crate::Error) -> bool {
+    err.is_network_error() || err.is_timeout()
 }
 
 #[derive(Clone)]

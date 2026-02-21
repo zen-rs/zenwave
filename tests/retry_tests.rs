@@ -25,6 +25,10 @@ struct MockClient {
 enum MockError {
     #[error("mock network error")]
     NetworkError,
+    #[error("mock timeout")]
+    TimeoutError,
+    #[error("mock http error")]
+    HttpError,
     #[error("no more mock responses")]
     Exhausted,
 }
@@ -37,6 +41,22 @@ impl From<MockError> for zenwave::Error {
             MockError::NetworkError => {
                 let io_err = std::io::Error::new(std::io::ErrorKind::Other, "network error");
                 Self::Transport(Box::new(io_err))
+            }
+            MockError::TimeoutError => Self::Timeout,
+            MockError::HttpError => {
+                let status = StatusCode::INTERNAL_SERVER_ERROR;
+                let response = http::Response::builder()
+                    .status(status)
+                    .body(Body::from("server exploded"))
+                    .expect("response should build");
+                Self::Http {
+                    status,
+                    message: "server exploded".to_string(),
+                    response: zenwave::error::HttpErrorResponse {
+                        response,
+                        body_text: Some("server exploded".to_string()),
+                    },
+                }
             }
             MockError::Exhausted => Self::Other(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -153,6 +173,45 @@ async fn retry_middleware_retries_on_error() {
 
     let attempts = state.lock().unwrap().attempts;
     assert_eq!(attempts, 3);
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+async fn retry_middleware_retries_on_timeout_error() {
+    let mock = MockClient::with_results(vec![Err(MockError::TimeoutError), Ok(ok_response())]);
+    let state = mock.state();
+
+    let mut client = mock.retry(3).min_delay(Duration::from_millis(1));
+
+    let mut request = http::Request::builder()
+        .uri("https://example.com/")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = client.respond(&mut request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(state.lock().unwrap().attempts, 2);
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+async fn retry_middleware_does_not_retry_http_errors() {
+    let mock = MockClient::with_results(vec![Err(MockError::HttpError), Ok(ok_response())]);
+    let state = mock.state();
+
+    let mut client = mock
+        .retry(3)
+        .min_delay(Duration::from_millis(1))
+        .max_delay(Duration::from_millis(5));
+
+    let mut request = http::Request::builder()
+        .uri("https://example.com/")
+        .body(Body::empty())
+        .unwrap();
+
+    let result = client.respond(&mut request).await;
+    assert!(result.is_err(), "HTTP errors should not be retried");
+    assert_eq!(state.lock().unwrap().attempts, 1);
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]

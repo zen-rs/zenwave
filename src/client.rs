@@ -523,28 +523,28 @@ pub trait Client: Endpoint + Sized {
 
     /// Enable HTTP caching middleware.
     fn enable_cache(self) -> impl Client {
-        WithMiddleware::new(self, Cache::new())
+        self.with(Cache::new())
     }
 
     /// Enable cookie management.
     fn enable_cookie(self) -> impl Client {
-        WithMiddleware::new(self, CookieStore::default())
+        self.with(CookieStore::default())
     }
 
     /// Enable cookie management with persistent backing storage (native targets only).
     #[cfg(not(target_arch = "wasm32"))]
     fn enable_persistent_cookie(self) -> impl Client {
-        WithMiddleware::new(self, CookieStore::persistent_default())
+        self.with(CookieStore::persistent_default())
     }
 
     /// Enforce a timeout for individual requests issued by this client.
     fn timeout(self, duration: Duration) -> impl Client {
-        WithMiddleware::new(self, Timeout::new(duration))
+        self.with(Timeout::new(duration))
     }
 
     /// Add Bearer Token Authentication middleware.
     fn bearer_auth(self, token: impl Into<String>) -> impl Client {
-        WithMiddleware::new(self, BearerAuth::new(token))
+        self.with(BearerAuth::new(token))
     }
 
     /// Add Basic Authentication middleware.
@@ -553,7 +553,7 @@ pub trait Client: Endpoint + Sized {
         username: impl Into<String>,
         password: Option<impl Into<String>>,
     ) -> impl Client {
-        WithMiddleware::new(self, BasicAuth::new(username, password))
+        self.with(BasicAuth::new(username, password))
     }
 
     /// Create a request with the specified method and URI.
