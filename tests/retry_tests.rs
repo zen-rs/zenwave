@@ -39,7 +39,7 @@ impl From<MockError> for zenwave::Error {
     fn from(err: MockError) -> Self {
         match err {
             MockError::NetworkError => {
-                let io_err = std::io::Error::new(std::io::ErrorKind::Other, "network error");
+                let io_err = std::io::Error::other("network error");
                 Self::Transport(Box::new(io_err))
             }
             MockError::TimeoutError => Self::Timeout,
@@ -58,10 +58,9 @@ impl From<MockError> for zenwave::Error {
                     },
                 }
             }
-            MockError::Exhausted => Self::Other(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "no more mock responses",
-            ))),
+            MockError::Exhausted => {
+                Self::Other(Box::new(std::io::Error::other("no more mock responses")))
+            }
         }
     }
 }

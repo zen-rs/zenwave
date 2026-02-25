@@ -76,6 +76,23 @@ async fn test_response_status_codes() {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+async fn test_http_error_preserves_raw_response_body() {
+    let err = get(endpoint("/status/500"))
+        .await
+        .expect_err("expected 500 to surface as error");
+
+    match err {
+        zenwave::Error::Http { response, .. } => {
+            assert_eq!(response.body_text.as_deref(), Some("status 500"));
+            let bytes = response.response.into_body().into_bytes().await.unwrap();
+            assert_eq!(bytes.as_ref(), b"status 500");
+        }
+        other => panic!("expected HTTP error variant, got: {other}"),
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_redirect_chain() {
     let mut client = client().follow_redirect();
 

@@ -252,6 +252,7 @@ fn no_proxy_matches(host: &str, entry: &str) -> bool {
         })
         .unwrap_or(entry);
 
+    let entry = entry.trim_start_matches("*.");
     let entry = entry.trim_start_matches('.');
     if entry.is_empty() {
         return false;
@@ -276,10 +277,11 @@ fn first_var<F>(keys: &[&str], read_var: &mut F) -> Option<String>
 where
     F: FnMut(&str) -> Option<String>,
 {
-    keys.iter()
-        .find_map(|key| read_var(key))
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    keys.iter().find_map(|key| {
+        read_var(key)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 #[cfg(test)]
@@ -309,5 +311,40 @@ mod tests {
         let proxy = intercept.uri();
         assert_eq!(proxy.host(), Some("localhost"));
         assert_eq!(proxy.port_u16(), Some(8080));
+    }
+
+    #[test]
+    fn matcher_accepts_wildcard_no_proxy_entries() {
+        let vars = HashMap::from([
+            ("HTTP_PROXY", "http://localhost:8080".to_string()),
+            ("NO_PROXY", "*.internal.com".to_string()),
+        ]);
+        let matcher = Matcher::from_var_reader(|key| vars.get(key).cloned());
+
+        let bypass_uri: Uri = "http://api.internal.com/path".parse().expect("valid URI");
+        assert!(
+            matcher.intercept(&bypass_uri).is_none(),
+            "expected wildcard NO_PROXY entry to bypass proxy"
+        );
+
+        let proxied_uri: Uri = "http://example.net/path".parse().expect("valid URI");
+        assert!(
+            matcher.intercept(&proxied_uri).is_some(),
+            "expected unrelated host to use proxy"
+        );
+    }
+
+    #[test]
+    fn matcher_uses_lowercase_when_uppercase_is_empty() {
+        let vars = HashMap::from([
+            ("HTTP_PROXY", "   ".to_string()),
+            ("http_proxy", "http://localhost:8080".to_string()),
+        ]);
+        let matcher = Matcher::from_var_reader(|key| vars.get(key).cloned());
+        let uri: Uri = "http://example.net/path".parse().expect("valid URI");
+        assert!(
+            matcher.intercept(&uri).is_some(),
+            "expected lowercase proxy value to be used when uppercase is empty"
+        );
     }
 }

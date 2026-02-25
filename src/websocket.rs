@@ -375,6 +375,41 @@ mod wasm {
         Closed,
     }
 
+    #[derive(Clone, Copy, Debug)]
+    struct MessageLimits {
+        max_message_size: Option<usize>,
+        max_frame_size: Option<usize>,
+    }
+
+    impl MessageLimits {
+        const fn from_config(config: &WebSocketConfig) -> Self {
+            Self {
+                max_message_size: config.max_message_size,
+                max_frame_size: config.max_frame_size,
+            }
+        }
+
+        const fn effective_limit(self) -> Option<usize> {
+            match (self.max_message_size, self.max_frame_size) {
+                (Some(max_message), Some(max_frame)) => Some(max_message.min(max_frame)),
+                (Some(max_message), None) => Some(max_message),
+                (None, Some(max_frame)) => Some(max_frame),
+                (None, None) => None,
+            }
+        }
+
+        fn validate_incoming(self, payload_len: usize) -> core::result::Result<(), String> {
+            if let Some(limit) = self.effective_limit()
+                && payload_len > limit
+            {
+                return Err(format!(
+                    "incoming websocket payload size {payload_len} exceeds configured limit {limit}"
+                ));
+            }
+            Ok(())
+        }
+    }
+
     /// Browser/wasm websocket connection backed by `web_sys`.
     pub struct WebSocket {
         sender: WebSocketSender,
@@ -442,8 +477,9 @@ mod wasm {
     /// Returns an error if the browser reports an error or the connection fails.
     pub async fn connect_with_config(
         uri: impl AsRef<str>,
-        _config: WebSocketConfig,
+        config: WebSocketConfig,
     ) -> Result<WebSocket> {
+        let limits = MessageLimits::from_config(&config);
         let socket = BrowserWebSocket::new(uri.as_ref())
             .map_err(|e| connection_failed(format_js_value(&e)))?;
         socket.set_binary_type(BinaryType::Arraybuffer);
@@ -461,9 +497,21 @@ mod wasm {
         socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
 
         let on_message_tx = event_tx.clone();
+        let on_message_socket = socket.clone();
         let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
+            const MESSAGE_TOO_LARGE_CODE: u16 = 1009;
+            const MESSAGE_TOO_LARGE_REASON: &str = "message too large";
+
             let data = event.data();
             if let Some(text) = data.as_string() {
+                if let Err(message) = limits.validate_incoming(text.as_bytes().len()) {
+                    let _ = on_message_tx.unbounded_send(WsEvent::Error(message));
+                    let _ = on_message_socket.close_with_code_and_reason(
+                        MESSAGE_TOO_LARGE_CODE,
+                        MESSAGE_TOO_LARGE_REASON,
+                    );
+                    return;
+                }
                 let _ =
                     on_message_tx.unbounded_send(WsEvent::Message(WebSocketMessage::from(text)));
                 return;
@@ -471,6 +519,14 @@ mod wasm {
 
             if let Ok(array) = data.clone().dyn_into::<js_sys::ArrayBuffer>() {
                 let view = js_sys::Uint8Array::new(&array);
+                if let Err(message) = limits.validate_incoming(view.length() as usize) {
+                    let _ = on_message_tx.unbounded_send(WsEvent::Error(message));
+                    let _ = on_message_socket.close_with_code_and_reason(
+                        MESSAGE_TOO_LARGE_CODE,
+                        MESSAGE_TOO_LARGE_REASON,
+                    );
+                    return;
+                }
                 let mut bytes = vec![0; view.length() as usize];
                 view.copy_to(&mut bytes[..]);
                 let _ =
@@ -479,6 +535,14 @@ mod wasm {
             }
 
             if let Ok(view) = data.dyn_into::<js_sys::Uint8Array>() {
+                if let Err(message) = limits.validate_incoming(view.length() as usize) {
+                    let _ = on_message_tx.unbounded_send(WsEvent::Error(message));
+                    let _ = on_message_socket.close_with_code_and_reason(
+                        MESSAGE_TOO_LARGE_CODE,
+                        MESSAGE_TOO_LARGE_REASON,
+                    );
+                    return;
+                }
                 let mut bytes = vec![0; view.length() as usize];
                 view.copy_to(&mut bytes[..]);
                 let _ =

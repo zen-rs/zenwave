@@ -11,7 +11,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-use crate::{Client, error::HttpErrorResponse};
+use crate::{Client, backend::capture_error_response, error::HttpErrorResponse};
 use anyhow::{Error, anyhow};
 use block::{Block, ConcreteBlock};
 use futures_channel::oneshot;
@@ -252,12 +252,9 @@ async fn send_with_url_session(
     *http_response.headers_mut() = headers;
 
     if status.is_client_error() || status.is_server_error() {
-        let body = http_response
-            .body_mut()
-            .as_str()
+        let (http_response, body) = capture_error_response(http_response)
             .await
-            .ok()
-            .map(std::borrow::ToOwned::to_owned);
+            .map_err(AppleError::bad_gateway)?;
         return Err(AppleError::Remote {
             status,
             body,

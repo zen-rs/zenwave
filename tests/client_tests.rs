@@ -1,9 +1,15 @@
 //! Tests for client functionality
 
 use http_kit::Method;
+use serde_json::Value;
 mod common;
 use common::httpbin_uri;
 use zenwave::{Client, client};
+
+async fn assert_response_method(response: zenwave::Response, expected_method: &str) {
+    let body: Value = response.into_body().into_json().await.unwrap();
+    assert_eq!(body["method"], expected_method);
+}
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
@@ -25,6 +31,7 @@ async fn test_client_post_method() {
     assert!(response.is_ok());
     let response = response.unwrap();
     assert!(response.status().is_success());
+    assert_response_method(response, "POST").await;
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
@@ -36,6 +43,7 @@ async fn test_client_put_method() {
     assert!(response.is_ok());
     let response = response.unwrap();
     assert!(response.status().is_success());
+    assert_response_method(response, "PUT").await;
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
@@ -47,6 +55,7 @@ async fn test_client_delete_method() {
     assert!(response.is_ok());
     let response = response.unwrap();
     assert!(response.status().is_success());
+    assert_response_method(response, "DELETE").await;
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
@@ -84,8 +93,6 @@ async fn test_request_builder_bytes() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_request_builder_json() {
-    use serde_json::Value;
-
     let mut client = client();
     let response_json: Result<Value, _> = client.get(httpbin_uri("/json")).unwrap().json().await;
     assert!(response_json.is_ok());
@@ -106,6 +113,8 @@ async fn test_client_with_middleware() {
     // Follow up request should include cookie
     let response2 = client.get(httpbin_uri("/cookies")).unwrap().await;
     assert!(response2.is_ok());
+    let body = response2.unwrap().into_body().into_string().await.unwrap();
+    assert!(body.contains("test=value"), "cookie header: {body}");
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]

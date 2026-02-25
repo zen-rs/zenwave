@@ -122,7 +122,10 @@ mod local {
             ),
             "/post" | "/put" | "/delete" | "/patch" => json_response(
                 StatusCode(200),
-                r#"{"result":"ok","server":"httpbin-local"}"#,
+                &format!(
+                    r#"{{"result":"ok","server":"httpbin-local","method":"{}"}}"#,
+                    request.method().as_str()
+                ),
             ),
             "/gzip" => bytes_response(StatusCode(200), b"gzip response"),
             "/delay/1" => {

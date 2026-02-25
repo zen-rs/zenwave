@@ -19,7 +19,7 @@ use web_sys::{
     wasm_bindgen::{JsCast, JsValue},
 };
 
-use crate::{Client, error::HttpErrorResponse};
+use crate::{Client, backend::capture_error_response, error::HttpErrorResponse};
 /// HTTP client backend for browser environments using `fetch`.
 pub struct WebBackend {
     window: SingleThreaded<Window>,
@@ -292,12 +292,9 @@ fn fetch(
         *response.status_mut() = status;
 
         if is_error {
-            let body = response
-                .body_mut()
-                .as_str()
+            let (response, body) = capture_error_response(response)
                 .await
-                .ok()
-                .map(|text| text.to_owned());
+                .map_err(|err| WebError::new(StatusCode::BAD_GATEWAY, err))?;
             return Err(WebError::remote(status, body, response));
         }
         Ok(response)

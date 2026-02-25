@@ -1,4 +1,4 @@
-use crate::{Client, error::HttpErrorResponse};
+use crate::{Client, backend::capture_error_response, error::HttpErrorResponse};
 use async_io::block_on;
 use async_net::TcpStream;
 use core::future::Future;
@@ -163,7 +163,7 @@ impl Endpoint for HyperBackend {
         // Drive the connection in the background.
         self.spawn_background(async move {
             if let Err(err) = connection.await {
-                eprintln!("hyper connection error: {err}");
+                tracing::error!(%err, "hyper connection error");
             }
         });
 
@@ -172,7 +172,7 @@ impl Endpoint for HyperBackend {
             .await
             .map_err(HyperError::Connection)?;
 
-        let mut response = response.map(|body| {
+        let response = response.map(|body| {
             let stream = BodyDataStream::new(body);
             let stream = stream.map_err(|error| {
                 http_kit::BodyError::Other(Box::new(error)) // TODO: improve error conversion
@@ -183,14 +183,10 @@ impl Endpoint for HyperBackend {
         let is_error = response.status().is_client_error() || response.status().is_server_error();
 
         if is_error {
-            let error_msg: Option<String> = response
-                .body_mut()
-                .as_str()
-                .await
-                .ok()
-                .map(std::borrow::ToOwned::to_owned);
+            let status = response.status();
+            let (response, error_msg) = capture_error_response(response).await?;
             return Err(HyperError::Remote {
-                status: response.status(),
+                status,
                 body: error_msg,
                 raw_response: response,
             }

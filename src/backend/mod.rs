@@ -21,6 +21,19 @@
 //!
 //! The default configuration uses `hyper-backend` with `rustls` TLS.
 
+#[cfg(any(
+    all(not(target_arch = "wasm32"), feature = "hyper-backend"),
+    all(target_vendor = "apple", feature = "apple-backend"),
+    target_arch = "wasm32"
+))]
+mod error_response;
+#[cfg(any(
+    all(not(target_arch = "wasm32"), feature = "hyper-backend"),
+    all(target_vendor = "apple", feature = "apple-backend"),
+    target_arch = "wasm32"
+))]
+pub(crate) use error_response::capture_error_response;
+
 #[cfg(all(not(target_arch = "wasm32"), feature = "hyper-backend"))]
 mod hyper;
 #[cfg(all(not(target_arch = "wasm32"), feature = "hyper-backend"))]
