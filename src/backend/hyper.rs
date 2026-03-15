@@ -142,6 +142,14 @@ impl Endpoint for HyperBackend {
         }
 
         let stream = connect(&request).await?;
+        let origin_form = request
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/");
+        *request.uri_mut() = origin_form
+            .parse()
+            .map_err(|err| HyperError::InvalidUri(format!("{origin_form}: {err}")))?;
         let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
             .handshake(stream)
             .await
@@ -166,6 +174,12 @@ impl Endpoint for HyperBackend {
             });
             http_kit::Body::from_stream(stream)
         });
+
+        tracing::debug!(
+            status = %response.status(),
+            headers = ?response.headers(),
+            "HyperBackend received response"
+        );
 
         let is_error = response.status().is_client_error() || response.status().is_server_error();
 
