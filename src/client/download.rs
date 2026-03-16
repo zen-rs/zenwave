@@ -14,6 +14,9 @@ use super::RequestBuilder;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DownloadError<E: HttpError> {
+    #[error("request build error: {0}")]
+    Build(#[source] crate::Error),
+
     #[error("request error: {0}")]
     Remote(#[source] E),
 
@@ -30,6 +33,7 @@ pub enum DownloadError<E: HttpError> {
 impl<E: HttpError> HttpError for DownloadError<E> {
     fn status(&self) -> StatusCode {
         match self {
+            Self::Build(err) => err.status(),
             Self::Remote(err) => err.status(),
             Self::Body(_) => StatusCode::BAD_GATEWAY,
             Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -47,6 +51,7 @@ where
         use crate::error::DownloadErrorKind;
 
         match err {
+            DownloadError::Build(e) => e,
             DownloadError::Remote(e) => e.into(),
             DownloadError::Body(e) => Self::Download(DownloadErrorKind::BodyRead(e.to_string())),
             DownloadError::Io(e) => Self::Download(DownloadErrorKind::FileSystem(e)),
@@ -110,7 +115,9 @@ pub async fn download_to_path<T: crate::Client>(
 
     if existing_len > 0 {
         let value = format!("bytes={existing_len}-");
-        builder = builder.header(header::RANGE.as_str(), value);
+        builder = builder
+            .header(header::RANGE.as_str(), value)
+            .map_err(DownloadError::Build)?;
     }
 
     let response = builder.await.map_err(DownloadError::Remote)?;

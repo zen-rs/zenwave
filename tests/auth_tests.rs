@@ -11,7 +11,7 @@ async fn test_bearer_auth_middleware() {
     let mut client = client().bearer_auth("test-token-123");
 
     // Test that the Bearer token is sent in the Authorization header
-    let response = client.get(httpbin_uri("/bearer")).await;
+    let response = client.get(httpbin_uri("/bearer")).unwrap().await;
     assert!(response.is_ok());
     let response = response.unwrap();
     assert!(response.status().is_success());
@@ -25,6 +25,7 @@ async fn test_bearer_auth_request_builder() {
     // Test Bearer auth on individual request
     let response = client
         .get(httpbin_uri("/bearer"))
+        .unwrap()
         .bearer_auth("test-token-456")
         .await;
 
@@ -41,6 +42,7 @@ async fn test_basic_auth_middleware() {
     // Test Basic auth with username and password
     let response = client
         .get(httpbin_uri("/basic-auth/testuser/testpass"))
+        .unwrap()
         .await;
     assert!(response.is_ok());
     let response = response.unwrap();
@@ -55,6 +57,7 @@ async fn test_basic_auth_request_builder() {
     // Test Basic auth on individual request
     let response = client
         .get(httpbin_uri("/basic-auth/user123/pass456"))
+        .unwrap()
         .basic_auth("user123", Some("pass456"))
         .await;
 
@@ -71,6 +74,7 @@ async fn test_basic_auth_no_password() {
     // Test Basic auth with only username (no password)
     let response = client
         .get(httpbin_uri("/headers"))
+        .unwrap()
         .basic_auth("onlyuser", None::<String>)
         .await;
 
@@ -108,6 +112,7 @@ async fn test_auth_headers_sent() {
     // Test that Bearer auth header is correctly sent
     let response = client
         .get(httpbin_uri("/headers"))
+        .unwrap()
         .bearer_auth("secret-token")
         .await
         .unwrap();
@@ -124,6 +129,7 @@ async fn test_basic_auth_encoding() {
     // Test Basic auth encoding
     let response = client
         .get(httpbin_uri("/headers"))
+        .unwrap()
         .basic_auth("testuser", Some("testpass"))
         .await
         .unwrap();
@@ -140,7 +146,7 @@ async fn test_multiple_auth_requests() {
 
     // Multiple requests should all use the same Bearer token
     for _ in 0..3 {
-        let response = client.get(httpbin_uri("/headers")).await;
+        let response = client.get(httpbin_uri("/headers")).unwrap().await;
         assert!(response.is_ok());
         let response = response.unwrap();
         let body = response.into_body().into_string().await.unwrap();
@@ -157,7 +163,7 @@ async fn test_auth_with_other_middleware() {
         .enable_cookie()
         .follow_redirect();
 
-    let response = client.get(httpbin_uri("/headers")).await;
+    let response = client.get(httpbin_uri("/headers")).unwrap().await;
     assert!(response.is_ok());
     let response = response.unwrap();
     assert!(response.status().is_success());
@@ -171,6 +177,7 @@ async fn test_override_auth_per_request() {
     // The per-request auth should override the middleware auth
     let response = client
         .get(httpbin_uri("/headers"))
+        .unwrap()
         .bearer_auth("override-token")
         .await
         .unwrap();
@@ -186,7 +193,7 @@ async fn test_unauthorized_access() {
     let mut client = client();
 
     // Test accessing an endpoint that requires auth without providing it
-    let response = client.get(httpbin_uri("/bearer")).await;
+    let response = client.get(httpbin_uri("/bearer")).unwrap().await;
     assert!(
         response.is_err(),
         "expected unauthenticated access to return an error"
@@ -207,6 +214,7 @@ async fn test_invalid_basic_auth() {
     // Test Basic auth with wrong credentials
     let response = client
         .get(httpbin_uri("/basic-auth/correct/password"))
+        .unwrap()
         .basic_auth("wrong", Some("credentials"))
         .await;
 

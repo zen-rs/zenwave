@@ -174,10 +174,12 @@ impl OAuth2ClientCredentials {
         let mut client = client();
         let response = client
             .post(&self.config.token_url)
+            .map_err(OAuth2Error::Transport)?
             .header(
                 header::CONTENT_TYPE.as_str(),
                 "application/x-www-form-urlencoded",
             )
+            .map_err(OAuth2Error::Transport)?
             .bytes_body(body.into_bytes())
             .await?;
 

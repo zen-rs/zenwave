@@ -34,7 +34,7 @@ async fn test_user_agent_header() {
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_custom_headers() {
     let mut client = client();
-    let response = client.get(endpoint("/headers")).await.unwrap();
+    let response = client.get(endpoint("/headers")).unwrap().await.unwrap();
     let text = response.into_body().into_string().await.unwrap();
 
     // Should contain header information
@@ -45,7 +45,7 @@ async fn test_custom_headers() {
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_post_with_json_body() {
     let mut client = client();
-    let request = client.method(Method::POST, endpoint("/post"));
+    let request = client.method(Method::POST, endpoint("/post")).unwrap();
     // Note: In a real implementation, you'd want to add a body() method to RequestBuilder
     let response = request.await;
 
@@ -80,7 +80,7 @@ async fn test_redirect_chain() {
     let mut client = client().follow_redirect();
 
     // Test a redirect chain
-    let response = client.get(endpoint("/redirect/5")).await.unwrap();
+    let response = client.get(endpoint("/redirect/5")).unwrap().await.unwrap();
     assert!(response.status().is_success());
 }
 
@@ -117,11 +117,12 @@ async fn test_cookie_persistence() {
     // Set a cookie
     let _response = client
         .get(endpoint("/cookies/set/test/cookievalue"))
+        .unwrap()
         .await
         .unwrap();
 
     // Verify cookie is sent in subsequent request
-    let response = client.get(endpoint("/cookies")).await.unwrap();
+    let response = client.get(endpoint("/cookies")).unwrap().await.unwrap();
     let body = response.into_body().into_string().await.unwrap();
     assert!(body.contains("test"));
     assert!(body.contains("cookievalue"));
@@ -143,7 +144,7 @@ async fn test_method_overrides() {
 
     for (method, url) in methods {
         let method_clone = method.clone();
-        let response = client.method(method, endpoint(url)).await;
+        let response = client.method(method, endpoint(url)).unwrap().await;
         assert!(response.is_ok(), "Failed for method: {method_clone:?}");
         let response = response.unwrap();
         assert!(

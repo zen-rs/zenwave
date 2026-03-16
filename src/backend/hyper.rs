@@ -8,6 +8,7 @@ use http::StatusCode;
 use http_body_util::BodyDataStream;
 use http_kit::{Endpoint, HttpError, Method, Request, Response};
 use hyper::http;
+use tracing::debug;
 use std::{
     mem::replace,
     pin::Pin,
@@ -175,7 +176,7 @@ impl Endpoint for HyperBackend {
             http_kit::Body::from_stream(stream)
         });
 
-        tracing::debug!(
+        debug!(
             status = %response.status(),
             headers = ?response.headers(),
             "HyperBackend received response"

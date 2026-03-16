@@ -81,7 +81,7 @@ async fn main() -> zenwave::Result<()> {
     let token = std::env::var("ZENWAVE_TOKEN").unwrap_or_else(|_| "demo-token".into());
 
     // Compose only the middleware you need.
-    let client = zenwave::client()
+    let mut client = zenwave::client()
         .timeout(Duration::from_secs(2))
         .enable_cache()
         .with(OAuth2ClientCredentials::new(
@@ -95,7 +95,9 @@ async fn main() -> zenwave::Result<()> {
 
     let echo: EchoResponse = client
         .post("https://httpbin.org/post")
+        .unwrap()
         .header("x-request-id", "demo-request")
+        ?
         .json_body(&MessageRequest { message: "hello" })?
         .json()
         .await?;
@@ -157,9 +159,10 @@ bytes, so interrupted transfers can resume without starting from scratch.
 use zenwave::Client;
 
 # async fn example() -> zenwave::Result<()> {
-let client = zenwave::client();
+let mut client = zenwave::client();
 let report = client
     .get("https://example.com/big.iso")
+    .unwrap()
     .download_to_path("big.iso")
     .await?;
 
@@ -192,6 +195,7 @@ use async_fs::File;
 let mut client = client();
 let response = client
     .post("https://example.com/upload")
+    .unwrap()
     .file_body("video.mp4")
     .await?
     .await?;
@@ -201,6 +205,7 @@ let mut stream_client = client();
 let file = File::open("log.txt").await?;
 let response = stream_client
     .post("https://example.com/logs")
+    .unwrap()
     .reader_body(file, None)
     .await?;
 assert!(response.status().is_success());
