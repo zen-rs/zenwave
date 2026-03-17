@@ -8,13 +8,13 @@ use http::StatusCode;
 use http_body_util::BodyDataStream;
 use http_kit::{Endpoint, HttpError, Method, Request, Response};
 use hyper::http;
-use tracing::debug;
 use std::{
     mem::replace,
     pin::Pin,
     task::{Context, Poll},
     thread,
 };
+use tracing::debug;
 
 use crate::{Client, error::HttpErrorResponse};
 

@@ -36,10 +36,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let response: EchoResponse = client
             .post("https://httpbin.org/post")
             .unwrap()
-            .header("x-request-id", "demo-request")
-            ?
-            .json_body(&payload)
-            ?
+            .header("x-request-id", "demo-request")?
+            .json_body(&payload)?
             .await?
             .into_json()
             .await?;

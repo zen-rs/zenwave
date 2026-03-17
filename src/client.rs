@@ -104,8 +104,7 @@ impl<T: Client> RequestBuilder<'_, T> {
         name: impl TryInto<HeaderName, Error: Display>,
         value: impl TryInto<HeaderValue, Error: Display>,
     ) -> Result<Self, crate::Error> {
-        let header_name: http_kit::header::HeaderName =
-            name.try_into().map_err(invalid_request)?;
+        let header_name: http_kit::header::HeaderName = name.try_into().map_err(invalid_request)?;
         let header_value: http_kit::header::HeaderValue =
             value.try_into().map_err(invalid_request)?;
         self.request.headers_mut().insert(header_name, header_value);
@@ -118,8 +117,9 @@ impl<T: Client> RequestBuilder<'_, T> {
     ///
     /// Panics if the body cannot be serialized to JSON.
     pub fn json_body<B: serde::Serialize>(mut self, body: &B) -> Result<Self, crate::Error> {
-        let json = serde_json::to_string(body)
-            .map_err(|error| invalid_request_with_prefix("failed to serialize JSON body: ", error))?;
+        let json = serde_json::to_string(body).map_err(|error| {
+            invalid_request_with_prefix("failed to serialize JSON body: ", error)
+        })?;
 
         // Set the body directly
         *self.request.body_mut() = http_kit::Body::from(json);
@@ -526,7 +526,11 @@ pub trait Client: Endpoint + Sized {
     }
 
     /// Create a request with the specified method and URI.
-    fn method<U>(&mut self, method: Method, uri: U) -> Result<RequestBuilder<'_, &mut Self>, crate::Error>
+    fn method<U>(
+        &mut self,
+        method: Method,
+        uri: U,
+    ) -> Result<RequestBuilder<'_, &mut Self>, crate::Error>
     where
         U: TryInto<Uri>,
         U::Error: Display,
