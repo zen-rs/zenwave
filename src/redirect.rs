@@ -22,6 +22,12 @@ impl<C: Client> FollowRedirect<C> {
     pub const fn new(client: C) -> Self {
         Self { client }
     }
+
+    /// Remove redirect middleware and recover the wrapped client.
+    #[must_use]
+    pub fn disable_redirect(self) -> C {
+        self.client
+    }
 }
 
 /// Errors encountered while following HTTP redirects.

@@ -14,8 +14,8 @@ URLSession on iOS/tvOS/watchOS/macOS) and browser/Cloudflare Workers targets thr
 ## Why Zenwave?
 
 - **Ergonomic requests** – convenience helpers (`get`, `post`, …) and a fluent `RequestBuilder`.
-- **Opt-in middleware** – add redirect following, cookie storage, OAuth2 refresh, or redirects only when you
-  need it.
+- **Composable middleware** – redirects work by default, while cookie storage, OAuth2 refresh, caching,
+  and other layers stay opt-in.
 - **Streaming bodies** – handle large uploads/downloads or upgrade to SSE without buffering.
 - **HTTP caching** – drop-in middleware honors `Cache-Control`, `Expires`, `ETag`, and
   `Last-Modified` to avoid redundant network hops.
@@ -42,6 +42,9 @@ async fn main() -> zenwave::Result<()> {
 
 The `ResponseExt` trait provides the `into_string`, `into_json`, `into_bytes`, and `into_sse` helpers
 you will see throughout the API.
+
+`zenwave::client()` follows redirects by default. If you need to inspect redirect responses
+directly, call `zenwave::client().disable_redirect()`.
 
 ## Examples
 
@@ -89,7 +92,6 @@ async fn main() -> zenwave::Result<()> {
             "client-id",
             "client-secret",
         ))
-        .follow_redirect()
         .enable_cookie()
         .bearer_auth(token);
 
@@ -248,9 +250,9 @@ sharing code between targets is straightforward.
 
 By default Apple targets (iOS, iPadOS, tvOS, watchOS, macOS) also use the Hyper backend. There is an
 experimental `apple-backend` feature that swaps Hyper out for `URLSession`, which satisfies
-watchOS/App Store restrictions but currently auto-follows redirects and auto-manages cookies. The
-two middleware tests that asserted “no redirect / no automatic cookies” are skipped whenever the
-`apple-backend` feature is enabled. Until the URLSession backend is stabilized, we recommend keeping
+watchOS/App Store restrictions but currently auto-manages cookies internally. Redirects are already
+enabled by default at the Zenwave client layer, so the middleware distinction only matters for raw
+backend usage. Until the URLSession backend is stabilized, we recommend keeping
 the default Hyper backend on Apple. If you still want to opt in:
 
 ```toml

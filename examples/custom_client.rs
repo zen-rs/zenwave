@@ -24,10 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let token = std::env::var("ZENWAVE_TOKEN").unwrap_or_else(|_| "demo-token".into());
 
         // Compose the middleware you need.
-        let mut client = zenwave::client()
-            .follow_redirect()
-            .enable_cookie()
-            .bearer_auth(token);
+        let mut client = zenwave::client().enable_cookie().bearer_auth(token);
 
         let payload = MessageRequest {
             message: "zenwave says hi!",

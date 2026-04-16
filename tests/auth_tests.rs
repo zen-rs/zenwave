@@ -158,10 +158,7 @@ async fn test_multiple_auth_requests() {
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_auth_with_other_middleware() {
     // Test auth combined with other middleware
-    let mut client = client()
-        .bearer_auth("combined-token")
-        .enable_cookie()
-        .follow_redirect();
+    let mut client = client().bearer_auth("combined-token").enable_cookie();
 
     let response = client.get(httpbin_uri("/headers")).unwrap().await;
     assert!(response.is_ok());

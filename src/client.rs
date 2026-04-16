@@ -215,34 +215,37 @@ impl<T: Client> RequestBuilder<'_, T> {
     }
 }
 
-// Consuming methods when T::Error is already zenwave::Error
-impl<T: Client<Error = crate::Error>> RequestBuilder<'_, T> {
+// Consuming helpers for any client whose error can be normalized into zenwave::Error.
+impl<T: Client> RequestBuilder<'_, T>
+where
+    T::Error: Into<crate::Error>,
+{
     pub async fn json<Res: DeserializeOwned>(self) -> Result<Res, crate::Error> {
-        let response = self.await?;
+        let response = self.await.map_err(Into::into)?;
         let mut body = response.into_body();
         Ok(body.into_json().await?)
     }
 
     pub async fn string(self) -> Result<ByteStr, crate::Error> {
-        let response = self.await?;
+        let response = self.await.map_err(Into::into)?;
         let body = response.into_body();
         Ok(body.into_string().await?)
     }
 
     pub async fn bytes(self) -> Result<Bytes, crate::Error> {
-        let response = self.await?;
+        let response = self.await.map_err(Into::into)?;
         let body = response.into_body();
         Ok(body.into_bytes().await?)
     }
 
     pub async fn form<Res: DeserializeOwned>(self) -> Result<Res, crate::Error> {
-        let response = self.await?;
+        let response = self.await.map_err(Into::into)?;
         let mut body = response.into_body();
         Ok(body.into_form().await?)
     }
 
     pub async fn sse(self) -> Result<SseStream, crate::Error> {
-        let response = self.await?;
+        let response = self.await.map_err(Into::into)?;
         let body = response.into_body();
         Ok(body.into_sse())
     }
@@ -481,7 +484,7 @@ pub trait Client: Endpoint + Sized {
     }
 
     /// Enable automatic redirect following.
-    fn follow_redirect(self) -> impl Client {
+    fn follow_redirect(self) -> FollowRedirect<Self> {
         FollowRedirect::new(self)
     }
 

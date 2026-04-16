@@ -77,7 +77,7 @@ async fn test_response_status_codes() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_redirect_chain() {
-    let mut client = client().follow_redirect();
+    let mut client = client();
 
     // Test a redirect chain
     let response = client.get(endpoint("/redirect/5")).unwrap().await.unwrap();

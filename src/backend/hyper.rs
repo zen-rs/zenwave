@@ -1,18 +1,23 @@
-use async_io::block_on;
-use async_net::TcpStream;
+use async_io::{Timer, block_on};
+use async_net::{TcpStream, resolve};
 use core::future::Future;
 use executor_core::{AnyExecutor, Executor};
 use futures_io::{AsyncRead, AsyncWrite};
+use futures_util::future::{Either, select};
+use futures_util::pin_mut;
 use futures_util::TryStreamExt;
 use http::StatusCode;
 use http_body_util::BodyDataStream;
 use http_kit::{Endpoint, HttpError, Method, Request, Response};
 use hyper::http;
 use std::{
+    io,
     mem::replace,
+    net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
     thread,
+    time::Duration,
 };
 use tracing::debug;
 
@@ -205,6 +210,9 @@ impl Endpoint for HyperBackend {
 
 impl Client for HyperBackend {}
 
+const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(300);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
 async fn connect(request: &http::Request<http_kit::Body>) -> Result<MaybeTlsStream, HyperError> {
     let uri = request.uri();
     let host = uri
@@ -219,7 +227,8 @@ async fn connect(request: &http::Request<http_kit::Body>) -> Result<MaybeTlsStre
     };
     let port = uri.port_u16().unwrap_or(if use_tls { 443 } else { 80 });
 
-    let stream = TcpStream::connect((host.as_str(), port))
+    let resolved = resolve((host.as_str(), port)).await.map_err(HyperError::Io)?;
+    let stream = connect_happy_eyeballs(&resolved)
         .await
         .map_err(HyperError::Io)?;
     stream.set_nodelay(true).map_err(HyperError::Io)?;
@@ -277,6 +286,104 @@ async fn connect(request: &http::Request<http_kit::Body>) -> Result<MaybeTlsStre
     }
 
     Ok(MaybeTlsStream::Plain(stream))
+}
+
+async fn connect_happy_eyeballs(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
+    let (ipv6_addrs, ipv4_addrs) = partition_socket_addrs(addrs);
+
+    match (ipv6_addrs.is_empty(), ipv4_addrs.is_empty()) {
+        (true, true) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "could not resolve to any of the addresses",
+        )),
+        (false, true) => connect_address_family(ipv6_addrs).await,
+        (true, false) => connect_address_family(ipv4_addrs).await,
+        (false, false) => race_address_families(ipv6_addrs, ipv4_addrs).await,
+    }
+}
+
+fn partition_socket_addrs(addrs: &[SocketAddr]) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+    let mut ipv6_addrs = Vec::new();
+    let mut ipv4_addrs = Vec::new();
+
+    for addr in addrs {
+        match addr {
+            SocketAddr::V6(_) => ipv6_addrs.push(*addr),
+            SocketAddr::V4(_) => ipv4_addrs.push(*addr),
+        }
+    }
+
+    (ipv6_addrs, ipv4_addrs)
+}
+
+async fn race_address_families(
+    ipv6_addrs: Vec<SocketAddr>,
+    ipv4_addrs: Vec<SocketAddr>,
+) -> io::Result<TcpStream> {
+    let ipv6_connect = async move { connect_address_family(ipv6_addrs).await };
+    let ipv4_connect = async move {
+        Timer::after(HAPPY_EYEBALLS_DELAY).await;
+        connect_address_family(ipv4_addrs).await
+    };
+
+    pin_mut!(ipv6_connect);
+    pin_mut!(ipv4_connect);
+
+    match select(ipv6_connect, ipv4_connect).await {
+        Either::Left((Ok(stream), _)) | Either::Right((Ok(stream), _)) => Ok(stream),
+        Either::Left((Err(ipv6_err), ipv4_pending)) => match ipv4_pending.await {
+            Ok(stream) => Ok(stream),
+            Err(ipv4_err) => Err(combine_connect_errors(ipv6_err, ipv4_err)),
+        },
+        Either::Right((Err(ipv4_err), ipv6_pending)) => match ipv6_pending.await {
+            Ok(stream) => Ok(stream),
+            Err(ipv6_err) => Err(combine_connect_errors(ipv6_err, ipv4_err)),
+        },
+    }
+}
+
+async fn connect_address_family(addrs: Vec<SocketAddr>) -> io::Result<TcpStream> {
+    let mut last_err = None;
+
+    for addr in addrs {
+        match connect_with_timeout(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_err = Some(err),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "address family had no usable socket addresses",
+        )
+    }))
+}
+
+async fn connect_with_timeout(addr: SocketAddr) -> io::Result<TcpStream> {
+    let connect = TcpStream::connect(addr);
+    let timeout = async {
+        Timer::after(CONNECT_TIMEOUT).await;
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("timed out connecting to {addr}"),
+        ))
+    };
+
+    pin_mut!(connect);
+    pin_mut!(timeout);
+
+    match select(connect, timeout).await {
+        Either::Left((result, _)) => result,
+        Either::Right((result, _)) => result,
+    }
+}
+
+fn combine_connect_errors(primary: io::Error, fallback: io::Error) -> io::Error {
+    io::Error::new(
+        primary.kind(),
+        format!("IPv6 and IPv4 connect attempts failed: {primary}; fallback: {fallback}"),
+    )
 }
 
 /// Connect using rustls with system certificates.
@@ -413,5 +520,36 @@ impl hyper::rt::Write for MaybeTlsStream {
             #[cfg(feature = "rustls")]
             Self::Rustls(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::partition_socket_addrs;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn partitions_socket_addrs_by_family_preserving_order() {
+        let addrs = vec![
+            "2001:db8::1:443".parse::<SocketAddr>().expect("valid IPv6"),
+            "203.0.113.10:443"
+                .parse::<SocketAddr>()
+                .expect("valid IPv4"),
+            "2001:db8::2:443".parse::<SocketAddr>().expect("valid IPv6"),
+        ];
+
+        let (ipv6, ipv4) = partition_socket_addrs(&addrs);
+
+        assert_eq!(
+            ipv6,
+            vec![
+                "2001:db8::1:443".parse().expect("valid IPv6"),
+                "2001:db8::2:443".parse().expect("valid IPv6")
+            ]
+        );
+        assert_eq!(
+            ipv4,
+            vec!["203.0.113.10:443".parse().expect("valid IPv4")]
+        );
     }
 }

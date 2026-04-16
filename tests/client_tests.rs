@@ -111,7 +111,7 @@ async fn test_client_with_middleware() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_follow_redirect() {
-    let mut client = client().follow_redirect();
+    let mut client = client();
     let response = client.get(httpbin_uri("/redirect/1")).unwrap().await;
     assert!(response.is_ok());
     let response = response.unwrap();

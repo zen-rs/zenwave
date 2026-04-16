@@ -50,8 +50,7 @@ async fn test_cookie_store_creation() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_follow_redirect_middleware() {
-    // Test with redirect middleware
-    let mut client = client().follow_redirect();
+    let mut client = client();
 
     // This should follow the redirect and return the final response
     let response = client.get(httpbin_uri("/redirect/1")).unwrap().await;
@@ -71,7 +70,7 @@ async fn test_follow_redirect_creation() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_follow_redirect_multiple_redirects() {
-    let mut client = client().follow_redirect();
+    let mut client = client();
 
     // Test multiple redirects
     let response = client.get(httpbin_uri("/redirect/3")).unwrap().await;
@@ -83,7 +82,7 @@ async fn test_follow_redirect_multiple_redirects() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_client_with_multiple_middleware() {
-    let mut client = client().follow_redirect().enable_cookie();
+    let mut client = client().enable_cookie();
 
     // Test that both middleware work together
     let response = client
@@ -100,8 +99,7 @@ async fn test_client_with_multiple_middleware() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
 async fn test_without_redirect_middleware() {
-    // Without redirect middleware, should get redirect response
-    let mut client = client();
+    let mut client = client().disable_redirect();
     let response = client.get(httpbin_uri("/redirect/1")).unwrap().await;
     assert!(response.is_ok());
     let response = response.unwrap();
