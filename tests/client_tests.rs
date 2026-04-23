@@ -5,8 +5,7 @@ mod common;
 use common::httpbin_uri;
 use zenwave::{Client, client};
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_client_get_method() {
     let mut client = client();
     let request_builder = client.get(httpbin_uri("/get")).unwrap();
@@ -16,8 +15,7 @@ async fn test_client_get_method() {
     assert!(response.status().is_success());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_client_post_method() {
     let mut client = client();
     let request_builder = client.post(httpbin_uri("/post")).unwrap();
@@ -27,8 +25,7 @@ async fn test_client_post_method() {
     assert!(response.status().is_success());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_client_put_method() {
     let mut client = client();
     let request_builder = client.put(httpbin_uri("/put")).unwrap();
@@ -38,8 +35,7 @@ async fn test_client_put_method() {
     assert!(response.status().is_success());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_client_delete_method() {
     let mut client = client();
     let request_builder = client.delete(httpbin_uri("/delete")).unwrap();
@@ -49,8 +45,7 @@ async fn test_client_delete_method() {
     assert!(response.status().is_success());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_client_method_generic() {
     let mut client = client();
     let request_builder = client.method(Method::GET, httpbin_uri("/get")).unwrap();
@@ -60,8 +55,7 @@ async fn test_client_method_generic() {
     assert!(response.status().is_success());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_request_builder_string() {
     let mut client = client();
     let response_string = client.get(httpbin_uri("/get")).unwrap().string().await;
@@ -71,8 +65,7 @@ async fn test_request_builder_string() {
     assert!(string.contains("httpbin"));
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_request_builder_bytes() {
     let mut client = client();
     let response_bytes = client.get(httpbin_uri("/get")).unwrap().bytes().await;
@@ -81,8 +74,7 @@ async fn test_request_builder_bytes() {
     assert!(!bytes.is_empty());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_request_builder_json() {
     use serde_json::Value;
 
@@ -93,8 +85,7 @@ async fn test_request_builder_json() {
     assert!(json.is_object());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_client_with_middleware() {
     let mut client = client().enable_cookie();
     let response = client
@@ -108,8 +99,7 @@ async fn test_client_with_middleware() {
     assert!(response2.is_ok());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_client_follow_redirect() {
     let mut client = client();
     let response = client.get(httpbin_uri("/redirect/1")).unwrap().await;
@@ -119,8 +109,8 @@ async fn test_client_follow_redirect() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
-async fn test_invalid_uri() {
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn test_invalid_uri() {
     let mut client = client();
     let response = client.get("");
     assert!(response.is_err());

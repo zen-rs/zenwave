@@ -271,10 +271,10 @@ mod tests {
     use super::*;
     use async_lock::Mutex;
     use async_net::{TcpListener, TcpStream};
-    use async_std::task::{self, JoinHandle};
     use http::{Request as HttpRequest, Response as HttpResponse};
     use http_kit::utils::{AsyncReadExt, AsyncWriteExt};
     use http_kit::{Body, Method};
+    use smol::Task;
     use std::convert::Infallible;
     use std::sync::{
         Arc,
@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn acquires_token_and_attaches_header() {
         let (url, handle, hits) =
-            match async_io::block_on(async { spawn_token_server(vec!["token-one"]).await }) {
+            match smol::block_on(async { spawn_token_server(vec!["token-one"]).await }) {
                 Ok(values) => values,
                 Err(err) => {
                     eprintln!("skipping oauth2 token test: {err}");
@@ -299,7 +299,7 @@ mod tests {
             .unwrap();
         let mut endpoint = RecordingEndpoint::default();
 
-        async_io::block_on(async {
+        smol::block_on(async {
             middleware
                 .handle(&mut request, &mut endpoint)
                 .await
@@ -359,7 +359,7 @@ mod tests {
 
     async fn spawn_token_server(
         tokens: Vec<&'static str>,
-    ) -> std::io::Result<(String, JoinHandle<()>, Arc<AtomicUsize>)> {
+    ) -> std::io::Result<(String, Task<()>, Arc<AtomicUsize>)> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
@@ -371,16 +371,17 @@ mod tests {
                 .collect::<Vec<_>>(),
         ));
 
-        let server = task::spawn(async move {
+        let server = smol::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else {
                     break;
                 };
                 let tokens = tokens.clone();
                 let hit_counter = hit_counter.clone();
-                task::spawn(async move {
+                smol::spawn(async move {
                     handle_token_request(socket, tokens, hit_counter).await;
-                });
+                })
+                .detach();
             }
         });
 

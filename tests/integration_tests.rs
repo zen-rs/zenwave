@@ -9,8 +9,7 @@ fn endpoint(path: &str) -> String {
     httpbin_uri(path)
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_real_world_api_request() {
     // Test with a real JSON API
     let response = get(endpoint("/json")).await.unwrap();
@@ -20,8 +19,7 @@ async fn test_real_world_api_request() {
     assert!(json.is_object());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_user_agent_header() {
     let response = get(endpoint("/user-agent")).await.unwrap();
     let text = response.into_body().into_string().await.unwrap();
@@ -30,8 +28,7 @@ async fn test_user_agent_header() {
     assert!(!text.is_empty());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_custom_headers() {
     let mut client = client();
     let response = client.get(endpoint("/headers")).unwrap().await.unwrap();
@@ -41,8 +38,7 @@ async fn test_custom_headers() {
     assert!(text.contains("headers"));
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_post_with_json_body() {
     let mut client = client();
     let request = client.method(Method::POST, endpoint("/post")).unwrap();
@@ -54,8 +50,7 @@ async fn test_post_with_json_body() {
     assert!(response.status().is_success());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_response_status_codes() {
     for status_code in [200, 201, 400, 401, 403, 404, 500, 502, 503] {
         let url = endpoint(&format!("/status/{status_code}"));
@@ -74,8 +69,7 @@ async fn test_response_status_codes() {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_redirect_chain() {
     let mut client = client();
 
@@ -84,8 +78,7 @@ async fn test_redirect_chain() {
     assert!(response.status().is_success());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_large_response() {
     // Test handling of larger responses
     let response = get(endpoint("/base64/aGVsbG8gd29ybGQ=")).await;
@@ -97,8 +90,7 @@ async fn test_large_response() {
     assert!(!bytes.is_empty());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_gzip_compression() {
     // Local test server advertises gzip support
     let response = get(endpoint("/gzip")).await;
@@ -109,8 +101,7 @@ async fn test_gzip_compression() {
     assert!(!bytes.is_empty());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_cookie_persistence() {
     let mut client = client().enable_cookie();
 
@@ -128,8 +119,7 @@ async fn test_cookie_persistence() {
     assert!(body.contains("cookievalue"));
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_method_overrides() {
     let mut client = client();
 

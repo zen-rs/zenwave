@@ -31,12 +31,13 @@ URLSession on iOS/tvOS/watchOS/macOS) and browser/Cloudflare Workers targets thr
 ```rust
 use zenwave::{get, ResponseExt};
 
-#[async_std::main]
-async fn main() -> zenwave::Result<()> {
-    let response = get("https://example.com/").await?;
-    let text = response.into_string().await?;
-    println!("{text}");
-    Ok(())
+fn main() -> zenwave::Result<()> {
+    smol::block_on(async {
+        let response = get("https://example.com/").await?;
+        let text = response.into_string().await?;
+        println!("{text}");
+        Ok(())
+    })
 }
 ```
 
@@ -79,33 +80,34 @@ struct MessageResponse {
     message: String,
 }
 
-#[async_std::main]
-async fn main() -> zenwave::Result<()> {
-    let token = std::env::var("ZENWAVE_TOKEN").unwrap_or_else(|_| "demo-token".into());
+fn main() -> zenwave::Result<()> {
+    smol::block_on(async {
+        let token = std::env::var("ZENWAVE_TOKEN").unwrap_or_else(|_| "demo-token".into());
 
-    // Compose only the middleware you need.
-    let mut client = zenwave::client()
-        .timeout(Duration::from_secs(2))
-        .enable_cache()
-        .with(OAuth2ClientCredentials::new(
-            "https://auth.example.com/token",
-            "client-id",
-            "client-secret",
-        ))
-        .enable_cookie()
-        .bearer_auth(token);
+        // Compose only the middleware you need.
+        let mut client = zenwave::client()
+            .timeout(Duration::from_secs(2))
+            .enable_cache()
+            .with(OAuth2ClientCredentials::new(
+                "https://auth.example.com/token",
+                "client-id",
+                "client-secret",
+            ))
+            .enable_cookie()
+            .bearer_auth(token);
 
-    let echo: EchoResponse = client
-        .post("https://httpbin.org/post")
-        .unwrap()
-        .header("x-request-id", "demo-request")
-        ?
-        .json_body(&MessageRequest { message: "hello" })?
-        .json()
-        .await?;
+        let echo: EchoResponse = client
+            .post("https://httpbin.org/post")
+            .unwrap()
+            .header("x-request-id", "demo-request")
+            ?
+            .json_body(&MessageRequest { message: "hello" })?
+            .json()
+            .await?;
 
-    println!("{}", echo.json.message);
-    Ok(())
+        println!("{}", echo.json.message);
+        Ok(())
+    })
 }
 ```
 
@@ -280,16 +282,17 @@ The `zenwave::websocket` module offers a cross-platform WebSocket client that hi
 ```rust
 use zenwave::websocket::{self, WebSocketMessage};
 
-#[async_std::main]
-async fn main() -> zenwave::Result<()> {
-    let mut socket = websocket::connect("wss://echo.websocket.events").await?;
-    socket.send_text("hello").await?;
+fn main() -> zenwave::Result<()> {
+    smol::block_on(async {
+        let mut socket = websocket::connect("wss://echo.websocket.events").await?;
+        socket.send_text("hello").await?;
 
-    if let Some(WebSocketMessage::Text(text)) = socket.recv().await? {
-        println!("Received: {text}");
-    }
+        if let Some(WebSocketMessage::Text(text)) = socket.recv().await? {
+            println!("Received: {text}");
+        }
 
-    socket.close().await
+        socket.close().await
+    })
 }
 ```
 

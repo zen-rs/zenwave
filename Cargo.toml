@@ -29,7 +29,7 @@ tracing = "0.1"
 [dev-dependencies]
 serde_json = "1.0"
 tempfile = "3.13"
-async-std = { version = "1.13", features = ["attributes"] }
+test_executors = "0.4"
 tiny_http = "0.12"
 
 [features]
@@ -100,6 +100,9 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+smol = "2.0"
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 async-io = "2.4"
 async-net = "2.0"
@@ -115,7 +118,7 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 rustls-native-certs = { version = "0.8", optional = true }
 native-tls = { version = "0.2", optional = true }
 webpki-roots = { version = "1.0", optional = true }
-async-tungstenite = { version = "0.34.0", default-features = false, features = ["async-std-runtime"], optional = true }
+async-tungstenite = { version = "0.34.0", default-features = false, features = ["smol-runtime"], optional = true }
 async-fs = { version = "2.2.0", default-features = false }
 dirs = "6.0"
 once_cell = "1.19"
