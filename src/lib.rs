@@ -75,16 +75,16 @@ compile_error!(
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(feature = "native-tls", feature = "rustls"),
-    not(feature = "hyper-backend"),
+    not(any(feature = "hyper-backend", feature = "ws")),
     any(
         all(target_vendor = "apple", feature = "apple-backend"),
         feature = "curl-backend"
     )
 ))]
 compile_error!(
-    "The `native-tls` and `rustls` features only apply to `hyper-backend`. \
-     Your current backend (apple-backend or curl-backend) has its own TLS implementation. \
-     Please disable these TLS features."
+    "The `native-tls` and `rustls` features apply to `hyper-backend` and native websocket support. \
+     Your current HTTP backend (apple-backend or curl-backend) has its own TLS implementation, so \
+     these TLS features are only valid here when websocket support is also enabled."
 );
 
 pub mod backend;

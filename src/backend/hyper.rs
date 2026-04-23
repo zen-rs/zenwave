@@ -119,10 +119,10 @@ impl From<HyperError> for crate::Error {
                         .unwrap_or("Unknown error")
                         .to_string()
                 }),
-                response: HttpErrorResponse {
+                response: Box::new(HttpErrorResponse {
                     response: raw_response,
                     body_text: body,
-                },
+                }),
             },
             HyperError::Connection(e) => Self::Transport(Box::new(e)),
             HyperError::Io(e) => Self::Io(e),
@@ -156,8 +156,7 @@ impl Endpoint for HyperBackend {
         let origin_form = request
             .uri()
             .path_and_query()
-            .map(|value| value.as_str())
-            .unwrap_or("/");
+            .map_or("/", http::uri::PathAndQuery::as_str);
         *request.uri_mut() = origin_form
             .parse()
             .map_err(|err| HyperError::InvalidUri(format!("{origin_form}: {err}")))?;
@@ -302,6 +301,7 @@ async fn connect_happy_eyeballs(host: &str, port: u16) -> io::Result<TcpStream> 
     let mut state = HappyEyeballsState::new();
     let mut attempts = FuturesUnordered::new();
     let mut resolver = start_resolution(host, port);
+    let mut resolver_closed = false;
 
     loop {
         state.rebuild_pending();
@@ -317,9 +317,10 @@ async fn connect_happy_eyeballs(host: &str, port: u16) -> io::Result<TcpStream> 
         }
 
         let resolver_event = async {
-            match resolver.as_mut() {
-                Some(receiver) => receiver.next().await,
-                None => None,
+            if resolver_closed {
+                pending::<Option<ResolutionEvent>>().await
+            } else {
+                resolver.next().await
             }
         };
         let resolution_delay = timer_at(state.resolution_delay_deadline);
@@ -342,24 +343,19 @@ async fn connect_happy_eyeballs(host: &str, port: u16) -> io::Result<TcpStream> 
             outcome = attempt_result => {
                 match outcome.result {
                     Ok(stream) => return Ok(stream),
-                    Err(error) => state.record_attempt_failure(outcome.addr, error),
+                    Err(error) => state.record_attempt_failure(outcome.addr, &error),
                 }
             }
             message = resolver_event.fuse() => {
-                match message {
-                    Some(message) => state.apply_resolution(message),
-                    None => {
-                        if let Some(receiver) = resolver.take() {
-                            drop(receiver);
-                        }
-                        state.mark_resolution_stream_closed();
-                    }
+                if let Some(message) = message { state.apply_resolution(message) } else {
+                    resolver_closed = true;
+                    state.mark_resolution_stream_closed();
                 }
             }
-            _ = resolution_delay.fuse() => {
+            () = resolution_delay.fuse() => {
                 state.open_resolution_gate();
             }
-            _ = next_attempt_due.fuse() => {}
+            () = next_attempt_due.fuse() => {}
         }
     }
 }
@@ -407,11 +403,11 @@ impl FamilyResolution {
         }
     }
 
-    fn is_finished(&self) -> bool {
+    const fn is_finished(&self) -> bool {
         !matches!(self, Self::Pending)
     }
 
-    fn is_positive(&self) -> bool {
+    const fn is_positive(&self) -> bool {
         matches!(self, Self::Ready(addrs) if !addrs.is_empty())
     }
 
@@ -609,11 +605,11 @@ impl HappyEyeballsState {
             .map(|started_at| started_at + bounded_connection_attempt_delay())
     }
 
-    fn open_resolution_gate(&mut self) {
+    const fn open_resolution_gate(&mut self) {
         self.resolution_delay_deadline = None;
     }
 
-    fn record_attempt_failure(&mut self, addr: SocketAddr, error: io::Error) {
+    fn record_attempt_failure(&mut self, addr: SocketAddr, error: &io::Error) {
         self.attempt_failures.push(format!("{addr}: {error}"));
     }
 
@@ -630,7 +626,7 @@ impl HappyEyeballsState {
         }
     }
 
-    fn resolution_complete(&self) -> bool {
+    const fn resolution_complete(&self) -> bool {
         self.ipv6.is_finished() && self.ipv4.is_finished()
     }
 
@@ -648,13 +644,10 @@ impl HappyEyeballsState {
         }
         diagnostics.extend(self.attempt_failures);
 
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "RFC 8305 connection setup failed: {}",
-                diagnostics.join("; ")
-            ),
-        )
+        io::Error::other(format!(
+            "RFC 8305 connection setup failed: {}",
+            diagnostics.join("; ")
+        ))
     }
 }
 
@@ -679,12 +672,11 @@ async fn connect_with_timeout(addr: SocketAddr) -> io::Result<TcpStream> {
     pin_mut!(timeout);
 
     match select(connect, timeout).await {
-        Either::Left((result, _)) => result,
-        Either::Right((result, _)) => result,
+        Either::Left((result, _)) | Either::Right((result, _)) => result,
     }
 }
 
-fn start_resolution(host: &str, port: u16) -> Option<UnboundedReceiver<ResolutionEvent>> {
+fn start_resolution(host: &str, port: u16) -> UnboundedReceiver<ResolutionEvent> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         let (sender, receiver) = unbounded();
         let family = if ip.is_ipv6() {
@@ -719,7 +711,7 @@ fn start_resolution(host: &str, port: u16) -> Option<UnboundedReceiver<Resolutio
             })
             .expect("literal IP sorted resolution event receiver should be alive");
         drop(sender);
-        return Some(receiver);
+        return receiver;
     }
 
     let (sender, receiver) = unbounded();
@@ -731,7 +723,7 @@ fn start_resolution(host: &str, port: u16) -> Option<UnboundedReceiver<Resolutio
         spawn_blocking_resolution(host.to_string(), port, query, sender.clone());
     }
     drop(sender);
-    Some(receiver)
+    receiver
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -848,14 +840,12 @@ fn bounded_connection_attempt_delay() -> Duration {
         .min(MAX_CONNECTION_ATTEMPT_DELAY)
 }
 
-fn timer_at(deadline: Option<Instant>) -> impl Future<Output = ()> {
-    async move {
-        match deadline {
-            Some(deadline) => {
-                Timer::at(deadline).await;
-            }
-            None => pending::<()>().await,
+async fn timer_at(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => {
+            Timer::at(deadline).await;
         }
+        None => pending::<()>().await,
     }
 }
 

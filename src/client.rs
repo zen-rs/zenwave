@@ -99,6 +99,11 @@ impl<T: Client> RequestBuilder<'_, T> {
         self
     }
 
+    /// Insert or replace a request header.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidRequest`] when the header name or value cannot be parsed.
     pub fn header(
         mut self,
         name: impl TryInto<HeaderName, Error: Display>,
@@ -113,9 +118,9 @@ impl<T: Client> RequestBuilder<'_, T> {
 
     /// Set a JSON-encoded body for the request.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the body cannot be serialized to JSON.
+    /// Returns [`crate::Error::InvalidRequest`] when the payload cannot be serialized to JSON.
     pub fn json_body<B: serde::Serialize>(mut self, body: &B) -> Result<Self, crate::Error> {
         let json = serde_json::to_string(body).map_err(|error| {
             invalid_request_with_prefix("failed to serialize JSON body: ", error)
@@ -172,6 +177,10 @@ impl<T: Client> RequestBuilder<'_, T> {
 
     /// Stream a file from disk as the request body without loading it into memory.
     #[cfg(not(target_arch = "wasm32"))]
+    ///
+    /// # Errors
+    ///
+    /// Returns any file-system error encountered while opening the file or loading its metadata.
     pub async fn file_body(
         self,
         path: impl AsRef<std::path::Path>,
@@ -220,30 +229,55 @@ impl<T: Client> RequestBuilder<'_, T>
 where
     T::Error: Into<crate::Error>,
 {
+    /// Deserialize the response body as JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response body is not valid JSON for `Res`.
     pub async fn json<Res: DeserializeOwned>(self) -> Result<Res, crate::Error> {
         let response = self.await.map_err(Into::into)?;
         let mut body = response.into_body();
         Ok(body.into_json().await?)
     }
 
+    /// Read the response body as text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response body cannot be decoded as text.
     pub async fn string(self) -> Result<ByteStr, crate::Error> {
         let response = self.await.map_err(Into::into)?;
         let body = response.into_body();
         Ok(body.into_string().await?)
     }
 
+    /// Read the response body as raw bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response body stream errors.
     pub async fn bytes(self) -> Result<Bytes, crate::Error> {
         let response = self.await.map_err(Into::into)?;
         let body = response.into_body();
         Ok(body.into_bytes().await?)
     }
 
+    /// Deserialize the response body as form data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response body cannot be decoded into `Res`.
     pub async fn form<Res: DeserializeOwned>(self) -> Result<Res, crate::Error> {
         let response = self.await.map_err(Into::into)?;
         let mut body = response.into_body();
         Ok(body.into_form().await?)
     }
 
+    /// Convert the response body into an SSE stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
     pub async fn sse(self) -> Result<SseStream, crate::Error> {
         let response = self.await.map_err(Into::into)?;
         let body = response.into_body();
@@ -529,6 +563,11 @@ pub trait Client: Endpoint + Sized {
     }
 
     /// Create a request with the specified method and URI.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidUri`] when `uri` cannot be parsed, or
+    /// [`crate::Error::InvalidRequest`] when the request cannot be constructed.
     fn method<U>(
         &mut self,
         method: Method,
@@ -553,6 +592,10 @@ pub trait Client: Endpoint + Sized {
     }
 
     /// Create a GET request.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error produced by [`Client::method`].
     fn get<U>(&mut self, uri: U) -> Result<RequestBuilder<'_, &mut Self>, crate::Error>
     where
         U: TryInto<Uri>,
@@ -562,6 +605,10 @@ pub trait Client: Endpoint + Sized {
     }
 
     /// Create a POST request.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error produced by [`Client::method`].
     fn post<U>(&mut self, uri: U) -> Result<RequestBuilder<'_, &mut Self>, crate::Error>
     where
         U: TryInto<Uri>,
@@ -571,6 +618,10 @@ pub trait Client: Endpoint + Sized {
     }
 
     /// Create a PUT request.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error produced by [`Client::method`].
     fn put<'a, U>(&mut self, uri: U) -> Result<RequestBuilder<'_, &mut Self>, crate::Error>
     where
         U: TryInto<Uri>,
@@ -581,6 +632,10 @@ pub trait Client: Endpoint + Sized {
     }
 
     /// Create a DELETE request.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error produced by [`Client::method`].
     fn delete<U>(&mut self, uri: U) -> Result<RequestBuilder<'_, &mut Self>, crate::Error>
     where
         U: TryInto<Uri>,

@@ -166,6 +166,7 @@ impl OAuth2ClientCredentials {
         let fetched = self.fetch_token().await?;
         let token_value = fetched.access_token.clone();
         *token_guard = Some(fetched);
+        drop(token_guard);
         Ok(token_value)
     }
 

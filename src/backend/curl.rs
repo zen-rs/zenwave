@@ -76,10 +76,10 @@ impl From<CurlError> for crate::Error {
                         .unwrap_or("Unknown error")
                         .to_string()
                 }),
-                response: HttpErrorResponse {
+                response: Box::new(HttpErrorResponse {
                     response: *raw_response,
                     body_text: body,
-                },
+                }),
             },
         }
     }
