@@ -1,25 +1,30 @@
 use async_io::{Timer, block_on};
-use async_net::{TcpStream, resolve};
+use async_net::TcpStream;
 use core::future::Future;
+use dns_lookup::{AddrFamily, AddrInfoHints, SockType, getaddrinfo};
 use executor_core::{AnyExecutor, Executor};
+use futures_channel::mpsc::{UnboundedReceiver, unbounded};
 use futures_io::{AsyncRead, AsyncWrite};
-use futures_util::future::{Either, select};
-use futures_util::pin_mut;
+use futures_util::FutureExt;
 use futures_util::TryStreamExt;
+use futures_util::future::{Either, pending, select};
+use futures_util::pin_mut;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use http::StatusCode;
 use http_body_util::BodyDataStream;
 use http_kit::{Endpoint, HttpError, Method, Request, Response};
 use hyper::http;
 use std::{
+    collections::{HashSet, VecDeque},
     io,
     mem::replace,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{Client, error::HttpErrorResponse};
 
@@ -164,7 +169,7 @@ impl Endpoint for HyperBackend {
         // Drive the connection in the background.
         self.spawn_background(async move {
             if let Err(err) = connection.await {
-                eprintln!("hyper connection error: {err}");
+                warn!(error = %err, "hyper connection error");
             }
         });
 
@@ -210,7 +215,13 @@ impl Endpoint for HyperBackend {
 
 impl Client for HyperBackend {}
 
-const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(300);
+// RFC 8305 defaults: Resolution Delay = 50ms, First Address Family Count = 1,
+// Connection Attempt Delay = 250ms.
+const RESOLUTION_DELAY: Duration = Duration::from_millis(50);
+const FIRST_ADDRESS_FAMILY_COUNT: usize = 1;
+const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+const MIN_CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(100);
+const MAX_CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 async fn connect(request: &http::Request<http_kit::Body>) -> Result<MaybeTlsStream, HyperError> {
@@ -227,8 +238,7 @@ async fn connect(request: &http::Request<http_kit::Body>) -> Result<MaybeTlsStre
     };
     let port = uri.port_u16().unwrap_or(if use_tls { 443 } else { 80 });
 
-    let resolved = resolve((host.as_str(), port)).await.map_err(HyperError::Io)?;
-    let stream = connect_happy_eyeballs(&resolved)
+    let stream = connect_happy_eyeballs(host.as_str(), port)
         .await
         .map_err(HyperError::Io)?;
     stream.set_nodelay(true).map_err(HyperError::Io)?;
@@ -288,76 +298,371 @@ async fn connect(request: &http::Request<http_kit::Body>) -> Result<MaybeTlsStre
     Ok(MaybeTlsStream::Plain(stream))
 }
 
-async fn connect_happy_eyeballs(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
-    let (ipv6_addrs, ipv4_addrs) = partition_socket_addrs(addrs);
+async fn connect_happy_eyeballs(host: &str, port: u16) -> io::Result<TcpStream> {
+    let mut state = HappyEyeballsState::new();
+    let mut attempts = FuturesUnordered::new();
+    let mut resolver = start_resolution(host, port);
 
-    match (ipv6_addrs.is_empty(), ipv4_addrs.is_empty()) {
-        (true, true) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "could not resolve to any of the addresses",
-        )),
-        (false, true) => connect_address_family(ipv6_addrs).await,
-        (true, false) => connect_address_family(ipv4_addrs).await,
-        (false, false) => race_address_families(ipv6_addrs, ipv4_addrs).await,
+    loop {
+        state.rebuild_pending();
+
+        if let Some(addr) = state.pop_next_attempt(Instant::now()) {
+            let attempt: AttemptFuture = Box::pin(connect_attempt(addr));
+            attempts.push(attempt);
+            continue;
+        }
+
+        if state.is_terminal(&attempts) {
+            return Err(state.into_connect_error());
+        }
+
+        let resolver_event = async {
+            match resolver.as_mut() {
+                Some(receiver) => receiver.next().await,
+                None => None,
+            }
+        };
+        let resolution_delay = timer_at(state.resolution_delay_deadline);
+        let next_attempt_due = timer_at(state.next_attempt_deadline());
+
+        pin_mut!(resolver_event);
+        pin_mut!(resolution_delay);
+        pin_mut!(next_attempt_due);
+
+        let attempt_result = async {
+            match attempts.next().await {
+                Some(outcome) => outcome,
+                None => pending::<AttemptOutcome>().await,
+            }
+        }
+        .fuse();
+        pin_mut!(attempt_result);
+
+        futures_util::select_biased! {
+            outcome = attempt_result => {
+                match outcome.result {
+                    Ok(stream) => return Ok(stream),
+                    Err(error) => state.record_attempt_failure(outcome.addr, error),
+                }
+            }
+            message = resolver_event.fuse() => {
+                match message {
+                    Some(message) => state.apply_resolution(message),
+                    None => {
+                        if let Some(receiver) = resolver.take() {
+                            drop(receiver);
+                        }
+                        state.mark_resolution_stream_closed();
+                    }
+                }
+            }
+            _ = resolution_delay.fuse() => {
+                state.open_resolution_gate();
+            }
+            _ = next_attempt_due.fuse() => {}
+        }
     }
 }
 
-fn partition_socket_addrs(addrs: &[SocketAddr]) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
-    let mut ipv6_addrs = Vec::new();
-    let mut ipv4_addrs = Vec::new();
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum AddressFamilyKind {
+    Ipv6,
+    Ipv4,
+}
 
-    for addr in addrs {
-        match addr {
-            SocketAddr::V6(_) => ipv6_addrs.push(*addr),
-            SocketAddr::V4(_) => ipv4_addrs.push(*addr),
+#[derive(Debug)]
+enum ResolutionEventKind {
+    Family {
+        family: AddressFamilyKind,
+        result: ResolutionResult,
+    },
+    SortedSnapshot(ResolutionResult),
+}
+
+#[derive(Debug)]
+struct ResolutionEvent {
+    kind: ResolutionEventKind,
+}
+
+#[derive(Debug)]
+enum ResolutionResult {
+    Addresses(Vec<SocketAddr>),
+    Empty,
+    Failed(String),
+}
+
+#[derive(Debug)]
+enum FamilyResolution {
+    Pending,
+    Ready(Vec<SocketAddr>),
+    Empty,
+    Failed(String),
+}
+
+impl FamilyResolution {
+    fn addrs(&self) -> &[SocketAddr] {
+        match self {
+            Self::Ready(addrs) => addrs,
+            Self::Pending | Self::Empty | Self::Failed(_) => &[],
         }
     }
 
-    (ipv6_addrs, ipv4_addrs)
-}
+    fn is_finished(&self) -> bool {
+        !matches!(self, Self::Pending)
+    }
 
-async fn race_address_families(
-    ipv6_addrs: Vec<SocketAddr>,
-    ipv4_addrs: Vec<SocketAddr>,
-) -> io::Result<TcpStream> {
-    let ipv6_connect = async move { connect_address_family(ipv6_addrs).await };
-    let ipv4_connect = async move {
-        Timer::after(HAPPY_EYEBALLS_DELAY).await;
-        connect_address_family(ipv4_addrs).await
-    };
+    fn is_positive(&self) -> bool {
+        matches!(self, Self::Ready(addrs) if !addrs.is_empty())
+    }
 
-    pin_mut!(ipv6_connect);
-    pin_mut!(ipv4_connect);
-
-    match select(ipv6_connect, ipv4_connect).await {
-        Either::Left((Ok(stream), _)) | Either::Right((Ok(stream), _)) => Ok(stream),
-        Either::Left((Err(ipv6_err), ipv4_pending)) => match ipv4_pending.await {
-            Ok(stream) => Ok(stream),
-            Err(ipv4_err) => Err(combine_connect_errors(ipv6_err, ipv4_err)),
-        },
-        Either::Right((Err(ipv4_err), ipv6_pending)) => match ipv6_pending.await {
-            Ok(stream) => Ok(stream),
-            Err(ipv6_err) => Err(combine_connect_errors(ipv6_err, ipv4_err)),
-        },
+    fn failure_message(&self, family: AddressFamilyKind) -> Option<String> {
+        match self {
+            Self::Failed(message) => Some(format!("{family:?} resolution failed: {message}")),
+            Self::Empty => Some(format!("{family:?} resolution returned no addresses")),
+            Self::Pending | Self::Ready(_) => None,
+        }
     }
 }
 
-async fn connect_address_family(addrs: Vec<SocketAddr>) -> io::Result<TcpStream> {
-    let mut last_err = None;
+#[derive(Debug)]
+struct AttemptOutcome {
+    addr: SocketAddr,
+    result: io::Result<TcpStream>,
+}
 
-    for addr in addrs {
-        match connect_with_timeout(addr).await {
-            Ok(stream) => return Ok(stream),
-            Err(err) => last_err = Some(err),
+type AttemptFuture = Pin<Box<dyn Future<Output = AttemptOutcome> + Send>>;
+
+#[derive(Debug)]
+struct HappyEyeballsState {
+    ipv6: FamilyResolution,
+    ipv4: FamilyResolution,
+    sorted_snapshot: Option<Vec<SocketAddr>>,
+    first_positive_family: Option<AddressFamilyKind>,
+    resolution_delay_deadline: Option<Instant>,
+    pending: VecDeque<SocketAddr>,
+    attempted: HashSet<SocketAddr>,
+    last_attempt_started_at: Option<Instant>,
+    attempt_failures: Vec<String>,
+}
+
+impl HappyEyeballsState {
+    fn new() -> Self {
+        Self {
+            ipv6: FamilyResolution::Pending,
+            ipv4: FamilyResolution::Pending,
+            sorted_snapshot: None,
+            first_positive_family: None,
+            resolution_delay_deadline: None,
+            pending: VecDeque::new(),
+            attempted: HashSet::new(),
+            last_attempt_started_at: None,
+            attempt_failures: Vec::new(),
         }
     }
 
-    Err(last_err.unwrap_or_else(|| {
+    fn apply_resolution(&mut self, event: ResolutionEvent) {
+        match event.kind {
+            ResolutionEventKind::Family { family, result } => {
+                let resolution = match result {
+                    ResolutionResult::Addresses(addrs) => FamilyResolution::Ready(addrs),
+                    ResolutionResult::Empty => FamilyResolution::Empty,
+                    ResolutionResult::Failed(message) => FamilyResolution::Failed(message),
+                };
+                match family {
+                    AddressFamilyKind::Ipv6 => {
+                        let ipv6_became_positive = !self.ipv6.is_positive()
+                            && matches!(&resolution, FamilyResolution::Ready(_));
+                        self.ipv6 = resolution;
+                        if ipv6_became_positive {
+                            if self.attempted.is_empty() {
+                                self.first_positive_family = Some(AddressFamilyKind::Ipv6);
+                            } else {
+                                self.first_positive_family
+                                    .get_or_insert(AddressFamilyKind::Ipv6);
+                            }
+                            self.resolution_delay_deadline = None;
+                        } else if self.ipv6.is_finished() && self.ipv4.is_positive() {
+                            self.resolution_delay_deadline = None;
+                        }
+                    }
+                    AddressFamilyKind::Ipv4 => {
+                        let ipv4_became_positive = !self.ipv4.is_positive()
+                            && matches!(&resolution, FamilyResolution::Ready(_));
+                        self.ipv4 = resolution;
+                        if ipv4_became_positive && self.first_positive_family.is_none() {
+                            self.first_positive_family = Some(AddressFamilyKind::Ipv4);
+                            if !self.ipv6.is_finished() {
+                                self.resolution_delay_deadline =
+                                    Some(Instant::now() + RESOLUTION_DELAY);
+                            }
+                        }
+                    }
+                }
+            }
+            ResolutionEventKind::SortedSnapshot(result) => match result {
+                ResolutionResult::Addresses(addrs) => self.sorted_snapshot = Some(addrs),
+                ResolutionResult::Empty => self.sorted_snapshot = Some(Vec::new()),
+                ResolutionResult::Failed(_) => self.sorted_snapshot = None,
+            },
+        }
+    }
+
+    fn rebuild_pending(&mut self) {
+        let ordered = self.ordered_candidates();
+        self.pending = ordered
+            .into_iter()
+            .filter(|addr| !self.attempted.contains(addr))
+            .collect();
+    }
+
+    fn ordered_candidates(&self) -> Vec<SocketAddr> {
+        let available = self.available_set();
+        if available.is_empty() {
+            return Vec::new();
+        }
+
+        if let Some(snapshot) = &self.sorted_snapshot {
+            let ordered = dedup_socket_addrs(
+                snapshot
+                    .iter()
+                    .copied()
+                    .filter(|addr| available.contains(addr))
+                    .collect(),
+            );
+            if !ordered.is_empty() {
+                return ordered;
+            }
+        }
+
+        let ipv6 = self.ipv6.addrs();
+        let ipv4 = self.ipv4.addrs();
+        match self
+            .first_positive_family
+            .unwrap_or(AddressFamilyKind::Ipv6)
+        {
+            AddressFamilyKind::Ipv6 => {
+                interleave_address_families(ipv6, ipv4, FIRST_ADDRESS_FAMILY_COUNT)
+            }
+            AddressFamilyKind::Ipv4 => {
+                interleave_address_families(ipv4, ipv6, FIRST_ADDRESS_FAMILY_COUNT)
+            }
+        }
+    }
+
+    fn available_set(&self) -> HashSet<SocketAddr> {
+        self.ipv6
+            .addrs()
+            .iter()
+            .chain(self.ipv4.addrs())
+            .copied()
+            .collect()
+    }
+
+    fn pop_next_attempt(&mut self, now: Instant) -> Option<SocketAddr> {
+        if !self.can_start_attempt(now) {
+            return None;
+        }
+
+        let addr = self.pending.pop_front()?;
+        self.attempted.insert(addr);
+        self.last_attempt_started_at = Some(now);
+        self.attempt_failures
+            .retain(|failure| !failure.starts_with(&format!("{addr}:")));
+        Some(addr)
+    }
+
+    fn can_start_attempt(&self, now: Instant) -> bool {
+        if self.pending.is_empty() {
+            return false;
+        }
+
+        if self.attempted.is_empty() {
+            return self.initial_attempt_gate_open(now);
+        }
+
+        self.next_attempt_deadline()
+            .is_some_and(|deadline| now >= deadline)
+    }
+
+    fn initial_attempt_gate_open(&self, now: Instant) -> bool {
+        if self.ipv6.is_positive() {
+            return true;
+        }
+
+        if !self.ipv4.is_positive() {
+            return false;
+        }
+
+        if self.ipv6.is_finished() {
+            return true;
+        }
+
+        self.resolution_delay_deadline
+            .is_some_and(|deadline| now >= deadline)
+    }
+
+    fn next_attempt_deadline(&self) -> Option<Instant> {
+        if self.attempted.is_empty() || self.pending.is_empty() {
+            return None;
+        }
+        self.last_attempt_started_at
+            .map(|started_at| started_at + bounded_connection_attempt_delay())
+    }
+
+    fn open_resolution_gate(&mut self) {
+        self.resolution_delay_deadline = None;
+    }
+
+    fn record_attempt_failure(&mut self, addr: SocketAddr, error: io::Error) {
+        self.attempt_failures.push(format!("{addr}: {error}"));
+    }
+
+    fn mark_resolution_stream_closed(&mut self) {
+        if matches!(self.ipv6, FamilyResolution::Pending) {
+            self.ipv6 = FamilyResolution::Failed(
+                "resolver stream closed before IPv6 result was delivered".to_string(),
+            );
+        }
+        if matches!(self.ipv4, FamilyResolution::Pending) {
+            self.ipv4 = FamilyResolution::Failed(
+                "resolver stream closed before IPv4 result was delivered".to_string(),
+            );
+        }
+    }
+
+    fn resolution_complete(&self) -> bool {
+        self.ipv6.is_finished() && self.ipv4.is_finished()
+    }
+
+    fn is_terminal(&self, attempts: &FuturesUnordered<AttemptFuture>) -> bool {
+        attempts.is_empty() && self.pending.is_empty() && self.resolution_complete()
+    }
+
+    fn into_connect_error(self) -> io::Error {
+        let mut diagnostics = Vec::new();
+        if let Some(message) = self.ipv6.failure_message(AddressFamilyKind::Ipv6) {
+            diagnostics.push(message);
+        }
+        if let Some(message) = self.ipv4.failure_message(AddressFamilyKind::Ipv4) {
+            diagnostics.push(message);
+        }
+        diagnostics.extend(self.attempt_failures);
+
         io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "address family had no usable socket addresses",
+            io::ErrorKind::Other,
+            format!(
+                "RFC 8305 connection setup failed: {}",
+                diagnostics.join("; ")
+            ),
         )
-    }))
+    }
+}
+
+async fn connect_attempt(addr: SocketAddr) -> AttemptOutcome {
+    AttemptOutcome {
+        addr,
+        result: connect_with_timeout(addr).await,
+    }
 }
 
 async fn connect_with_timeout(addr: SocketAddr) -> io::Result<TcpStream> {
@@ -379,11 +684,179 @@ async fn connect_with_timeout(addr: SocketAddr) -> io::Result<TcpStream> {
     }
 }
 
-fn combine_connect_errors(primary: io::Error, fallback: io::Error) -> io::Error {
-    io::Error::new(
-        primary.kind(),
-        format!("IPv6 and IPv4 connect attempts failed: {primary}; fallback: {fallback}"),
-    )
+fn start_resolution(host: &str, port: u16) -> Option<UnboundedReceiver<ResolutionEvent>> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        let (sender, receiver) = unbounded();
+        let family = if ip.is_ipv6() {
+            AddressFamilyKind::Ipv6
+        } else {
+            AddressFamilyKind::Ipv4
+        };
+        let addr = SocketAddr::new(ip, port);
+        sender
+            .unbounded_send(ResolutionEvent {
+                kind: ResolutionEventKind::Family {
+                    family,
+                    result: ResolutionResult::Addresses(vec![addr]),
+                },
+            })
+            .expect("literal IP resolution event receiver should be alive");
+        sender
+            .unbounded_send(ResolutionEvent {
+                kind: ResolutionEventKind::Family {
+                    family: if family == AddressFamilyKind::Ipv6 {
+                        AddressFamilyKind::Ipv4
+                    } else {
+                        AddressFamilyKind::Ipv6
+                    },
+                    result: ResolutionResult::Empty,
+                },
+            })
+            .expect("literal IP opposite-family resolution event receiver should be alive");
+        sender
+            .unbounded_send(ResolutionEvent {
+                kind: ResolutionEventKind::SortedSnapshot(ResolutionResult::Addresses(vec![addr])),
+            })
+            .expect("literal IP sorted resolution event receiver should be alive");
+        drop(sender);
+        return Some(receiver);
+    }
+
+    let (sender, receiver) = unbounded();
+    for query in [
+        ResolveQuery::Family(AddressFamilyKind::Ipv6),
+        ResolveQuery::Family(AddressFamilyKind::Ipv4),
+        ResolveQuery::SortedSnapshot,
+    ] {
+        spawn_blocking_resolution(host.to_string(), port, query, sender.clone());
+    }
+    drop(sender);
+    Some(receiver)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResolveQuery {
+    Family(AddressFamilyKind),
+    SortedSnapshot,
+}
+
+fn spawn_blocking_resolution(
+    host: String,
+    port: u16,
+    query: ResolveQuery,
+    sender: futures_channel::mpsc::UnboundedSender<ResolutionEvent>,
+) {
+    thread::spawn(move || {
+        let result = match query {
+            ResolveQuery::Family(family) => resolve_family_blocking(&host, port, Some(family)),
+            ResolveQuery::SortedSnapshot => resolve_family_blocking(&host, port, None),
+        };
+        let kind = match query {
+            ResolveQuery::Family(family) => ResolutionEventKind::Family { family, result },
+            ResolveQuery::SortedSnapshot => ResolutionEventKind::SortedSnapshot(result),
+        };
+        let _ = sender.unbounded_send(ResolutionEvent { kind });
+    });
+}
+
+fn resolve_family_blocking(
+    host: &str,
+    port: u16,
+    family: Option<AddressFamilyKind>,
+) -> ResolutionResult {
+    let service = port.to_string();
+    let hints = AddrInfoHints {
+        address: family.map_or(0, |family| match family {
+            AddressFamilyKind::Ipv6 => AddrFamily::Inet6.into(),
+            AddressFamilyKind::Ipv4 => AddrFamily::Inet.into(),
+        }),
+        socktype: SockType::Stream.into(),
+        ..AddrInfoHints::default()
+    };
+
+    match getaddrinfo(Some(host), Some(service.as_str()), Some(hints)) {
+        Ok(iter) => match iter.collect::<io::Result<Vec<_>>>() {
+            Ok(entries) => {
+                let addrs =
+                    dedup_socket_addrs(entries.into_iter().map(|entry| entry.sockaddr).collect());
+                if addrs.is_empty() {
+                    ResolutionResult::Empty
+                } else {
+                    ResolutionResult::Addresses(addrs)
+                }
+            }
+            Err(error) => ResolutionResult::Failed(error.to_string()),
+        },
+        Err(error) => ResolutionResult::Failed(format!("{error:?}")),
+    }
+}
+
+fn dedup_socket_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::with_capacity(addrs.len());
+    for addr in addrs {
+        if seen.insert(addr) {
+            deduped.push(addr);
+        }
+    }
+    deduped
+}
+
+fn interleave_address_families(
+    primary: &[SocketAddr],
+    secondary: &[SocketAddr],
+    first_family_count: usize,
+) -> Vec<SocketAddr> {
+    assert!(
+        first_family_count > 0,
+        "first address family count must be greater than zero",
+    );
+
+    let mut ordered = Vec::with_capacity(primary.len() + secondary.len());
+    let mut primary_index = 0;
+    let mut secondary_index = 0;
+
+    while primary_index < primary.len() || secondary_index < secondary.len() {
+        for _ in 0..first_family_count {
+            if let Some(addr) = primary.get(primary_index) {
+                ordered.push(*addr);
+                primary_index += 1;
+            }
+        }
+
+        if let Some(addr) = secondary.get(secondary_index) {
+            ordered.push(*addr);
+            secondary_index += 1;
+        }
+
+        if primary_index >= primary.len() && secondary_index < secondary.len() {
+            ordered.extend_from_slice(&secondary[secondary_index..]);
+            break;
+        }
+        if secondary_index >= secondary.len() && primary_index < primary.len() {
+            ordered.extend_from_slice(&primary[primary_index..]);
+            break;
+        }
+    }
+
+    ordered
+}
+
+fn bounded_connection_attempt_delay() -> Duration {
+    CONNECTION_ATTEMPT_DELAY
+        .max(MIN_CONNECTION_ATTEMPT_DELAY)
+        .min(MAX_CONNECTION_ATTEMPT_DELAY)
+}
+
+fn timer_at(deadline: Option<Instant>) -> impl Future<Output = ()> {
+    async move {
+        match deadline {
+            Some(deadline) => {
+                Timer::at(deadline).await;
+            }
+            None => pending::<()>().await,
+        }
+    }
 }
 
 /// Connect using rustls with system certificates.
@@ -525,31 +998,95 @@ impl hyper::rt::Write for MaybeTlsStream {
 
 #[cfg(test)]
 mod tests {
-    use super::partition_socket_addrs;
-    use std::net::SocketAddr;
+    use super::{
+        AddressFamilyKind, HappyEyeballsState, ResolutionEvent, ResolutionEventKind,
+        ResolutionResult, interleave_address_families,
+    };
+    use std::{net::SocketAddr, time::Instant};
 
     #[test]
-    fn partitions_socket_addrs_by_family_preserving_order() {
-        let addrs = vec![
-            "2001:db8::1:443".parse::<SocketAddr>().expect("valid IPv6"),
+    fn interleaves_addresses_with_first_family_count() {
+        let ipv6 = vec![
+            "[2001:db8::1]:443"
+                .parse::<SocketAddr>()
+                .expect("valid IPv6"),
+            "[2001:db8::2]:443"
+                .parse::<SocketAddr>()
+                .expect("valid IPv6"),
+        ];
+        let ipv4 = vec![
             "203.0.113.10:443"
                 .parse::<SocketAddr>()
                 .expect("valid IPv4"),
-            "2001:db8::2:443".parse::<SocketAddr>().expect("valid IPv6"),
+            "203.0.113.11:443"
+                .parse::<SocketAddr>()
+                .expect("valid IPv4"),
         ];
-
-        let (ipv6, ipv4) = partition_socket_addrs(&addrs);
-
         assert_eq!(
-            ipv6,
+            interleave_address_families(&ipv6, &ipv4, 1),
             vec![
-                "2001:db8::1:443".parse().expect("valid IPv6"),
-                "2001:db8::2:443".parse().expect("valid IPv6")
+                "[2001:db8::1]:443".parse().expect("valid IPv6"),
+                "203.0.113.10:443".parse().expect("valid IPv4"),
+                "[2001:db8::2]:443".parse().expect("valid IPv6"),
+                "203.0.113.11:443".parse().expect("valid IPv4"),
             ]
         );
+    }
+
+    #[test]
+    fn promotes_ipv6_when_aaaa_arrives_during_resolution_delay() {
+        let mut state = HappyEyeballsState::new();
+        state.apply_resolution(ResolutionEvent {
+            kind: ResolutionEventKind::Family {
+                family: AddressFamilyKind::Ipv4,
+                result: ResolutionResult::Addresses(vec![
+                    "203.0.113.10:443"
+                        .parse::<SocketAddr>()
+                        .expect("valid IPv4"),
+                ]),
+            },
+        });
+        state.apply_resolution(ResolutionEvent {
+            kind: ResolutionEventKind::Family {
+                family: AddressFamilyKind::Ipv6,
+                result: ResolutionResult::Addresses(vec![
+                    "[2001:db8::1]:443"
+                        .parse::<SocketAddr>()
+                        .expect("valid IPv6"),
+                ]),
+            },
+        });
+
+        let ordered = state.ordered_candidates();
+        assert_eq!(state.first_positive_family, Some(AddressFamilyKind::Ipv6));
         assert_eq!(
-            ipv4,
-            vec!["203.0.113.10:443".parse().expect("valid IPv4")]
+            ordered.first().copied(),
+            Some("[2001:db8::1]:443".parse().expect("valid IPv6"))
+        );
+    }
+
+    #[test]
+    fn holds_ipv4_until_resolution_delay_expires_when_aaaa_is_still_pending() {
+        let mut state = HappyEyeballsState::new();
+        state.apply_resolution(ResolutionEvent {
+            kind: ResolutionEventKind::Family {
+                family: AddressFamilyKind::Ipv4,
+                result: ResolutionResult::Addresses(vec![
+                    "203.0.113.10:443"
+                        .parse::<SocketAddr>()
+                        .expect("valid IPv4"),
+                ]),
+            },
+        });
+
+        assert_eq!(state.first_positive_family, Some(AddressFamilyKind::Ipv4));
+        assert!(
+            state.resolution_delay_deadline.is_some(),
+            "A responses must wait for the resolution delay while AAAA remains pending",
+        );
+        assert!(
+            !state.initial_attempt_gate_open(Instant::now()),
+            "IPv4 must not start immediately while AAAA is still pending",
         );
     }
 }
