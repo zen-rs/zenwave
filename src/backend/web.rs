@@ -6,7 +6,6 @@ use core::{
     task::{Context, Poll},
 };
 
-use http::Method;
 use http_kit::{
     BodyError, Endpoint, HttpError, StatusCode,
     utils::{Stream, StreamExt},
@@ -84,10 +83,10 @@ impl From<WebError> for crate::Error {
                         .unwrap_or("Unknown error")
                         .to_string()
                 }),
-                response: HttpErrorResponse {
+                response: Box::new(HttpErrorResponse {
                     response: raw_response,
                     body_text: body,
-                },
+                }),
             },
         }
     }
@@ -167,14 +166,12 @@ fn fetch(
 ) -> impl Future<Output = Result<http_kit::Response, WebError>> + Send {
     SingleThreaded(async move {
         let request_init = web_sys::RequestInit::new();
-        let method = request.method().clone();
-        request_init.set_method(method.as_str());
+        request_init.set_method(request.method().as_str());
         let headers = web_sys::Headers::new().unwrap();
         let body = std::mem::replace(request.body_mut(), http_kit::Body::empty());
         let has_body = body.is_empty().map(|empty| !empty).unwrap_or(true);
 
-        let allow_body = !matches!(method, Method::GET | Method::HEAD);
-        if has_body && allow_body {
+        if has_body {
             let body_stream = body.map(|result| {
                 result
                     .map(|chunk| {

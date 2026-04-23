@@ -7,9 +7,6 @@ use core::{
     pin::Pin,
     task::{Context, Poll},
 };
-use http::HeaderMap;
-use http::Version;
-use http_kit::utils::Bytes;
 use http_kit::{Endpoint, Request, Response};
 
 use crate::client::Client;
@@ -22,9 +19,10 @@ use crate::client::Client;
 ///
 /// # Warning
 ///
-/// This middleware buffers the request body in memory so it can be replayed on retries.
-/// For large streaming bodies, this can be expensive or undesirable; consider disabling
-/// retries or ensuring requests are small/replayable when using this middleware.
+/// This middleware retries requests by calling the inner client's `respond` method multiple times.
+/// If the request body is a stream that is consumed by the inner client (e.g., during a partial upload),
+/// subsequent retries may send an empty or incomplete body. This is safe for requests with empty bodies
+/// (like GET) or buffered bodies that can be replayed.
 #[derive(Debug, Clone)]
 pub struct Retry<C: Client> {
     client: C,
@@ -77,32 +75,21 @@ impl<C: Client> Retry<C> {
     }
 }
 
-impl<C> Client for Retry<C>
-where
-    C: Client,
-    C::Error: Into<crate::Error>,
-{
-}
+impl<C: Client> Client for Retry<C> {}
 
-impl<C> Endpoint for Retry<C>
-where
-    C: Client,
-    C::Error: Into<crate::Error>,
-{
-    type Error = crate::Error;
+impl<C: Client> Endpoint for Retry<C> {
+    type Error = C::Error;
 
     #[allow(clippy::cast_possible_truncation)]
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-        let snapshot = RequestSnapshot::from_request(request).await?;
         let mut attempts = 0;
         loop {
-            *request = snapshot.build_request()?;
             match self.client.respond(request).await {
                 Ok(response) => return Ok(response),
                 Err(err) => {
                     attempts += 1;
                     if attempts > self.max_retries {
-                        return Err(err.into());
+                        return Err(err);
                     }
 
                     // Simple exponential backoff
@@ -114,58 +101,11 @@ where
 
                     #[cfg(target_arch = "wasm32")]
                     SingleThreaded(gloo_timers::future::TimeoutFuture::new(
-                        delay.as_millis().try_into().unwrap_or(u32::MAX)
+                        delay.as_millis() as u32
                     ))
                     .await;
                 }
             }
         }
-    }
-}
-
-#[derive(Clone)]
-struct RequestSnapshot {
-    method: http::Method,
-    uri: http::Uri,
-    version: Version,
-    headers: HeaderMap,
-    extensions: http::Extensions,
-    body: Bytes,
-}
-
-impl RequestSnapshot {
-    async fn from_request(request: &mut Request) -> Result<Self, crate::Error> {
-        let method = request.method().clone();
-        let uri = request.uri().clone();
-        let version = request.version();
-        let headers = request.headers().clone();
-        let extensions = request.extensions().clone();
-        let body = request
-            .body_mut()
-            .take()
-            .map_err(|_| crate::Error::InvalidRequest("request body already consumed".to_string()))?
-            .into_bytes()
-            .await?;
-
-        Ok(Self {
-            method,
-            uri,
-            version,
-            headers,
-            extensions,
-            body,
-        })
-    }
-
-    fn build_request(&self) -> Result<Request, crate::Error> {
-        let mut request = http::Request::builder()
-            .method(self.method.clone())
-            .uri(self.uri.clone())
-            .version(self.version)
-            .body(http_kit::Body::from(self.body.clone()))
-            .map_err(|err| crate::Error::InvalidRequest(err.to_string()))?;
-        *request.headers_mut() = self.headers.clone();
-        *request.extensions_mut() = self.extensions.clone();
-        Ok(request)
     }
 }

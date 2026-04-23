@@ -5,7 +5,6 @@ use std::{
 
 use async_fs::OpenOptions;
 use futures_util::StreamExt;
-use http::HeaderValue;
 use http_kit::{
     BodyError, HttpError, StatusCode, header,
     utils::{AsyncSeekExt, AsyncWriteExt},
@@ -15,11 +14,11 @@ use super::RequestBuilder;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DownloadError<E: HttpError> {
+    #[error("request build error: {0}")]
+    Build(#[source] Box<crate::Error>),
+
     #[error("request error: {0}")]
     Remote(#[source] E),
-
-    #[error("invalid request: {0}")]
-    Request(String),
 
     #[error("failed to read response body: {0}")]
     Body(#[source] BodyError),
@@ -34,8 +33,8 @@ pub enum DownloadError<E: HttpError> {
 impl<E: HttpError> HttpError for DownloadError<E> {
     fn status(&self) -> StatusCode {
         match self {
+            Self::Build(err) => err.status(),
             Self::Remote(err) => err.status(),
-            Self::Request(_) => StatusCode::BAD_REQUEST,
             Self::Body(_) => StatusCode::BAD_GATEWAY,
             Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Upstream(status) => *status,
@@ -52,8 +51,8 @@ where
         use crate::error::DownloadErrorKind;
 
         match err {
+            DownloadError::Build(e) => *e,
             DownloadError::Remote(e) => e.into(),
-            DownloadError::Request(msg) => Self::InvalidRequest(msg),
             DownloadError::Body(e) => Self::Download(DownloadErrorKind::BodyRead(e.to_string())),
             DownloadError::Io(e) => Self::Download(DownloadErrorKind::FileSystem(e)),
             DownloadError::Upstream(status) => {
@@ -118,12 +117,11 @@ pub async fn download_to_path<T: crate::Client>(
         let value = format!("bytes={existing_len}-");
         builder = builder
             .header(header::RANGE.as_str(), value)
-            .map_err(|err| DownloadError::Request(err.to_string()))?;
+            .map_err(|error| DownloadError::Build(Box::new(error)))?;
     }
 
     let response = builder.await.map_err(DownloadError::Remote)?;
     let status = response.status();
-    let headers = response.headers().clone();
     let mut body = response.into_body();
 
     if !(status.is_success() || status == StatusCode::PARTIAL_CONTENT) {
@@ -132,31 +130,18 @@ pub async fn download_to_path<T: crate::Client>(
 
     let mut resumed_from = 0_u64;
     let mut file = if existing_len > 0 && status == StatusCode::PARTIAL_CONTENT {
-        let content_range_start = headers
-            .get(header::CONTENT_RANGE)
-            .and_then(parse_content_range_start);
-        if content_range_start == Some(existing_len) {
-            resumed_from = existing_len;
-            let mut file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&path_buf)
-                .await
-                .map_err(DownloadError::Io)?;
-            file.seek(SeekFrom::Start(existing_len))
-                .await
-                .map_err(DownloadError::Io)?;
-            file
-        } else {
-            OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&path_buf)
-                .await
-                .map_err(DownloadError::Io)?
-        }
+        resumed_from = existing_len;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path_buf)
+            .await
+            .map_err(DownloadError::Io)?;
+        file.seek(SeekFrom::Start(existing_len))
+            .await
+            .map_err(DownloadError::Io)?;
+        file
     } else {
         OpenOptions::new()
             .create(true)
@@ -180,16 +165,4 @@ pub async fn download_to_path<T: crate::Client>(
         resumed_from,
         bytes_written,
     })
-}
-
-fn parse_content_range_start(value: &HeaderValue) -> Option<u64> {
-    let text = value.to_str().ok()?;
-    let mut parts = text.split_whitespace();
-    let unit = parts.next()?;
-    if unit != "bytes" {
-        return None;
-    }
-    let range = parts.next()?;
-    let (start, _) = range.split_once('-')?;
-    start.parse::<u64>().ok()
 }

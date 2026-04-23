@@ -12,7 +12,6 @@ use http_kit::{
 use serde::Deserialize;
 use url::form_urlencoded::Serializer;
 
-use crate::auth::auth_header_suppressed;
 use crate::{Client, DefaultBackend, client};
 
 type TokenError = OAuth2Error<<DefaultBackend as Endpoint>::Error>;
@@ -36,10 +35,6 @@ pub enum OAuth2Error<H: HttpError> {
     /// The token response body could not be parsed.
     #[error("invalid token response: {0}")]
     InvalidResponse(BodyError),
-
-    /// Failed to build the Authorization header from the fetched token.
-    #[error("invalid bearer token header")]
-    InvalidHeader,
 }
 
 impl<H: HttpError> HttpError for OAuth2Error<H> {
@@ -48,7 +43,6 @@ impl<H: HttpError> HttpError for OAuth2Error<H> {
             Self::Transport(err) => err.status(),
             Self::Upstream { status, .. } => *status,
             Self::InvalidResponse(_) => StatusCode::BAD_GATEWAY,
-            Self::InvalidHeader => StatusCode::BAD_REQUEST,
         }
     }
 }
@@ -75,9 +69,6 @@ where
             OAuth2Error::InvalidResponse(e) => {
                 Self::OAuth2(OAuth2ErrorKind::InvalidTokenResponse(e.to_string()))
             }
-            OAuth2Error::InvalidHeader => Self::OAuth2(OAuth2ErrorKind::InvalidTokenResponse(
-                "invalid bearer token header".to_string(),
-            )),
         }
     }
 }
@@ -175,6 +166,7 @@ impl OAuth2ClientCredentials {
         let fetched = self.fetch_token().await?;
         let token_value = fetched.access_token.clone();
         *token_guard = Some(fetched);
+        drop(token_guard);
         Ok(token_value)
     }
 
@@ -182,11 +174,13 @@ impl OAuth2ClientCredentials {
         let body = self.build_body();
         let mut client = client();
         let response = client
-            .post(&self.config.token_url)?
+            .post(&self.config.token_url)
+            .map_err(OAuth2Error::Transport)?
             .header(
                 header::CONTENT_TYPE.as_str(),
                 "application/x-www-form-urlencoded",
-            )?
+            )
+            .map_err(OAuth2Error::Transport)?
             .bytes_body(body.into_bytes())
             .await?;
 
@@ -243,9 +237,7 @@ impl Middleware for OAuth2ClientCredentials {
         request: &mut Request,
         mut next: E,
     ) -> Result<Response, http_kit::middleware::MiddlewareError<E::Error, Self::Error>> {
-        if !request.headers().contains_key(header::AUTHORIZATION)
-            && !auth_header_suppressed(request)
-        {
+        if !request.headers().contains_key(header::AUTHORIZATION) {
             let token = self
                 .ensure_token()
                 .await
@@ -255,7 +247,7 @@ impl Middleware for OAuth2ClientCredentials {
                 header::AUTHORIZATION,
                 header_value
                     .parse()
-                    .map_err(|_| MiddlewareError::Middleware(OAuth2Error::InvalidHeader))?,
+                    .expect("Fail to create a bearer header"),
             );
         }
 
@@ -279,10 +271,10 @@ mod tests {
     use super::*;
     use async_lock::Mutex;
     use async_net::{TcpListener, TcpStream};
-    use async_std::task::{self, JoinHandle};
     use http::{Request as HttpRequest, Response as HttpResponse};
     use http_kit::utils::{AsyncReadExt, AsyncWriteExt};
     use http_kit::{Body, Method};
+    use smol::Task;
     use std::convert::Infallible;
     use std::sync::{
         Arc,
@@ -292,7 +284,7 @@ mod tests {
     #[test]
     fn acquires_token_and_attaches_header() {
         let (url, handle, hits) =
-            match async_io::block_on(async { spawn_token_server(vec!["token-one"]).await }) {
+            match smol::block_on(async { spawn_token_server(vec!["token-one"]).await }) {
                 Ok(values) => values,
                 Err(err) => {
                     eprintln!("skipping oauth2 token test: {err}");
@@ -307,7 +299,7 @@ mod tests {
             .unwrap();
         let mut endpoint = RecordingEndpoint::default();
 
-        async_io::block_on(async {
+        smol::block_on(async {
             middleware
                 .handle(&mut request, &mut endpoint)
                 .await
@@ -367,7 +359,7 @@ mod tests {
 
     async fn spawn_token_server(
         tokens: Vec<&'static str>,
-    ) -> std::io::Result<(String, JoinHandle<()>, Arc<AtomicUsize>)> {
+    ) -> std::io::Result<(String, Task<()>, Arc<AtomicUsize>)> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
@@ -379,16 +371,17 @@ mod tests {
                 .collect::<Vec<_>>(),
         ));
 
-        let server = task::spawn(async move {
+        let server = smol::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else {
                     break;
                 };
                 let tokens = tokens.clone();
                 let hit_counter = hit_counter.clone();
-                task::spawn(async move {
+                smol::spawn(async move {
                     handle_token_request(socket, tokens, hit_counter).await;
-                });
+                })
+                .detach();
             }
         });
 

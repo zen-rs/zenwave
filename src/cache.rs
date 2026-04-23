@@ -5,10 +5,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use http::{
-    HeaderMap, HeaderValue, Method, Response as HttpResponse, StatusCode,
-    header::{self, HeaderName},
-};
+use http::{HeaderMap, HeaderValue, Method, Response as HttpResponse, StatusCode, header};
 use httpdate::parse_http_date;
 
 use http_kit::utils::Bytes;
@@ -65,29 +62,24 @@ impl Middleware for Cache {
         }
 
         let now = Instant::now();
-        if let Some(entry) = self.entries.get(&key) {
-            if !entry.vary_matches(request.headers()) {
-                self.entries.remove(&key);
-            } else if !request_cc.no_cache && !entry.must_revalidate && entry.is_fresh(now) {
-                return Ok(entry.to_response(now));
-            }
+        if let Some(entry) = self.entries.get(&key)
+            && !request_cc.no_cache
+            && !entry.must_revalidate
+            && entry.is_fresh(now)
+        {
+            return Ok(entry.to_response(now));
         }
 
         let mut cached_entry = None;
         if let Some(entry) = self.entries.get(&key) {
-            if !entry.vary_matches(request.headers()) {
+            let entry_requires_revalidation = entry.must_revalidate || !entry.is_fresh(now);
+            let needs_revalidation = request_cc.no_cache || entry_requires_revalidation;
+            if needs_revalidation && entry.can_revalidate() {
+                let owned_entry = self.entries.remove(&key).unwrap();
+                owned_entry.apply_conditional_headers(request.headers_mut());
+                cached_entry = Some(owned_entry);
+            } else if entry_requires_revalidation && !entry.can_revalidate() {
                 self.entries.remove(&key);
-                cached_entry = None;
-            } else {
-                let entry_requires_revalidation = entry.must_revalidate || !entry.is_fresh(now);
-                let needs_revalidation = request_cc.no_cache || entry_requires_revalidation;
-                if needs_revalidation && entry.can_revalidate() {
-                    let owned_entry = self.entries.remove(&key).unwrap();
-                    owned_entry.apply_conditional_headers(request.headers_mut());
-                    cached_entry = Some(owned_entry);
-                } else if entry_requires_revalidation && !entry.can_revalidate() {
-                    self.entries.remove(&key);
-                }
             }
         }
 
@@ -97,7 +89,7 @@ impl Middleware for Cache {
             .map_err(MiddlewareError::Endpoint)?;
         if response.status() == StatusCode::NOT_MODIFIED {
             if let Some(mut entry) = cached_entry {
-                entry.update_from_304(&response, now, request.headers());
+                entry.update_from_304(&response, now);
                 let response = entry.to_response(now);
                 self.entries.insert(key, entry);
                 return Ok(response);
@@ -112,15 +104,10 @@ impl Middleware for Cache {
         let allow_shared = !auth_present || response_cc.public;
 
         if allow_shared && !response_cc.no_store {
-            let (response, entry) = CachedResponse::from_response(
-                response,
-                response_cc,
-                now,
-                request_cc.no_cache,
-                request.headers(),
-            )
-            .await
-            .map_err(MiddlewareError::Middleware)?;
+            let (response, entry) =
+                CachedResponse::from_response(response, response_cc, now, request_cc.no_cache)
+                    .await
+                    .map_err(MiddlewareError::Middleware)?;
             if let Some(entry) = entry {
                 let result = entry.to_response(now);
                 self.entries.insert(key, entry);
@@ -143,8 +130,6 @@ struct CachedResponse {
     must_revalidate: bool,
     etag: Option<HeaderValue>,
     last_modified: Option<HeaderValue>,
-    vary: Vec<HeaderName>,
-    vary_values: HashMap<HeaderName, Vec<HeaderValue>>,
 }
 
 /// Errors that can occur while caching HTTP responses.
@@ -178,7 +163,6 @@ impl CachedResponse {
         directives: CacheControl,
         now: Instant,
         request_no_cache: bool,
-        request_headers: &HeaderMap,
     ) -> Result<(Response, Option<Self>), CacheError> {
         let (mut parts, body) = response.into_parts();
         let etag = parts.headers.get(header::ETAG).cloned();
@@ -201,13 +185,6 @@ impl CachedResponse {
             return Ok((response, None));
         }
 
-        let vary = parse_vary(&parts.headers);
-        if vary.vary_any {
-            let response = HttpResponse::from_parts(parts, body);
-            return Ok((response, None));
-        }
-        let vary_values = capture_vary_values(request_headers, &vary.headers);
-
         let bytes = body.into_bytes().await?;
         parts.headers.remove(header::AGE);
         let response = HttpResponse::from_parts(parts, http_kit::Body::from(bytes.clone()));
@@ -223,8 +200,6 @@ impl CachedResponse {
                 must_revalidate,
                 etag,
                 last_modified,
-                vary: vary.headers,
-                vary_values,
             }),
         ))
     }
@@ -247,7 +222,7 @@ impl CachedResponse {
         }
     }
 
-    fn update_from_304(&mut self, response: &Response, now: Instant, request_headers: &HeaderMap) {
+    fn update_from_304(&mut self, response: &Response, now: Instant) {
         self.stored_at = now;
         for name in &[
             header::CACHE_CONTROL,
@@ -272,12 +247,6 @@ impl CachedResponse {
         {
             self.freshness = Some(duration);
         }
-
-        let vary = parse_vary(response.headers());
-        if !vary.headers.is_empty() && !vary.vary_any {
-            self.vary = vary.headers;
-            self.vary_values = capture_vary_values(request_headers, &self.vary);
-        }
     }
 
     fn to_response(&self, now: Instant) -> Response {
@@ -295,30 +264,6 @@ impl CachedResponse {
         builder
             .body(http_kit::Body::from(self.body.clone()))
             .expect("failed to build cached response")
-    }
-
-    fn vary_matches(&self, request_headers: &HeaderMap) -> bool {
-        if self.vary.is_empty() {
-            return true;
-        }
-
-        for name in &self.vary {
-            let stored = self
-                .vary_values
-                .get(name)
-                .map(|values| values.as_slice())
-                .unwrap_or(&[]);
-            let current = request_headers
-                .get_all(name)
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>();
-            if stored != current {
-                return false;
-            }
-        }
-
-        true
     }
 }
 
@@ -432,47 +377,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn respects_vary_header() {
-        async_io::block_on(async {
-            let backend = VaryEndpoint::default();
-            let mut cache = Cache::new();
-
-            let mut request = HttpRequest::builder()
-                .method(Method::GET)
-                .uri("http://example.com/data")
-                .header("Accept-Encoding", "gzip")
-                .body(Body::empty())
-                .unwrap();
-            let mut endpoint = backend.clone();
-            let response = cache.handle(&mut request, &mut endpoint).await.unwrap();
-            assert_eq!(body_text(response).await, "gzip");
-            assert_eq!(backend.calls(), 1);
-
-            let mut request = HttpRequest::builder()
-                .method(Method::GET)
-                .uri("http://example.com/data")
-                .header("Accept-Encoding", "br")
-                .body(Body::empty())
-                .unwrap();
-            let mut endpoint = backend.clone();
-            let response = cache.handle(&mut request, &mut endpoint).await.unwrap();
-            assert_eq!(body_text(response).await, "br");
-            assert_eq!(backend.calls(), 2);
-
-            let mut request = HttpRequest::builder()
-                .method(Method::GET)
-                .uri("http://example.com/data")
-                .header("Accept-Encoding", "gzip")
-                .body(Body::empty())
-                .unwrap();
-            let mut endpoint = backend.clone();
-            let response = cache.handle(&mut request, &mut endpoint).await.unwrap();
-            assert_eq!(body_text(response).await, "gzip");
-            assert_eq!(backend.calls(), 3);
-        });
-    }
-
     fn new_request() -> Request {
         HttpRequest::builder()
             .method(Method::GET)
@@ -567,87 +471,6 @@ mod tests {
                 .unwrap())
         }
     }
-
-    #[derive(Clone, Default)]
-    struct VaryEndpoint {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl VaryEndpoint {
-        fn calls(&self) -> usize {
-            self.calls.load(Ordering::SeqCst)
-        }
-    }
-
-    impl Endpoint for VaryEndpoint {
-        type Error = Infallible;
-        async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let body = request
-                .headers()
-                .get(header::ACCEPT_ENCODING)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("identity")
-                .to_string();
-            Ok(HttpResponse::builder()
-                .status(StatusCode::OK)
-                .header(header::CACHE_CONTROL, "max-age=60")
-                .header(header::VARY, "Accept-Encoding")
-                .body(Body::from(body))
-                .unwrap())
-        }
-    }
-}
-
-struct VaryInfo {
-    headers: Vec<HeaderName>,
-    vary_any: bool,
-}
-
-fn parse_vary(headers: &HeaderMap) -> VaryInfo {
-    let mut vary_headers = Vec::new();
-    let mut vary_any = false;
-
-    for value in headers.get_all(header::VARY) {
-        if let Ok(text) = value.to_str() {
-            for part in text.split(',') {
-                let name = part.trim();
-                if name.is_empty() {
-                    continue;
-                }
-                if name == "*" {
-                    vary_any = true;
-                    continue;
-                }
-                if let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) {
-                    if !vary_headers.contains(&header_name) {
-                        vary_headers.push(header_name);
-                    }
-                }
-            }
-        }
-    }
-
-    VaryInfo {
-        headers: vary_headers,
-        vary_any,
-    }
-}
-
-fn capture_vary_values(
-    request_headers: &HeaderMap,
-    vary: &[HeaderName],
-) -> HashMap<HeaderName, Vec<HeaderValue>> {
-    let mut values = HashMap::new();
-    for name in vary {
-        let captured = request_headers
-            .get_all(name)
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        values.insert(name.clone(), captured);
-    }
-    values
 }
 
 fn expires_in(headers: &HeaderMap) -> Option<Duration> {

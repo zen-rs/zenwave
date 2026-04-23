@@ -6,7 +6,6 @@ use std::{
 };
 
 use async_net::TcpListener;
-use async_std::future::timeout;
 use async_tungstenite::{
     accept_async,
     tungstenite::{
@@ -21,6 +20,7 @@ use futures_util::{
     StreamExt,
     io::{AsyncRead, AsyncWrite},
 };
+use smol::{Timer, future::or, spawn};
 use zenwave::websocket::{WebSocketConfig, WebSocketError};
 
 fn public_echo_servers() -> Vec<String> {
@@ -35,7 +35,7 @@ fn public_echo_servers() -> Vec<String> {
     ]
 }
 
-#[async_std::test]
+#[test_executors::async_test]
 async fn websocket_echo_roundtrip() {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,
@@ -46,7 +46,7 @@ async fn websocket_echo_roundtrip() {
     };
     let addr = listener.local_addr().unwrap();
 
-    let server = async_std::task::spawn(async move {
+    let server = spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = accept_async(stream).await.unwrap();
         if let Some(Ok(message)) = ws.next().await {
@@ -66,7 +66,7 @@ async fn websocket_echo_roundtrip() {
     server.await;
 }
 
-#[async_std::test]
+#[test_executors::async_test]
 async fn websocket_split_roundtrip() {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,
@@ -77,7 +77,7 @@ async fn websocket_split_roundtrip() {
     };
     let addr = listener.local_addr().unwrap();
 
-    let server = async_std::task::spawn(async move {
+    let server = spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = accept_async(stream).await.unwrap();
         if let Some(Ok(Message::Text(text))) = ws.next().await {
@@ -91,11 +91,11 @@ async fn websocket_split_roundtrip() {
         .unwrap();
     let (sender, receiver) = client.split();
 
-    let send_task = async_std::task::spawn({
+    let send_task = spawn({
         let sender = sender.clone();
         async move { sender.send_text("hello world").await.unwrap() }
     });
-    let recv_task = async_std::task::spawn(async move { receiver.recv().await.unwrap() });
+    let recv_task = spawn(async move { receiver.recv().await.unwrap() });
 
     send_task.await;
     let message = recv_task.await.unwrap();
@@ -105,7 +105,7 @@ async fn websocket_split_roundtrip() {
     server.await;
 }
 
-#[async_std::test]
+#[test_executors::async_test]
 async fn websocket_respects_max_message_size_config() {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,
@@ -116,7 +116,7 @@ async fn websocket_respects_max_message_size_config() {
     };
     let addr = listener.local_addr().unwrap();
 
-    let server = async_std::task::spawn(async move {
+    let server = spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = accept_async(stream).await.unwrap();
         let payload = vec![0u8; 2048];
@@ -138,7 +138,7 @@ async fn websocket_respects_max_message_size_config() {
     server.await;
 }
 
-#[async_std::test]
+#[test_executors::async_test]
 async fn websocket_binary_roundtrip() {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,
@@ -149,7 +149,7 @@ async fn websocket_binary_roundtrip() {
     };
     let addr = listener.local_addr().unwrap();
 
-    let server = async_std::task::spawn(async move {
+    let server = spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = accept_async(stream).await.unwrap();
         if let Some(Ok(message)) = ws.next().await {
@@ -176,7 +176,7 @@ async fn websocket_binary_roundtrip() {
     server.await;
 }
 
-#[async_std::test]
+#[test_executors::async_test]
 async fn websocket_handles_server_ping() {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,
@@ -187,7 +187,7 @@ async fn websocket_handles_server_ping() {
     };
     let addr = listener.local_addr().unwrap();
 
-    let server = async_std::task::spawn(async move {
+    let server = spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = accept_async(stream).await.unwrap();
         ws.send(Message::Ping(b"are you there?".to_vec().into()))
@@ -203,11 +203,13 @@ async fn websocket_handles_server_ping() {
         .await
         .unwrap();
 
-    let message = timeout(Duration::from_secs(5), async { client.recv().await })
-        .await
-        .expect("timeout waiting for server message")
-        .expect("websocket read failed")
-        .expect("websocket closed before payload");
+    let message = or(async { client.recv().await }, async {
+        Timer::after(Duration::from_secs(5)).await;
+        panic!("timeout waiting for server message");
+    })
+    .await
+    .expect("websocket read failed")
+    .expect("websocket closed before payload");
     assert_eq!(message.as_text(), Some("pong-after-ping"));
 
     // Server may have already closed the connection, so ignore close errors
@@ -215,7 +217,7 @@ async fn websocket_handles_server_ping() {
     server.await;
 }
 
-#[async_std::test]
+#[test_executors::async_test]
 async fn websocket_public_echo_service_roundtrip() {
     let payload = format!(
         "zenwave-public-echo-{}",
@@ -270,7 +272,7 @@ where
 
 const MB: usize = 1024 * 1024;
 
-#[async_std::test]
+#[test_executors::async_test]
 async fn websocket_accepts_64mb_message_by_default() {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,
@@ -281,7 +283,7 @@ async fn websocket_accepts_64mb_message_by_default() {
     };
     let addr = listener.local_addr().unwrap();
 
-    let server = async_std::task::spawn(async move {
+    let server = spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = accept_async(stream).await.unwrap();
         let payload = vec![0x42u8; 64 * MB];
@@ -293,18 +295,20 @@ async fn websocket_accepts_64mb_message_by_default() {
         .await
         .unwrap();
 
-    let message = timeout(Duration::from_secs(30), async { client.recv().await })
-        .await
-        .expect("timeout waiting for 64MB payload")
-        .expect("websocket read failed")
-        .expect("websocket closed before payload");
+    let message = or(async { client.recv().await }, async {
+        Timer::after(Duration::from_secs(30)).await;
+        panic!("timeout waiting for 64MB payload");
+    })
+    .await
+    .expect("websocket read failed")
+    .expect("websocket closed before payload");
     assert_eq!(message.as_bytes().map(<[u8]>::len), Some(64 * MB));
 
     client.close().await.unwrap();
     server.await;
 }
 
-#[async_std::test]
+#[test_executors::async_test]
 async fn websocket_rejects_128mb_message_by_default() {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,
@@ -315,7 +319,7 @@ async fn websocket_rejects_128mb_message_by_default() {
     };
     let addr = listener.local_addr().unwrap();
 
-    let server = async_std::task::spawn(async move {
+    let server = spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = accept_async(stream).await.unwrap();
         let payload = vec![0x24u8; 128 * MB];
@@ -327,9 +331,11 @@ async fn websocket_rejects_128mb_message_by_default() {
         .await
         .unwrap();
 
-    match timeout(Duration::from_secs(30), async { client.recv().await })
-        .await
-        .expect("timeout waiting for 128MB payload")
+    match or(async { client.recv().await }, async {
+        Timer::after(Duration::from_secs(30)).await;
+        panic!("timeout waiting for 128MB payload");
+    })
+    .await
     {
         Err(WebSocketError::ConnectionFailed(_)) => {}
         other => panic!("expected connection failure for oversized frame, got {other:?}"),
@@ -349,20 +355,25 @@ async fn attempt_public_echo(url: &str, payload: &str) -> Result<(), String> {
         .await
         .map_err(|err| format!("send error: {err}"))?;
 
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let Some(message) = client.recv().await.map_err(|err| format!("{err}"))? else {
-                return Err("connection closed before echo received".to_string());
-            };
+    or(
+        async {
+            loop {
+                let Some(message) = client.recv().await.map_err(|err| format!("{err}"))? else {
+                    return Err("connection closed before echo received".to_string());
+                };
 
-            // Some public echo services send a banner on connect; ignore until our payload arrives.
-            if message.as_text() == Some(payload) {
-                return Ok(());
+                // Some public echo services send a banner on connect; ignore until our payload arrives.
+                if message.as_text() == Some(payload) {
+                    return Ok(());
+                }
             }
-        }
-    })
-    .await
-    .map_err(|_| "timeout waiting for echo".to_string())??;
+        },
+        async {
+            Timer::after(Duration::from_secs(10)).await;
+            Err("timeout waiting for echo".to_string())
+        },
+    )
+    .await?;
 
     client
         .close()

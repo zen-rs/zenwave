@@ -11,9 +11,6 @@
 //! rich helper methods for error classification and handling.
 
 use http_kit::{BodyError, Response, StatusCode};
-
-/// Result type for zenwave operations.
-pub type Result<T> = std::result::Result<T, Error>;
 use std::error::Error as StdError;
 use thiserror::Error;
 
@@ -34,7 +31,7 @@ pub enum Error {
         message: String,
         /// Full HTTP error response details
         #[source]
-        response: HttpErrorResponse,
+        response: Box<HttpErrorResponse>,
     },
 
     /// Network transport layer error (connection failed, DNS resolution failed, etc.).
@@ -192,26 +189,31 @@ pub enum WebSocketErrorKind {
 
 impl Error {
     /// Check if this is a network transport error.
+    #[must_use]
     pub const fn is_network_error(&self) -> bool {
         matches!(self, Self::Transport(_) | Self::Tls(_))
     }
 
     /// Check if this is a timeout error.
+    #[must_use]
     pub const fn is_timeout(&self) -> bool {
         matches!(self, Self::Timeout)
     }
 
     /// Check if this is a client error (4xx HTTP status).
+    #[must_use]
     pub fn is_client_error(&self) -> bool {
         matches!(self, Self::Http { status, .. } if status.is_client_error())
     }
 
     /// Check if this is a server error (5xx HTTP status).
+    #[must_use]
     pub fn is_server_error(&self) -> bool {
         matches!(self, Self::Http { status, .. } if status.is_server_error())
     }
 
     /// Check if this is a redirect-related error.
+    #[must_use]
     pub const fn is_redirect_error(&self) -> bool {
         matches!(
             self,
@@ -220,11 +222,13 @@ impl Error {
     }
 
     /// Check if this is a request construction error.
+    #[must_use]
     pub const fn is_request_error(&self) -> bool {
         matches!(self, Self::InvalidRequest(_) | Self::InvalidUri(_))
     }
 
     /// Get the response body text (if this is an HTTP error).
+    #[must_use]
     pub fn response_body(&self) -> Option<&str> {
         match self {
             Self::Http { response, .. } => response.body_text.as_deref(),
@@ -233,6 +237,7 @@ impl Error {
     }
 
     /// Get the full HTTP response (if this is an HTTP error).
+    #[must_use]
     pub const fn response(&self) -> Option<&Response> {
         match self {
             Self::Http { response, .. } => Some(&response.response),
@@ -257,17 +262,20 @@ impl Error {
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// # let mut client = zenwave::client();
-    /// match client.get("https://api.example.com/data")?.await {
+    /// match client.get("https://api.example.com/data") {
     ///     Err(e) => {
     ///         if let Some(api_err) = e.deserialize_http_error::<ApiError>() {
     ///             println!("API error: {} - {}", api_err.code, api_err.message);
     ///         }
     ///     }
-    ///     Ok(resp) => { /* ... */ }
+    ///     Ok(builder) => {
+    ///         let _resp = builder.await?;
+    ///     }
     /// }
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn deserialize_http_error<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
         match self {
             Self::Http { response, .. } => response
@@ -281,6 +289,7 @@ impl Error {
     /// Get the error category/kind.
     ///
     /// Useful for logging and monitoring.
+    #[must_use]
     pub const fn kind(&self) -> ErrorKind {
         match self {
             Self::Http { .. } => ErrorKind::Http,

@@ -1,6 +1,6 @@
 #![allow(clippy::cast_sign_loss)]
 
-use core::{pin::Pin, time::Duration};
+use core::{fmt::Display, pin::Pin, time::Duration};
 use std::marker::PhantomData;
 use std::{fmt::Debug, future::Future};
 
@@ -30,9 +30,6 @@ use crate::{
     timeout::Timeout,
 };
 
-const DEFAULT_ACCEPT: &str = "*/*";
-const DEFAULT_USER_AGENT: &str = concat!("zenwave/", env!("CARGO_PKG_VERSION"));
-
 /// Builder for HTTP requests using a Client.
 #[derive(Debug)]
 pub struct RequestBuilder<'a, T: Client> {
@@ -56,64 +53,36 @@ impl<'a, T: Client> IntoFuture for RequestBuilder<'a, T> {
 
 // ClientError has been removed - all errors now use zenwave::Error
 
+fn invalid_uri(error: impl Display) -> crate::Error {
+    crate::Error::InvalidUri(error.to_string())
+}
+
+fn invalid_request(error: impl Display) -> crate::Error {
+    crate::Error::InvalidRequest(error.to_string())
+}
+
+fn invalid_request_with_prefix(prefix: &str, error: impl Display) -> crate::Error {
+    let error_text = error.to_string();
+    let mut message = String::with_capacity(prefix.len() + error_text.len());
+    message.push_str(prefix);
+    message.push_str(error_text.as_str());
+    crate::Error::InvalidRequest(message)
+}
+
 impl<T: Client> RequestBuilder<'_, T> {
-    #[cfg(not(target_arch = "wasm32"))]
-    fn set_content_length_if_known(&mut self, len: Option<u64>) {
-        if let Some(len) = len {
-            let has_len = self.request.headers().contains_key(header::CONTENT_LENGTH);
-            let has_te = self
-                .request
-                .headers()
-                .contains_key(header::TRANSFER_ENCODING);
-            if has_len || has_te {
-                return;
-            }
-
-            if let Ok(value) = HeaderValue::from_str(&len.to_string()) {
-                self.request
-                    .headers_mut()
-                    .insert(header::CONTENT_LENGTH, value);
-            }
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn set_content_length_if_known(&mut self, _len: Option<u64>) {}
-
-    fn set_body_with_len(&mut self, body: http_kit::Body) {
-        let len = body.len().and_then(|len| u64::try_from(len).ok());
-
-        // Set Content-Type from body's mime if not already set
-        if !self.request.headers().contains_key(header::CONTENT_TYPE) {
-            if let Some(mime) = body.mime() {
-                if let Ok(value) = HeaderValue::from_str(mime.as_ref()) {
-                    self.request
-                        .headers_mut()
-                        .insert(header::CONTENT_TYPE, value);
-                }
-            }
-        }
-
-        *self.request.body_mut() = body;
-        self.set_content_length_if_known(len);
-    }
-
-    pub fn bearer_auth(mut self, token: impl Into<String>) -> Result<Self, crate::Error> {
+    pub fn bearer_auth(mut self, token: impl Into<String>) -> Self {
         let auth_value = format!("Bearer {}", token.into());
-        let header_value = auth_value.parse().map_err(|err| {
-            crate::Error::InvalidRequest(format!("invalid bearer auth header: {err}"))
-        })?;
         self.request
             .headers_mut()
-            .insert(http_kit::header::AUTHORIZATION, header_value);
-        Ok(self)
+            .insert(http_kit::header::AUTHORIZATION, auth_value.parse().unwrap());
+        self
     }
 
     pub fn basic_auth(
         mut self,
         username: impl Into<String>,
         password: Option<impl Into<String>>,
-    ) -> Result<Self, crate::Error> {
+    ) -> Self {
         use base64::Engine;
 
         let credentials = match password {
@@ -124,27 +93,25 @@ impl<T: Client> RequestBuilder<'_, T> {
         let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
         let auth_value = format!("Basic {encoded}");
 
-        let header_value = auth_value.parse().map_err(|err| {
-            crate::Error::InvalidRequest(format!("invalid basic auth header: {err}"))
-        })?;
-
         self.request
             .headers_mut()
-            .insert(http_kit::header::AUTHORIZATION, header_value);
-        Ok(self)
+            .insert(http_kit::header::AUTHORIZATION, auth_value.parse().unwrap());
+        self
     }
 
+    /// Insert or replace a request header.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidRequest`] when the header name or value cannot be parsed.
     pub fn header(
         mut self,
-        name: impl TryInto<HeaderName, Error: Debug>,
-        value: impl TryInto<HeaderValue, Error: Debug>,
+        name: impl TryInto<HeaderName, Error: Display>,
+        value: impl TryInto<HeaderValue, Error: Display>,
     ) -> Result<Self, crate::Error> {
-        let header_name: http_kit::header::HeaderName = name
-            .try_into()
-            .map_err(|err| crate::Error::InvalidRequest(format!("invalid header name: {err:?}")))?;
-        let header_value: http_kit::header::HeaderValue = value.try_into().map_err(|err| {
-            crate::Error::InvalidRequest(format!("invalid header value: {err:?}"))
-        })?;
+        let header_name: http_kit::header::HeaderName = name.try_into().map_err(invalid_request)?;
+        let header_value: http_kit::header::HeaderValue =
+            value.try_into().map_err(invalid_request)?;
         self.request.headers_mut().insert(header_name, header_value);
         Ok(self)
     }
@@ -153,14 +120,14 @@ impl<T: Client> RequestBuilder<'_, T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the body cannot be serialized to JSON.
+    /// Returns [`crate::Error::InvalidRequest`] when the payload cannot be serialized to JSON.
     pub fn json_body<B: serde::Serialize>(mut self, body: &B) -> Result<Self, crate::Error> {
-        let json = serde_json::to_string(body).map_err(|err| {
-            crate::Error::InvalidRequest(format!("failed to serialize JSON body: {err}"))
+        let json = serde_json::to_string(body).map_err(|error| {
+            invalid_request_with_prefix("failed to serialize JSON body: ", error)
         })?;
 
-        // Set the body and add content-length when available.
-        self.set_body_with_len(http_kit::Body::from(json));
+        // Set the body directly
+        *self.request.body_mut() = http_kit::Body::from(json);
 
         // Add content-type header
         let content_type = header::CONTENT_TYPE;
@@ -171,7 +138,7 @@ impl<T: Client> RequestBuilder<'_, T> {
     }
 
     pub fn bytes_body(mut self, bytes: Vec<u8>) -> Self {
-        self.set_body_with_len(http_kit::Body::from(bytes));
+        *self.request.body_mut() = http_kit::Body::from(bytes);
         self
     }
 
@@ -182,8 +149,15 @@ impl<T: Client> RequestBuilder<'_, T> {
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
         use futures_util::io::AsyncReadExt;
+        use http_kit::header;
 
-        self.set_content_length_if_known(length);
+        if let Some(len) = length
+            && let Ok(value) = header::HeaderValue::from_str(&len.to_string())
+        {
+            self.request
+                .headers_mut()
+                .insert(header::CONTENT_LENGTH, value);
+        }
 
         let stream = futures_util::stream::unfold(reader, |mut reader| async move {
             let mut buf = vec![0u8; 8192];
@@ -203,6 +177,10 @@ impl<T: Client> RequestBuilder<'_, T> {
 
     /// Stream a file from disk as the request body without loading it into memory.
     #[cfg(not(target_arch = "wasm32"))]
+    ///
+    /// # Errors
+    ///
+    /// Returns any file-system error encountered while opening the file or loading its metadata.
     pub async fn file_body(
         self,
         path: impl AsRef<std::path::Path>,
@@ -246,34 +224,62 @@ impl<T: Client> RequestBuilder<'_, T> {
     }
 }
 
-// Consuming methods when T::Error is already zenwave::Error
-impl<T: Client<Error = crate::Error>> RequestBuilder<'_, T> {
+// Consuming helpers for any client whose error can be normalized into zenwave::Error.
+impl<T: Client> RequestBuilder<'_, T>
+where
+    T::Error: Into<crate::Error>,
+{
+    /// Deserialize the response body as JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response body is not valid JSON for `Res`.
     pub async fn json<Res: DeserializeOwned>(self) -> Result<Res, crate::Error> {
-        let response = self.await?;
+        let response = self.await.map_err(Into::into)?;
         let mut body = response.into_body();
         Ok(body.into_json().await?)
     }
 
+    /// Read the response body as text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response body cannot be decoded as text.
     pub async fn string(self) -> Result<ByteStr, crate::Error> {
-        let response = self.await?;
+        let response = self.await.map_err(Into::into)?;
         let body = response.into_body();
         Ok(body.into_string().await?)
     }
 
+    /// Read the response body as raw bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response body stream errors.
     pub async fn bytes(self) -> Result<Bytes, crate::Error> {
-        let response = self.await?;
+        let response = self.await.map_err(Into::into)?;
         let body = response.into_body();
         Ok(body.into_bytes().await?)
     }
 
+    /// Deserialize the response body as form data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response body cannot be decoded into `Res`.
     pub async fn form<Res: DeserializeOwned>(self) -> Result<Res, crate::Error> {
-        let response = self.await?;
+        let response = self.await.map_err(Into::into)?;
         let mut body = response.into_body();
         Ok(body.into_form().await?)
     }
 
+    /// Convert the response body into an SSE stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
     pub async fn sse(self) -> Result<SseStream, crate::Error> {
-        let response = self.await?;
+        let response = self.await.map_err(Into::into)?;
         let body = response.into_body();
         Ok(body.into_sse())
     }
@@ -512,7 +518,7 @@ pub trait Client: Endpoint + Sized {
     }
 
     /// Enable automatic redirect following.
-    fn follow_redirect(self) -> impl Client {
+    fn follow_redirect(self) -> FollowRedirect<Self> {
         FollowRedirect::new(self)
     }
 
@@ -557,6 +563,11 @@ pub trait Client: Endpoint + Sized {
     }
 
     /// Create a request with the specified method and URI.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidUri`] when `uri` cannot be parsed, or
+    /// [`crate::Error::InvalidRequest`] when the request cannot be constructed.
     fn method<U>(
         &mut self,
         method: Method,
@@ -564,31 +575,14 @@ pub trait Client: Endpoint + Sized {
     ) -> Result<RequestBuilder<'_, &mut Self>, crate::Error>
     where
         U: TryInto<Uri>,
-        U::Error: Debug,
+        U::Error: Display,
     {
-        let uri = uri
-            .try_into()
-            .map_err(|err| crate::Error::InvalidUri(format!("{err:?}")))?;
+        let uri = uri.try_into().map_err(invalid_uri)?;
         let request = http::Request::builder()
             .method(method)
             .uri(uri)
             .body(http_kit::Body::empty())
-            .map_err(|err| crate::Error::InvalidRequest(err.to_string()))?;
-        let mut request = request;
-
-        if !request.headers().contains_key(header::ACCEPT) {
-            request
-                .headers_mut()
-                .insert(header::ACCEPT, HeaderValue::from_static(DEFAULT_ACCEPT));
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        if !request.headers().contains_key(header::USER_AGENT) {
-            request.headers_mut().insert(
-                header::USER_AGENT,
-                HeaderValue::from_static(DEFAULT_USER_AGENT),
-            );
-        }
+            .map_err(invalid_request)?;
 
         Ok(RequestBuilder {
             client: self,
@@ -598,38 +592,54 @@ pub trait Client: Endpoint + Sized {
     }
 
     /// Create a GET request.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error produced by [`Client::method`].
     fn get<U>(&mut self, uri: U) -> Result<RequestBuilder<'_, &mut Self>, crate::Error>
     where
         U: TryInto<Uri>,
-        U::Error: Debug,
+        U::Error: Display,
     {
         self.method(Method::GET, uri)
     }
 
     /// Create a POST request.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error produced by [`Client::method`].
     fn post<U>(&mut self, uri: U) -> Result<RequestBuilder<'_, &mut Self>, crate::Error>
     where
         U: TryInto<Uri>,
-        U::Error: Debug,
+        U::Error: Display,
     {
         self.method(Method::POST, uri)
     }
 
     /// Create a PUT request.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error produced by [`Client::method`].
     fn put<'a, U>(&mut self, uri: U) -> Result<RequestBuilder<'_, &mut Self>, crate::Error>
     where
         U: TryInto<Uri>,
-        U::Error: Debug,
+        U::Error: Display,
         Self: 'a,
     {
         self.method(Method::PUT, uri)
     }
 
     /// Create a DELETE request.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error produced by [`Client::method`].
     fn delete<U>(&mut self, uri: U) -> Result<RequestBuilder<'_, &mut Self>, crate::Error>
     where
         U: TryInto<Uri>,
-        U::Error: Debug,
+        U::Error: Display,
     {
         self.method(Method::DELETE, uri)
     }

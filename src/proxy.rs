@@ -216,7 +216,7 @@ impl Matcher {
 
     fn intercept(&self, uri: &Uri) -> Option<Intercept> {
         let host = uri.host()?.to_lowercase();
-        if self.no_proxy.iter().any(|entry| no_proxy_matches(&host, entry)) {
+        if self.no_proxy.iter().any(|entry| host.ends_with(entry)) {
             return None;
         }
 
@@ -233,32 +233,4 @@ impl Matcher {
             raw_auth: config.raw_auth.clone(),
         })
     }
-}
-
-fn no_proxy_matches(host: &str, entry: &str) -> bool {
-    if entry == "*" {
-        return true;
-    }
-
-    let entry = entry
-        .split_once(':')
-        .map(|(host_part, port)| {
-            if port.chars().all(|c| c.is_ascii_digit()) {
-                host_part
-            } else {
-                entry
-            }
-        })
-        .unwrap_or(entry);
-
-    let entry = entry.trim_start_matches('.');
-    if entry.is_empty() {
-        return false;
-    }
-
-    if host == entry {
-        return true;
-    }
-
-    host.ends_with(&format!(".{entry}"))
 }

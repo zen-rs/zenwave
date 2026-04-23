@@ -52,6 +52,55 @@ impl From<WebSocketError> for crate::Error {
     }
 }
 
+/// Configuration applied when establishing a websocket connection.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct WebSocketConfig {
+    /// Maximum incoming websocket message size in bytes.
+    /// `None` means no limit.
+    pub max_message_size: Option<usize>,
+
+    /// Maximum incoming websocket frame size in bytes.
+    /// `None` means no limit.
+    pub max_frame_size: Option<usize>,
+}
+
+const DEFAULT_MAX_MESSAGE_SIZE: Option<usize> = Some(64 << 20);
+const DEFAULT_MAX_FRAME_SIZE: Option<usize> = Some(16 << 20);
+
+impl Default for WebSocketConfig {
+    fn default() -> Self {
+        Self {
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+        }
+    }
+}
+
+impl WebSocketConfig {
+    /// Override the maximum incoming websocket message size in bytes.
+    ///
+    /// `None` means no limit.
+    ///
+    /// Defaults to 64 MiB.
+    #[must_use]
+    pub const fn with_max_message_size(mut self, max_message_size: Option<usize>) -> Self {
+        self.max_message_size = max_message_size;
+        self
+    }
+
+    /// Override the maximum incoming websocket frame size in bytes.
+    ///
+    /// `None` means no limit.
+    ///
+    /// Defaults to 16 MiB.
+    #[must_use]
+    pub const fn with_max_frame_size(mut self, max_frame_size: Option<usize>) -> Self {
+        self.max_frame_size = max_frame_size;
+        self
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn serialize_payload<T>(value: &T) -> Result<String, WebSocketError>
 where
@@ -63,23 +112,96 @@ where
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use async_lock::Mutex;
+    use async_net::TcpStream;
     use async_tungstenite::{
         WebSocketReceiver as AsyncReceiver, WebSocketSender as AsyncSender, WebSocketStream,
+        client_async_with_config,
         tungstenite::{
             Message as TungsteniteMessage, Utf8Bytes,
             protocol::WebSocketConfig as TungsteniteConfig,
         },
     };
+    use futures_io::{AsyncRead, AsyncWrite};
     use futures_util::StreamExt;
     use http_kit::utils::{ByteStr, Bytes};
-    use std::{fmt, sync::Arc};
+    #[cfg(feature = "rustls")]
+    use rustls::pki_types::ServerName;
+    use std::{
+        fmt, io,
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
+    };
     use url::Url;
 
     use super::{WebSocketConfig, WebSocketError, WebSocketMessage, serialize_payload};
 
-    type NativeSocket = WebSocketStream<async_tungstenite::async_std::ConnectStream>;
-    type NativeSender = AsyncSender<async_tungstenite::async_std::ConnectStream>;
-    type NativeReceiver = AsyncReceiver<async_tungstenite::async_std::ConnectStream>;
+    type NativeSocket = WebSocketStream<MaybeTlsStream>;
+    type NativeSender = AsyncSender<MaybeTlsStream>;
+    type NativeReceiver = AsyncReceiver<MaybeTlsStream>;
+
+    #[derive(Debug)]
+    enum MaybeTlsStream {
+        Plain(TcpStream),
+        #[cfg(feature = "rustls")]
+        Rustls(Box<futures_rustls::client::TlsStream<TcpStream>>),
+        #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
+        Native(async_native_tls::TlsStream<TcpStream>),
+    }
+
+    impl Unpin for MaybeTlsStream {}
+
+    impl AsyncRead for MaybeTlsStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            match &mut *self {
+                Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+                #[cfg(feature = "rustls")]
+                Self::Rustls(stream) => Pin::new(stream).poll_read(cx, buf),
+                #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
+                Self::Native(stream) => Pin::new(stream).poll_read(cx, buf),
+            }
+        }
+    }
+
+    impl AsyncWrite for MaybeTlsStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            match &mut *self {
+                Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+                #[cfg(feature = "rustls")]
+                Self::Rustls(stream) => Pin::new(stream).poll_write(cx, buf),
+                #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
+                Self::Native(stream) => Pin::new(stream).poll_write(cx, buf),
+            }
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            match &mut *self {
+                Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+                #[cfg(feature = "rustls")]
+                Self::Rustls(stream) => Pin::new(stream).poll_flush(cx),
+                #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
+                Self::Native(stream) => Pin::new(stream).poll_flush(cx),
+            }
+        }
+
+        fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            match &mut *self {
+                Self::Plain(stream) => Pin::new(stream).poll_close(cx),
+                #[cfg(feature = "rustls")]
+                Self::Rustls(stream) => Pin::new(stream).poll_close(cx),
+                #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
+                Self::Native(stream) => Pin::new(stream).poll_close(cx),
+            }
+        }
+    }
 
     #[derive(Debug)]
     struct SharedSocket {
@@ -156,12 +278,106 @@ mod native {
         let mut config = TungsteniteConfig::default();
         config.max_message_size = websocket_config.max_message_size;
         config.max_frame_size = websocket_config.max_frame_size;
-        let (ws_stream, _) =
-            async_tungstenite::async_std::connect_async_with_config(request, Some(config))
-                .await
-                .map_err(|e| WebSocketError::ConnectionFailed(Box::new(e)))?;
+        let stream = connect_stream(uri.as_ref()).await?;
+        let (ws_stream, _) = client_async_with_config(request, stream, Some(config))
+            .await
+            .map_err(|e| WebSocketError::ConnectionFailed(Box::new(e)))?;
 
         Ok(WebSocket::from_socket(ws_stream))
+    }
+
+    async fn connect_stream(uri: &str) -> Result<MaybeTlsStream, WebSocketError> {
+        let url = Url::parse(uri)?;
+        let host = url.host_str().ok_or_else(|| {
+            WebSocketError::ConnectionFailed(Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "websocket URI is missing a host",
+            )))
+        })?;
+        let port = url.port_or_known_default().ok_or_else(|| {
+            WebSocketError::ConnectionFailed(Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "websocket URI does not imply a port",
+            )))
+        })?;
+        let stream = TcpStream::connect((host, port))
+            .await
+            .map_err(|error| WebSocketError::ConnectionFailed(Box::new(error)))?;
+
+        match url.scheme() {
+            "ws" => Ok(MaybeTlsStream::Plain(stream)),
+            "wss" => connect_secure(host, stream).await,
+            other => Err(WebSocketError::UnsupportedScheme(other.to_string())),
+        }
+    }
+
+    async fn connect_secure(
+        host: &str,
+        stream: TcpStream,
+    ) -> Result<MaybeTlsStream, WebSocketError> {
+        #[cfg(feature = "rustls")]
+        {
+            return connect_rustls(host, stream).await;
+        }
+
+        #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
+        {
+            return connect_native_tls(host, stream).await;
+        }
+
+        #[cfg(not(any(feature = "rustls", feature = "native-tls")))]
+        {
+            let _ = host;
+            let _ = stream;
+            Err(WebSocketError::ConnectionFailed(Box::new(
+                io::Error::other("wss requires either the `rustls` or `native-tls` feature"),
+            )))
+        }
+    }
+
+    #[cfg(feature = "rustls")]
+    async fn connect_rustls(
+        host: &str,
+        stream: TcpStream,
+    ) -> Result<MaybeTlsStream, WebSocketError> {
+        use std::sync::Arc as SyncArc;
+
+        use futures_rustls::TlsConnector;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        let cert_result = rustls_native_certs::load_native_certs();
+        for cert in cert_result.certs {
+            let _ = root_store.add(cert);
+        }
+
+        if root_store.is_empty() {
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
+
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(SyncArc::new(config));
+        let server_name = ServerName::try_from(host.to_string())
+            .map_err(|error| WebSocketError::ConnectionFailed(Box::new(io::Error::other(error))))?;
+        let stream = connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|error| WebSocketError::ConnectionFailed(Box::new(io::Error::other(error))))?;
+        Ok(MaybeTlsStream::Rustls(Box::new(stream)))
+    }
+
+    #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
+    async fn connect_native_tls(
+        host: &str,
+        stream: TcpStream,
+    ) -> Result<MaybeTlsStream, WebSocketError> {
+        let connector = async_native_tls::TlsConnector::new();
+        let stream = connector
+            .connect(host, stream)
+            .await
+            .map_err(|error| WebSocketError::ConnectionFailed(Box::new(io::Error::other(error))))?;
+        Ok(MaybeTlsStream::Native(stream))
     }
 
     impl WebSocket {
