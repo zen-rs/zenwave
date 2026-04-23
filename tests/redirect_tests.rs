@@ -96,8 +96,7 @@ fn ok_response() -> Response {
         .unwrap()
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn follow_redirect_resolves_relative_paths_and_keeps_headers() {
     let mock = MockClient::with_responses(vec![
         redirect_response(StatusCode::FOUND, "/landing"),
@@ -126,8 +125,7 @@ async fn follow_redirect_resolves_relative_paths_and_keeps_headers() {
     drop(state);
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn follow_redirect_strips_sensitive_headers_on_host_change() {
     let mock = MockClient::with_responses(vec![
         redirect_response(StatusCode::MOVED_PERMANENTLY, "https://example.net/next"),

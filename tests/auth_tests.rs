@@ -5,8 +5,7 @@ use common::httpbin_uri;
 use zenwave::auth::{BasicAuth, BearerAuth};
 use zenwave::{Client, client};
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_bearer_auth_middleware() {
     let mut client = client().bearer_auth("test-token-123");
 
@@ -17,8 +16,7 @@ async fn test_bearer_auth_middleware() {
     assert!(response.status().is_success());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_bearer_auth_request_builder() {
     let mut client = client();
 
@@ -34,8 +32,7 @@ async fn test_bearer_auth_request_builder() {
     assert!(response.status().is_success());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_basic_auth_middleware() {
     let mut client = client().basic_auth("testuser", Some("testpass"));
 
@@ -49,8 +46,7 @@ async fn test_basic_auth_middleware() {
     assert!(response.status().is_success());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_basic_auth_request_builder() {
     let mut client = client();
 
@@ -66,8 +62,7 @@ async fn test_basic_auth_request_builder() {
     assert!(response.status().is_success());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_basic_auth_no_password() {
     let mut client = client();
 
@@ -88,15 +83,15 @@ async fn test_basic_auth_no_password() {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
-async fn test_bearer_auth_creation() {
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn test_bearer_auth_creation() {
     let bearer_auth = BearerAuth::new("my-token");
     assert!(!format!("{bearer_auth:?}").is_empty());
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
-async fn test_basic_auth_creation() {
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn test_basic_auth_creation() {
     let basic_auth = BasicAuth::new("username", Some("password"));
     assert!(!format!("{basic_auth:?}").is_empty());
 
@@ -104,8 +99,7 @@ async fn test_basic_auth_creation() {
     assert!(!format!("{basic_auth_no_pass:?}").is_empty());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_auth_headers_sent() {
     let mut client = client();
 
@@ -121,8 +115,7 @@ async fn test_auth_headers_sent() {
     assert!(body.contains("Bearer secret-token"));
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_basic_auth_encoding() {
     let mut client = client();
 
@@ -139,8 +132,7 @@ async fn test_basic_auth_encoding() {
     assert!(body.contains("Basic"));
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_multiple_auth_requests() {
     let mut client = client().bearer_auth("persistent-token");
 
@@ -154,8 +146,7 @@ async fn test_multiple_auth_requests() {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_auth_with_other_middleware() {
     // Test auth combined with other middleware
     let mut client = client().bearer_auth("combined-token").enable_cookie();
@@ -166,8 +157,7 @@ async fn test_auth_with_other_middleware() {
     assert!(response.status().is_success());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_override_auth_per_request() {
     let mut client = client().bearer_auth("default-token");
 
@@ -184,8 +174,7 @@ async fn test_override_auth_per_request() {
     assert!(body.contains("Bearer override-token"));
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_unauthorized_access() {
     let mut client = client();
 
@@ -203,8 +192,7 @@ async fn test_unauthorized_access() {
     );
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn test_invalid_basic_auth() {
     let mut client = client();
 

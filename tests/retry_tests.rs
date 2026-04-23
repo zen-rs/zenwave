@@ -65,8 +65,7 @@ fn ok_response() -> Response {
         .unwrap()
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn retry_middleware_retries_on_error() {
     let mock = MockClient::with_results(vec![
         Err(MockError::NetworkError),
@@ -93,8 +92,7 @@ async fn retry_middleware_retries_on_error() {
     assert_eq!(attempts, 3);
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), async_std::test)]
+#[test_executors::async_test]
 async fn retry_middleware_gives_up_after_max_retries() {
     let mock = MockClient::with_results(vec![
         Err(MockError::NetworkError),

@@ -31,12 +31,13 @@ URLSession on iOS/tvOS/watchOS/macOS) and browser/Cloudflare Workers targets thr
 ```rust
 use zenwave::{get, ResponseExt};
 
-#[async_std::main]
-async fn main() -> zenwave::Result<()> {
-    let response = get("https://example.com/").await?;
-    let text = response.into_string().await?;
-    println!("{text}");
-    Ok(())
+fn main() -> zenwave::Result<()> {
+    smol::block_on(async {
+        let response = get("https://example.com/").await?;
+        let text = response.into_string().await?;
+        println!("{text}");
+        Ok(())
+    })
 }
 ```
 
@@ -79,33 +80,34 @@ struct MessageResponse {
     message: String,
 }
 
-#[async_std::main]
-async fn main() -> zenwave::Result<()> {
-    let token = std::env::var("ZENWAVE_TOKEN").unwrap_or_else(|_| "demo-token".into());
+fn main() -> zenwave::Result<()> {
+    smol::block_on(async {
+        let token = std::env::var("ZENWAVE_TOKEN").unwrap_or_else(|_| "demo-token".into());
 
-    // Compose only the middleware you need.
-    let mut client = zenwave::client()
-        .timeout(Duration::from_secs(2))
-        .enable_cache()
-        .with(OAuth2ClientCredentials::new(
-            "https://auth.example.com/token",
-            "client-id",
-            "client-secret",
-        ))
-        .enable_cookie()
-        .bearer_auth(token);
+        // Compose only the middleware you need.
+        let mut client = zenwave::client()
+            .timeout(Duration::from_secs(2))
+            .enable_cache()
+            .with(OAuth2ClientCredentials::new(
+                "https://auth.example.com/token",
+                "client-id",
+                "client-secret",
+            ))
+            .enable_cookie()
+            .bearer_auth(token);
 
-    let echo: EchoResponse = client
-        .post("https://httpbin.org/post")
-        .unwrap()
-        .header("x-request-id", "demo-request")
-        ?
-        .json_body(&MessageRequest { message: "hello" })?
-        .json()
-        .await?;
+        let echo: EchoResponse = client
+            .post("https://httpbin.org/post")
+            .unwrap()
+            .header("x-request-id", "demo-request")
+            ?
+            .json_body(&MessageRequest { message: "hello" })?
+            .json()
+            .await?;
 
-    println!("{}", echo.json.message);
-    Ok(())
+        println!("{}", echo.json.message);
+        Ok(())
+    })
 }
 ```
 
@@ -256,7 +258,7 @@ backend usage. Until the URLSession backend is stabilized, we recommend keeping
 the default Hyper backend on Apple. If you still want to opt in:
 
 ```toml
-zenwave = { version = "0.1.0", features = ["apple-backend"] }
+zenwave = { version = "0.3.0", features = ["apple-backend"] }
 ```
 
 ## Curl backend
@@ -267,7 +269,7 @@ curl backend:
 
 ```toml
 [dependencies]
-zenwave = { version = "0.1.0", default-features = false, features = ["curl-backend"] }
+zenwave = { version = "0.3.0", default-features = false, features = ["curl-backend"] }
 ```
 
 You still get the same middleware API; the only difference is which backend transports the bytes.
@@ -280,16 +282,17 @@ The `zenwave::websocket` module offers a cross-platform WebSocket client that hi
 ```rust
 use zenwave::websocket::{self, WebSocketMessage};
 
-#[async_std::main]
-async fn main() -> zenwave::Result<()> {
-    let mut socket = websocket::connect("wss://echo.websocket.events").await?;
-    socket.send_text("hello").await?;
+fn main() -> zenwave::Result<()> {
+    smol::block_on(async {
+        let mut socket = websocket::connect("wss://echo.websocket.events").await?;
+        socket.send_text("hello").await?;
 
-    if let Some(WebSocketMessage::Text(text)) = socket.recv().await? {
-        println!("Received: {text}");
-    }
+        if let Some(WebSocketMessage::Text(text)) = socket.recv().await? {
+            println!("Received: {text}");
+        }
 
-    socket.close().await
+        socket.close().await
+    })
 }
 ```
 
@@ -312,7 +315,7 @@ Add Zenwave to your `Cargo.toml`. The default configuration uses the Hyper backe
 
 ```toml
 [dependencies]
-zenwave = { version = "0.1.0" }
+zenwave = { version = "0.3.0" }
 ```
 
 For browser/Workers builds, no special configuration is needed - Zenwave automatically uses the
@@ -320,7 +323,7 @@ built-in web backend (Fetch API) on wasm32 targets:
 
 ```toml
 # For wasm32 targets, default features are ignored and the web backend is used automatically
-zenwave = { version = "0.1.0" }
+zenwave = { version = "0.3.0" }
 ```
 
 ### Feature flags
@@ -352,13 +355,13 @@ other backends have their own TLS implementations.
 
 ```toml
 # Use curl backend instead of hyper
-zenwave = { version = "0.1.0", default-features = false, features = ["curl-backend"] }
+zenwave = { version = "0.3.0", default-features = false, features = ["curl-backend"] }
 
 # Use hyper with native-tls instead of rustls
-zenwave = { version = "0.1.0", default-features = false, features = ["hyper-backend", "native-tls"] }
+zenwave = { version = "0.3.0", default-features = false, features = ["hyper-backend", "native-tls"] }
 
 # Use Apple's native URLSession on macOS/iOS
-zenwave = { version = "0.1.0", default-features = false, features = ["apple-backend"] }
+zenwave = { version = "0.3.0", default-features = false, features = ["apple-backend"] }
 ```
 
 ## License
