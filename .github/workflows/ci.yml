@@ -67,6 +67,82 @@ jobs:
           shared-key: ci-ubuntu
       - run: cargo build --target wasm32-unknown-unknown
 
+  mobile:
+    name: Mobile (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: iOS device
+            os: macos-latest
+            target: aarch64-apple-ios
+            features: apple-backend
+            android-api: ""
+            android-clang-prefix: ""
+            android-rust-target-env: ""
+          - name: iOS simulator
+            os: macos-latest
+            target: aarch64-apple-ios-sim
+            features: apple-backend
+            android-api: ""
+            android-clang-prefix: ""
+            android-rust-target-env: ""
+          - name: Android arm64
+            os: ubuntu-latest
+            target: aarch64-linux-android
+            features: hyper-rustls
+            android-api: "35"
+            android-clang-prefix: aarch64-linux-android
+            android-rust-target-env: aarch64_linux_android
+          - name: Android x86_64
+            os: ubuntu-latest
+            target: x86_64-linux-android
+            features: hyper-rustls
+            android-api: "35"
+            android-clang-prefix: x86_64-linux-android
+            android-rust-target-env: x86_64_linux_android
+          - name: Android armv7
+            os: ubuntu-latest
+            target: armv7-linux-androideabi
+            features: hyper-rustls
+            android-api: "35"
+            android-clang-prefix: armv7a-linux-androideabi
+            android-rust-target-env: armv7_linux_androideabi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mobile-${{ matrix.target }}
+      - name: Configure Android NDK compiler
+        if: matrix.android-api != ''
+        shell: bash
+        run: |
+          : "${ANDROID_NDK_LATEST_HOME:?ANDROID_NDK_LATEST_HOME is required on ubuntu-latest}"
+          toolchain="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cc="$toolchain/${{ matrix.android-clang-prefix }}${{ matrix.android-api }}-clang"
+          cxx="$toolchain/${{ matrix.android-clang-prefix }}${{ matrix.android-api }}-clang++"
+          ar="$toolchain/llvm-ar"
+
+          test -x "$cc" || { echo "::error::Android C compiler not found: $cc"; exit 1; }
+          test -x "$cxx" || { echo "::error::Android C++ compiler not found: $cxx"; exit 1; }
+          test -x "$ar" || { echo "::error::Android archiver not found: $ar"; exit 1; }
+
+          rust_target_env="${{ matrix.android-rust-target-env }}"
+          cargo_target_env="$(echo "$rust_target_env" | tr '[:lower:]' '[:upper:]')"
+
+          {
+            echo "CC_${rust_target_env}=$cc"
+            echo "CXX_${rust_target_env}=$cxx"
+            echo "AR_${rust_target_env}=$ar"
+            echo "CARGO_TARGET_${cargo_target_env}_LINKER=$cc"
+          } >> "$GITHUB_ENV"
+      - name: Check mobile target
+        run: cargo check --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }}
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
