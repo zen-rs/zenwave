@@ -417,13 +417,16 @@ mod tests {
 
     impl Endpoint for CountingEndpoint {
         type Error = Infallible;
-        async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
+        fn respond(
+            &mut self,
+            _request: &mut Request,
+        ) -> impl std::future::Future<Output = Result<Response, Self::Error>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut builder = HttpResponse::builder().status(StatusCode::OK);
             for (name, value) in &self.headers {
                 builder = builder.header(*name, *value);
             }
-            Ok(builder.body(Body::from(self.body)).unwrap())
+            std::future::ready(Ok(builder.body(Body::from(self.body)).unwrap()))
         }
     }
 
@@ -452,23 +455,26 @@ mod tests {
 
     impl Endpoint for ConditionalEndpoint {
         type Error = Infallible;
-        async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+        fn respond(
+            &mut self,
+            request: &mut Request,
+        ) -> impl std::future::Future<Output = Result<Response, Self::Error>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if request.headers().contains_key(header::IF_NONE_MATCH) {
                 self.conditional.fetch_add(1, Ordering::SeqCst);
-                return Ok(HttpResponse::builder()
+                return std::future::ready(Ok(HttpResponse::builder()
                     .status(StatusCode::NOT_MODIFIED)
                     .header(header::ETAG, "\"v1\"")
                     .header(header::CACHE_CONTROL, "no-cache")
                     .body(Body::empty())
-                    .unwrap());
+                    .unwrap()));
             }
-            Ok(HttpResponse::builder()
+            std::future::ready(Ok(HttpResponse::builder()
                 .status(StatusCode::OK)
                 .header(header::ETAG, "\"v1\"")
                 .header(header::CACHE_CONTROL, "no-cache")
                 .body(Body::from("fresh"))
-                .unwrap())
+                .unwrap()))
         }
     }
 }

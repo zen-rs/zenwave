@@ -342,7 +342,10 @@ mod tests {
 
     impl Endpoint for RecordingEndpoint {
         type Error = Infallible;
-        async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+        fn respond(
+            &mut self,
+            request: &mut Request,
+        ) -> impl std::future::Future<Output = Result<Response, Self::Error>> {
             self.calls += 1;
             self.last_auth = request
                 .headers()
@@ -350,10 +353,10 @@ mod tests {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
 
-            Ok(HttpResponse::builder()
+            std::future::ready(Ok(HttpResponse::builder()
                 .status(StatusCode::OK)
                 .body(Body::empty())
-                .unwrap())
+                .unwrap()))
         }
     }
 

@@ -58,24 +58,30 @@ impl MockClient {
 
 impl Endpoint for MockClient {
     type Error = MockError;
-    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-        let mut state = self.state.lock().unwrap();
-        state.seen.push(SeenRequest {
-            method: request.method().clone(),
-            uri: request.uri().to_string(),
-            custom_header: request
-                .headers()
-                .get("x-test")
-                .and_then(|value| value.to_str().ok())
-                .map(ToOwned::to_owned),
-            authorization: request
-                .headers()
-                .get("authorization")
-                .and_then(|value| value.to_str().ok())
-                .map(ToOwned::to_owned),
-        });
+    fn respond(
+        &mut self,
+        request: &mut Request,
+    ) -> impl std::future::Future<Output = Result<Response, Self::Error>> {
+        let response = {
+            let mut state = self.state.lock().unwrap();
+            state.seen.push(SeenRequest {
+                method: request.method().clone(),
+                uri: request.uri().to_string(),
+                custom_header: request
+                    .headers()
+                    .get("x-test")
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned),
+                authorization: request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned),
+            });
+            state.responses.pop_front().ok_or(MockError::Exhausted)
+        };
 
-        state.responses.pop_front().ok_or(MockError::Exhausted)
+        std::future::ready(response)
     }
 }
 
