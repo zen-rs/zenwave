@@ -61,7 +61,6 @@ impl HyperBackend {
 }
 
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
 pub enum HyperError {
     Connection(hyper::Error),
     Io(std::io::Error),
@@ -70,7 +69,7 @@ pub enum HyperError {
     Remote {
         status: StatusCode,
         body: Option<String>,
-        raw_response: Response,
+        raw_response: Box<Response>,
     },
 }
 
@@ -120,7 +119,7 @@ impl From<HyperError> for crate::Error {
                         .to_string()
                 }),
                 response: Box::new(HttpErrorResponse {
-                    response: raw_response,
+                    response: *raw_response,
                     body_text: body,
                 }),
             },
@@ -203,7 +202,7 @@ impl Endpoint for HyperBackend {
             return Err(HyperError::Remote {
                 status: response.status(),
                 body: error_msg,
-                raw_response: response,
+                raw_response: Box::new(response),
             }
             .into());
         }
