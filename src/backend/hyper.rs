@@ -298,6 +298,13 @@ async fn connect(request: &http::Request<http_kit::Body>) -> Result<MaybeTlsStre
 }
 
 async fn connect_happy_eyeballs(host: &str, port: u16) -> io::Result<TcpStream> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        let addr = SocketAddr::new(ip, port);
+        return connect_with_timeout(addr)
+            .await
+            .map_err(|error| io::Error::new(error.kind(), format!("{addr}: {error}")));
+    }
+
     let mut state = HappyEyeballsState::new();
     let mut attempts = FuturesUnordered::new();
     let mut resolver = start_resolution(host, port);
@@ -677,43 +684,6 @@ async fn connect_with_timeout(addr: SocketAddr) -> io::Result<TcpStream> {
 }
 
 fn start_resolution(host: &str, port: u16) -> UnboundedReceiver<ResolutionEvent> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        let (sender, receiver) = unbounded();
-        let family = if ip.is_ipv6() {
-            AddressFamilyKind::Ipv6
-        } else {
-            AddressFamilyKind::Ipv4
-        };
-        let addr = SocketAddr::new(ip, port);
-        sender
-            .unbounded_send(ResolutionEvent {
-                kind: ResolutionEventKind::Family {
-                    family,
-                    result: ResolutionResult::Addresses(vec![addr]),
-                },
-            })
-            .expect("literal IP resolution event receiver should be alive");
-        sender
-            .unbounded_send(ResolutionEvent {
-                kind: ResolutionEventKind::Family {
-                    family: if family == AddressFamilyKind::Ipv6 {
-                        AddressFamilyKind::Ipv4
-                    } else {
-                        AddressFamilyKind::Ipv6
-                    },
-                    result: ResolutionResult::Empty,
-                },
-            })
-            .expect("literal IP opposite-family resolution event receiver should be alive");
-        sender
-            .unbounded_send(ResolutionEvent {
-                kind: ResolutionEventKind::SortedSnapshot(ResolutionResult::Addresses(vec![addr])),
-            })
-            .expect("literal IP sorted resolution event receiver should be alive");
-        drop(sender);
-        return receiver;
-    }
-
     let (sender, receiver) = unbounded();
     for query in [
         ResolveQuery::Family(AddressFamilyKind::Ipv6),
@@ -990,7 +960,7 @@ impl hyper::rt::Write for MaybeTlsStream {
 mod tests {
     use super::{
         AddressFamilyKind, HappyEyeballsState, ResolutionEvent, ResolutionEventKind,
-        ResolutionResult, interleave_address_families,
+        ResolutionResult, connect_happy_eyeballs, interleave_address_families,
     };
     use std::{net::SocketAddr, time::Instant};
 
@@ -1077,6 +1047,21 @@ mod tests {
         assert!(
             !state.initial_attempt_gate_open(Instant::now()),
             "IPv4 must not start immediately while AAAA is still pending",
+        );
+    }
+
+    #[test]
+    fn literal_ip_connect_does_not_report_opposite_family_resolution() {
+        let error = smol::block_on(connect_happy_eyeballs("127.0.0.1", 9))
+            .expect_err("discard port should not accept connections in tests");
+        let message = error.to_string();
+        assert!(
+            !message.contains("Ipv6 resolution"),
+            "literal IPv4 must not run DNS or report IPv6 resolution: {message}",
+        );
+        assert!(
+            message.contains("127.0.0.1:9"),
+            "literal IP connection error should name the attempted socket address: {message}",
         );
     }
 }
