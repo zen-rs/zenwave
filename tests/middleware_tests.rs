@@ -169,13 +169,16 @@ impl CountingBackend {
 
 impl Endpoint for CountingBackend {
     type Error = Infallible;
-    async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
+    fn respond(
+        &mut self,
+        _request: &mut Request,
+    ) -> impl std::future::Future<Output = Result<Response, Self::Error>> {
         let hit = self.hits.fetch_add(1, Ordering::SeqCst) + 1;
-        Ok(http::Response::builder()
+        std::future::ready(Ok(http::Response::builder()
             .status(StatusCode::OK)
             .header(http::header::CACHE_CONTROL, "max-age=60")
             .body(Body::from(format!("hit-{hit}")))
-            .unwrap())
+            .unwrap()))
     }
 }
 

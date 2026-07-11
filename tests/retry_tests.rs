@@ -49,10 +49,19 @@ impl MockClient {
 
 impl Endpoint for MockClient {
     type Error = MockError;
-    async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
-        let mut state = self.state.lock().unwrap();
-        state.attempts += 1;
-        state.results.pop_front().ok_or(MockError::Exhausted)?
+    fn respond(
+        &mut self,
+        _request: &mut Request,
+    ) -> impl std::future::Future<Output = Result<Response, Self::Error>> {
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            state.attempts += 1;
+            state
+                .results
+                .pop_front()
+                .unwrap_or(Err(MockError::Exhausted))
+        };
+        std::future::ready(result)
     }
 }
 

@@ -258,7 +258,7 @@ backend usage. Until the URLSession backend is stabilized, we recommend keeping
 the default Hyper backend on Apple. If you still want to opt in:
 
 ```toml
-zenwave = { version = "0.1.0", features = ["apple-backend"] }
+zenwave = { version = "0.3.0", features = ["apple-backend"] }
 ```
 
 ## Curl backend
@@ -269,7 +269,7 @@ curl backend:
 
 ```toml
 [dependencies]
-zenwave = { version = "0.1.0", default-features = false, features = ["curl-backend"] }
+zenwave = { version = "0.3.0", default-features = false, features = ["curl-backend"] }
 ```
 
 You still get the same middleware API; the only difference is which backend transports the bytes.
@@ -315,7 +315,7 @@ Add Zenwave to your `Cargo.toml`. The default configuration uses the Hyper backe
 
 ```toml
 [dependencies]
-zenwave = { version = "0.1.0" }
+zenwave = { version = "0.3.0" }
 ```
 
 For browser/Workers builds, no special configuration is needed - Zenwave automatically uses the
@@ -323,7 +323,7 @@ built-in web backend (Fetch API) on wasm32 targets:
 
 ```toml
 # For wasm32 targets, default features are ignored and the web backend is used automatically
-zenwave = { version = "0.1.0" }
+zenwave = { version = "0.3.0" }
 ```
 
 ### Feature flags
@@ -355,13 +355,13 @@ other backends have their own TLS implementations.
 
 ```toml
 # Use curl backend instead of hyper
-zenwave = { version = "0.1.0", default-features = false, features = ["curl-backend"] }
+zenwave = { version = "0.3.0", default-features = false, features = ["curl-backend"] }
 
 # Use hyper with native-tls instead of rustls
-zenwave = { version = "0.1.0", default-features = false, features = ["hyper-backend", "native-tls"] }
+zenwave = { version = "0.3.0", default-features = false, features = ["hyper-backend", "native-tls"] }
 
 # Use Apple's native URLSession on macOS/iOS
-zenwave = { version = "0.1.0", default-features = false, features = ["apple-backend"] }
+zenwave = { version = "0.3.0", default-features = false, features = ["apple-backend"] }
 ```
 
 ## License

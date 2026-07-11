@@ -61,9 +61,7 @@ jobs:
 
   wasm-macos:
     name: wasm-pack (macOS Safari)
-    runs-on: macos-latest
-    # safaridriver has known issues binding ports in GitHub Actions
-    continue-on-error: true
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
 

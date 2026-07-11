@@ -359,13 +359,16 @@ mod tests {
 
     impl Endpoint for SetCookieEndpoint {
         type Error = Infallible;
-        async fn respond(&mut self, _request: &mut Request) -> Result<Response, Self::Error> {
-            Ok(HttpResponse::builder()
+        fn respond(
+            &mut self,
+            _request: &mut Request,
+        ) -> impl std::future::Future<Output = Result<Response, Self::Error>> {
+            std::future::ready(Ok(HttpResponse::builder()
                 .status(StatusCode::OK)
                 .header(header::SET_COOKIE, "session=abc; Path=/")
                 .header(header::SET_COOKIE, "theme=dark; Path=/")
                 .body(Body::empty())
-                .unwrap())
+                .unwrap()))
         }
     }
 
@@ -382,17 +385,20 @@ mod tests {
 
     impl Endpoint for RecordingEndpoint {
         type Error = Infallible;
-        async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+        fn respond(
+            &mut self,
+            request: &mut Request,
+        ) -> impl std::future::Future<Output = Result<Response, Self::Error>> {
             self.last_cookie = request
                 .headers()
                 .get(header::COOKIE)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
 
-            Ok(HttpResponse::builder()
+            std::future::ready(Ok(HttpResponse::builder()
                 .status(StatusCode::OK)
                 .body(Body::empty())
-                .unwrap())
+                .unwrap()))
         }
     }
 }

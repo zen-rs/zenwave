@@ -423,10 +423,11 @@ mod tests {
 
     impl Endpoint for FakeBackend {
         type Error = Infallible;
-        async fn respond(
+        fn respond(
             &mut self,
             request: &mut Request,
-        ) -> Result<Response<http_kit::Body>, Self::Error> {
+        ) -> impl std::future::Future<Output = Result<Response<http_kit::Body>, Self::Error>>
+        {
             let start = if self.honor_range {
                 parse_range(request)
             } else {
@@ -465,7 +466,7 @@ mod tests {
                 );
             }
 
-            Ok(response)
+            std::future::ready(Ok(response))
         }
     }
 
