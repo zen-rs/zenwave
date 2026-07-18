@@ -156,7 +156,11 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, convert::Infallible};
+    use std::{
+        collections::VecDeque,
+        convert::Infallible,
+        future::{Future, ready},
+    };
 
     use http_kit::{Body, Endpoint, Request, Response, StatusCode, header};
 
@@ -170,15 +174,17 @@ mod tests {
     impl Endpoint for RedirectBackend {
         type Error = Infallible;
 
-        async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+        fn respond(
+            &mut self,
+            request: &mut Request,
+        ) -> impl Future<Output = Result<Response, Self::Error>> {
             self.credential_presence.push((
                 request.headers().contains_key(header::AUTHORIZATION),
                 request.headers().contains_key(header::COOKIE),
             ));
-            Ok(self
-                .responses
-                .pop_front()
-                .expect("redirect test backend must have a response for every request"))
+            ready(Ok(self.responses.pop_front().expect(
+                "redirect test backend must have a response for every request",
+            )))
         }
     }
 
@@ -204,7 +210,8 @@ mod tests {
             .body(Body::empty())
             .expect("redirect test request must build");
 
-        smol::block_on(client.respond(&mut request)).expect("redirect chain must complete");
+        futures_executor::block_on(client.respond(&mut request))
+            .expect("redirect chain must complete");
 
         assert_eq!(
             client.disable_redirect().credential_presence,
