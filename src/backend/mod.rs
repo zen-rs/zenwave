@@ -40,30 +40,32 @@ pub use apple::AppleBackend;
 // Default backend selection for native platforms (non-wasm32)
 // ============================================================================
 
+/// The default HTTP client backend: Hyper with async-io.
+///
+/// Hyper takes precedence whenever it is enabled so Cargo feature unification
+/// cannot silently replace an explicitly requested Hyper transport with a
+/// platform backend pulled in by an unrelated dependency.
+#[cfg(all(not(target_arch = "wasm32"), feature = "hyper-backend"))]
+pub type DefaultBackend = HyperBackend;
+
 /// The default HTTP client backend: Apple's `NSURLSession`.
-/// This is selected when `apple-backend` feature is enabled on Apple platforms.
+///
+/// This is selected on Apple platforms only when `apple-backend` is enabled
+/// without `hyper-backend`.
 #[cfg(all(
     not(target_arch = "wasm32"),
     target_vendor = "apple",
-    feature = "apple-backend"
+    feature = "apple-backend",
+    not(feature = "hyper-backend")
 ))]
 pub type DefaultBackend = AppleBackend;
-
-/// The default HTTP client backend: Hyper with async-io.
-/// This is the recommended default for most native platforms.
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    not(all(target_vendor = "apple", feature = "apple-backend")),
-    feature = "hyper-backend"
-))]
-pub type DefaultBackend = HyperBackend;
 
 /// The default HTTP client backend: libcurl.
 /// This is selected when `curl-backend` is enabled but `hyper-backend` is not.
 #[cfg(all(
     not(target_arch = "wasm32"),
-    not(all(target_vendor = "apple", feature = "apple-backend")),
     not(feature = "hyper-backend"),
+    not(all(target_vendor = "apple", feature = "apple-backend")),
     feature = "curl-backend"
 ))]
 pub type DefaultBackend = CurlBackend;
