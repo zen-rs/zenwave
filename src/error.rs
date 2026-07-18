@@ -69,6 +69,13 @@ pub enum Error {
     #[error("failed to parse response body: {0}")]
     BodyParse(#[from] BodyError),
 
+    /// Response body exceeded the caller-provided in-memory limit.
+    #[error("response body exceeds the {limit}-byte limit")]
+    ResponseBodyTooLarge {
+        /// Maximum response body size accepted by the caller.
+        limit: usize,
+    },
+
     /// Cookie management error.
     #[error("cookie error: {0}")]
     Cookie(#[from] CookieErrorKind),
@@ -299,6 +306,7 @@ impl Error {
             Self::TooManyRedirects { .. } | Self::InvalidRedirectLocation => ErrorKind::Redirect,
             Self::InvalidUri(_) | Self::InvalidRequest(_) => ErrorKind::Request,
             Self::BodyParse(_) => ErrorKind::BodyParse,
+            Self::ResponseBodyTooLarge { .. } => ErrorKind::ResponseBodyLimit,
             Self::Cookie(_) => ErrorKind::Cookie,
             Self::OAuth2(_) => ErrorKind::OAuth2,
             Self::Download(_) => ErrorKind::Download,
@@ -328,6 +336,8 @@ pub enum ErrorKind {
     Request,
     /// Response body parsing error
     BodyParse,
+    /// Response body exceeded a caller-provided size limit
+    ResponseBodyLimit,
     /// Cookie management error
     Cookie,
     /// `OAuth2` authentication error
@@ -352,6 +362,7 @@ impl std::fmt::Display for ErrorKind {
             Self::Redirect => write!(f, "redirect"),
             Self::Request => write!(f, "request"),
             Self::BodyParse => write!(f, "body_parse"),
+            Self::ResponseBodyLimit => write!(f, "response_body_limit"),
             Self::Cookie => write!(f, "cookie"),
             Self::OAuth2 => write!(f, "oauth2"),
             Self::Download => write!(f, "download"),

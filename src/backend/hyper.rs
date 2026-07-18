@@ -150,7 +150,6 @@ impl Endpoint for HyperBackend {
         {
             request.headers_mut().insert(http::header::HOST, value);
         }
-
         let stream = connect(&request).await?;
         let origin_form = request
             .uri()
@@ -164,7 +163,7 @@ impl Endpoint for HyperBackend {
             .await
             .map_err(HyperError::Connection)?;
 
-        // Drive the connection in the background.
+        // Drive the connection in the background while the caller consumes its body.
         self.spawn_background(async move {
             if let Err(err) = connection.await {
                 warn!(error = %err, "hyper connection error");
@@ -177,10 +176,8 @@ impl Endpoint for HyperBackend {
             .map_err(HyperError::Connection)?;
 
         let mut response = response.map(|body| {
-            let stream = BodyDataStream::new(body);
-            let stream = stream.map_err(|error| {
-                http_kit::BodyError::Other(Box::new(error)) // TODO: improve error conversion
-            });
+            let stream = BodyDataStream::new(body)
+                .map_err(|error| http_kit::BodyError::Other(Box::new(error)));
             http_kit::Body::from_stream(stream)
         });
 
@@ -958,10 +955,192 @@ impl hyper::rt::Write for MaybeTlsStream {
 #[cfg(test)]
 mod tests {
     use super::{
-        AddressFamilyKind, HappyEyeballsState, ResolutionEvent, ResolutionEventKind,
+        AddressFamilyKind, HappyEyeballsState, HyperBackend, ResolutionEvent, ResolutionEventKind,
         ResolutionResult, connect_happy_eyeballs, interleave_address_families,
     };
-    use std::{net::SocketAddr, time::Instant};
+    use crate::Client as _;
+    use futures_util::{StreamExt as _, future::Either};
+    use std::{
+        io::{Read as _, Write as _},
+        net::{SocketAddr, TcpListener},
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    const STREAMING_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    struct TestStreamingServer {
+        address: SocketAddr,
+        release_first: mpsc::Sender<()>,
+        first_written: mpsc::Receiver<()>,
+        release_second: mpsc::Sender<()>,
+        worker: thread::JoinHandle<()>,
+    }
+
+    impl TestStreamingServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("test server must bind");
+            let address = listener.local_addr().expect("test address must exist");
+            let (release_first, release_first_rx) = mpsc::channel();
+            let (first_written_tx, first_written) = mpsc::channel();
+            let (release_second, release_second_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                serve_streaming_responses(
+                    &listener,
+                    &release_first_rx,
+                    &first_written_tx,
+                    &release_second_rx,
+                );
+            });
+            Self {
+                address,
+                release_first,
+                first_written,
+                release_second,
+                worker,
+            }
+        }
+
+        fn finish(self) {
+            self.worker.join().expect("test server must finish");
+        }
+    }
+
+    fn serve_streaming_responses(
+        listener: &TcpListener,
+        release_first: &mpsc::Receiver<()>,
+        first_written: &mpsc::Sender<()>,
+        release_second: &mpsc::Receiver<()>,
+    ) {
+        let (mut socket, _) = listener.accept().expect("test request must arrive");
+        socket
+            .set_nodelay(true)
+            .expect("streaming test socket must disable Nagle buffering");
+        read_http_request(&mut socket);
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 276\r\nConnection: close\r\n\r\n")
+            .expect("response header must write");
+        socket.flush().expect("response header must flush");
+        release_first
+            .recv()
+            .expect("test must release the first response fragment");
+        socket
+            .write_all(&[0xA5; 138])
+            .expect("first response fragment must write");
+        socket.flush().expect("first response bytes must flush");
+        first_written
+            .send(())
+            .expect("first-fragment signal must send");
+        release_second
+            .recv()
+            .expect("test must release the response tail");
+        socket
+            .write_all(&[0x5A; 138])
+            .expect("response tail must write");
+    }
+
+    fn read_http_request(socket: &mut std::net::TcpStream) {
+        let mut request = [0_u8; 4_096];
+        let mut filled = 0_usize;
+        loop {
+            let read = socket
+                .read(&mut request[filled..])
+                .expect("test request must be readable");
+            assert_ne!(read, 0, "test request ended before its HTTP header");
+            filled += read;
+            if request[..filled]
+                .windows(4)
+                .any(|window| window == b"\r\n\r\n")
+            {
+                return;
+            }
+            assert!(
+                filled < request.len(),
+                "test request exceeded its explicit header bound"
+            );
+        }
+    }
+
+    #[test]
+    fn response_headers_arrive_before_a_streaming_body_completes() {
+        let server = TestStreamingServer::start();
+
+        let mut client = HyperBackend::new();
+        let response = futures_executor::block_on(async {
+            let response = client
+                .get(format!("http://{}/stream", server.address))
+                .expect("test request must build")
+                .into_future();
+            futures_util::pin_mut!(response);
+            let timeout = async_io::Timer::after(STREAMING_TEST_TIMEOUT);
+            futures_util::pin_mut!(timeout);
+            match futures_util::future::select(response, timeout).await {
+                Either::Left((response, _)) => Some(response.expect("test request must succeed")),
+                Either::Right(_) => None,
+            }
+        });
+        let Some(response) = response else {
+            server
+                .release_first
+                .send(())
+                .expect("timed-out test must unblock its server");
+            server
+                .release_second
+                .send(())
+                .expect("timed-out test must release the response tail");
+            server.finish();
+            panic!("response headers did not arrive before body completion");
+        };
+        let mut body = response.into_body();
+        let (first_result_tx, first_result_rx) = mpsc::sync_channel(1);
+        let body_worker = thread::spawn(move || {
+            let first = futures_executor::block_on(body.next());
+            first_result_tx
+                .send((body, first))
+                .expect("first body result must send");
+        });
+        server
+            .release_first
+            .send(())
+            .expect("test must release the first response fragment");
+        server
+            .first_written
+            .recv()
+            .expect("server must write the first response fragment");
+        let (mut body, first) = match first_result_rx.recv_timeout(STREAMING_TEST_TIMEOUT) {
+            Ok(result) => result,
+            Err(error) => {
+                server
+                    .release_second
+                    .send(())
+                    .expect("timed-out test must release the response tail");
+                let (_, result) = first_result_rx
+                    .recv()
+                    .expect("released body poll must complete");
+                body_worker.join().expect("body worker must finish");
+                server.finish();
+                panic!(
+                    "first response fragment was buffered until completion ({error}); released poll result: {result:?}"
+                );
+            }
+        };
+        let first = first
+            .expect("response must contain a first body chunk")
+            .expect("first body chunk must be valid");
+        assert_eq!(first.as_ref(), &[0xA5; 138]);
+        server
+            .release_second
+            .send(())
+            .expect("test must release the response tail");
+        let second = futures_executor::block_on(body.next())
+            .expect("response must contain a second body chunk")
+            .expect("second body chunk must be valid");
+        assert_eq!(second.as_ref(), &[0x5A; 138]);
+        assert!(futures_executor::block_on(body.next()).is_none());
+        body_worker.join().expect("body worker must finish");
+        server.finish();
+    }
 
     #[test]
     fn interleaves_addresses_with_first_family_count() {
