@@ -213,6 +213,7 @@ async fn send_with_url_session(
     }
 
     let body_bytes = {
+        super::apply_default_user_agent(request.headers_mut());
         let body = replace(request.body_mut(), Body::empty());
         body.into_bytes()
             .await

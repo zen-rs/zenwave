@@ -6,7 +6,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use blocking::unblock;
 use curl::easy::{Easy2, Handler, List, ProxyType, ReadError, WriteError};
 use http::{
-    HeaderMap, Method,
+    HeaderMap,
     header::{HeaderName, HeaderValue},
 };
 use http_kit::{Body, Endpoint, HttpError, Request, Response, StatusCode};
@@ -110,13 +110,17 @@ impl Client for CurlBackend {}
 impl Endpoint for CurlBackend {
     type Error = crate::Error;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-        let dummy_request = http::Request::builder()
-            .method(Method::GET)
-            .uri("/")
-            .body(Body::empty())
-            .expect("building dummy request failed");
-        let request = replace(request, dummy_request);
-        execute(request, self.proxy.clone())
+        // Send a copy so the caller's request keeps its method, URI, and headers
+        // for middleware such as `Retry`; only the body is consumed.
+        let body = replace(request.body_mut(), Body::empty());
+        let mut outgoing = http::Request::new(body);
+        *outgoing.method_mut() = request.method().clone();
+        *outgoing.uri_mut() = request.uri().clone();
+        *outgoing.version_mut() = request.version();
+        *outgoing.headers_mut() = request.headers().clone();
+        super::apply_default_user_agent(outgoing.headers_mut());
+
+        execute(outgoing, self.proxy.clone())
             .await
             .map_err(Into::into)
     }
@@ -163,6 +167,13 @@ fn perform(request: PreparedRequest) -> Result<Response, CurlError> {
     easy.url(&request.url).map_err(map_curl_error)?;
     easy.custom_request(&request.method)
         .map_err(map_curl_error)?;
+
+    // A HEAD response carries headers but no body. Setting the method string
+    // alone leaves libcurl waiting for a body that never arrives, which hangs
+    // the request until the connection times out, so tell it explicitly.
+    if request.method.eq_ignore_ascii_case("HEAD") {
+        easy.nobody(true).map_err(map_curl_error)?;
+    }
 
     if upload_len > 0 {
         easy.upload(true).map_err(map_curl_error)?;

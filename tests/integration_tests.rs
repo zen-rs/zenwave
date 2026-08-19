@@ -1,145 +1,180 @@
-//! Integration tests for Zenwave using real HTTP requests.
+//! End-to-end tests exercising the default client against a local HTTP server.
 
+use serde_json::Value;
 mod common;
 use common::httpbin_uri;
-use serde_json::Value;
-use zenwave::{Client, Method, client, get};
+use zenwave::{Client, Method, ResponseExt, client, get};
 
-fn endpoint(path: &str) -> String {
-    httpbin_uri(path)
+#[test_executors::async_test]
+async fn a_json_api_response_deserializes() {
+    let json: Value = get(httpbin_uri("/json"))
+        .await
+        .expect("request must succeed")
+        .into_json()
+        .await
+        .expect("response must be JSON");
+    assert_eq!(json["slideshow"]["author"], "zenwave");
 }
 
 #[test_executors::async_test]
-async fn test_real_world_api_request() {
-    // Test with a real JSON API
-    let response = get(endpoint("/json")).await.unwrap();
-    assert!(response.status().is_success());
+async fn the_client_sends_a_user_agent() {
+    let text = get(httpbin_uri("/user-agent"))
+        .await
+        .expect("request must succeed")
+        .into_string()
+        .await
+        .expect("body must read");
 
-    let json: Value = response.into_body().into_json().await.unwrap();
-    assert!(json.is_object());
+    let user_agent = text
+        .trim()
+        .strip_prefix("user-agent: ")
+        .expect("the route echoes the user agent");
+    assert!(
+        user_agent.starts_with("zenwave/"),
+        "expected the default zenwave agent, got {user_agent:?}"
+    );
 }
 
 #[test_executors::async_test]
-async fn test_user_agent_header() {
-    let response = get(endpoint("/user-agent")).await.unwrap();
-    let text = response.into_body().into_string().await.unwrap();
-
-    // Should contain some user agent info
-    assert!(!text.is_empty());
-}
-
-#[test_executors::async_test]
-async fn test_custom_headers() {
+async fn custom_request_headers_reach_the_server() {
     let mut client = client();
-    let response = client.get(endpoint("/headers")).unwrap().await.unwrap();
-    let text = response.into_body().into_string().await.unwrap();
-
-    // Should contain header information
-    assert!(text.contains("headers"));
+    let body = client
+        .get(httpbin_uri("/headers"))
+        .expect("uri must parse")
+        .header("x-test", "integration")
+        .expect("header must be valid")
+        .string()
+        .await
+        .expect("request must succeed");
+    assert!(body.contains("X-Test: integration"), "got {body}");
 }
 
 #[test_executors::async_test]
-async fn test_post_with_json_body() {
+async fn a_json_body_round_trips_to_the_server() {
     let mut client = client();
-    let request = client.method(Method::POST, endpoint("/post")).unwrap();
-    // Note: In a real implementation, you'd want to add a body() method to RequestBuilder
-    let response = request.await;
+    let text = client
+        .post(httpbin_uri("/echo"))
+        .expect("uri must parse")
+        .json_body(&serde_json::json!({ "hello": "world" }))
+        .expect("payload must serialize")
+        .string()
+        .await
+        .expect("request must succeed");
 
-    assert!(response.is_ok());
-    let response = response.unwrap();
-    assert!(response.status().is_success());
+    assert!(text.contains("method=POST"), "got {text}");
+    assert!(text.contains("content-type=application/json"), "got {text}");
+    assert!(text.contains(r#""hello":"world""#), "got {text}");
 }
 
 #[test_executors::async_test]
-async fn test_response_status_codes() {
-    for status_code in [200, 201, 400, 401, 403, 404, 500, 502, 503] {
-        let url = endpoint(&format!("/status/{status_code}"));
-        let response = get(url).await;
-        if status_code < 400 {
-            let response = response.unwrap();
-            assert_eq!(response.status().as_u16(), status_code);
-        } else {
-            let error = response.expect_err("expected error status to surface as Err");
-            let description = format!("{error}");
-            assert!(
-                description.contains(&status_code.to_string()),
-                "error message should mention status code {status_code}: {description}"
-            );
-        }
+async fn success_statuses_are_returned_and_error_statuses_surface_as_errors() {
+    for status in [200_u16, 201, 204] {
+        let response = get(httpbin_uri(&format!("/status/{status}")))
+            .await
+            .unwrap_or_else(|error| panic!("{status} must succeed: {error}"));
+        assert_eq!(response.status().as_u16(), status);
+    }
+
+    for status in [400_u16, 401, 403, 404, 500, 502, 503] {
+        let Err(error) = get(httpbin_uri(&format!("/status/{status}"))).await else {
+            panic!("{status} must surface as Err");
+        };
+        assert_eq!(
+            error.response().map(|response| response.status().as_u16()),
+            Some(status),
+            "the error must carry the original status"
+        );
+        assert!(
+            error.to_string().contains(&status.to_string()),
+            "got {error}"
+        );
     }
 }
 
 #[test_executors::async_test]
-async fn test_redirect_chain() {
+async fn a_long_redirect_chain_is_followed_to_completion() {
     let mut client = client();
-
-    // Test a redirect chain
-    let response = client.get(endpoint("/redirect/5")).unwrap().await.unwrap();
-    assert!(response.status().is_success());
+    let body = client
+        .get(httpbin_uri("/redirect/5"))
+        .expect("uri must parse")
+        .string()
+        .await
+        .expect("five redirects are within the default limit");
+    assert_eq!(body.trim(), "redirect complete");
 }
 
 #[test_executors::async_test]
-async fn test_large_response() {
-    // Test handling of larger responses
-    let response = get(endpoint("/base64/aGVsbG8gd29ybGQ=")).await;
-    assert!(response.is_ok());
-    let response = response.unwrap();
-    let body = response.into_body().into_bytes().await;
-    assert!(body.is_ok());
-    let bytes = body.unwrap();
-    assert!(!bytes.is_empty());
+async fn a_multi_kilobyte_body_is_read_in_full() {
+    let bytes = get(httpbin_uri("/bytes/4096"))
+        .await
+        .expect("request must succeed")
+        .into_bytes()
+        .await
+        .expect("body must read");
+    assert_eq!(bytes.len(), 4096, "the whole body must be collected");
+    assert!(bytes.iter().all(|byte| *byte == 0xAB));
 }
 
 #[test_executors::async_test]
-async fn test_gzip_compression() {
-    // Local test server advertises gzip support
-    let response = get(endpoint("/gzip")).await;
-    assert!(response.is_ok());
-    let response = response.unwrap();
-    let bytes = response.into_body().into_bytes().await.unwrap();
-    // Should get some response data (gzipped content is handled by the HTTP client)
-    assert!(!bytes.is_empty());
+async fn a_base64_route_decodes_to_its_payload() {
+    let bytes = get(httpbin_uri("/base64/aGVsbG8gd29ybGQ="))
+        .await
+        .expect("request must succeed")
+        .into_bytes()
+        .await
+        .expect("body must read");
+    assert_eq!(bytes.as_ref(), b"hello world");
 }
 
 #[test_executors::async_test]
-async fn test_cookie_persistence() {
+async fn cookies_persist_across_requests_on_one_client() {
     let mut client = client().enable_cookie();
 
-    // Set a cookie
-    let _response = client
-        .get(endpoint("/cookies/set/test/cookievalue"))
-        .unwrap()
+    client
+        .get(httpbin_uri("/cookies/set/test/cookievalue"))
+        .expect("uri must parse")
         .await
-        .unwrap();
+        .expect("setting a cookie must succeed");
 
-    // Verify cookie is sent in subsequent request
-    let response = client.get(endpoint("/cookies")).unwrap().await.unwrap();
-    let body = response.into_body().into_string().await.unwrap();
-    assert!(body.contains("test"));
-    assert!(body.contains("cookievalue"));
+    let body = client
+        .get(httpbin_uri("/cookies"))
+        .expect("uri must parse")
+        .string()
+        .await
+        .expect("request must succeed");
+    assert!(body.contains("test=cookievalue"), "got {body}");
 }
 
 #[test_executors::async_test]
-async fn test_method_overrides() {
+async fn every_method_reaches_its_route() {
     let mut client = client();
-
-    // Test different HTTP methods
-    let methods = [
+    for (method, path) in [
         (Method::GET, "/get"),
         (Method::POST, "/post"),
         (Method::PUT, "/put"),
         (Method::DELETE, "/delete"),
         (Method::PATCH, "/patch"),
-    ];
-
-    for (method, url) in methods {
-        let method_clone = method.clone();
-        let response = client.method(method, endpoint(url)).unwrap().await;
-        assert!(response.is_ok(), "Failed for method: {method_clone:?}");
-        let response = response.unwrap();
+    ] {
+        let response = client
+            .method(method.clone(), httpbin_uri(path))
+            .expect("uri must parse")
+            .await
+            .unwrap_or_else(|error| panic!("{method} {path} must succeed: {error}"));
         assert!(
             response.status().is_success(),
-            "Failed for method: {method_clone:?}"
+            "{method} {path} returned {}",
+            response.status()
         );
     }
+}
+
+#[test_executors::async_test]
+async fn error_for_status_passes_a_success_response_through() {
+    let response = get(httpbin_uri("/get"))
+        .await
+        .expect("request must succeed")
+        .error_for_status()
+        .await
+        .expect("a 2xx must pass through unchanged");
+    assert!(response.status().is_success());
 }

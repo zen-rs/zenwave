@@ -21,6 +21,9 @@ pub struct Proxy {
 
 impl Proxy {
     /// Create a proxy matcher from the standard environment variables.
+    ///
+    /// Reads `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`, each also
+    /// accepted in lowercase, which is the more common spelling for `http_proxy`.
     #[must_use]
     pub fn from_env() -> Self {
         Self::new(Matcher::from_env())
@@ -52,12 +55,40 @@ impl Proxy {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn into_matcher(self) -> Arc<Matcher> {
-        self.matcher
+    /// Whether requests to `uri` are routed through a proxy.
+    ///
+    /// Returns `false` for destinations covered by `NO_PROXY`, for schemes other
+    /// than `http`/`https`, and when no proxy is configured for the scheme.
+    #[must_use]
+    pub fn intercepts(&self, uri: &Uri) -> bool {
+        self.matcher.intercept(uri).is_some()
     }
 
-    #[cfg(any(feature = "curl-backend", test))]
+    /// Address of the proxy that serves `uri`, without any credentials.
+    ///
+    /// Credentials belong in the `Proxy-Authorization` header rather than the
+    /// connect address; see [`Proxy::proxy_authorization`].
+    #[must_use]
+    pub fn proxy_uri(&self, uri: &Uri) -> Option<String> {
+        let intercept = self.matcher.intercept(uri)?;
+        let proxy = intercept.uri();
+        let authority = proxy.authority()?;
+        Some(format!(
+            "{}://{authority}",
+            proxy.scheme_str().unwrap_or("http")
+        ))
+    }
+
+    /// `Proxy-Authorization` header value for `uri`, when the proxy needs credentials.
+    #[must_use]
+    pub fn proxy_authorization(&self, uri: &Uri) -> Option<String> {
+        self.matcher
+            .intercept(uri)?
+            .basic_auth()
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    }
+
     pub(crate) fn intercept(&self, uri: &Uri) -> Option<Intercept> {
         self.matcher.intercept(uri)
     }
@@ -102,13 +133,7 @@ impl ProxyBuilder {
     /// Set the comma-separated `NO_PROXY` list.
     #[must_use]
     pub fn no_proxy(mut self, value: impl Into<String>) -> Self {
-        let raw = value.into();
-        let entries = raw
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .map(str::to_lowercase)
-            .collect::<Vec<_>>();
-        self.no_proxy.extend(entries);
+        self.no_proxy.extend(parse_no_proxy(&value.into()));
         self
     }
 
@@ -135,11 +160,11 @@ struct ProxyConfig {
 impl ProxyConfig {
     fn parse(value: &str) -> Option<Self> {
         let parsed = Uri::from_str(value).ok()?;
-        let auth = parsed.authority()?;
-        let (userinfo, _) = auth
+        let authority = parsed.authority()?;
+        let (userinfo, host_port) = authority
             .as_str()
             .rsplit_once('@')
-            .unwrap_or(("", auth.as_str()));
+            .unwrap_or(("", authority.as_str()));
 
         let basic_auth = (!userinfo.is_empty())
             .then(|| {
@@ -152,8 +177,22 @@ impl ProxyConfig {
             .split_once(':')
             .map(|(user, pass)| (user.to_string(), pass.to_string()));
 
+        // Rebuild the address without the userinfo: credentials are sent in the
+        // `Proxy-Authorization` header, not in the address we connect to.
+        let uri = if userinfo.is_empty() {
+            parsed
+        } else {
+            let mut parts = parsed.clone().into_parts();
+            parts.authority = host_port.parse().ok();
+            // Uri::from_parts needs a path when an authority is present.
+            if parts.path_and_query.is_none() {
+                parts.path_and_query = Some(http::uri::PathAndQuery::from_static("/"));
+            }
+            Uri::from_parts(parts).unwrap_or(parsed)
+        };
+
         Some(Self {
-            uri: parsed,
+            uri,
             basic_auth,
             raw_auth,
         })
@@ -164,6 +203,8 @@ impl ProxyConfig {
 pub(crate) struct Intercept {
     uri: Uri,
     basic_auth: Option<HeaderValue>,
+    /// Username/password kept unencoded for libcurl, which does its own encoding.
+    #[cfg_attr(not(feature = "curl-backend"), allow(dead_code))]
     raw_auth: Option<(String, String)>,
 }
 
@@ -172,15 +213,47 @@ impl Intercept {
         &self.uri
     }
 
+    /// Host of the proxy to connect to.
+    #[cfg(feature = "hyper-backend")]
+    pub(crate) fn host(&self) -> Option<&str> {
+        self.uri.host()
+    }
+
+    /// Port of the proxy, defaulting to the scheme's usual port.
+    #[cfg(feature = "hyper-backend")]
+    pub(crate) fn port(&self) -> u16 {
+        if let Some(port) = self.uri.port_u16() {
+            return port;
+        }
+        if self.uri.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        }
+    }
+
     pub(crate) const fn basic_auth(&self) -> Option<&HeaderValue> {
         self.basic_auth.as_ref()
     }
 
+    #[cfg(feature = "curl-backend")]
     pub(crate) fn raw_auth(&self) -> Option<(&str, &str)> {
         self.raw_auth
             .as_ref()
             .map(|(user, pass)| (user.as_str(), pass.as_str()))
     }
+}
+
+/// Whether `host` is exempted by a `NO_PROXY` entry.
+///
+/// An entry matches the host itself or any of its subdomains, but not a
+/// different host that merely ends with the same text.
+fn host_matches_no_proxy(host: &str, entry: &str) -> bool {
+    if entry == "*" || host == entry {
+        return true;
+    }
+    host.strip_suffix(entry)
+        .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 #[derive(Clone, Debug)]
@@ -191,19 +264,29 @@ pub(crate) struct Matcher {
     no_proxy: HashSet<String>,
 }
 
+/// Read an environment variable, accepting either case of its name.
+fn proxy_env(name: &str) -> Option<String> {
+    env::var(name.to_uppercase())
+        .or_else(|_| env::var(name.to_lowercase()))
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// Split a `NO_PROXY`-style list into lowercase host suffixes.
+fn parse_no_proxy(raw: &str) -> HashSet<String> {
+    raw.split(',')
+        .map(|entry| entry.trim().trim_start_matches('.').to_lowercase())
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
 impl Matcher {
     fn from_env() -> Self {
-        let http = env::var("HTTP_PROXY").ok();
-        let https = env::var("HTTPS_PROXY").ok();
-        let all = env::var("ALL_PROXY").ok();
-        let no_proxy = env::var("NO_PROXY")
-            .ok()
-            .map(|v| {
-                v.split(',')
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_lowercase)
-                    .collect()
-            })
+        let http = proxy_env("HTTP_PROXY");
+        let https = proxy_env("HTTPS_PROXY");
+        let all = proxy_env("ALL_PROXY");
+        let no_proxy = proxy_env("NO_PROXY")
+            .map(|raw| parse_no_proxy(&raw))
             .unwrap_or_default();
 
         Self {
@@ -215,8 +298,15 @@ impl Matcher {
     }
 
     fn intercept(&self, uri: &Uri) -> Option<Intercept> {
-        let host = uri.host()?.to_lowercase();
-        if self.no_proxy.iter().any(|entry| host.ends_with(entry)) {
+        let host = uri.host()?.trim_matches('.').to_lowercase();
+        if host.is_empty() {
+            return None;
+        }
+        if self
+            .no_proxy
+            .iter()
+            .any(|entry| host_matches_no_proxy(&host, entry))
+        {
             return None;
         }
 

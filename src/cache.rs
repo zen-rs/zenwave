@@ -1,7 +1,7 @@
 //! HTTP caching middleware that honors basic Cache-Control and validator headers.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -11,23 +11,76 @@ use httpdate::parse_http_date;
 use http_kit::utils::Bytes;
 use http_kit::{Endpoint, HttpError, Middleware, Request, Response, middleware::MiddlewareError};
 
+/// Remaining freshness implied by an `Expires` header, if it is still in the future.
+fn expires_in(headers: &HeaderMap) -> Option<Duration> {
+    let expires = headers.get(header::EXPIRES)?;
+    let text = expires.to_str().ok()?;
+    let timestamp = parse_http_date(text).ok()?;
+    let duration = timestamp.duration_since(SystemTime::now()).ok()?;
+    if duration.is_zero() {
+        None
+    } else {
+        Some(duration)
+    }
+}
+
 /// Middleware implementing an in-memory HTTP cache.
 ///
 /// The cache honors the core HTTP caching directives (`Cache-Control`, `Expires`, `ETag`,
 /// `Last-Modified`) so it can serve fresh responses locally and transparently revalidate stale
 /// entries using conditional requests.
-#[derive(Debug, Default)]
+///
+/// The cache holds at most [`Cache::DEFAULT_CAPACITY`] responses unless a
+/// different bound is given to [`Cache::with_capacity`]. Once full, the least
+/// recently used entry is dropped, so a long-lived client cannot grow without
+/// limit as it visits new URLs.
+#[derive(Debug)]
 pub struct Cache {
     entries: HashMap<String, CachedResponse>,
+    /// Keys in least-recently-used order; the front is the next eviction victim.
+    recency: VecDeque<String>,
+    capacity: usize,
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Cache {
-    /// Create an empty in-memory cache.
+    /// Number of responses a cache built with [`Cache::new`] retains.
+    pub const DEFAULT_CAPACITY: usize = 256;
+
+    /// Create an empty in-memory cache holding [`Cache::DEFAULT_CAPACITY`] responses.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_capacity(Self::DEFAULT_CAPACITY)
+    }
+
+    /// Create an empty in-memory cache holding at most `capacity` responses.
+    ///
+    /// A `capacity` of zero disables storage: responses still pass through, but
+    /// nothing is retained.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: HashMap::with_capacity(capacity.min(Self::DEFAULT_CAPACITY)),
+            recency: VecDeque::new(),
+            capacity,
         }
+    }
+
+    /// Number of responses currently held.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the cache currently holds no responses.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     fn cache_key(request: &Request) -> Option<String> {
@@ -35,6 +88,43 @@ impl Cache {
             return None;
         }
         Some(request.uri().to_string())
+    }
+
+    /// Drop an entry and forget its recency.
+    fn evict(&mut self, key: &str) -> Option<CachedResponse> {
+        let entry = self.entries.remove(key);
+        if entry.is_some() {
+            self.recency.retain(|candidate| candidate != key);
+        }
+        entry
+    }
+
+    /// Record `key` as the most recently used entry.
+    fn touch(&mut self, key: &str) {
+        self.recency.retain(|candidate| candidate != key);
+        self.recency.push_back(key.to_string());
+    }
+
+    /// Store an entry, evicting the least recently used one when full.
+    fn store(&mut self, key: &str, entry: CachedResponse) {
+        if self.capacity == 0 {
+            return;
+        }
+
+        if !self.entries.contains_key(key) {
+            while self.entries.len() >= self.capacity {
+                // Recency and entries disagree only if a key was stored without
+                // being tracked; clear rather than loop forever.
+                let Some(oldest) = self.recency.pop_front() else {
+                    self.entries.clear();
+                    break;
+                };
+                self.entries.remove(&oldest);
+            }
+        }
+
+        self.entries.insert(key.to_string(), entry);
+        self.touch(key);
     }
 }
 
@@ -54,7 +144,7 @@ impl Middleware for Cache {
 
         let request_cc = CacheControl::from_header_map(request.headers());
         if request_cc.no_store {
-            self.entries.remove(&key);
+            self.evict(&key);
             return next
                 .respond(request)
                 .await
@@ -62,24 +152,23 @@ impl Middleware for Cache {
         }
 
         let now = Instant::now();
-        if let Some(entry) = self.entries.get(&key)
-            && !request_cc.no_cache
-            && !entry.must_revalidate
-            && entry.is_fresh(now)
-        {
-            return Ok(entry.to_response(now));
-        }
-
         let mut cached_entry = None;
         if let Some(entry) = self.entries.get(&key) {
             let entry_requires_revalidation = entry.must_revalidate || !entry.is_fresh(now);
-            let needs_revalidation = request_cc.no_cache || entry_requires_revalidation;
-            if needs_revalidation && entry.can_revalidate() {
-                let owned_entry = self.entries.remove(&key).unwrap();
+            if !request_cc.no_cache && !entry_requires_revalidation {
+                let response = entry.to_response(now);
+                self.touch(&key);
+                return Ok(response);
+            }
+
+            if entry.can_revalidate() {
+                let owned_entry = self
+                    .evict(&key)
+                    .expect("entry was just observed under this key");
                 owned_entry.apply_conditional_headers(request.headers_mut());
                 cached_entry = Some(owned_entry);
-            } else if entry_requires_revalidation && !entry.can_revalidate() {
-                self.entries.remove(&key);
+            } else {
+                self.evict(&key);
             }
         }
 
@@ -91,7 +180,7 @@ impl Middleware for Cache {
             if let Some(mut entry) = cached_entry {
                 entry.update_from_304(&response, now);
                 let response = entry.to_response(now);
-                self.entries.insert(key, entry);
+                self.store(&key, entry);
                 return Ok(response);
             }
 
@@ -110,7 +199,7 @@ impl Middleware for Cache {
                     .map_err(MiddlewareError::Middleware)?;
             if let Some(entry) = entry {
                 let result = entry.to_response(now);
-                self.entries.insert(key, entry);
+                self.store(&key, entry);
                 return Ok(result);
             }
             return Ok(response);
@@ -476,17 +565,5 @@ mod tests {
                 .body(Body::from("fresh"))
                 .unwrap()))
         }
-    }
-}
-
-fn expires_in(headers: &HeaderMap) -> Option<Duration> {
-    let expires = headers.get(header::EXPIRES)?;
-    let text = expires.to_str().ok()?;
-    let timestamp = parse_http_date(text).ok()?;
-    let duration = timestamp.duration_since(SystemTime::now()).ok()?;
-    if duration.is_zero() {
-        None
-    } else {
-        Some(duration)
     }
 }

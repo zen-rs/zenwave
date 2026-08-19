@@ -1,216 +1,178 @@
-//! Tests for authentication middleware and request builders
+//! Tests for authentication middleware and per-request credentials.
 
 mod common;
 use common::httpbin_uri;
 use zenwave::auth::{BasicAuth, BearerAuth};
 use zenwave::{Client, client};
 
-#[test_executors::async_test]
-async fn test_bearer_auth_middleware() {
-    let mut client = client().bearer_auth("test-token-123");
-
-    // Test that the Bearer token is sent in the Authorization header
-    let response = client.get(httpbin_uri("/bearer")).unwrap().await;
-    assert!(response.is_ok());
-    let response = response.unwrap();
-    assert!(response.status().is_success());
-}
+/// base64("testuser:testpass")
+const TESTUSER_TESTPASS: &str = "dGVzdHVzZXI6dGVzdHBhc3M=";
 
 #[test_executors::async_test]
-async fn test_bearer_auth_request_builder() {
-    let mut client = client();
+async fn bearer_auth_middleware_authenticates_every_request() {
+    let mut client = client()
+        .bearer_auth("test-token-123")
+        .expect("token must be a valid header value");
 
-    // Test Bearer auth on individual request
-    let response = client
-        .get(httpbin_uri("/bearer"))
-        .unwrap()
-        .bearer_auth("test-token-456")
-        .await;
-
-    assert!(response.is_ok());
-    let response = response.unwrap();
-    assert!(response.status().is_success());
-}
-
-#[test_executors::async_test]
-async fn test_basic_auth_middleware() {
-    let mut client = client().basic_auth("testuser", Some("testpass"));
-
-    // Test Basic auth with username and password
-    let response = client
-        .get(httpbin_uri("/basic-auth/testuser/testpass"))
-        .unwrap()
-        .await;
-    assert!(response.is_ok());
-    let response = response.unwrap();
-    assert!(response.status().is_success());
-}
-
-#[test_executors::async_test]
-async fn test_basic_auth_request_builder() {
-    let mut client = client();
-
-    // Test Basic auth on individual request
-    let response = client
-        .get(httpbin_uri("/basic-auth/user123/pass456"))
-        .unwrap()
-        .basic_auth("user123", Some("pass456"))
-        .await;
-
-    assert!(response.is_ok());
-    let response = response.unwrap();
-    assert!(response.status().is_success());
-}
-
-#[test_executors::async_test]
-async fn test_basic_auth_no_password() {
-    let mut client = client();
-
-    // Test Basic auth with only username (no password)
-    let response = client
-        .get(httpbin_uri("/headers"))
-        .unwrap()
-        .basic_auth("onlyuser", None::<String>)
-        .await;
-
-    assert!(response.is_ok());
-    let response = response.unwrap();
-    let body = response.into_body().into_string().await.unwrap();
-
-    // Check that the Authorization header is present
-    assert!(body.contains("Authorization"));
-    assert!(body.contains("Basic"));
-}
-
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-fn test_bearer_auth_creation() {
-    let bearer_auth = BearerAuth::new("my-token");
-    assert!(!format!("{bearer_auth:?}").is_empty());
-}
-
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-fn test_basic_auth_creation() {
-    let basic_auth = BasicAuth::new("username", Some("password"));
-    assert!(!format!("{basic_auth:?}").is_empty());
-
-    let basic_auth_no_pass = BasicAuth::new("username", None::<String>);
-    assert!(!format!("{basic_auth_no_pass:?}").is_empty());
-}
-
-#[test_executors::async_test]
-async fn test_auth_headers_sent() {
-    let mut client = client();
-
-    // Test that Bearer auth header is correctly sent
-    let response = client
-        .get(httpbin_uri("/headers"))
-        .unwrap()
-        .bearer_auth("secret-token")
-        .await
-        .unwrap();
-
-    let body = response.into_body().into_string().await.unwrap();
-    assert!(body.contains("Bearer secret-token"));
-}
-
-#[test_executors::async_test]
-async fn test_basic_auth_encoding() {
-    let mut client = client();
-
-    // Test Basic auth encoding
-    let response = client
-        .get(httpbin_uri("/headers"))
-        .unwrap()
-        .basic_auth("testuser", Some("testpass"))
-        .await
-        .unwrap();
-
-    let body = response.into_body().into_string().await.unwrap();
-    // The base64 encoding of "testuser:testpass" should be present
-    assert!(body.contains("Basic"));
-}
-
-#[test_executors::async_test]
-async fn test_multiple_auth_requests() {
-    let mut client = client().bearer_auth("persistent-token");
-
-    // Multiple requests should all use the same Bearer token
-    for _ in 0..3 {
-        let response = client.get(httpbin_uri("/headers")).unwrap().await;
-        assert!(response.is_ok());
-        let response = response.unwrap();
-        let body = response.into_body().into_string().await.unwrap();
-        assert!(body.contains("Bearer persistent-token"));
+    for attempt in 0..3 {
+        let body = client
+            .get(httpbin_uri("/headers"))
+            .expect("uri must parse")
+            .string()
+            .await
+            .unwrap_or_else(|error| panic!("request {attempt} must succeed: {error}"));
+        assert!(
+            body.contains("Bearer test-token-123"),
+            "request {attempt} lost its token: {body}"
+        );
     }
 }
 
 #[test_executors::async_test]
-async fn test_auth_with_other_middleware() {
-    // Test auth combined with other middleware
-    let mut client = client().bearer_auth("combined-token").enable_cookie();
+async fn bearer_auth_on_a_request_builder_sends_the_token() {
+    let mut client = client();
+    let body = client
+        .get(httpbin_uri("/headers"))
+        .expect("uri must parse")
+        .bearer_auth("secret-token")
+        .expect("token must be a valid header value")
+        .string()
+        .await
+        .expect("request must succeed");
+    assert!(body.contains("Bearer secret-token"), "got {body}");
+}
 
-    let response = client.get(httpbin_uri("/headers")).unwrap().await;
-    assert!(response.is_ok());
-    let response = response.unwrap();
+#[test_executors::async_test]
+async fn basic_auth_middleware_satisfies_the_server_challenge() {
+    let mut client = client()
+        .basic_auth("testuser", Some("testpass"))
+        .expect("credentials must encode");
+
+    let response = client
+        .get(httpbin_uri("/basic-auth/testuser/testpass"))
+        .expect("uri must parse")
+        .await
+        .expect("correct credentials must be accepted");
     assert!(response.status().is_success());
 }
 
 #[test_executors::async_test]
-async fn test_override_auth_per_request() {
-    let mut client = client().bearer_auth("default-token");
-
-    // The per-request auth should override the middleware auth
-    let response = client
+async fn basic_auth_sends_the_expected_base64_credentials() {
+    let mut client = client();
+    let body = client
         .get(httpbin_uri("/headers"))
-        .unwrap()
-        .bearer_auth("override-token")
+        .expect("uri must parse")
+        .basic_auth("testuser", Some("testpass"))
+        .expect("credentials must encode")
+        .string()
         .await
-        .unwrap();
-
-    let body = response.into_body().into_string().await.unwrap();
-    // Should contain the override token, not the default one
-    assert!(body.contains("Bearer override-token"));
-}
-
-#[test_executors::async_test]
-async fn test_unauthorized_access() {
-    let mut client = client();
-
-    // Test accessing an endpoint that requires auth without providing it
-    let response = client.get(httpbin_uri("/bearer")).unwrap().await;
+        .expect("request must succeed");
     assert!(
-        response.is_err(),
-        "expected unauthenticated access to return an error"
-    );
-    let err = response.unwrap_err();
-    let description = format!("{err}");
-    assert!(
-        description.contains("401"),
-        "error should mention 401 status: {description}"
+        body.contains(&format!("Basic {TESTUSER_TESTPASS}")),
+        "credentials must be base64 of user:pass, got {body}"
     );
 }
 
 #[test_executors::async_test]
-async fn test_invalid_basic_auth() {
+async fn basic_auth_without_a_password_still_sends_the_separator() {
     let mut client = client();
+    let body = client
+        .get(httpbin_uri("/headers"))
+        .expect("uri must parse")
+        .basic_auth("onlyuser", None::<String>)
+        .expect("credentials must encode")
+        .string()
+        .await
+        .expect("request must succeed");
+    // base64("onlyuser:")
+    assert!(body.contains("Basic b25seXVzZXI6"), "got {body}");
+}
 
-    // Test Basic auth with wrong credentials
-    let response = client
+#[test_executors::async_test]
+async fn a_per_request_token_overrides_the_client_wide_one() {
+    let mut client = client()
+        .bearer_auth("default-token")
+        .expect("token must be a valid header value");
+
+    let body = client
+        .get(httpbin_uri("/headers"))
+        .expect("uri must parse")
+        .bearer_auth("override-token")
+        .expect("token must be a valid header value")
+        .string()
+        .await
+        .expect("request must succeed");
+
+    assert!(body.contains("Bearer override-token"), "got {body}");
+    assert!(
+        !body.contains("Bearer default-token"),
+        "the middleware token must not also be sent: {body}"
+    );
+}
+
+#[test_executors::async_test]
+async fn auth_middleware_composes_with_cookies() {
+    let mut client = client()
+        .bearer_auth("combined-token")
+        .expect("token must be a valid header value")
+        .enable_cookie();
+
+    let body = client
+        .get(httpbin_uri("/headers"))
+        .expect("uri must parse")
+        .string()
+        .await
+        .expect("request must succeed");
+    assert!(body.contains("Bearer combined-token"), "got {body}");
+}
+
+#[test_executors::async_test]
+async fn missing_credentials_surface_as_a_401_error() {
+    let mut client = client();
+    let error = client
+        .get(httpbin_uri("/bearer"))
+        .expect("uri must parse")
+        .await
+        .expect_err("unauthenticated access must fail");
+    assert!(error.is_client_error(), "got {error:?}");
+    assert_eq!(
+        error.response().map(http::Response::status),
+        Some(http::StatusCode::UNAUTHORIZED)
+    );
+}
+
+#[test_executors::async_test]
+async fn wrong_credentials_surface_as_a_401_error() {
+    let mut client = client();
+    let error = client
         .get(httpbin_uri("/basic-auth/correct/password"))
-        .unwrap()
+        .expect("uri must parse")
         .basic_auth("wrong", Some("credentials"))
-        .await;
+        .expect("credentials must encode")
+        .await
+        .expect_err("invalid credentials must fail");
+    assert!(error.is_client_error(), "got {error:?}");
+    assert!(error.to_string().contains("401"), "got {error}");
+}
 
-    assert!(
-        response.is_err(),
-        "expected invalid credentials to produce an error"
-    );
-    let err = response.unwrap_err();
-    let description = format!("{err}");
-    assert!(
-        description.contains("401"),
-        "error should mention 401 status: {description}"
-    );
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn a_token_that_cannot_be_a_header_is_rejected_rather_than_panicking() {
+    let error = BearerAuth::new("token\nInjected: header").expect_err("a newline must be rejected");
+    assert!(error.is_request_error(), "got {error:?}");
+
+    let mut client = client();
+    let error = client
+        .get("http://example.com/")
+        .expect("uri must parse")
+        .bearer_auth("token\r\nInjected: header")
+        .expect_err("a newline must be rejected");
+    assert!(error.is_request_error(), "got {error:?}");
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn basic_credentials_are_always_encodable() {
+    // Base64 output is header-safe, so even control characters must be accepted.
+    BasicAuth::new("user\n", Some("pass\r")).expect("base64 output is always header safe");
 }

@@ -7,11 +7,10 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 mod local {
-    use std::{fmt::Write, io::Cursor, thread, time::Duration};
+    use std::{fmt::Write, io::Cursor, sync::OnceLock, thread, time::Duration};
 
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
-    use once_cell::sync::OnceCell;
     use tiny_http::{Header, ListenAddr, Request, Response, Server, StatusCode};
     use url::Url;
 
@@ -37,7 +36,7 @@ mod local {
     }
 
     pub fn test_server() -> &'static TestServer {
-        static INSTANCE: OnceCell<TestServer> = OnceCell::new();
+        static INSTANCE: OnceLock<TestServer> = OnceLock::new();
         INSTANCE.get_or_init(TestServer::start)
     }
 
@@ -56,13 +55,21 @@ mod local {
     }
 
     fn run_server(server: &Server) {
-        for request in server.incoming_requests() {
-            let response = handle_request(&request);
+        for mut request in server.incoming_requests() {
+            let response = handle_request(&mut request);
             let _ = request.respond(response);
         }
     }
 
-    fn handle_request(request: &Request) -> Response<Cursor<Vec<u8>>> {
+    /// Read the whole request body, which the echo routes reflect back.
+    fn read_body(request: &mut Request) -> Vec<u8> {
+        let mut body = Vec::new();
+        let _ = request.as_reader().read_to_end(&mut body);
+        body
+    }
+
+    #[allow(clippy::too_many_lines)] // A flat router reads better than nested dispatch.
+    fn handle_request(request: &mut Request) -> Response<Cursor<Vec<u8>>> {
         // tiny_http only provides the path/query, so prefix with a dummy scheme/host.
         let url = Url::parse(&format!("http://localhost{}", request.url())).unwrap();
         let mut path = url.path().to_string();
@@ -124,13 +131,31 @@ mod local {
                 StatusCode(200),
                 r#"{"result":"ok","server":"httpbin-local"}"#,
             ),
-            "/gzip" => bytes_response(StatusCode(200), b"gzip response"),
+            // Reflects the method, headers of interest, and body so tests can
+            // assert on what was actually sent.
+            "/echo" => {
+                let method = request.method().as_str().to_string();
+                let content_type = header_value(request, "content-type").unwrap_or_default();
+                let query = url.query().unwrap_or_default().to_string();
+                let body = read_body(request);
+                let mut payload =
+                    format!("method={method}\ncontent-type={content_type}\nquery={query}\nbody=");
+                payload.push_str(&String::from_utf8_lossy(&body));
+                text_response(StatusCode(200), payload)
+            }
             "/delay/1" => {
                 // Small delay to emulate a slow endpoint.
                 thread::sleep(Duration::from_millis(10));
                 text_response(StatusCode(200), "delayed")
             }
             "/html" => text_response(StatusCode(200), "<html><body>not json</body></html>"),
+            // A structured error body, for `Error::deserialize_http_error`.
+            "/error-json" => json_response(
+                StatusCode(422),
+                r#"{"code":"invalid_field","message":"name is required"}"#,
+            ),
+            // Fixed-size payload for streaming and limit tests.
+            "/bytes/4096" => bytes_response(StatusCode(200), vec![0xAB_u8; 4096]),
             _ => {
                 if let Some(stripped) = path.strip_prefix("/basic-auth/") {
                     return handle_basic_auth(request, stripped);
@@ -146,6 +171,17 @@ mod local {
                 }
                 if path.starts_with("/redirect/") {
                     return handle_redirect(path.as_str());
+                }
+                // Method- and body-preserving redirects (307/308).
+                if let Some(code) = path.strip_prefix("/redirect-keep/") {
+                    let status = code.parse::<u16>().unwrap_or(307);
+                    let location = Header::from_bytes("Location", "/echo").unwrap();
+                    return text_response(StatusCode(status), "keep-method redirect")
+                        .with_header(location);
+                }
+                // Fails with a connection-less 503 the first N times, then succeeds.
+                if let Some(count) = path.strip_prefix("/flaky/") {
+                    return handle_flaky(count);
                 }
                 if path == "/redirect-to" {
                     return handle_redirect_to(&query);
@@ -173,7 +209,9 @@ mod local {
         let mut parts = path.split('/');
         let name = parts.next().unwrap_or_default();
         let value = parts.next().unwrap_or_default();
-        let header = Header::from_bytes("Set-Cookie", format!("{name}={value}")).unwrap();
+        // Real httpbin scopes these to the site root; without an explicit Path a
+        // client following RFC 6265 would confine the cookie to /cookies/set/....
+        let header = Header::from_bytes("Set-Cookie", format!("{name}={value}; Path=/")).unwrap();
         text_response(StatusCode(200), "cookie set").with_header(header)
     }
 
@@ -196,6 +234,19 @@ mod local {
             |_| text_response(StatusCode(400), "invalid base64"),
             |bytes| bytes_response(StatusCode(200), bytes),
         )
+    }
+
+    /// Answer `503` until the named counter has been hit `count` times.
+    fn handle_flaky(count: &str) -> Response<Cursor<Vec<u8>>> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+
+        let threshold = count.parse::<usize>().unwrap_or(1);
+        let seen = HITS.fetch_add(1, Ordering::SeqCst);
+        if seen < threshold {
+            return text_response(StatusCode(503), "try again");
+        }
+        text_response(StatusCode(200), format!("ok after {seen} failures"))
     }
 
     fn handle_redirect(path: &str) -> Response<Cursor<Vec<u8>>> {

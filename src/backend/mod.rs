@@ -21,6 +21,24 @@
 //!
 //! The default configuration uses `hyper-backend` with `rustls` TLS.
 
+/// Default `User-Agent` sent by the native backends when a request has none.
+///
+/// Many servers reject or throttle requests without a `User-Agent`, so the
+/// backends fill one in rather than sending the header empty. Set the header on
+/// the request to override it.
+pub const DEFAULT_USER_AGENT: &str =
+    concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
+/// Add [`DEFAULT_USER_AGENT`] to `headers` unless the caller already set one.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn apply_default_user_agent(headers: &mut http::HeaderMap) {
+    use http::header::{HeaderValue, USER_AGENT};
+
+    if !headers.contains_key(USER_AGENT) {
+        headers.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
+    }
+}
+
 #[cfg(all(not(target_arch = "wasm32"), feature = "hyper-backend"))]
 mod hyper;
 #[cfg(all(not(target_arch = "wasm32"), feature = "hyper-backend"))]

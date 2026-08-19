@@ -79,7 +79,7 @@ impl Middleware for Timeout {
 fn timeout_future(duration: Duration) -> SingleThreaded<TimeoutFuture> {
     // gloo expects milliseconds as u32; saturate to avoid overflow for long durations.
     let millis = duration.as_millis().try_into().unwrap_or(u32::MAX);
-    SingleThreaded(TimeoutFuture::new(millis))
+    SingleThreaded::new(TimeoutFuture::new(millis))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -87,11 +87,27 @@ fn timeout_future(duration: Duration) -> Timer {
     Timer::after(duration)
 }
 
+/// Wrapper asserting `Send`/`Sync` for a wasm-only future.
+///
+/// The middleware stack requires `Send` futures, but browser timer futures are
+/// not `Send`. wasm32 targets are single-threaded, so no other thread can
+/// observe the inner future and the assertion cannot be violated.
 #[cfg(target_arch = "wasm32")]
-struct SingleThreaded<T>(T);
+pub(crate) struct SingleThreaded<T>(T);
 
 #[cfg(target_arch = "wasm32")]
+impl<T> SingleThreaded<T> {
+    /// Wrap a future that is only ever polled on the single wasm thread.
+    pub(crate) const fn new(inner: T) -> Self {
+        Self(inner)
+    }
+}
+
+// SAFETY: wasm32 is single-threaded, so the inner value is never sent or shared
+// across threads even though the wrapper claims it may be.
+#[cfg(target_arch = "wasm32")]
 unsafe impl<T> Send for SingleThreaded<T> {}
+// SAFETY: see the `Send` impl above.
 #[cfg(target_arch = "wasm32")]
 unsafe impl<T> Sync for SingleThreaded<T> {}
 

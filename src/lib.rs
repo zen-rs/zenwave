@@ -105,11 +105,10 @@ mod client;
 pub mod redirect;
 pub mod retry;
 
-// Re-export the unified error type
-pub use error::Error;
+// Re-export the unified error type and its classification enum.
+pub use error::{Error, ErrorKind};
 
 mod ext;
-/// Multipart/form-data utilities.
 pub mod multipart;
 #[cfg(all(not(target_arch = "wasm32"), feature = "proxy"))]
 pub mod proxy;
@@ -183,16 +182,22 @@ pub fn raw_client() -> DefaultBackend {
 
 /// Construct the default backend configured with a proxy matcher.
 ///
-/// This helper only exists when the default backend is curl-backend, which
-/// supports proxy configuration. Other backends do not support this API.
+/// Available whenever the default backend supports proxies, which means the
+/// hyper backend (HTTP proxies) or the curl backend (HTTP and SOCKS proxies).
+/// The Apple and web backends manage proxying themselves, so this helper is not
+/// compiled when one of them is the default.
 #[cfg(all(
     not(target_arch = "wasm32"),
-    feature = "curl-backend",
-    not(all(target_vendor = "apple", feature = "apple-backend")),
-    not(feature = "hyper-backend")
+    feature = "proxy",
+    any(
+        feature = "hyper-backend",
+        all(
+            feature = "curl-backend",
+            not(all(target_vendor = "apple", feature = "apple-backend"))
+        )
+    )
 ))]
 #[must_use]
-#[allow(clippy::missing_const_for_fn)]
 pub fn client_with_proxy(proxy: Proxy) -> DefaultClient {
     DefaultClient {
         inner: DefaultBackend::with_proxy(proxy).follow_redirect(),
@@ -201,19 +206,23 @@ pub fn client_with_proxy(proxy: Proxy) -> DefaultClient {
 
 #[cfg(all(
     not(target_arch = "wasm32"),
-    feature = "curl-backend",
-    not(all(target_vendor = "apple", feature = "apple-backend")),
-    not(feature = "hyper-backend")
+    feature = "proxy",
+    any(
+        feature = "hyper-backend",
+        all(
+            feature = "curl-backend",
+            not(all(target_vendor = "apple", feature = "apple-backend"))
+        )
+    )
 ))]
 impl DefaultClient {
-    /// Replace the proxy matcher on the default curl-backed client.
+    /// Replace the proxy matcher on the default client.
     #[must_use]
     pub fn proxy(self, proxy: Proxy) -> Self {
         client_with_proxy(proxy)
     }
 }
 
-/// Create a default HTTP client backend.
 /// Send a GET request to the specified URI using the default client backend.
 ///
 /// # Errors

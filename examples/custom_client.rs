@@ -23,16 +23,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     async_io::block_on(async {
         let token = std::env::var("ZENWAVE_TOKEN").unwrap_or_else(|_| "demo-token".into());
 
-        // Compose the middleware you need.
-        let mut client = zenwave::client().enable_cookie().bearer_auth(token);
+        // Compose the middleware you need. `bearer_auth` is fallible because a
+        // token containing, say, a newline cannot be sent as a header.
+        let mut client = zenwave::client().enable_cookie().bearer_auth(token)?;
 
         let payload = MessageRequest {
             message: "zenwave says hi!",
         };
 
         let response: EchoResponse = client
-            .post("https://httpbin.org/post")
-            .unwrap()
+            .post("https://httpbin.org/post")?
             .header("x-request-id", "demo-request")?
             .json_body(&payload)?
             .await?

@@ -16,6 +16,12 @@ use crate::{Client, DefaultBackend, client};
 
 type TokenError = OAuth2Error<<DefaultBackend as Endpoint>::Error>;
 
+/// Shortest time a freshly fetched token is treated as usable.
+///
+/// Guards against a token endpoint reporting a zero or tiny `expires_in`, which
+/// would otherwise make every request fetch a new token.
+const MIN_TOKEN_VALIDITY: Duration = Duration::from_secs(1);
+
 /// Errors produced while performing `OAuth2` flows.
 #[derive(Debug, thiserror::Error)]
 pub enum OAuth2Error<H: HttpError> {
@@ -107,6 +113,12 @@ impl TokenInfo {
 }
 
 impl OAuth2ClientCredentials {
+    /// Refresh a token this long before it actually expires.
+    const DEFAULT_SAFETY_WINDOW: Duration = Duration::from_secs(30);
+
+    /// Lifetime assumed when the token endpoint omits `expires_in`.
+    const DEFAULT_TOKEN_LIFETIME: u64 = 3600;
+
     /// Create a new middleware that exchanges client credentials for access tokens.
     pub fn new(
         token_url: impl Into<String>,
@@ -120,27 +132,43 @@ impl OAuth2ClientCredentials {
                 client_secret: client_secret.into(),
                 scope: None,
                 audience: None,
-                safety_window: Duration::from_secs(30),
+                safety_window: Self::DEFAULT_SAFETY_WINDOW,
             }),
             token: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Mutate the configuration in place when it is not yet shared.
+    fn update_config(&mut self, edit: impl FnOnce(&mut Config)) {
+        if let Some(config) = Arc::get_mut(&mut self.config) {
+            edit(config);
+        } else {
+            let mut config = (*self.config).clone();
+            edit(&mut config);
+            self.config = Arc::new(config);
         }
     }
 
     /// Restrict the request to specific scopes.
     #[must_use]
     pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
-        let mut cfg = (*self.config).clone();
-        cfg.scope = Some(scope.into());
-        self.config = Arc::new(cfg);
+        let scope = scope.into();
+        self.update_config(|config| config.scope = Some(scope));
         self
     }
 
     /// Set a custom audience parameter if required by the provider.
     #[must_use]
     pub fn with_audience(mut self, audience: impl Into<String>) -> Self {
-        let mut cfg = (*self.config).clone();
-        cfg.audience = Some(audience.into());
-        self.config = Arc::new(cfg);
+        let audience = audience.into();
+        self.update_config(|config| config.audience = Some(audience));
+        self
+    }
+
+    /// Refresh tokens this long before they expire.
+    #[must_use]
+    pub fn with_safety_window(mut self, safety_window: Duration) -> Self {
+        self.update_config(|config| config.safety_window = safety_window);
         self
     }
 
@@ -201,13 +229,22 @@ impl OAuth2ClientCredentials {
             .await
             .map_err(OAuth2Error::InvalidResponse)?;
 
-        let expires_in = token.expires_in.unwrap_or(3600);
-        let lifetime = Duration::from_secs(expires_in);
-        let safety = self
-            .config
-            .safety_window
-            .min(Duration::from_secs(expires_in / 2));
-        let expires_at = Instant::now() + lifetime.saturating_sub(safety);
+        // Only bearer tokens can be attached as `Authorization: Bearer ...`.
+        if let Some(token_type) = &token.token_type
+            && !token_type.eq_ignore_ascii_case("bearer")
+        {
+            return Err(OAuth2Error::Upstream {
+                status,
+                message: format!("unsupported OAuth2 token type: {token_type}"),
+            });
+        }
+
+        let lifetime =
+            Duration::from_secs(token.expires_in.unwrap_or(Self::DEFAULT_TOKEN_LIFETIME));
+        // Never let the safety window consume the whole lifetime: a token that is
+        // already expired on arrival would be refetched for every single request.
+        let safety = self.config.safety_window.min(lifetime / 2);
+        let expires_at = Instant::now() + lifetime.saturating_sub(safety).max(MIN_TOKEN_VALIDITY);
 
         Ok(TokenInfo {
             access_token: token.access_token,
@@ -242,13 +279,18 @@ impl Middleware for OAuth2ClientCredentials {
                 .ensure_token()
                 .await
                 .map_err(MiddlewareError::Middleware)?;
-            let header_value = format!("Bearer {token}");
-            request.headers_mut().insert(
-                header::AUTHORIZATION,
-                header_value
-                    .parse()
-                    .expect("Fail to create a bearer header"),
-            );
+            // The token comes from a remote endpoint, so a value that cannot be
+            // put in a header is a protocol error rather than a bug here.
+            let header_value = crate::auth::bearer_header_value(&token).map_err(|_| {
+                MiddlewareError::Middleware(OAuth2Error::InvalidResponse(
+                    http_kit::BodyError::Other(Box::new(std::io::Error::other(
+                        "access token is not a valid header value",
+                    ))),
+                ))
+            })?;
+            request
+                .headers_mut()
+                .insert(header::AUTHORIZATION, header_value);
         }
 
         next.respond(request)
@@ -260,7 +302,8 @@ impl Middleware for OAuth2ClientCredentials {
 #[derive(Debug, Deserialize)]
 struct TokenEndpointResponse {
     access_token: String,
-    #[allow(dead_code)]
+    /// `Bearer` per RFC 6750; other schemes are not supported by this middleware.
+    #[serde(default)]
     token_type: Option<String>,
     #[serde(default)]
     expires_in: Option<u64>,

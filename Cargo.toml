@@ -20,14 +20,13 @@ futures-channel = "0.3"
 thiserror = "2.0"
 futures-io = "0.3"
 async-lock = "3.4"
-anyhow = "1.0.100"
-js-sys = "0.3.82"
 http = "1.3.1"
 httpdate = "1.0"
+# Cookie expiry handling needs this on every target.
+time = { version = "0.3.47", default-features = false, features = ["std", "parsing"] }
 tracing = "0.1"
 
 [dev-dependencies]
-serde_json = "1.0"
 tempfile = "3.13"
 test_executors = "0.4"
 tiny_http = "0.12"
@@ -54,9 +53,9 @@ hyper-native-tls = ["hyper-backend", "native-tls"]
 # hyper + rustls: Uses rustls with system certificates
 hyper-rustls = ["hyper-backend", "rustls"]
 # Apple's NSURLSession (macOS/iOS only)
-apple-backend = []
+apple-backend = ["dep:anyhow"]
 # libcurl backend with proxy support
-curl-backend = ["dep:curl", "dep:blocking", "proxy"]
+curl-backend = ["dep:curl", "dep:blocking", "dep:anyhow", "proxy"]
 # Websocket support (async-tungstenite on native, web-sys WebSocket on wasm)
 ws = ["dep:async-tungstenite"]
 
@@ -76,10 +75,14 @@ hyper-backend = [
     "dep:dns-lookup",
 ]
 
-# Proxy support for hyper-backend and curl-backend (native platforms only).
+# Proxy support for the hyper and curl backends (native platforms only).
+# Enabled automatically by curl-backend; enable it explicitly to use a proxy with
+# the hyper backend.
 proxy = []
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3.82"
+time = { version = "0.3.47", features = ["wasm-bindgen"] }
 web-sys = { version = "0.3", features = [
     "Window",
     "Request",
@@ -108,6 +111,7 @@ smol = "2.0"
 async-io = "2.4"
 async-net = "2.0"
 blocking = { version = "1.6", optional = true }
+anyhow = { version = "1.0.100", optional = true }
 curl = { version = "0.4", optional = true }
 dns-lookup = { version = "3.0", optional = true }
 executor-core = { version = "0.7.0" }
@@ -122,9 +126,6 @@ webpki-roots = { version = "1.0", optional = true }
 async-tungstenite = { version = "0.34.0", default-features = false, features = ["smol-runtime"], optional = true }
 async-fs = { version = "2.2.0", default-features = false }
 dirs = "6.0"
-once_cell = "1.19"
-time = "0.3.47"
-tower-service = "0.3"
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 block = "0.1"

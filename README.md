@@ -94,13 +94,11 @@ fn main() -> zenwave::Result<()> {
                 "client-secret",
             ))
             .enable_cookie()
-            .bearer_auth(token);
+            .bearer_auth(token)?;
 
         let echo: EchoResponse = client
-            .post("https://httpbin.org/post")
-            .unwrap()
-            .header("x-request-id", "demo-request")
-            ?
+            .post("https://httpbin.org/post")?
+            .header("x-request-id", "demo-request")?
             .json_body(&MessageRequest { message: "hello" })?
             .json()
             .await?;
@@ -111,20 +109,40 @@ fn main() -> zenwave::Result<()> {
 }
 ```
 
-You can also call `.basic_auth` or `.with(custom_middleware)` to plug in your own behavior. Every
-request builder supports `.header`, `.bearer_auth`, `.basic_auth`, `.json_body`, `.bytes_body`, and
-body readers (`.json()`, `.string()`, `.bytes()`, `.form()`, `.sse()`).
+You can also call `.basic_auth` or `.with(custom_middleware)` to plug in your own behavior.
+`.bearer_auth` and `.basic_auth` return a `Result` because a credential that cannot be expressed as a
+header value (a token containing a newline, say) is rejected instead of panicking.
+
+Every request builder supports:
+
+- **Requests** — `.header`, `.query`, `.bearer_auth`, `.basic_auth`
+- **Bodies** — `.json_body`, `.form_body`, `.multipart_body`, `.bytes_body`, `.text_body`,
+  `.stream_body`, and on native targets `.reader_body` / `.file_body`
+- **Responses** — `.json()`, `.string()`, `.bytes()`, `.bytes_with_limit()`, `.form()`, `.sse()`
+
+Methods are available as `.get`, `.post`, `.put`, `.patch`, `.delete`, `.head`, `.options`, or
+`.method(Method::…, uri)` for anything else.
 
 Timeouts are middleware too. Calling `.timeout(Duration::from_secs(2))` wraps the client in a
 native-executor-backed timer so every subsequent request automatically fails with a
 `504 Gateway Timeout` when the deadline is exceeded.
 
+`.retry(n)` retries transport failures with exponential backoff. Request bodies of known length are
+buffered so they can be resent; a streaming body of unknown length cannot be rewound, so such a
+request is attempted once rather than retried with a truncated body.
+
+`.enable_cache()` keeps up to `Cache::DEFAULT_CAPACITY` responses and evicts the least recently used
+one when full; use `.enable_cache_with_capacity(n)` to choose a different bound.
+
+`.enable_cookie()` scopes cookies per RFC 6265: a stored cookie is only replayed when its domain,
+path, and `Secure` flag match the outgoing request, and expired cookies are dropped.
+
 ## Proxy configuration (native Hyper / curl backends)
 
-Zenwave can route requests through HTTP or SOCKS proxies by reading the
-standard `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` variables or
-by constructing a matcher manually. Both the Hyper and libcurl-native backends
-honor the same configuration:
+Zenwave can route requests through a proxy by reading the standard `HTTP_PROXY`,
+`HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` variables (either case) or by
+constructing a matcher manually. Enable the `proxy` feature to use one with the
+Hyper backend; `curl-backend` enables it automatically.
 
 ```rust
 use zenwave::{self, Proxy};
@@ -134,7 +152,7 @@ fn main() {
     let proxy = Proxy::from_env();
     let client = zenwave::client_with_proxy(proxy);
 
-    // Or build one manually. Supports http, socks4, socks4a, socks5, and socks5h schemes.
+    // Or build one manually.
     let custom = Proxy::builder()
         .http("http://corp-proxy:8080")
         .no_proxy("internal.example.com")
@@ -146,11 +164,21 @@ fn main() {
 }
 ```
 
-Only the Hyper and curl backends currently honor proxies. HTTP CONNECT proxies
-(`http://` / `https://`) and SOCKS4/5 proxies (`socks4[a]`, `socks5[h]`) are supported.
-The Apple (`apple-backend`) and Web (`wasm32`) backends do not expose proxy
-APIs, so helper functions such as `client_with_proxy` or `.proxy(...)` are not
-compiled when those backends are selected as the default.
+Proxy scheme support differs by backend:
+
+| Backend | `http://`, `https://` proxies | `socks4[a]`, `socks5[h]` proxies |
+| --- | --- | --- |
+| `hyper-backend` (with `proxy`) | Yes | No — reported as an unsupported scheme |
+| `curl-backend` | Yes | Yes |
+| `apple-backend`, wasm32 | Managed by the platform | Managed by the platform |
+
+With the Hyper backend, plain-HTTP destinations are forwarded to the proxy using an absolute-form
+request URI, and `https` destinations are tunnelled with `CONNECT` before the TLS handshake. Proxy
+credentials embedded in the proxy URL are sent as `Proxy-Authorization` rather than in the connect
+address.
+
+The Apple (`apple-backend`) and Web (`wasm32`) backends handle proxying themselves, so
+`client_with_proxy` and `.proxy(...)` are not compiled when one of them is the default backend.
 
 ## Large downloads with resume
 
@@ -349,7 +377,7 @@ other backends have their own TLS implementations.
 
 #### Other Features
 
-- `proxy` – enables proxy support (automatically enabled with `curl-backend`).
+- `proxy` – enables proxy support for the Hyper backend (automatically enabled with `curl-backend`).
 
 ### Example configurations
 

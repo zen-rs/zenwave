@@ -12,14 +12,14 @@ use futures_util::pin_mut;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use http::StatusCode;
 use http_body_util::BodyDataStream;
-use http_kit::{Endpoint, HttpError, Method, Request, Response};
+use http_kit::{Endpoint, HttpError, Request, Response};
 use hyper::http;
 use std::{
     collections::{HashSet, VecDeque},
     io,
-    mem::replace,
     net::{IpAddr, SocketAddr},
     pin::Pin,
+    sync::LazyLock,
     task::{Context, Poll},
     thread,
     time::{Duration, Instant},
@@ -32,13 +32,15 @@ use crate::{Client, error::HttpErrorResponse};
 #[derive(Debug, Default)]
 pub struct HyperBackend {
     executor: Option<AnyExecutor>,
+    #[cfg(feature = "proxy")]
+    proxy: Option<crate::Proxy>,
 }
 
 impl HyperBackend {
     /// Create a new `HyperBackend`.
     #[must_use]
-    pub const fn new() -> Self {
-        Self { executor: None }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Create a `HyperBackend` that uses the provided executor for background tasks.
@@ -46,29 +48,109 @@ impl HyperBackend {
     pub fn with_executor(executor: impl Executor + 'static) -> Self {
         Self {
             executor: Some(AnyExecutor::new(executor)),
+            #[cfg(feature = "proxy")]
+            proxy: None,
         }
+    }
+
+    /// Route requests through `proxy` when it matches the destination.
+    ///
+    /// `http` destinations are sent to the proxy in absolute form; `https`
+    /// destinations are tunnelled with `CONNECT` before the TLS handshake.
+    #[cfg(feature = "proxy")]
+    #[must_use]
+    pub const fn with_proxy(proxy: crate::Proxy) -> Self {
+        Self {
+            executor: None,
+            proxy: Some(proxy),
+        }
+    }
+
+    /// Replace the proxy matcher on this backend.
+    #[cfg(feature = "proxy")]
+    #[must_use]
+    pub fn proxy(mut self, proxy: crate::Proxy) -> Self {
+        self.proxy = Some(proxy);
+        self
+    }
+
+    /// Proxy hop for `uri`, when one applies.
+    #[cfg(feature = "proxy")]
+    fn proxy_for(&self, uri: &http::Uri) -> Option<crate::proxy::Intercept> {
+        self.proxy.as_ref()?.intercept(uri)
     }
 
     fn spawn_background(&self, fut: impl Future<Output = ()> + Send + 'static) {
         if let Some(executor) = &self.executor {
             executor.spawn(fut).detach();
         } else {
-            thread::spawn(move || {
-                block_on(fut);
-            });
+            shared_driver().spawn(Box::pin(fut));
         }
     }
 }
 
+/// Background task that drives hyper connections when no executor was provided.
+///
+/// Every in-flight response needs its connection polled while the caller reads
+/// the body. Spawning one thread per request made that cost an OS thread per
+/// request, so all connections share a single driver thread instead.
+struct SharedDriver {
+    sender: futures_channel::mpsc::UnboundedSender<BoxedTask>,
+}
+
+type BoxedTask = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+impl SharedDriver {
+    fn start() -> Self {
+        let (sender, receiver) = unbounded::<BoxedTask>();
+        thread::Builder::new()
+            .name("zenwave-hyper-driver".to_string())
+            .spawn(move || {
+                // Polls every submitted connection concurrently on this one
+                // thread, and only returns once the sender is dropped.
+                block_on(receiver.for_each_concurrent(None, |task| task));
+            })
+            .expect("zenwave must be able to start its connection driver thread");
+        Self { sender }
+    }
+
+    fn spawn(&self, task: BoxedTask) {
+        // The driver outlives the process, so a send only fails if its thread
+        // panicked; fall back to a dedicated thread in that case.
+        if let Err(err) = self.sender.unbounded_send(task) {
+            warn!("connection driver unavailable, falling back to a thread");
+            let task = err.into_inner();
+            thread::spawn(move || block_on(task));
+        }
+    }
+}
+
+fn shared_driver() -> &'static SharedDriver {
+    static DRIVER: LazyLock<SharedDriver> = LazyLock::new(SharedDriver::start);
+    &DRIVER
+}
+
+/// Failure modes of the hyper transport.
 #[derive(Debug)]
 pub enum HyperError {
+    /// The HTTP/1 connection or exchange failed.
     Connection(hyper::Error),
+    /// Connecting to or reading from the socket failed.
     Io(std::io::Error),
+    /// An `https` URL was requested but no TLS feature is enabled.
     TlsNotAvailable,
+    /// The request URI was missing a host or otherwise unusable.
     InvalidUri(String),
+    /// A proxy scheme this backend cannot speak, such as SOCKS.
+    #[cfg(feature = "proxy")]
+    UnsupportedProxyScheme(String),
+    /// The server answered with a 4xx or 5xx status.
     Remote {
+        /// Status the server returned.
         status: StatusCode,
+        /// Prefix of the response body, when it was valid UTF-8.
         body: Option<String>,
+        /// The response, with its body already consumed.
         raw_response: Box<Response>,
     },
 }
@@ -80,6 +162,12 @@ impl core::fmt::Display for HyperError {
             Self::Io(err) => write!(f, "io error: {err}"),
             Self::TlsNotAvailable => write!(f, "TLS requested but no TLS feature enabled"),
             Self::InvalidUri(uri) => write!(f, "invalid uri: {uri}"),
+            #[cfg(feature = "proxy")]
+            Self::UnsupportedProxyScheme(scheme) => write!(
+                f,
+                "proxy scheme `{scheme}` is not supported by the hyper backend; \
+                 enable the `curl-backend` feature for SOCKS proxies"
+            ),
             Self::Remote { status, body, .. } => {
                 if let Some(body) = body {
                     write!(f, "remote error: {status} - {body}")
@@ -124,11 +212,17 @@ impl From<HyperError> for crate::Error {
                 }),
             },
             HyperError::Connection(e) => Self::Transport(Box::new(e)),
-            HyperError::Io(e) => Self::Io(e),
+            // These come from DNS resolution, connecting, and socket reads, so
+            // they belong to the transport layer rather than to file I/O.
+            HyperError::Io(e) => Self::Transport(Box::new(e)),
             HyperError::TlsNotAvailable => {
                 Self::Tls(Box::new(std::io::Error::other("TLS not available")))
             }
             HyperError::InvalidUri(uri) => Self::InvalidUri(uri),
+            #[cfg(feature = "proxy")]
+            HyperError::UnsupportedProxyScheme(scheme) => Self::InvalidRequest(format!(
+                "proxy scheme `{scheme}` is not supported by the hyper backend"
+            )),
         }
     }
 }
@@ -136,28 +230,57 @@ impl From<HyperError> for crate::Error {
 impl Endpoint for HyperBackend {
     type Error = crate::Error;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-        let dummy_request = http::Request::builder()
-            .method(Method::GET)
-            .uri("/")
-            .body(http_kit::Body::empty())
-            .unwrap();
-        let mut request: http::Request<http_kit::Body> = replace(request, dummy_request);
+        // Send a copy so the caller's request keeps its method, URI, and headers.
+        // Middleware such as `Retry` and `FollowRedirect` inspect and re-send it
+        // after this call returns; only the body is consumed.
+        let body = request
+            .body_mut()
+            .take()
+            .unwrap_or_else(|_| http_kit::Body::empty());
+        let mut outgoing = http::Request::new(body);
+        *outgoing.method_mut() = request.method().clone();
+        *outgoing.uri_mut() = request.uri().clone();
+        *outgoing.version_mut() = request.version();
+        *outgoing.headers_mut() = request.headers().clone();
+
+        super::apply_default_user_agent(outgoing.headers_mut());
 
         // Ensure Host header is present (required by hyper 1.0 / HTTP 1.1)
-        if request.headers().get(http::header::HOST).is_none()
-            && let Some(authority) = request.uri().authority()
+        if outgoing.headers().get(http::header::HOST).is_none()
+            && let Some(authority) = outgoing.uri().authority()
             && let Ok(value) = http::header::HeaderValue::from_str(authority.as_str())
         {
-            request.headers_mut().insert(http::header::HOST, value);
+            outgoing.headers_mut().insert(http::header::HOST, value);
         }
-        let stream = connect(&request).await?;
-        let origin_form = request
-            .uri()
-            .path_and_query()
-            .map_or("/", http::uri::PathAndQuery::as_str);
-        *request.uri_mut() = origin_form
-            .parse()
-            .map_err(|err| HyperError::InvalidUri(format!("{origin_form}: {err}")))?;
+        #[cfg(feature = "proxy")]
+        let intercept = self.proxy_for(outgoing.uri());
+        #[cfg(not(feature = "proxy"))]
+        let intercept: Option<()> = None;
+
+        let connection = connect(&outgoing, intercept.as_ref()).await?;
+
+        // A plain-HTTP request through a proxy keeps its absolute-form URI so the
+        // proxy knows which origin to forward it to; everything else uses
+        // origin-form, as HTTP/1.1 requires on a direct connection.
+        if connection.keep_absolute_form {
+            #[cfg(feature = "proxy")]
+            if let Some(intercept) = &intercept
+                && let Some(credentials) = intercept.basic_auth()
+            {
+                outgoing
+                    .headers_mut()
+                    .insert(http::header::PROXY_AUTHORIZATION, credentials.clone());
+            }
+        } else {
+            let origin_form = outgoing
+                .uri()
+                .path_and_query()
+                .map_or("/", http::uri::PathAndQuery::as_str);
+            *outgoing.uri_mut() = origin_form
+                .parse()
+                .map_err(|err| HyperError::InvalidUri(format!("{origin_form}: {err}")))?;
+        }
+        let stream = connection.stream;
         let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
             .handshake(stream)
             .await
@@ -171,7 +294,7 @@ impl Endpoint for HyperBackend {
         });
 
         let response = sender
-            .send_request(request)
+            .send_request(outgoing)
             .await
             .map_err(HyperError::Connection)?;
 
@@ -190,12 +313,7 @@ impl Endpoint for HyperBackend {
         let is_error = response.status().is_client_error() || response.status().is_server_error();
 
         if is_error {
-            let error_msg: Option<String> = response
-                .body_mut()
-                .as_str()
-                .await
-                .ok()
-                .map(std::borrow::ToOwned::to_owned);
+            let error_msg = read_error_body(response.body_mut()).await;
             return Err(HyperError::Remote {
                 status: response.status(),
                 body: error_msg,
@@ -215,82 +333,252 @@ impl Client for HyperBackend {}
 const RESOLUTION_DELAY: Duration = Duration::from_millis(50);
 const FIRST_ADDRESS_FAMILY_COUNT: usize = 1;
 const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
-const MIN_CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(100);
-const MAX_CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_secs(2);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-async fn connect(request: &http::Request<http_kit::Body>) -> Result<MaybeTlsStream, HyperError> {
-    let uri = request.uri();
-    let host = uri
-        .host()
-        .ok_or_else(|| HyperError::InvalidUri(uri.to_string()))?
-        .to_string();
-    let scheme = uri.scheme_str().unwrap_or("http");
-    let use_tls = match scheme {
-        "https" => true,
-        "http" => false,
-        other => return Err(HyperError::InvalidUri(other.to_string())),
+/// Largest error-response body captured into the returned error message.
+///
+/// A failing server can answer with an arbitrarily large page, so only a prefix
+/// is kept for diagnostics.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// Read up to [`MAX_ERROR_BODY_BYTES`] of an error body as UTF-8 text.
+async fn read_error_body(body: &mut http_kit::Body) -> Option<String> {
+    let mut collected: Vec<u8> = Vec::new();
+    while let Some(Ok(chunk)) = body.next().await {
+        let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(collected.len());
+        if remaining == 0 {
+            break;
+        }
+        let take = chunk.len().min(remaining);
+        collected.extend_from_slice(&chunk[..take]);
+    }
+    if collected.is_empty() {
+        return None;
+    }
+    String::from_utf8(collected).ok()
+}
+
+/// An established transport, plus how the request line must be written on it.
+struct Connection {
+    stream: MaybeTlsStream,
+    /// True when the request must keep its absolute-form URI (plain HTTP via a proxy).
+    keep_absolute_form: bool,
+}
+
+/// Destination parsed out of a request URI.
+struct Destination {
+    host: String,
+    port: u16,
+    use_tls: bool,
+}
+
+impl Destination {
+    fn from_uri(uri: &http::Uri) -> Result<Self, HyperError> {
+        let host = uri
+            .host()
+            .ok_or_else(|| HyperError::InvalidUri(uri.to_string()))?
+            .to_string();
+        let scheme = uri.scheme_str().unwrap_or("http");
+        let use_tls = match scheme {
+            "https" => true,
+            "http" => false,
+            other => return Err(HyperError::InvalidUri(other.to_string())),
+        };
+        Ok(Self {
+            port: uri.port_u16().unwrap_or(if use_tls { 443 } else { 80 }),
+            host,
+            use_tls,
+        })
+    }
+}
+
+/// Open a transport for `request`, tunnelling through `intercept` when given.
+#[cfg(feature = "proxy")]
+async fn connect(
+    request: &http::Request<http_kit::Body>,
+    intercept: Option<&crate::proxy::Intercept>,
+) -> Result<Connection, HyperError> {
+    let destination = Destination::from_uri(request.uri())?;
+
+    let Some(intercept) = intercept else {
+        return connect_direct(&destination).await;
     };
-    let port = uri.port_u16().unwrap_or(if use_tls { 443 } else { 80 });
 
-    let stream = connect_happy_eyeballs(host.as_str(), port)
+    // This backend speaks HTTP proxying only; SOCKS needs the curl backend.
+    let proxy_scheme = intercept.uri().scheme_str().unwrap_or("http");
+    if !matches!(proxy_scheme, "http" | "https") {
+        return Err(HyperError::UnsupportedProxyScheme(proxy_scheme.to_string()));
+    }
+
+    let proxy_host = intercept
+        .host()
+        .ok_or_else(|| HyperError::InvalidUri(intercept.uri().to_string()))?;
+    let stream = open_socket(proxy_host, intercept.port()).await?;
+
+    if destination.use_tls {
+        // The proxy cannot see inside TLS, so ask it for a raw tunnel first.
+        let tunnel = establish_tunnel(stream, &destination, intercept).await?;
+        return Ok(Connection {
+            stream: wrap_tls(destination.host, tunnel).await?,
+            keep_absolute_form: false,
+        });
+    }
+
+    // Plain HTTP is forwarded by the proxy itself, using the absolute-form URI.
+    Ok(Connection {
+        stream: MaybeTlsStream::Plain(stream),
+        keep_absolute_form: true,
+    })
+}
+
+/// Open a transport for `request`. Without the `proxy` feature there is no hop.
+#[cfg(not(feature = "proxy"))]
+async fn connect(
+    request: &http::Request<http_kit::Body>,
+    _intercept: Option<&()>,
+) -> Result<Connection, HyperError> {
+    connect_direct(&Destination::from_uri(request.uri())?).await
+}
+
+/// Connect straight to the destination, negotiating TLS when it asks for it.
+async fn connect_direct(destination: &Destination) -> Result<Connection, HyperError> {
+    let stream = open_socket(&destination.host, destination.port).await?;
+    let stream = if destination.use_tls {
+        wrap_tls(destination.host.clone(), stream).await?
+    } else {
+        MaybeTlsStream::Plain(stream)
+    };
+    Ok(Connection {
+        stream,
+        keep_absolute_form: false,
+    })
+}
+
+/// Open a TCP connection with Nagle disabled.
+async fn open_socket(host: &str, port: u16) -> Result<TcpStream, HyperError> {
+    let stream = connect_happy_eyeballs(host, port)
         .await
         .map_err(HyperError::Io)?;
     stream.set_nodelay(true).map_err(HyperError::Io)?;
+    Ok(stream)
+}
 
-    if use_tls {
-        // TLS selection logic:
-        // 1. When both native-tls and rustls are enabled (default-backend):
-        //    - On Apple platforms: use native-tls
-        //    - On other platforms: use rustls with system certificates
-        // 2. When only native-tls is enabled: use native-tls
-        // 3. When only rustls is enabled: use rustls with system certificates
+/// Ask the proxy to tunnel to `destination` with `CONNECT`.
+#[cfg(feature = "proxy")]
+async fn establish_tunnel(
+    mut stream: TcpStream,
+    destination: &Destination,
+    intercept: &crate::proxy::Intercept,
+) -> Result<TcpStream, HyperError> {
+    use futures_util::{AsyncReadExt as _, AsyncWriteExt as _};
 
-        // Case: Both TLS implementations available, Apple platform -> use native-tls
-        #[cfg(all(feature = "native-tls", feature = "rustls", target_vendor = "apple"))]
-        {
-            let connector = async_native_tls::TlsConnector::new();
-            let tls = connector
-                .connect(host.as_str(), stream)
-                .await
-                .map_err(|err| HyperError::Io(std::io::Error::other(err)))?;
-            return Ok(MaybeTlsStream::Native(tls));
+    let authority = format!("{}:{}", destination.host, destination.port);
+    let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n",);
+    if let Some(credentials) = intercept.basic_auth()
+        && let Ok(value) = credentials.to_str()
+    {
+        request.push_str("Proxy-Authorization: ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(HyperError::Io)?;
+    stream.flush().await.map_err(HyperError::Io)?;
+
+    // Read one byte at a time: a buffered read could consume the first bytes of
+    // the tunnelled TLS handshake, which belong to the stream we hand back.
+    let mut response = Vec::with_capacity(256);
+    let mut byte = [0_u8; 1];
+    while !response.ends_with(b"\r\n\r\n") {
+        if response.len() >= MAX_CONNECT_RESPONSE_BYTES {
+            return Err(HyperError::Io(io::Error::other(
+                "proxy CONNECT response headers exceeded their bound",
+            )));
         }
-
-        // Case: Both TLS implementations available, non-Apple platform -> use rustls
-        #[cfg(all(
-            feature = "native-tls",
-            feature = "rustls",
-            not(target_vendor = "apple")
-        ))]
-        {
-            return connect_rustls(host, stream).await;
-        }
-
-        // Case: Only native-tls enabled
-        #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
-        {
-            let connector = async_native_tls::TlsConnector::new();
-            let tls = connector
-                .connect(host.as_str(), stream)
-                .await
-                .map_err(|err| HyperError::Io(std::io::Error::other(err)))?;
-            return Ok(MaybeTlsStream::Native(tls));
-        }
-
-        // Case: Only rustls enabled
-        #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
-        {
-            return connect_rustls(host, stream).await;
-        }
-
-        #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-        {
-            return Err(HyperError::TlsNotAvailable);
+        match stream.read(&mut byte).await.map_err(HyperError::Io)? {
+            0 => {
+                return Err(HyperError::Io(io::Error::other(
+                    "proxy closed the connection during CONNECT",
+                )));
+            }
+            _ => response.push(byte[0]),
         }
     }
 
-    Ok(MaybeTlsStream::Plain(stream))
+    let status_line = response
+        .split(|byte| *byte == b'\n')
+        .next()
+        .map(|line| String::from_utf8_lossy(line).trim().to_string())
+        .unwrap_or_default();
+    // "HTTP/1.1 200 Connection established"
+    let succeeded = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .is_some_and(|code| (200..300).contains(&code));
+    if !succeeded {
+        return Err(HyperError::Io(io::Error::other(format!(
+            "proxy refused CONNECT: {status_line}"
+        ))));
+    }
+
+    Ok(stream)
+}
+
+/// Largest `CONNECT` response header block accepted from a proxy.
+#[cfg(feature = "proxy")]
+const MAX_CONNECT_RESPONSE_BYTES: usize = 8 * 1024;
+
+// Negotiate TLS for `host` over an established stream.
+//
+// One definition is compiled per TLS configuration. When both `native-tls` and
+// `rustls` are enabled (as `default-backend` does), Apple platforms use
+// native-tls so the system keychain applies, and everything else uses rustls
+// with the system certificate store.
+
+/// Negotiate TLS using the platform's native stack.
+#[cfg(any(
+    all(feature = "native-tls", feature = "rustls", target_vendor = "apple"),
+    all(feature = "native-tls", not(feature = "rustls")),
+))]
+async fn wrap_tls(host: String, stream: TcpStream) -> Result<MaybeTlsStream, HyperError> {
+    connect_native_tls(&host, stream).await
+}
+
+/// Negotiate TLS using rustls with system certificates.
+#[cfg(any(
+    all(
+        feature = "native-tls",
+        feature = "rustls",
+        not(target_vendor = "apple")
+    ),
+    all(feature = "rustls", not(feature = "native-tls")),
+))]
+async fn wrap_tls(host: String, stream: TcpStream) -> Result<MaybeTlsStream, HyperError> {
+    connect_rustls(host, stream).await
+}
+
+/// Reject `https` when the crate was built without any TLS backend.
+#[cfg(not(any(feature = "native-tls", feature = "rustls")))]
+#[allow(clippy::unused_async)]
+async fn wrap_tls(_host: String, _stream: TcpStream) -> Result<MaybeTlsStream, HyperError> {
+    Err(HyperError::TlsNotAvailable)
+}
+
+/// Perform the native-tls handshake.
+#[cfg(feature = "native-tls")]
+#[allow(dead_code)] // Unused on non-Apple targets when both TLS features are enabled.
+async fn connect_native_tls(host: &str, stream: TcpStream) -> Result<MaybeTlsStream, HyperError> {
+    let connector = async_native_tls::TlsConnector::new();
+    let tls = connector
+        .connect(host, stream)
+        .await
+        .map_err(|err| HyperError::Io(std::io::Error::other(err)))?;
+    Ok(MaybeTlsStream::Native(tls))
 }
 
 async fn connect_happy_eyeballs(host: &str, port: u16) -> io::Result<TcpStream> {
@@ -605,7 +893,7 @@ impl HappyEyeballsState {
             return None;
         }
         self.last_attempt_started_at
-            .map(|started_at| started_at + bounded_connection_attempt_delay())
+            .map(|started_at| started_at + CONNECTION_ATTEMPT_DELAY)
     }
 
     const fn open_resolution_gate(&mut self) {
@@ -800,12 +1088,6 @@ fn interleave_address_families(
     ordered
 }
 
-fn bounded_connection_attempt_delay() -> Duration {
-    CONNECTION_ATTEMPT_DELAY
-        .max(MIN_CONNECTION_ATTEMPT_DELAY)
-        .min(MAX_CONNECTION_ATTEMPT_DELAY)
-}
-
 async fn timer_at(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => {
@@ -815,9 +1097,9 @@ async fn timer_at(deadline: Option<Instant>) {
     }
 }
 
-/// Connect using rustls with system certificates.
+/// Perform the rustls handshake, trusting the system certificate store.
 #[cfg(feature = "rustls")]
-#[allow(dead_code)] // Used on non-Apple platforms; unused on Apple when both TLS features enabled
+#[allow(dead_code)] // Unused on Apple targets when both TLS features are enabled.
 async fn connect_rustls(host: String, stream: TcpStream) -> Result<MaybeTlsStream, HyperError> {
     use std::sync::Arc;
 

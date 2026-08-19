@@ -176,6 +176,15 @@ pub enum DownloadErrorKind {
     /// Failed to read response body.
     #[error("failed to read response body: {0}")]
     BodyRead(String),
+
+    /// The server resumed a download at an offset other than the requested one.
+    #[error("server resumed at byte {actual} but byte {expected} was requested")]
+    UnexpectedRange {
+        /// First byte offset the client asked to resume from.
+        expected: u64,
+        /// First byte offset the server actually sent.
+        actual: u64,
+    },
 }
 
 /// WebSocket-related errors.
@@ -383,6 +392,15 @@ impl http_kit::HttpError for Error {
             | Self::Download(DownloadErrorKind::UpstreamError(status)) => *status,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
+    }
+}
+
+// A middleware that cannot fail still needs to satisfy the `Into<Error>` bound
+// used by `MiddlewareError`, so the consuming helpers stay available on clients
+// wrapped in infallible middleware.
+impl From<std::convert::Infallible> for Error {
+    fn from(never: std::convert::Infallible) -> Self {
+        match never {}
     }
 }
 
