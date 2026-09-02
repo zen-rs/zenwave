@@ -168,20 +168,21 @@ fn fetch(
         let request_init = web_sys::RequestInit::new();
         request_init.set_method(request.method().as_str());
         let headers = web_sys::Headers::new().unwrap();
+        // The request body is handed to `fetch` as bytes, never as a
+        // `ReadableStream`. A streamed request body is a Chromium-only
+        // feature that also needs HTTP/2 and `duplex: "half"`; Firefox and
+        // Safari reject it, and a Cloudflare Worker never pulls a stream
+        // driven from Rust, so the request sat pending until the runtime
+        // cancelled the invocation. Buffering costs one copy of the body and
+        // works everywhere `fetch` does.
         let body = std::mem::replace(request.body_mut(), http_kit::Body::empty());
-        let has_body = body.is_empty().map(|empty| !empty).unwrap_or(true);
-
-        if has_body {
-            let body_stream = body.map(|result| {
-                result
-                    .map(|chunk| {
-                        let chunk: Box<[u8]> = chunk.to_vec().into_boxed_slice();
-                        JsValue::from(chunk)
-                    })
-                    .map_err(|e| JsValue::from_str(&format!("{e:?}")))
-            });
-            let body_value = wasm_streams::ReadableStream::from_stream(body_stream).into_raw();
-            request_init.set_body(body_value.dyn_ref().unwrap());
+        let bytes = body
+            .into_bytes()
+            .await
+            .map_err(|e| WebError::new(StatusCode::BAD_REQUEST, e))?;
+        if !bytes.is_empty() {
+            let body_value: JsValue = js_sys::Uint8Array::from(bytes.as_ref()).into();
+            request_init.set_body(&body_value);
         }
 
         for (name, value) in request.headers().iter() {
