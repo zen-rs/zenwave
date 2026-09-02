@@ -13,10 +13,7 @@ use http_kit::{
 use std::error::Error as StdError;
 use std::io;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{
-    Window, WorkerGlobalScope,
-    wasm_bindgen::{JsCast, JsValue},
-};
+use web_sys::wasm_bindgen::{JsCast, JsValue};
 
 use crate::{Client, error::HttpErrorResponse};
 /// HTTP client backend for browser environments using `fetch`.
@@ -24,36 +21,36 @@ pub struct WebBackend {
     scope: SingleThreaded<FetchScope>,
 }
 
-/// The global object that owns `fetch`.
+/// `globalThis` and the `fetch` it owns.
 ///
-/// A page has a `Window`; a web worker, a service worker and a Cloudflare
-/// Worker have a `WorkerGlobalScope` and no `window` at all. Both expose the
-/// same `fetch`, so the backend resolves whichever `globalThis` is once and
-/// never assumes a page.
-enum FetchScope {
-    Window(Window),
-    Worker(WorkerGlobalScope),
+/// A page has a `Window`, a web worker a `WorkerGlobalScope`, and a
+/// Cloudflare Worker a global whose constructor is not exposed at all, so
+/// no `instanceof` test names every runtime. What every one of them has is
+/// a `fetch` property on `globalThis`; the backend takes that function once
+/// and calls it with `globalThis` as `this`, which is how the platform
+/// itself dispatches `fetch(request)`.
+struct FetchScope {
+    global: JsValue,
+    fetch: web_sys::js_sys::Function,
 }
 
 impl FetchScope {
     /// The scope this code is running in, or `None` when `globalThis` has
-    /// no `fetch`-capable shape at all (a bare JS shell, for instance).
+    /// no `fetch` at all (a bare JS shell, for instance).
     fn current() -> Option<Self> {
-        let global = web_sys::js_sys::global();
-        if global.is_instance_of::<Window>() {
-            return Some(Self::Window(global.unchecked_into()));
-        }
-        if global.is_instance_of::<WorkerGlobalScope>() {
-            return Some(Self::Worker(global.unchecked_into()));
-        }
-        None
+        let global: JsValue = web_sys::js_sys::global().into();
+        let fetch = web_sys::js_sys::Reflect::get(&global, &JsValue::from_str("fetch")).ok()?;
+        let fetch = fetch.dyn_into::<web_sys::js_sys::Function>().ok()?;
+        Some(Self { global, fetch })
     }
 
-    fn fetch_with_request(&self, request: &web_sys::Request) -> web_sys::js_sys::Promise {
-        match self {
-            Self::Window(window) => window.fetch_with_request(request),
-            Self::Worker(scope) => scope.fetch_with_request(request),
-        }
+    fn fetch_with_request(
+        &self,
+        request: &web_sys::Request,
+    ) -> Result<web_sys::js_sys::Promise, JsValue> {
+        self.fetch
+            .call1(&self.global, request)
+            .map(web_sys::js_sys::Promise::from)
     }
 }
 
@@ -247,7 +244,12 @@ fn fetch(
                 )
             })?;
 
-        let promise = scope.fetch_with_request(&fetch_request);
+        let promise = scope.fetch_with_request(&fetch_request).map_err(|err| {
+            WebError::new(
+                StatusCode::BAD_GATEWAY,
+                transport_error(format_js_value(&err)),
+            )
+        })?;
         let fut = SingleThreaded(JsFuture::from(promise));
         let response = fut.await.map_err(|e| {
             WebError::new(
