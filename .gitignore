@@ -2,3 +2,8 @@
 /Cargo.lock
 .DS_Store
 *.info
+tests/workerd/target/
+tests/workerd/dist/
+tests/workerd/.skyzen/
+.wrangler/
+tests/workerd/wrangler-dev.log

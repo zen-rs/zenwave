@@ -202,6 +202,22 @@ zenwave = { version = "0.5", default-features = false, features = ["apple-backen
 
 Other features: `proxy` (auto-enabled by `curl-backend`), `ws` (websocket support).
 
+## Testing
+
+Native backends are covered by `cargo test`. The wasm backend is tested in
+three runtimes, because they differ in exactly the places that break:
+
+- `scripts/test-wasm.sh <chrome|firefox|safari>` — wasm-pack in a browser
+  page (a `Window`) and in a dedicated web worker (no `window`).
+- `scripts/test-workerd.sh` — a real Cloudflare Worker. It builds the
+  [skyzen](https://crates.io/crates/skyzen) app in `tests/workerd/`,
+  path-patched to this checkout, runs it under `wrangler dev` (local
+  workerd), and asserts that a bodiless GET, a JSON POST and a bytes PUT all
+  round-trip through zenwave. Needs `skyzen`, `wrangler`, `jq` and the
+  `wasm32-unknown-unknown` target.
+
+CI runs all three.
+
 ## Examples
 
 ```sh

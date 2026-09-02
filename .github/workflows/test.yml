@@ -94,3 +94,28 @@ jobs:
 
       - name: Run apple backend suite
         run: bash scripts/test-apple.sh
+
+  workerd:
+    name: Cloudflare Worker (workerd via wrangler)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-workerd
+          workspaces: |
+            . -> target
+            tests/workerd -> target
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: skyzen-cli
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install wrangler
+        run: npm install --global wrangler@4
+      - name: Run zenwave inside workerd
+        run: bash scripts/test-workerd.sh
