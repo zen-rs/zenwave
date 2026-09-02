@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3](https://github.com/zen-rs/zenwave/compare/v0.5.2...v0.5.3) - 2026-09-02
+
+### Fixed
+
+- *(wasm)* find fetch on globalThis, not only on window
+
+### Other
+
+- run zenwave inside a real Cloudflare Worker, and take fetch from globalThis
+- Merge pull request #26 from zen-rs/main
+
 ## [0.5.2](https://github.com/zen-rs/zenwave/compare/v0.5.1...v0.5.2) - 2026-09-02
 
 ### Fixed
