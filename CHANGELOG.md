@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/zen-rs/zenwave/compare/v0.5.0...v0.5.1) - 2026-08-29
+
+### Fixed
+
+- use wasm-streams 0.5 so wasm32 links with skyzen
+
+### Other
+
+- leave crate version to release-plz
+- Merge pull request #14 from zen-rs/fix/wasm-streams-0.5
+- Rewrite README, add AGENTS.md, remove stale AGENT.md
+
 ## [0.5.0](https://github.com/zen-rs/zenwave/compare/v0.4.0...v0.5.0) - 2026-07-18
 
 ### Other
