@@ -24,6 +24,58 @@ mod wasm_tests {
         assert!(json.is_object());
     }
 
+    /// A JSON request body reaches the server intact.
+    ///
+    /// The body must go out as bytes: a `ReadableStream` request body is
+    /// refused by Firefox and Safari and never pulled by a Cloudflare
+    /// Worker, so this is the test that fails when the backend regresses
+    /// to streaming an already-buffered body.
+    #[wasm_bindgen_test]
+    async fn wasm_post_json_body_round_trips() {
+        let mut client = client();
+        let payload = serde_json::json!({ "grant_type": "authorization_code", "code": "wasm" });
+
+        let response = client
+            .post(httpbin_uri("/post"))
+            .unwrap()
+            .json_body(&payload)
+            .unwrap()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let echoed: Value = response.into_body().into_json().await.unwrap();
+        assert_eq!(echoed.get("json"), Some(&payload));
+    }
+
+    /// A raw bytes body reaches the server intact, so uploads are not
+    /// silently re-encoded on the way out.
+    ///
+    /// Sent as `text/plain` so httpbin echoes it verbatim under `data`; a
+    /// binary media type comes back as a base64 data URL instead.
+    #[wasm_bindgen_test]
+    async fn wasm_put_bytes_body_round_trips() {
+        let mut client = client();
+        let payload = b"zenwave sends bytes, not streams".to_vec();
+
+        let response = client
+            .put(httpbin_uri("/put"))
+            .unwrap()
+            .header("Content-Type", "text/plain")
+            .unwrap()
+            .bytes_body(payload.clone())
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let echoed: Value = response.into_body().into_json().await.unwrap();
+        let data = echoed
+            .get("data")
+            .and_then(Value::as_str)
+            .expect("httpbin echoes the body under `data`");
+        assert_eq!(data.as_bytes(), payload.as_slice());
+    }
+
     /// Ensure browser builds can compose request builders in wasm.
     #[wasm_bindgen_test]
     async fn wasm_request_builder_with_custom_header() {
