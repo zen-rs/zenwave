@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/zen-rs/zenwave/compare/v0.5.3...v0.6.0) - 2026-09-03
+
+### Added
+
+- [**breaking**] build the default client from a Transport
+- [**breaking**] apple backend follows Transport
+- [**breaking**] curl backend follows Transport
+- [**breaking**] transport-level proxy rules for hyper and websockets
+- [**breaking**] unify TLS behind Transport with platform-verified rustls and extra roots
+
+### Fixed
+
+- compile the TLS engine only when hyper or websockets consume it
+- *(curl)* check revocation best-effort so Schannel accepts CAs without a CRL
+
+### Other
+
+- Merge pull request #50 from zen-rs/main
+- install cargo-audit as a prebuilt binary
+- *(android)* tell cargo-machete about the fixtures included via #[path]
+- *(android)* instrumented app exercising the platform verifier on a real device
+- run the iOS suite with simctl spawn, document App Transport Security
+- engineless feature slice with a single backend
+- keep the slow backend far behind the timeout it must lose to
+- clippy the feature powerset on three OSes, run the suite on an iOS simulator and an Android device
+- keep the Transport doctest compiling on wasm32
+- pick explicit TLS engines now that rustls and native-tls are exclusive
+
 ## [0.5.3](https://github.com/zen-rs/zenwave/compare/v0.5.2...v0.5.3) - 2026-09-02
 
 ### Fixed
