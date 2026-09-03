@@ -4,7 +4,7 @@ use anyhow::{Context, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use blocking::unblock;
-use curl::easy::{Easy2, Handler, List, ProxyType, ReadError, WriteError};
+use curl::easy::{Easy2, Handler, List, ProxyType, ReadError, SslOpt, WriteError};
 use http::{
     HeaderMap, Method,
     header::{HeaderName, HeaderValue},
@@ -12,12 +12,12 @@ use http::{
 use http_kit::{Body, Endpoint, HttpError, Request, Response, StatusCode};
 use thiserror::Error;
 
-use crate::{Client, Proxy, error::HttpErrorResponse, transport::proxy::Intercept};
+use crate::{Client, Transport, error::HttpErrorResponse, transport::proxy::Intercept};
 
 /// HTTP backend implemented with libcurl.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CurlBackend {
-    proxy: Option<Proxy>,
+    transport: Transport,
 }
 
 #[derive(Debug, Error)]
@@ -26,6 +26,8 @@ pub enum CurlError {
     BadRequest(#[source] anyhow::Error),
     #[error("bad gateway: {0}")]
     BadGateway(#[source] anyhow::Error),
+    #[error("TLS failure: {0}")]
+    Tls(#[source] curl::Error),
     #[error("remote error: {status}")]
     Remote {
         status: StatusCode,
@@ -38,7 +40,7 @@ impl HttpError for CurlError {
     fn status(&self) -> StatusCode {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
-            Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
+            Self::BadGateway(_) | Self::Tls(_) => StatusCode::BAD_GATEWAY,
             Self::Remote { status, .. } => *status,
         }
     }
@@ -63,6 +65,7 @@ impl From<CurlError> for crate::Error {
                 let io_err = std::io::Error::other(e);
                 Self::Transport(Box::new(io_err))
             }
+            CurlError::Tls(e) => Self::tls(e),
             CurlError::Remote {
                 status,
                 body,
@@ -85,22 +88,16 @@ impl From<CurlError> for crate::Error {
 }
 
 impl CurlBackend {
-    /// Create a new backend without proxy configuration.
+    /// Create a backend that follows `transport` for proxy rules and trust.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new(transport: Transport) -> Self {
+        Self { transport }
     }
+}
 
-    /// Create a backend configured to use the supplied proxy matcher.
-    #[must_use]
-    pub const fn with_proxy(proxy: Proxy) -> Self {
-        Self { proxy: Some(proxy) }
-    }
-
-    /// Replace the proxy matcher.
-    #[must_use]
-    pub fn proxy(self, proxy: Proxy) -> Self {
-        Self::with_proxy(proxy)
+impl Default for CurlBackend {
+    fn default() -> Self {
+        Self::new(Transport::system())
     }
 }
 
@@ -115,13 +112,11 @@ impl Endpoint for CurlBackend {
             .body(Body::empty())
             .expect("building dummy request failed");
         let request = replace(request, dummy_request);
-        execute(request, self.proxy.clone())
-            .await
-            .map_err(Into::into)
+        execute(request, &self.transport).await.map_err(Into::into)
     }
 }
 
-async fn execute(request: Request, proxy: Option<Proxy>) -> Result<Response, CurlError> {
+async fn execute(request: Request, transport: &Transport) -> Result<Response, CurlError> {
     let (parts, body) = request.into_parts();
     let mut headers = Vec::with_capacity(parts.headers.len());
     for (name, value) in &parts.headers {
@@ -135,9 +130,9 @@ async fn execute(request: Request, proxy: Option<Proxy>) -> Result<Response, Cur
         .map_err(CurlError::bad_request)?
         .to_vec();
 
-    let proxy = proxy
-        .as_ref()
-        .and_then(|cfg| cfg.intercept(&parts.uri))
+    let proxy = transport
+        .proxy()
+        .intercept(&parts.uri)
         .map(|intercept| resolve_proxy(&intercept).map_err(CurlError::bad_request))
         .transpose()?;
 
@@ -147,6 +142,7 @@ async fn execute(request: Request, proxy: Option<Proxy>) -> Result<Response, Cur
         headers,
         body: body_bytes,
         proxy,
+        ca_bundle: transport.ca_bundle().map(<[u8]>::to_vec),
     };
 
     let response = unblock(move || perform(prepared)).await?;
@@ -180,9 +176,21 @@ fn perform(request: PreparedRequest) -> Result<Response, CurlError> {
         Some(easy.http_headers(list).map_err(map_curl_error)?)
     };
 
-    if let Some(proxy) = &request.proxy {
-        apply_proxy(&mut easy, proxy).map_err(map_curl_error)?;
+    // The matcher is the only source of proxy rules: an empty CURLOPT_PROXY
+    // stops libcurl from consulting `http_proxy` and friends on its own.
+    match &request.proxy {
+        Some(proxy) => apply_proxy(&mut easy, proxy).map_err(map_curl_error)?,
+        None => easy.proxy("").map_err(map_curl_error)?,
     }
+    if let Some(bundle) = &request.ca_bundle {
+        easy.ssl_cainfo_blob(bundle).map_err(map_curl_error)?;
+    }
+    // Revocation is checked when the information is reachable and skipped
+    // when it is not (no distribution point, offline responder), which is how
+    // the platform verifiers behind the rustls and native-tls engines behave.
+    // Only Schannel interprets this flag; the other TLS libraries ignore it.
+    easy.ssl_options(SslOpt::new().revoke_best_effort(true))
+        .map_err(map_curl_error)?;
 
     easy.perform().map_err(map_curl_error)?;
 
@@ -220,8 +228,26 @@ fn perform(request: PreparedRequest) -> Result<Response, CurlError> {
     Ok(http_response)
 }
 
+/// Sort a libcurl failure into zenwave's error taxonomy: handshake and
+/// certificate problems are TLS errors, everything else is transport.
 fn map_curl_error(error: curl::Error) -> CurlError {
-    CurlError::bad_gateway(error)
+    let is_tls = error.is_ssl_connect_error()
+        || error.is_peer_failed_verification()
+        || error.is_ssl_certproblem()
+        || error.is_ssl_cipher()
+        || error.is_ssl_cacert()
+        || error.is_ssl_cacert_badfile()
+        || error.is_ssl_crl_badfile()
+        || error.is_ssl_issuer_error()
+        || error.is_use_ssl_failed()
+        || error.is_ssl_engine_notfound()
+        || error.is_ssl_engine_setfailed()
+        || error.is_ssl_engine_initfailed();
+    if is_tls {
+        CurlError::Tls(error)
+    } else {
+        CurlError::bad_gateway(error)
+    }
 }
 
 #[derive(Debug)]
@@ -231,12 +257,13 @@ struct PreparedRequest {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     proxy: Option<ResolvedProxy>,
+    ca_bundle: Option<Vec<u8>>,
 }
 #[derive(Debug)]
 struct ResolvedProxy {
     endpoint: String,
     kind: ProxyType,
-    credentials: Option<String>,
+    credentials: Option<(String, String)>,
 }
 
 fn apply_proxy(
@@ -245,10 +272,10 @@ fn apply_proxy(
 ) -> std::result::Result<(), curl::Error> {
     handler.proxy(&proxy.endpoint)?;
     handler.proxy_type(proxy.kind)?;
-    if let Some(creds) = &proxy.credentials {
-        let (username, password) = creds
-            .split_once(':')
-            .map_or((creds.as_str(), ""), |(user, pass)| (user, pass));
+    // The matcher already applied `no_proxy`; an empty CURLOPT_NOPROXY keeps
+    // libcurl from second-guessing it with the `no_proxy` environment variable.
+    handler.noproxy("")?;
+    if let Some((username, password)) = &proxy.credentials {
         handler.proxy_username(username)?;
         handler.proxy_password(password)?;
     }
@@ -268,46 +295,19 @@ fn resolve_proxy(intercept: &Intercept) -> anyhow::Result<ResolvedProxy> {
         .as_str();
     let endpoint = format!("{scheme}://{authority}");
 
-    let (kind, credentials) = match scheme.as_str() {
-        "http" => (
-            ProxyType::Http,
-            intercept
-                .basic_auth()
-                .and_then(decode_basic_auth)
-                .map(|(user, pass)| format!("{user}:{pass}")),
-        ),
-        "https" => (
-            ProxyType::Http,
-            intercept
-                .basic_auth()
-                .and_then(decode_basic_auth)
-                .map(|(user, pass)| format!("{user}:{pass}")),
-        ),
-        "socks4" => (
-            ProxyType::Socks4,
-            intercept
-                .raw_auth()
-                .map(|(user, pass)| format!("{user}:{pass}")),
-        ),
-        "socks4a" => (
-            ProxyType::Socks4a,
-            intercept
-                .raw_auth()
-                .map(|(user, pass)| format!("{user}:{pass}")),
-        ),
-        "socks5" => (
-            ProxyType::Socks5,
-            intercept
-                .raw_auth()
-                .map(|(user, pass)| format!("{user}:{pass}")),
-        ),
-        "socks5h" => (
-            ProxyType::Socks5Hostname,
-            intercept
-                .raw_auth()
-                .map(|(user, pass)| format!("{user}:{pass}")),
-        ),
+    let kind = match scheme.as_str() {
+        "http" | "https" => ProxyType::Http,
+        "socks4" => ProxyType::Socks4,
+        "socks4a" => ProxyType::Socks4a,
+        "socks5" => ProxyType::Socks5,
+        "socks5h" => ProxyType::Socks5Hostname,
         other => return Err(anyhow!("unsupported proxy scheme `{other}`")),
+    };
+    let credentials = match kind {
+        ProxyType::Http => intercept.basic_auth().and_then(decode_basic_auth),
+        _ => intercept
+            .raw_auth()
+            .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
     };
 
     Ok(ResolvedProxy {

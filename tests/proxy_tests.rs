@@ -1,6 +1,9 @@
 //! Proxy rules through `Transport`: absolute-form forwarding, `CONNECT`
 //! tunnels, SOCKS5, `no_proxy`, and the errors a misbehaving proxy produces.
-#![cfg(all(not(target_arch = "wasm32"), feature = "hyper-backend"))]
+#![cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "hyper-backend", feature = "curl-backend")
+))]
 
 mod common;
 
@@ -11,9 +14,7 @@ use common::{
     socks5::{Socks5Proxy, SocksDestination},
     tls::tls_fixture,
 };
-use zenwave::{
-    Client, Error, Proxy, ResponseExt as _, Transport, backend::HyperBackend, error::ProxyErrorKind,
-};
+use zenwave::{Client, Proxy, ResponseExt as _, Transport, backend::DefaultBackend};
 
 fn transport(proxy: Proxy) -> Transport {
     Transport::builder()
@@ -44,7 +45,7 @@ async fn http_target_is_forwarded_in_absolute_form_with_credentials() {
     let rules = Proxy::builder()
         .http(proxy.uri_with_credentials("alice", "s3cret"))
         .build();
-    let mut client = HyperBackend::new(transport(rules));
+    let mut client = DefaultBackend::new(transport(rules));
 
     let response = client
         .get(httpbin_uri("/get"))
@@ -73,7 +74,7 @@ async fn no_proxy_bypasses_the_proxy() {
         .http(proxy.uri())
         .no_proxy("127.0.0.1, localhost")
         .build();
-    let mut client = HyperBackend::new(transport(rules));
+    let mut client = DefaultBackend::new(transport(rules));
 
     client
         .get(httpbin_uri("/get"))
@@ -86,7 +87,7 @@ async fn no_proxy_bypasses_the_proxy() {
 #[test_executors::async_test]
 async fn proxy_none_ignores_everything() {
     let proxy = HttpProxy::start();
-    let mut client = HyperBackend::new(transport(Proxy::none()));
+    let mut client = DefaultBackend::new(transport(Proxy::none()));
     client
         .get(httpbin_uri("/get"))
         .expect("valid request")
@@ -102,7 +103,7 @@ async fn https_target_is_tunnelled_with_connect() {
     let rules = Proxy::builder()
         .https(proxy.uri_with_credentials("bob", "hunter2"))
         .build();
-    let mut client = HyperBackend::new(transport_with_test_ca(rules));
+    let mut client = DefaultBackend::new(transport_with_test_ca(rules));
 
     let response = client
         .get(fixture.https_uri("/"))
@@ -127,24 +128,27 @@ async fn https_target_is_tunnelled_with_connect() {
 }
 
 #[test_executors::async_test]
-async fn rejected_tunnel_is_a_proxy_error() {
+async fn rejected_tunnel_is_an_error() {
     let proxy = HttpProxy::start_requiring(&basic("bob", "hunter2"));
     let fixture = tls_fixture();
     let rules = Proxy::builder().https(proxy.uri()).build();
-    let mut client = HyperBackend::new(transport_with_test_ca(rules));
+    let mut client = DefaultBackend::new(transport_with_test_ca(rules));
 
     let error = client
         .get(fixture.https_uri("/"))
         .expect("valid request")
         .await
         .expect_err("the proxy demands credentials");
+    #[cfg(feature = "hyper-backend")]
     assert!(
         matches!(
             error,
-            Error::Proxy(ProxyErrorKind::TunnelRejected(status)) if status.as_u16() == 407
+            zenwave::Error::Proxy(zenwave::error::ProxyErrorKind::TunnelRejected(status)) if status.as_u16() == 407
         ),
         "{error:?}"
     );
+    #[cfg(not(feature = "hyper-backend"))]
+    assert!(error.is_network_error(), "{error:?}");
 }
 
 #[test_executors::async_test]
@@ -153,7 +157,7 @@ async fn socks5_resolves_locally_and_authenticates() {
     let rules = Proxy::builder()
         .all(proxy.uri_with_credentials("socks5", "carol", "pw"))
         .build();
-    let mut client = HyperBackend::new(transport(rules));
+    let mut client = DefaultBackend::new(transport(rules));
 
     let response = client
         .get(httpbin_uri("/get"))
@@ -176,7 +180,7 @@ async fn socks5h_sends_the_hostname_to_the_proxy() {
     let proxy = Socks5Proxy::start();
     let fixture = tls_fixture();
     let rules = Proxy::builder().all(proxy.uri("socks5h")).build();
-    let mut client = HyperBackend::new(transport_with_test_ca(rules));
+    let mut client = DefaultBackend::new(transport_with_test_ca(rules));
 
     let response = client
         .get(fixture.https_uri("/"))
@@ -194,17 +198,21 @@ async fn socks5h_sends_the_hostname_to_the_proxy() {
     );
 }
 
+#[cfg(feature = "hyper-backend")]
 #[test_executors::async_test]
 async fn socks4_is_refused_by_hyper() {
     let rules = Proxy::builder().all("socks4://127.0.0.1:1").build();
-    let mut client = HyperBackend::new(transport(rules));
+    let mut client = DefaultBackend::new(transport(rules));
     let error = client
         .get(httpbin_uri("/get"))
         .expect("valid request")
         .await
         .expect_err("socks4 is not spoken by the hyper backend");
     assert!(
-        matches!(error, Error::Proxy(ProxyErrorKind::UnsupportedScheme(ref scheme)) if scheme == "socks4"),
+        matches!(
+            error,
+            zenwave::Error::Proxy(zenwave::error::ProxyErrorKind::UnsupportedScheme(ref scheme)) if scheme == "socks4"
+        ),
         "{error:?}"
     );
 }

@@ -48,7 +48,7 @@ default = ["hyper-backend", "rustls", "ws"]
 # hyper over async-io/async-net. Needs exactly one TLS engine (`rustls` or `native-tls`).
 hyper-backend = []
 # libcurl via the `curl` crate. libcurl brings its own TLS engine.
-curl-backend = ["dep:curl", "dep:blocking"]
+curl-backend = ["dep:curl", "dep:blocking", "dep:rustls-native-certs", "dep:pem"]
 # Apple's NSURLSession (macOS/iOS only). Security.framework does the TLS.
 apple-backend = []
 
@@ -116,6 +116,8 @@ futures-rustls = { version = "0.26", optional = true, default-features = false, 
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 rustls-platform-verifier = { version = "0.7", optional = true }
 rustls-pki-types = { version = "1.12", features = ["std"] }
+rustls-native-certs = { version = "0.8", optional = true }
+pem = { version = "4", optional = true }
 native-tls = { version = "0.2", optional = true }
 async-tungstenite = { version = "0.34.0", default-features = false, features = ["smol-runtime"], optional = true }
 async-fs = { version = "2.2.0", default-features = false }

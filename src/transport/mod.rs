@@ -40,6 +40,8 @@ use crate::Error;
 
 #[cfg(android_verifier)]
 mod android;
+#[cfg(feature = "curl-backend")]
+mod ca_bundle;
 #[cfg(connector)]
 pub(crate) mod connect;
 #[cfg(connector)]
@@ -72,6 +74,9 @@ pub struct Transport {
 struct Inner {
     proxy: Proxy,
     extra_roots: Vec<CertificateDer<'static>>,
+    /// Platform roots plus extras as PEM, for libcurl. `None` without extras.
+    #[cfg(feature = "curl-backend")]
+    ca_bundle: Option<Vec<u8>>,
     #[cfg(tls_engine)]
     tls: tls::TlsConnector,
 }
@@ -132,6 +137,12 @@ impl Transport {
     #[cfg(tls_engine)]
     pub(crate) fn tls(&self) -> &tls::TlsConnector {
         &self.inner.tls
+    }
+
+    /// The full PEM bundle libcurl should trust, when extra roots were added.
+    #[cfg(feature = "curl-backend")]
+    pub(crate) fn ca_bundle(&self) -> Option<&[u8]> {
+        self.inner.ca_bundle.as_deref()
     }
 }
 
@@ -215,10 +226,18 @@ impl TransportBuilder {
         {
             #[cfg(tls_engine)]
             let tls = tls::TlsConnector::new(&self.extra_roots)?;
+            #[cfg(feature = "curl-backend")]
+            let ca_bundle = if self.extra_roots.is_empty() {
+                None
+            } else {
+                Some(ca_bundle::platform_roots_with(&self.extra_roots)?)
+            };
             Ok(Transport {
                 inner: Arc::new(Inner {
                     proxy: self.proxy.unwrap_or_else(Proxy::system),
                     extra_roots: self.extra_roots,
+                    #[cfg(feature = "curl-backend")]
+                    ca_bundle,
                     #[cfg(tls_engine)]
                     tls,
                 }),
