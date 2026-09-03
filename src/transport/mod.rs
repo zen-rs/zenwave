@@ -14,6 +14,8 @@
 //!
 //! ```rust,no_run
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # #[cfg(not(target_arch = "wasm32"))]
+//! # {
 //! use zenwave::Transport;
 //!
 //! let corporate_ca = std::fs::read("/etc/ssl/corp-root.pem")?;
@@ -21,6 +23,7 @@
 //!     .extra_root_certificates_pem(&corporate_ca)?
 //!     .build()?;
 //! # let _ = transport;
+//! # }
 //! # Ok(())
 //! # }
 //! ```
