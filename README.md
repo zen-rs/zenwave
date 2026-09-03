@@ -198,7 +198,11 @@ and `ndk-glue` fill in before `main`; an app that embeds Rust calls
 `rustls-platform-verifier` must be on the class path; see that crate's README.
 The JVM is first touched on the first TLS connection, so plain HTTP works
 without it; a TLS connection in a process that never registered the context
-panics with ndk-context's `android context was not initialized`.
+panics with ndk-context's `android context was not initialized`. The
+instrumented app under `tests/android` shows the whole wiring (the Gradle
+repository for the Kotlin half, the proguard rule, a native method that hands
+the JVM and `Context` to ndk-context) and is what `scripts/test-android.sh`
+runs on a real device.
 
 ## Proxy support
 

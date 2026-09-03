@@ -221,6 +221,9 @@ async fn websocket_handles_server_ping() {
     server.await;
 }
 
+// A public wss:// endpoint needs the platform verifier, which needs the JVM on
+// Android; `tests/android` covers TLS there.
+#[cfg(not(target_os = "android"))]
 #[test_executors::async_test]
 async fn websocket_public_echo_service_roundtrip() {
     let payload = format!(

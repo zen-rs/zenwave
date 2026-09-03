@@ -6,8 +6,9 @@
 # `adb connect <ip>:<port>` first). ANDROID_NDK_HOME is taken from the SDK's
 # newest NDK when unset.
 #
-# The plain test binary has no JVM, so TLS through the platform verifier is
-# not exercised here; `tests/android` covers that inside an instrumented app.
+# The plain test binaries have no JVM, so the TLS cases are gated off them;
+# the instrumented app under `tests/android` runs those afterwards through
+# Gradle (`connectedDebugAndroidTest`), which needs `gradle` on the PATH.
 set -euo pipefail
 
 features=${1:-hyper-backend,rustls,ws}
@@ -38,5 +39,14 @@ case "$abi" in
 esac
 
 rustup target add "$target"
-echo "running on $ANDROID_SERIAL ($abi) with features $features"
+echo "::group::plain test binaries on $ANDROID_SERIAL ($abi) with features $features"
 cargo dinghy -d "$ANDROID_SERIAL" -p "$platform" test --no-default-features --features "$features"
+echo "::endgroup::"
+
+# TLS through the platform verifier needs the JVM: the instrumented app under
+# tests/android registers the context with ndk-context and runs those cases.
+echo "::group::instrumented TLS suite (tests/android)"
+export ANDROID_HOME=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}
+command -v gradle >/dev/null || { echo "gradle is required for the instrumented suite" >&2; exit 1; }
+(cd "$(dirname "$0")/../tests/android" && gradle --console=plain connectedDebugAndroidTest)
+echo "::endgroup::"
