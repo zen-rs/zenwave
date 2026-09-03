@@ -97,7 +97,7 @@ Runs on every push and PR (`.github/workflows/ci.yml` + `test.yml`):
   arm64/x86_64/armv7) with tests
 - Tests: hyper (rustls and native-tls) and curl on Linux/Windows/macOS,
   apple-backend on macOS, the suite on an iOS simulator (`scripts/test-ios.sh`,
-  cargo-dinghy), wasm-pack in Chrome/Firefox/Safari, workerd
+  `simctl spawn`), wasm-pack in Chrome/Firefox/Safari, workerd
 - Android runs on a physical device, not in CI: `scripts/test-android.sh`
   over adb (never an emulator); TLS on Android needs the JVM and is covered by
   the instrumented app under `tests/android`

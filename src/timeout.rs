@@ -159,9 +159,12 @@ mod tests {
 
     #[test]
     fn errors_after_timeout_expires() {
+        // Both sides are timers and `select` prefers a ready response, so the
+        // backend stays far behind the timeout even when the reactor's first
+        // wake-up is late (a simulator on a busy CI runner).
         let mut middleware = Timeout::new(Duration::from_millis(5));
         let backend = SlowEndpoint {
-            delay: Duration::from_millis(50),
+            delay: Duration::from_secs(5),
             status: StatusCode::OK,
         };
         let mut req = request();

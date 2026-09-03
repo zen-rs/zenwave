@@ -111,7 +111,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test-ios-simulator
-      - uses: taiki-e/install-action@cargo-dinghy
       - name: Run the suite on a simulator
         run: bash scripts/test-ios.sh
 

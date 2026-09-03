@@ -185,6 +185,11 @@ extras. Without extra roots libcurl keeps its own view of the platform store.
 
 The Apple backend adds the extras as anchors of each server's `SecTrust`
 alongside the built-in roots, from the session delegate's challenge handler.
+In an iOS app, App Transport Security still requires a system-trusted chain
+for every host that is not local, even after the delegate accepts the trust;
+a server that only the extra roots vouch for needs an `NSExceptionDomains`
+entry with `NSExceptionAllowsInsecureHTTPLoads` for its hostname in
+`Info.plist` (or `NSAllowsArbitraryLoads`).
 
 On Android the platform verifier needs the JVM. zenwave reads it from
 [`ndk-context`](https://crates.io/crates/ndk-context), which `android-activity`

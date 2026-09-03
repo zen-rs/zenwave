@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# Run the test suite on an iOS simulator through cargo-dinghy.
+# Run the test suite on an iOS simulator.
 #
-# The first available iPhone simulator of an installed iOS runtime is booted,
-# used for every feature set given as arguments (default: the Apple backend
-# and hyper, each with websockets), and shut down again.
+# The first available iPhone simulator of an installed iOS runtime is booted;
+# every test executable is built for the simulator target and run inside the
+# simulator with `simctl spawn`, whose exit status is the test binary's. Each
+# feature set given as an argument gets a run (default: the Apple backend and
+# hyper, each with websockets).
+#
+# The binaries run as bare processes, not as an app bundle, so App Transport
+# Security does not apply to URLSession here; real apps need the
+# `NSExceptionDomains` entry described in the README to reach a server that
+# only the extra roots trust.
 set -euo pipefail
 
 feature_sets=("$@")
@@ -12,8 +19,8 @@ if [[ ${#feature_sets[@]} -eq 0 ]]; then
 fi
 
 case "$(uname -m)" in
-  arm64) target=aarch64-apple-ios-sim; platform=auto-ios-aarch64-sim ;;
-  x86_64) target=x86_64-apple-ios; platform=auto-ios-x86_64 ;;
+  arm64) target=aarch64-apple-ios-sim ;;
+  x86_64) target=x86_64-apple-ios ;;
   *) echo "unsupported host architecture $(uname -m)" >&2; exit 1 ;;
 esac
 
@@ -30,12 +37,19 @@ cleanup() {
 }
 trap cleanup EXIT
 echo "booting simulator $simulator"
-xcrun simctl boot "$simulator" || true # already booted is fine
+xcrun simctl boot "$simulator" 2>/dev/null || true # already booted is fine
 xcrun simctl bootstatus "$simulator" -b
 
 rustup target add "$target"
 for features in "${feature_sets[@]}"; do
   echo "::group::iOS simulator tests: $features"
-  cargo dinghy -d "$simulator" -p "$platform" test --no-default-features --features "$features"
+  executables=$(cargo test --no-run --target "$target" --no-default-features --features "$features" \
+      --message-format=json \
+    | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty')
+  [[ -n "$executables" ]] || { echo "no test executables were built" >&2; exit 1; }
+  while IFS= read -r executable; do
+    echo "--- $(basename "$executable")"
+    xcrun simctl spawn "$simulator" "$executable"
+  done <<<"$executables"
   echo "::endgroup::"
 done
