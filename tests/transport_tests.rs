@@ -31,16 +31,16 @@ fn system_transport_is_shared() {
     assert_eq!(first, second);
 }
 
-#[cfg(feature = "hyper-backend")]
-mod hyper {
-    use zenwave::{Client, Error, ResponseExt as _, Transport, backend::HyperBackend};
+#[cfg(any(feature = "hyper-backend", feature = "curl-backend"))]
+mod http {
+    use zenwave::{Client, Error, ResponseExt as _, Transport, backend::DefaultBackend};
 
     use crate::common::tls::tls_fixture;
 
     #[test_executors::async_test]
     async fn system_roots_reject_a_locally_issued_certificate() {
         let fixture = tls_fixture();
-        let mut client = HyperBackend::default();
+        let mut client = DefaultBackend::default();
         let error = client
             .get(fixture.https_uri("/"))
             .expect("valid request")
@@ -57,7 +57,7 @@ mod hyper {
             .expect("test CA parses")
             .build()
             .expect("transport builds");
-        let mut client = HyperBackend::new(transport);
+        let mut client = DefaultBackend::new(transport);
         let response = client
             .get(fixture.https_uri("/"))
             .expect("valid request")

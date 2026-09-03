@@ -40,10 +40,13 @@ src/
     apple.rs      — URLSession backend (Apple platforms)
     web.rs        — Fetch API backend (wasm32)
   transport/
-    mod.rs        — Transport / TransportBuilder (trusted roots; all targets)
+    mod.rs        — Transport / TransportBuilder (proxy rules + trusted roots; all targets)
+    proxy.rs      — Proxy / ProxyBuilder over hyper-util's matcher (env + OS settings)
     tls.rs        — TLS engine: rustls + rustls-platform-verifier, or native-tls
-    stream.rs     — Stream (TCP / TLS) and the hyper I/O adapter
-    connect.rs    — connect(transport, target) shared by hyper and websocket
+    stream.rs     — Stream (TCP / TLS / TLS-in-TLS) and the hyper I/O adapter
+    connect.rs    — connect(transport, target): direct, HTTP proxy, CONNECT tunnel, SOCKS5
+    tunnel.rs     — HTTP CONNECT through hyper's upgrade machinery
+    socks5.rs     — SOCKS5 CONNECT client (RFC 1928/1929)
     happy_eyeballs.rs — RFC 8305 TCP connection racing
     android.rs    — hands the JVM from ndk-context to the platform verifier
   ext.rs          — ResponseExt trait (into_json, into_string, etc.)
@@ -54,7 +57,6 @@ src/
   redirect.rs     — redirect-following middleware (on by default)
   retry.rs        — retry middleware
   timeout.rs      — per-request timeout middleware
-  proxy.rs        — proxy configuration (hyper/curl only)
   websocket.rs    — cross-platform WebSocket client
   multipart.rs    — multipart/form-data
   error.rs        — error types

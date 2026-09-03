@@ -107,7 +107,7 @@ async fn test_hyper_backend_http_error_returns_err() {
 async fn test_curl_backend_http_error_returns_err() {
     use zenwave::backend::CurlBackend;
 
-    let mut backend = CurlBackend::new();
+    let mut backend = CurlBackend::default();
     let mut request = http::Request::builder()
         .method(Method::GET)
         .uri(httpbin_uri("/status/500"))
