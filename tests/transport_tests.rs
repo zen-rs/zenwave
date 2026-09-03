@@ -31,6 +31,9 @@ fn system_transport_is_shared() {
     assert_eq!(first, second);
 }
 
+// The plain Android test binary has no JVM for the platform verifier; TLS on
+// Android is exercised by the instrumented app under `tests/android`.
+#[cfg(not(target_os = "android"))]
 mod http {
     use zenwave::{Client, Error, ResponseExt as _, Transport, backend::DefaultBackend};
 
@@ -67,6 +70,7 @@ mod http {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 #[cfg(feature = "ws")]
 mod websocket {
     use zenwave::{

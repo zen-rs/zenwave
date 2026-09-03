@@ -29,25 +29,16 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  clippy:
-    name: Clippy (${{ matrix.name }})
+  features:
+    # Every valid feature combination, on every desktop OS, through clippy.
+    # One slice per TLS engine so the powerset runs in parallel.
+    name: Features (${{ matrix.os }}, ${{ matrix.engine }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: Linux
-            os: ubuntu-latest
-            features: "--features curl-backend"
-            targets: "--all-targets"
-          - name: Linux + native-tls
-            os: ubuntu-latest
-            features: "--no-default-features --features hyper-backend,native-tls,ws,curl-backend"
-            targets: "--all-targets"
-          - name: macOS + Apple backend
-            os: macos-latest
-            features: "--no-default-features --features apple-backend"
-            targets: ""
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        engine: [rustls, native-tls, none]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -55,8 +46,10 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: clippy-${{ matrix.name }}
-      - run: cargo clippy ${{ matrix.targets }} ${{ matrix.features }} -- -D warnings
+          shared-key: features-${{ matrix.os }}
+      - uses: taiki-e/install-action@cargo-hack
+      - run: bash scripts/check-features.sh ${{ matrix.engine }}
+        shell: bash
 
   wasm:
     name: WASM
@@ -72,6 +65,9 @@ jobs:
       - run: cargo build --target wasm32-unknown-unknown
 
   mobile:
+    # Cross-compilation for the mobile targets, tests included. The suites run
+    # on an iOS simulator in test.yml and on a physical Android device through
+    # scripts/test-android.sh (emulators are not used).
     name: Mobile (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -81,35 +77,35 @@ jobs:
           - name: iOS device
             os: macos-latest
             target: aarch64-apple-ios
-            features: apple-backend
+            features: apple-backend,hyper-backend,rustls,ws
             android-api: ""
             android-clang-prefix: ""
             android-rust-target-env: ""
           - name: iOS simulator
             os: macos-latest
             target: aarch64-apple-ios-sim
-            features: apple-backend
+            features: apple-backend,hyper-backend,rustls,ws
             android-api: ""
             android-clang-prefix: ""
             android-rust-target-env: ""
           - name: Android arm64
             os: ubuntu-latest
             target: aarch64-linux-android
-            features: hyper-rustls
+            features: hyper-backend,rustls,ws
             android-api: "35"
             android-clang-prefix: aarch64-linux-android
             android-rust-target-env: aarch64_linux_android
           - name: Android x86_64
             os: ubuntu-latest
             target: x86_64-linux-android
-            features: hyper-rustls
+            features: hyper-backend,rustls,ws
             android-api: "35"
             android-clang-prefix: x86_64-linux-android
             android-rust-target-env: x86_64_linux_android
           - name: Android armv7
             os: ubuntu-latest
             target: armv7-linux-androideabi
-            features: hyper-rustls
+            features: hyper-backend,rustls,ws
             android-api: "35"
             android-clang-prefix: armv7a-linux-androideabi
             android-rust-target-env: armv7_linux_androideabi
@@ -144,8 +140,8 @@ jobs:
             echo "AR_${rust_target_env}=$ar"
             echo "CARGO_TARGET_${cargo_target_env}_LINKER=$cc"
           } >> "$GITHUB_ENV"
-      - name: Check mobile target
-        run: cargo check --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }}
+      - name: Check mobile target (library and tests)
+        run: cargo check --all-targets --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }}
 
   coverage:
     name: Coverage
@@ -200,22 +196,6 @@ jobs:
           shared-key: ci-ubuntu
       - uses: taiki-e/install-action@cargo-machete
       - run: cargo machete
-
-  feature-checks:
-    name: Features
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-ubuntu
-      # Test valid backend + TLS combinations
-      - run: cargo check --no-default-features --features curl-backend
-      - run: cargo check --no-default-features --features hyper-backend,native-tls
-      - run: cargo check --no-default-features --features hyper-backend,rustls
-      - run: cargo check --no-default-features --features hyper-backend,native-tls,ws
-      - run: cargo check --no-default-features --features hyper-backend,rustls,ws
 
   test:
     name: Test

@@ -191,6 +191,9 @@ On Android the platform verifier needs the JVM. zenwave reads it from
 and `ndk-glue` fill in before `main`; an app that embeds Rust calls
 `ndk_context::initialize_android_context` from `JNI_OnLoad`. The Kotlin half of
 `rustls-platform-verifier` must be on the class path; see that crate's README.
+The JVM is first touched on the first TLS connection, so plain HTTP works
+without it; a TLS connection in a process that never registered the context
+panics with ndk-context's `android context was not initialized`.
 
 ## Proxy support
 
