@@ -9,11 +9,31 @@
 
 use std::{fmt, sync::Arc};
 
+use base64::Engine as _;
 use http::Uri;
 use hyper_util::client::proxy::matcher::{self, Matcher};
 
 /// A matched proxy for one destination: its URI and credentials.
 pub type Intercept = matcher::Intercept;
+
+/// The username and password from the proxy URI, whatever the proxy speaks:
+/// the matcher pre-encodes them as `Basic` for HTTP proxies and keeps them
+/// raw for SOCKS.
+#[must_use]
+pub fn credentials(intercept: &Intercept) -> Option<(String, String)> {
+    if let Some((user, password)) = intercept.raw_auth() {
+        return Some((user.to_owned(), password.to_owned()));
+    }
+    let header = intercept.basic_auth()?.to_str().ok()?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(header.strip_prefix("Basic ")?)
+        .ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    let (user, password) = text
+        .split_once(':')
+        .map_or((text.as_str(), ""), |(user, password)| (user, password));
+    Some((user.to_owned(), password.to_owned()))
+}
 
 /// Proxy rules applied to every connection a [`super::Transport`] opens.
 ///

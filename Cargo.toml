@@ -50,7 +50,7 @@ hyper-backend = []
 # libcurl via the `curl` crate. libcurl brings its own TLS engine.
 curl-backend = ["dep:curl", "dep:blocking", "dep:rustls-native-certs", "dep:pem"]
 # Apple's NSURLSession (macOS/iOS only). Security.framework does the TLS.
-apple-backend = []
+apple-backend = ["dep:block", "dep:objc", "dep:security-framework", "dep:core-foundation"]
 
 # TLS engines for `hyper-backend` and native websockets. Exactly one may be enabled.
 #
@@ -127,8 +127,10 @@ time = "0.3.47"
 tower-service = "0.3"
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
-block = "0.1"
-objc = "0.2"
+block = { version = "0.1", optional = true }
+objc = { version = "0.2", optional = true }
+security-framework = { version = "3.7", optional = true }
+core-foundation = { version = "0.10", optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.22", optional = true }

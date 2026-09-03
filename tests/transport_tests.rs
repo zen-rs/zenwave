@@ -31,7 +31,6 @@ fn system_transport_is_shared() {
     assert_eq!(first, second);
 }
 
-#[cfg(any(feature = "hyper-backend", feature = "curl-backend"))]
 mod http {
     use zenwave::{Client, Error, ResponseExt as _, Transport, backend::DefaultBackend};
 
