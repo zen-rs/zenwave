@@ -1,13 +1,14 @@
 //! Connection-level configuration shared by every backend.
 //!
-//! A [`Transport`] describes how bytes reach a server: which root
-//! certificates are trusted when a TLS connection is opened. Every backend is
-//! constructed from one, and [`Transport::system`] is what
-//! [`zenwave::client()`](crate::client) uses: the operating system's trust
-//! store, evaluated by the platform (Security.framework on Apple systems,
+//! A [`Transport`] describes how bytes reach a server: which proxy, if any,
+//! sits in between, and which root certificates are trusted when a TLS
+//! connection is opened. Every backend is constructed from one, and
+//! [`Transport::system`] is what [`zenwave::client()`](crate::client) uses:
+//! the operating system's proxy settings and trust store, the latter
+//! evaluated by the platform (Security.framework on Apple systems,
 //! `CryptoAPI` on Windows, the Android trust manager, the system CA bundle on
 //! Linux and the BSDs) and, in a browser or a Cloudflare Worker, whatever the
-//! runtime itself trusts.
+//! runtime itself decides.
 //!
 //! Building a transport is where trust material is loaded and validated, so
 //! it is done once and the result is cheap to clone and share.
@@ -43,10 +44,19 @@ mod android;
 pub(crate) mod connect;
 #[cfg(connector)]
 mod happy_eyeballs;
+#[cfg(native)]
+pub mod proxy;
+#[cfg(connector)]
+mod socks5;
 #[cfg(connector)]
 pub(crate) mod stream;
 #[cfg(tls_engine)]
 pub(crate) mod tls;
+#[cfg(connector)]
+mod tunnel;
+
+#[cfg(native)]
+pub use proxy::{Proxy, ProxyBuilder};
 
 /// How connections are established: trusted roots and, on native platforms,
 /// the TLS engine configured with them.
@@ -60,7 +70,7 @@ pub struct Transport {
 
 #[cfg(native)]
 struct Inner {
-    #[cfg(native)]
+    proxy: Proxy,
     extra_roots: Vec<CertificateDer<'static>>,
     #[cfg(tls_engine)]
     tls: tls::TlsConnector,
@@ -105,6 +115,13 @@ impl Transport {
         TransportBuilder::default()
     }
 
+    /// The proxy rules connections follow.
+    #[cfg(native)]
+    #[allow(dead_code)] // consumed by the curl and Apple backends
+    pub(crate) fn proxy(&self) -> &Proxy {
+        &self.inner.proxy
+    }
+
     /// Root certificates trusted in addition to the platform's.
     #[cfg(native)]
     #[allow(dead_code)] // consumed by the curl and Apple backends
@@ -122,7 +139,9 @@ impl fmt::Debug for Transport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = f.debug_struct("Transport");
         #[cfg(native)]
-        debug.field("extra_roots", &self.inner.extra_roots.len());
+        debug
+            .field("proxy", &self.inner.proxy)
+            .field("extra_roots", &self.inner.extra_roots.len());
         debug.finish_non_exhaustive()
     }
 }
@@ -135,6 +154,8 @@ impl fmt::Debug for Transport {
 #[derive(Default)]
 pub struct TransportBuilder {
     #[cfg(native)]
+    proxy: Option<Proxy>,
+    #[cfg(native)]
     extra_roots: Vec<CertificateDer<'static>>,
 }
 
@@ -142,12 +163,22 @@ impl fmt::Debug for TransportBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = f.debug_struct("TransportBuilder");
         #[cfg(native)]
-        debug.field("extra_roots", &self.extra_roots.len());
+        debug
+            .field("proxy", &self.proxy)
+            .field("extra_roots", &self.extra_roots.len());
         debug.finish_non_exhaustive()
     }
 }
 
 impl TransportBuilder {
+    /// Follow these proxy rules instead of [`Proxy::system`].
+    #[cfg(native)]
+    #[must_use]
+    pub fn proxy(mut self, proxy: Proxy) -> Self {
+        self.proxy = Some(proxy);
+        self
+    }
+
     /// Trust every `CERTIFICATE` block in `pem` in addition to the platform roots.
     ///
     /// # Errors
@@ -186,6 +217,7 @@ impl TransportBuilder {
             let tls = tls::TlsConnector::new(&self.extra_roots)?;
             Ok(Transport {
                 inner: Arc::new(Inner {
+                    proxy: self.proxy.unwrap_or_else(Proxy::system),
                     extra_roots: self.extra_roots,
                     #[cfg(tls_engine)]
                     tls,

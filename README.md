@@ -180,20 +180,29 @@ and `ndk-glue` fill in before `main`; an app that embeds Rust calls
 
 ## Proxy support
 
-Available with the `curl-backend` feature (native only).
+Every transport follows proxy rules; the default, `Proxy::system()`, reads
+`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` (either case, lower-case
+wins as in curl) and then the operating system's proxy settings (macOS System
+Settings, Windows internet options). The Apple backend hands that case to
+`URLSession`, which also runs PAC scripts. To state the rules yourself:
 
 ```rust
-use zenwave::Proxy;
+use zenwave::{Proxy, Transport};
 
-// Read HTTP_PROXY / HTTPS_PROXY / NO_PROXY from env
-let proxy = Proxy::from_env();
-
-// Or build manually — supports http, socks4, socks4a, socks5, socks5h
 let proxy = Proxy::builder()
     .http("http://corp-proxy:8080")
-    .no_proxy("internal.example.com")
+    .https("http://user:password@corp-proxy:8080")
+    .no_proxy("localhost, .internal.corp, 10.0.0.0/8")
     .build();
+let transport = Transport::builder().proxy(proxy).build()?;
 ```
+
+`Proxy::env()` reads only the environment, `Proxy::none()` always connects
+directly. Proxy URIs may use `http`, `https`, `socks5` (resolve on the client)
+or `socks5h` (resolve on the proxy); the curl backend also understands `socks4`
+and `socks4a`. HTTP proxies see plaintext requests in absolute form and a
+`CONNECT` tunnel for TLS and for websockets, with `Proxy-Authorization` taken
+from the proxy URI's credentials.
 
 ## Backends and feature flags
 
@@ -228,8 +237,7 @@ zenwave = { version = "0.5", default-features = false, features = ["curl-backend
 zenwave = { version = "0.5", default-features = false, features = ["apple-backend"] }
 ```
 
-Other features: `hyper-rustls` / `hyper-native-tls` (shorthands), `proxy`
-(auto-enabled by `curl-backend`).
+Other features: `hyper-rustls` / `hyper-native-tls` (shorthands).
 
 ## Testing
 

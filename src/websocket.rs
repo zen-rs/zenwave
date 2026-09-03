@@ -139,7 +139,7 @@ mod native {
     use crate::{
         Transport,
         transport::{
-            connect::{Target, connect as connect_stream},
+            connect::{Connection, Target, Via, connect as connect_stream},
             stream::Stream,
         },
     };
@@ -230,9 +230,21 @@ mod native {
         let port = url
             .port_or_known_default()
             .ok_or_else(|| WebSocketError::InvalidTarget("websocket URI does not imply a port"))?;
-        let stream = connect_stream(transport, Target { host, port, tls })
-            .await
-            .map_err(|error| WebSocketError::Transport(Box::new(error)))?;
+        let Connection { stream, via } = connect_stream(
+            transport,
+            Target {
+                host,
+                port,
+                tls,
+                tunnel_plaintext: true,
+            },
+        )
+        .await
+        .map_err(|error| WebSocketError::Transport(Box::new(error)))?;
+        debug_assert!(
+            matches!(via, Via::Direct),
+            "websocket targets are always tunnelled, never proxied in absolute form"
+        );
 
         let mut config = TungsteniteConfig::default();
         config.max_message_size = websocket_config.max_message_size;

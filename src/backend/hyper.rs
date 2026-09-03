@@ -14,7 +14,7 @@ use crate::{
     Client, Transport,
     error::HttpErrorResponse,
     transport::{
-        connect::{Target, connect},
+        connect::{Target, Via, connect},
         stream::HyperIo,
     },
 };
@@ -145,7 +145,7 @@ impl Endpoint for HyperBackend {
         {
             request.headers_mut().insert(http::header::HOST, value);
         }
-        let stream = {
+        let connection = {
             let uri = request.uri();
             let host = uri
                 .host()
@@ -156,15 +156,37 @@ impl Endpoint for HyperBackend {
                 other => return Err(HyperError::InvalidUri(other.to_string()).into()),
             };
             let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
-            connect(&self.transport, Target { host, port, tls }).await?
+            connect(
+                &self.transport,
+                Target {
+                    host,
+                    port,
+                    tls,
+                    tunnel_plaintext: false,
+                },
+            )
+            .await?
         };
-        let origin_form = request
-            .uri()
-            .path_and_query()
-            .map_or("/", http::uri::PathAndQuery::as_str);
-        *request.uri_mut() = origin_form
-            .parse()
-            .map_err(|err| HyperError::InvalidUri(format!("{origin_form}: {err}")))?;
+        match connection.via {
+            Via::Direct => {
+                let origin_form = request
+                    .uri()
+                    .path_and_query()
+                    .map_or("/", http::uri::PathAndQuery::as_str);
+                *request.uri_mut() = origin_form
+                    .parse()
+                    .map_err(|err| HyperError::InvalidUri(format!("{origin_form}: {err}")))?;
+            }
+            Via::HttpProxy { authorization } => {
+                // Absolute-form request line: the proxy needs the full URI.
+                if let Some(authorization) = authorization {
+                    request
+                        .headers_mut()
+                        .insert(http::header::PROXY_AUTHORIZATION, authorization);
+                }
+            }
+        }
+        let stream = connection.stream;
         let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
             .handshake(HyperIo(stream))
             .await
