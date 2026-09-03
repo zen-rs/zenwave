@@ -36,8 +36,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test-${{ matrix.os }}
-      - name: Run hyper backend tests
-        run: cargo test --no-default-features --features hyper-backend --workspace
+      - name: Run hyper backend tests (rustls)
+        run: cargo test --no-default-features --features hyper-backend,rustls,ws --workspace
+      - name: Run hyper backend tests (native-tls)
+        run: cargo test --no-default-features --features hyper-backend,native-tls,ws --workspace
 
   wasm-linux:
     name: wasm-pack (Linux - ${{ matrix.browser }})
