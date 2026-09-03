@@ -14,7 +14,7 @@ use common::httpbin_uri;
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 #[cfg(feature = "hyper-backend")]
 fn test_hyper_backend_creation() {
-    let backend = HyperBackend::new();
+    let backend = HyperBackend::default();
     // Just ensure it can be created
     assert!(!format!("{backend:?}").is_empty());
 }
@@ -30,7 +30,7 @@ fn test_hyper_backend_default() {
 #[test_executors::async_test]
 #[cfg(feature = "hyper-backend")]
 async fn test_hyper_backend_get_request() {
-    let mut backend = HyperBackend::new();
+    let mut backend = HyperBackend::default();
     let mut request = http::Request::builder()
         .method(Method::GET)
         .uri(httpbin_uri("/get"))
@@ -45,7 +45,7 @@ async fn test_hyper_backend_get_request() {
 #[test_executors::async_test]
 #[cfg(feature = "hyper-backend")]
 async fn test_hyper_backend_post_request() {
-    let mut backend = HyperBackend::new();
+    let mut backend = HyperBackend::default();
     let mut request = http::Request::builder()
         .method(Method::POST)
         .uri(httpbin_uri("/post"))
@@ -60,7 +60,7 @@ async fn test_hyper_backend_post_request() {
 #[test_executors::async_test]
 #[cfg(feature = "hyper-backend")]
 async fn test_hyper_backend_https_request() {
-    let mut backend = HyperBackend::new();
+    let mut backend = HyperBackend::default();
     let mut request = http::Request::builder()
         .method(Method::GET)
         .uri(httpbin_uri("/get"))
@@ -75,7 +75,7 @@ async fn test_hyper_backend_https_request() {
 #[test_executors::async_test]
 #[cfg(feature = "hyper-backend")]
 async fn test_hyper_backend_invalid_uri() {
-    let mut backend = HyperBackend::new();
+    let mut backend = HyperBackend::default();
     let mut request = http::Request::builder()
         .method(Method::GET)
         .uri("invalid-uri")
@@ -88,7 +88,7 @@ async fn test_hyper_backend_invalid_uri() {
 #[test_executors::async_test]
 #[cfg(feature = "hyper-backend")]
 async fn test_hyper_backend_http_error_returns_err() {
-    let mut backend = HyperBackend::new();
+    let mut backend = HyperBackend::default();
     let mut request = http::Request::builder()
         .method(Method::GET)
         .uri(httpbin_uri("/status/404"))

@@ -6,6 +6,10 @@
 //! `ZENWAVE_TEST_BASE_URL` is provided.
 
 #[cfg(not(target_arch = "wasm32"))]
+pub mod tls;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
 mod local {
     use std::{fmt::Write, io::Cursor, thread, time::Duration};
 
@@ -267,4 +271,5 @@ mod local {
     }
 }
 
+#[allow(unused_imports)]
 pub use local::*;
