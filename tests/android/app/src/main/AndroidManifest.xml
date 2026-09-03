@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- The fixtures speak plain HTTP on loopback next to the TLS servers. -->
+    <application android:usesCleartextTraffic="true" />
+</manifest>
