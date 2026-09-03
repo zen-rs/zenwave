@@ -6,6 +6,10 @@
 //! `ZENWAVE_TEST_BASE_URL` is provided.
 
 #[cfg(not(target_arch = "wasm32"))]
+pub mod proxy;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod socks5;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod tls;
 
 #[cfg(not(target_arch = "wasm32"))]

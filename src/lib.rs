@@ -81,6 +81,8 @@ pub use client::Client;
 pub use http_kit::*;
 pub use oauth2::OAuth2ClientCredentials;
 pub mod transport;
+#[cfg(not(target_arch = "wasm32"))]
+pub use transport::{Proxy, ProxyBuilder};
 pub use transport::{Transport, TransportBuilder};
 
 pub mod auth;
@@ -100,15 +102,11 @@ pub use error::Error;
 mod ext;
 /// Multipart/form-data utilities.
 pub mod multipart;
-#[cfg(all(not(target_arch = "wasm32"), feature = "proxy"))]
-pub mod proxy;
 /// Websocket utilities (requires the `ws` feature).
 #[cfg(feature = "ws")]
 pub mod websocket;
 
 pub use ext::ResponseExt;
-#[cfg(all(not(target_arch = "wasm32"), feature = "proxy"))]
-pub use proxy::{Proxy, ProxyBuilder};
 pub use timeout::Timeout;
 
 /// The default Zenwave client.
@@ -168,38 +166,6 @@ pub fn client() -> DefaultClient {
 #[must_use]
 pub fn raw_client() -> DefaultBackend {
     DefaultClient::raw()
-}
-
-/// Construct the default backend configured with a proxy matcher.
-///
-/// This helper only exists when the default backend is curl-backend, which
-/// supports proxy configuration. Other backends do not support this API.
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    feature = "curl-backend",
-    not(all(target_vendor = "apple", feature = "apple-backend")),
-    not(feature = "hyper-backend")
-))]
-#[must_use]
-#[allow(clippy::missing_const_for_fn)]
-pub fn client_with_proxy(proxy: Proxy) -> DefaultClient {
-    DefaultClient {
-        inner: DefaultBackend::with_proxy(proxy).follow_redirect(),
-    }
-}
-
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    feature = "curl-backend",
-    not(all(target_vendor = "apple", feature = "apple-backend")),
-    not(feature = "hyper-backend")
-))]
-impl DefaultClient {
-    /// Replace the proxy matcher on the default curl-backed client.
-    #[must_use]
-    pub fn proxy(self, proxy: Proxy) -> Self {
-        client_with_proxy(proxy)
-    }
 }
 
 /// Create a default HTTP client backend.

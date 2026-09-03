@@ -11,10 +11,12 @@ use futures_io::{AsyncRead, AsyncWrite};
 
 use super::tls::TlsStream;
 
-/// A connected stream: plain TCP, or TLS over TCP.
+/// A connected stream: plain TCP, TLS over TCP, or TLS to the target inside
+/// TLS to an HTTPS proxy.
 pub enum Stream {
     Tcp(TcpStream),
     Tls(Box<TlsStream<TcpStream>>),
+    TlsOverTls(Box<TlsStream<TlsStream<TcpStream>>>),
 }
 
 impl fmt::Debug for Stream {
@@ -22,6 +24,7 @@ impl fmt::Debug for Stream {
         match self {
             Self::Tcp(_) => f.write_str("Stream::Tcp"),
             Self::Tls(_) => f.write_str("Stream::Tls"),
+            Self::TlsOverTls(_) => f.write_str("Stream::TlsOverTls"),
         }
     }
 }
@@ -37,6 +40,7 @@ impl AsyncRead for Stream {
         match &mut *self {
             Self::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
             Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::TlsOverTls(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
 }
@@ -50,6 +54,7 @@ impl AsyncWrite for Stream {
         match &mut *self {
             Self::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
             Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::TlsOverTls(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
@@ -61,6 +66,7 @@ impl AsyncWrite for Stream {
         match &mut *self {
             Self::Tcp(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
             Self::Tls(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Self::TlsOverTls(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
         }
     }
 
@@ -68,6 +74,7 @@ impl AsyncWrite for Stream {
         match &mut *self {
             Self::Tcp(stream) => Pin::new(stream).poll_flush(cx),
             Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
+            Self::TlsOverTls(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
@@ -75,16 +82,15 @@ impl AsyncWrite for Stream {
         match &mut *self {
             Self::Tcp(stream) => Pin::new(stream).poll_close(cx),
             Self::Tls(stream) => Pin::new(stream).poll_close(cx),
+            Self::TlsOverTls(stream) => Pin::new(stream).poll_close(cx),
         }
     }
 }
 
 /// Adapts a `futures-io` stream to hyper's I/O traits.
-#[cfg(feature = "hyper-backend")]
 #[derive(Debug)]
 pub struct HyperIo<S>(pub S);
 
-#[cfg(feature = "hyper-backend")]
 impl<S: AsyncRead + Unpin> hyper::rt::Read for HyperIo<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -106,7 +112,6 @@ impl<S: AsyncRead + Unpin> hyper::rt::Read for HyperIo<S> {
     }
 }
 
-#[cfg(feature = "hyper-backend")]
 impl<S: AsyncWrite + Unpin> hyper::rt::Write for HyperIo<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,

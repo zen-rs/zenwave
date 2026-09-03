@@ -92,6 +92,10 @@ pub enum Error {
     #[error("websocket error: {0}")]
     WebSocket(#[from] WebSocketErrorKind),
 
+    /// The proxy between the client and the target refused or broke the connection.
+    #[error("proxy error: {0}")]
+    Proxy(#[from] ProxyErrorKind),
+
     /// I/O error (file operations, etc.).
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -119,6 +123,30 @@ impl std::fmt::Display for HttpErrorResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "HTTP response with status {}", self.response.status())
     }
+}
+
+/// Proxy-related errors.
+#[derive(Debug, Error)]
+pub enum ProxyErrorKind {
+    /// The proxy URI uses a scheme this backend cannot speak.
+    #[error("unsupported proxy scheme `{0}`")]
+    UnsupportedScheme(String),
+
+    /// The proxy URI names no host.
+    #[error("proxy URI has no host")]
+    MissingHost,
+
+    /// The HTTP proxy answered `CONNECT` with a non-2xx status.
+    #[error("proxy refused the CONNECT tunnel with status {0}")]
+    TunnelRejected(StatusCode),
+
+    /// The HTTP proxy did not follow the tunnel protocol.
+    #[error("proxy broke the tunnel protocol: {0}")]
+    TunnelProtocol(&'static str),
+
+    /// The SOCKS5 handshake failed.
+    #[error("SOCKS5 handshake failed: {0}")]
+    Socks(String),
 }
 
 /// Cookie-related errors.
@@ -204,7 +232,7 @@ impl Error {
     /// Check if this is a network transport error.
     #[must_use]
     pub const fn is_network_error(&self) -> bool {
-        matches!(self, Self::Transport(_) | Self::Tls(_))
+        matches!(self, Self::Transport(_) | Self::Tls(_) | Self::Proxy(_))
     }
 
     /// Check if this is a timeout error.
@@ -317,6 +345,7 @@ impl Error {
             Self::OAuth2(_) => ErrorKind::OAuth2,
             Self::Download(_) => ErrorKind::Download,
             Self::WebSocket(_) => ErrorKind::WebSocket,
+            Self::Proxy(_) => ErrorKind::Proxy,
             Self::Io(_) => ErrorKind::Io,
             Self::Other(_) => ErrorKind::Other,
         }
@@ -352,6 +381,8 @@ pub enum ErrorKind {
     Download,
     /// WebSocket error
     WebSocket,
+    /// Proxy error
+    Proxy,
     /// I/O error
     Io,
     /// Other/uncategorized error
@@ -373,6 +404,7 @@ impl std::fmt::Display for ErrorKind {
             Self::OAuth2 => write!(f, "oauth2"),
             Self::Download => write!(f, "download"),
             Self::WebSocket => write!(f, "websocket"),
+            Self::Proxy => write!(f, "proxy"),
             Self::Io => write!(f, "io"),
             Self::Other => write!(f, "other"),
         }

@@ -12,8 +12,7 @@ use http::{
 use http_kit::{Body, Endpoint, HttpError, Request, Response, StatusCode};
 use thiserror::Error;
 
-use crate::proxy::Intercept;
-use crate::{Client, Proxy, error::HttpErrorResponse};
+use crate::{Client, Proxy, error::HttpErrorResponse, transport::proxy::Intercept};
 
 /// HTTP backend implemented with libcurl.
 #[derive(Debug, Clone, Default)]
