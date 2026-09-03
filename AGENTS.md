@@ -67,7 +67,8 @@ src/
 Everything is middleware. `Client` is a trait extending `http_kit::Endpoint`.
 Each middleware wraps the inner client and transforms requests/responses.
 `zenwave::client()` returns a `DefaultClient` which is just the platform
-backend wrapped in `FollowRedirect`. Backends are constructed from a
+backend over `Transport::system()` wrapped in `FollowRedirect`;
+`zenwave::client_with(transport)` does the same over an explicit `Transport`. Backends are constructed from a
 `Transport` (trusted roots, TLS engine); `Transport::system()` is built once
 per process. `cfg` aliases (`native`, `tls_rustls`, `tls_native`,
 `tls_engine`, `connector`, `android_verifier`) come from `build.rs`.

@@ -91,7 +91,7 @@ Built-in middleware:
 | `.with(OAuth2ClientCredentials::new(...))` | Client-credentials OAuth2 flow with automatic refresh |
 
 Redirects are on by default. Call `zenwave::client().disable_redirect()` to get the
-raw backend, or use `zenwave::raw_client()`.
+raw backend, or build one with `DefaultClient::raw(transport)`.
 
 ## File downloads with resume
 
@@ -162,13 +162,19 @@ shared.
 To trust a private CA in addition to the platform roots:
 
 ```rust
-use zenwave::{Transport, backend::HyperBackend};
+use zenwave::Transport;
 
 let transport = Transport::builder()
     .extra_root_certificates_pem(&std::fs::read("corp-root.pem")?)?
     .build()?;
-let client = HyperBackend::new(transport);
+let client = zenwave::client_with(transport);
 ```
+
+`zenwave::client_with` is the default client over that transport; every
+backend takes one the same way (`HyperBackend::new(transport)`,
+`CurlBackend::new(transport)`, `AppleBackend::new(transport)`,
+`WebBackend::new(transport)`), and `DefaultClient::raw(transport)` is the
+platform backend without redirect following.
 
 Websockets take the same transport: `websocket::connect_with(uri, &transport, config)`.
 
