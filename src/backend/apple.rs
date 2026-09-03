@@ -17,6 +17,7 @@ use core::ffi::c_void;
 use std::{
     collections::HashMap,
     ffi::{CStr, CString},
+    fmt::Write as _,
     mem::replace,
     os::raw::c_char,
     ptr,
@@ -776,10 +777,37 @@ unsafe fn nsobject_to_string(obj: *mut Object) -> Option<String> {
     Some(c_str.to_string_lossy().into_owned())
 }
 
+/// The error's description, followed by the chain of underlying errors with
+/// their domains and codes, so a TLS or proxy failure names its real cause.
 unsafe fn error_to_anyhow(error: *mut Object) -> Error {
     let description: *mut Object = msg_send![error, localizedDescription];
-    nsobject_to_string(description)
-        .map_or_else(|| anyhow!("URLSession error"), |message| anyhow!(message))
+    let mut message =
+        nsobject_to_string(description).unwrap_or_else(|| "URLSession error".to_owned());
+    let mut current = error;
+    loop {
+        let user_info: *mut Object = msg_send![current, userInfo];
+        if user_info.is_null() {
+            break;
+        }
+        let Ok(key) = str_to_nsstring("NSUnderlyingError") else {
+            break;
+        };
+        let underlying: *mut Object = msg_send![user_info, objectForKey: key];
+        if underlying.is_null() {
+            break;
+        }
+        let domain: *mut Object = msg_send![underlying, domain];
+        let code: isize = msg_send![underlying, code];
+        let detail: *mut Object = msg_send![underlying, localizedDescription];
+        let _ = write!(
+            message,
+            " (caused by {} {code}: {})",
+            nsobject_to_string(domain).unwrap_or_default(),
+            nsobject_to_string(detail).unwrap_or_default()
+        );
+        current = underlying;
+    }
+    anyhow!(message)
 }
 
 /// What the delegate needs to answer authentication challenges.
