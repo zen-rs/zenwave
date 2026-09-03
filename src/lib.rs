@@ -28,63 +28,50 @@
 //! **Note:** Explicitly selecting a backend on wasm32 will result in a compile error.
 //!
 //! ## Native Platforms
-//! On native platforms, Zenwave supports multiple HTTP client backends.
+//! On native platforms, Zenwave supports multiple HTTP client backends and,
+//! for hyper and websockets, two TLS engines.
 //!
-//! ### Default Backend (`default-backend` feature)
-//! The default configuration uses platform-specific TLS selection:
-//! - **Apple platforms (macOS/iOS):** hyper + native-tls (Security.framework)
-//! - **Other platforms:** hyper + rustls with system certificates
+//! ### Default
+//! `hyper-backend` + `rustls` + `ws`. rustls verifies certificates through the
+//! operating system (`rustls-platform-verifier`): Security.framework on
+//! Apple platforms, `CryptoAPI` on Windows, the Android trust manager, and the
+//! system CA bundle on Linux. See [`Transport`] for adding roots.
 //!
-//! ### Explicit Backend Selection
-//! Available backends (enable via Cargo features):
-//! - **`hyper-rustls`**: Hyper with rustls TLS (uses system certificates).
-//! - **`hyper-native-tls`**: Hyper with native TLS (OpenSSL, `SChannel`, or Security.framework).
-//! - **`curl-backend`**: libcurl-based backend with proxy support.
+//! ### Features
+//! - **`hyper-backend`**: hyper over async-io. Needs `rustls` or `native-tls`.
+//! - **`rustls`** / **`native-tls`**: the TLS engine for hyper and websockets. Exactly one.
+//! - **`curl-backend`**: libcurl-based backend with its own TLS.
 //! - **`apple-backend`**: Apple's native `NSURLSession` (macOS/iOS only).
+//! - **`ws`**: websocket support.
 //!
-//! To use a different backend, disable default features and enable your choice:
 //! ```toml
 //! # Use curl backend instead
 //! zenwave = { version = "*", default-features = false, features = ["curl-backend"] }
 //!
 //! # Use hyper with native-tls explicitly
-//! zenwave = { version = "*", default-features = false, features = ["hyper-native-tls"] }
-//!
-//! # Use hyper with rustls explicitly
-//! zenwave = { version = "*", default-features = false, features = ["hyper-rustls"] }
+//! zenwave = { version = "*", default-features = false, features = ["hyper-native-tls", "ws"] }
 //! ```
 
 #![allow(clippy::multiple_crate_versions)]
 
-// Compile-time check: native-tls and rustls are mutually exclusive,
-// UNLESS `default-backend` is enabled (which intentionally enables both for
-// platform-specific selection at compile time).
-#[cfg(all(
-    feature = "native-tls",
-    feature = "rustls",
-    not(feature = "default-backend")
-))]
-compile_error!(
-    "Features `native-tls` and `rustls` are mutually exclusive. \
-     Please enable only one TLS backend, or use `default-backend` for automatic platform selection."
-);
-
-// TLS features are only applicable to hyper-backend on native platforms.
-// Other backends (apple-backend, curl-backend) have their own TLS implementations.
-// Note: wasm32 check is omitted here because TLS deps aren't even available on wasm32.
+// Exactly one TLS engine serves hyper and native websockets.
 #[cfg(all(
     not(target_arch = "wasm32"),
-    any(feature = "native-tls", feature = "rustls"),
-    not(any(feature = "hyper-backend", feature = "ws")),
-    any(
-        all(target_vendor = "apple", feature = "apple-backend"),
-        feature = "curl-backend"
-    )
+    feature = "rustls",
+    feature = "native-tls"
 ))]
 compile_error!(
-    "The `native-tls` and `rustls` features apply to `hyper-backend` and native websocket support. \
-     Your current HTTP backend (apple-backend or curl-backend) has its own TLS implementation, so \
-     these TLS features are only valid here when websocket support is also enabled."
+    "`rustls` and `native-tls` are mutually exclusive TLS engines; enable exactly one \
+     (the default feature set enables `rustls`)."
+);
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "hyper-backend", feature = "ws"),
+    not(any(feature = "rustls", feature = "native-tls"))
+))]
+compile_error!(
+    "`hyper-backend` and `ws` need a TLS engine: enable `rustls` (default) or `native-tls`."
 );
 
 pub mod backend;
@@ -93,6 +80,10 @@ pub use cache::Cache;
 pub use client::Client;
 pub use http_kit::*;
 pub use oauth2::OAuth2ClientCredentials;
+pub mod transport;
+#[cfg(not(target_arch = "wasm32"))]
+pub use transport::{Proxy, ProxyBuilder};
+pub use transport::{Transport, TransportBuilder};
 
 pub mod auth;
 pub mod cache;
@@ -111,15 +102,11 @@ pub use error::Error;
 mod ext;
 /// Multipart/form-data utilities.
 pub mod multipart;
-#[cfg(all(not(target_arch = "wasm32"), feature = "proxy"))]
-pub mod proxy;
 /// Websocket utilities (requires the `ws` feature).
 #[cfg(feature = "ws")]
 pub mod websocket;
 
 pub use ext::ResponseExt;
-#[cfg(all(not(target_arch = "wasm32"), feature = "proxy"))]
-pub use proxy::{Proxy, ProxyBuilder};
 pub use timeout::Timeout;
 
 /// The default Zenwave client.
@@ -132,11 +119,11 @@ pub struct DefaultClient {
 }
 
 impl DefaultClient {
-    /// Create a default client with redirect following enabled.
+    /// A client over `transport` with redirect following enabled.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(transport: Transport) -> Self {
         Self {
-            inner: DefaultBackend::default().follow_redirect(),
+            inner: DefaultBackend::new(transport).follow_redirect(),
         }
     }
 
@@ -146,16 +133,20 @@ impl DefaultClient {
         self.inner.disable_redirect()
     }
 
-    /// Create a raw backend without redirect middleware.
+    /// The bare platform backend over `transport`, without redirect middleware.
+    // Not every backend's constructor is `const` (URLSession sessions are
+    // opened lazily into a map), so this stays a plain fn on every target.
+    #[allow(clippy::missing_const_for_fn)]
     #[must_use]
-    pub fn raw() -> DefaultBackend {
-        DefaultBackend::default()
+    pub fn raw(transport: Transport) -> DefaultBackend {
+        DefaultBackend::new(transport)
     }
 }
 
 impl Default for DefaultClient {
+    /// The system transport: OS proxy settings and OS root certificates.
     fn default() -> Self {
-        Self::new()
+        Self::new(Transport::system())
     }
 }
 
@@ -169,48 +160,18 @@ impl Endpoint for DefaultClient {
 
 impl Client for DefaultClient {}
 
-/// Create a default HTTP client backend.
+/// The default client over the system transport: the operating system's
+/// proxy settings and root certificates, redirects followed.
 #[must_use]
 pub fn client() -> DefaultClient {
-    DefaultClient::new()
+    DefaultClient::default()
 }
 
-/// Create a raw default backend without redirect middleware.
+/// The default client over a transport of your own: explicit proxy rules,
+/// extra root certificates. See [`Transport::builder`].
 #[must_use]
-pub fn raw_client() -> DefaultBackend {
-    DefaultClient::raw()
-}
-
-/// Construct the default backend configured with a proxy matcher.
-///
-/// This helper only exists when the default backend is curl-backend, which
-/// supports proxy configuration. Other backends do not support this API.
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    feature = "curl-backend",
-    not(all(target_vendor = "apple", feature = "apple-backend")),
-    not(feature = "hyper-backend")
-))]
-#[must_use]
-#[allow(clippy::missing_const_for_fn)]
-pub fn client_with_proxy(proxy: Proxy) -> DefaultClient {
-    DefaultClient {
-        inner: DefaultBackend::with_proxy(proxy).follow_redirect(),
-    }
-}
-
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    feature = "curl-backend",
-    not(all(target_vendor = "apple", feature = "apple-backend")),
-    not(feature = "hyper-backend")
-))]
-impl DefaultClient {
-    /// Replace the proxy matcher on the default curl-backed client.
-    #[must_use]
-    pub fn proxy(self, proxy: Proxy) -> Self {
-        client_with_proxy(proxy)
-    }
+pub fn client_with(transport: Transport) -> DefaultClient {
+    DefaultClient::new(transport)
 }
 
 /// Create a default HTTP client backend.

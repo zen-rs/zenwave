@@ -125,9 +125,13 @@ async fn websocket_respects_max_message_size_config() {
     });
 
     let config = WebSocketConfig::default().with_max_message_size(Some(1024));
-    let client = zenwave::websocket::connect_with_config(format!("ws://{addr}"), config)
-        .await
-        .unwrap();
+    let client = zenwave::websocket::connect_with(
+        format!("ws://{addr}"),
+        &zenwave::Transport::system(),
+        config,
+    )
+    .await
+    .unwrap();
 
     match client.recv().await {
         Err(WebSocketError::ConnectionFailed(_)) => {}
@@ -217,6 +221,9 @@ async fn websocket_handles_server_ping() {
     server.await;
 }
 
+// A public wss:// endpoint needs the platform verifier, which needs the JVM on
+// Android; `tests/android` covers TLS there.
+#[cfg(not(target_os = "android"))]
 #[test_executors::async_test]
 async fn websocket_public_echo_service_roundtrip() {
     let payload = format!(

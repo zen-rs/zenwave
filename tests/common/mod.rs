@@ -6,6 +6,32 @@
 //! `ZENWAVE_TEST_BASE_URL` is provided.
 
 #[cfg(not(target_arch = "wasm32"))]
+pub mod proxy;
+
+/// A hostname for the TLS fixture that no resolver knows: only the test
+/// proxies map it to the loopback server. Proxy tests reach the fixture
+/// through this name because `CFNetwork` never proxies a literal loopback
+/// address, and every backend must hand the name to the proxy unresolved.
+#[allow(dead_code)]
+pub const FIXTURE_HOST: &str = "zenwave-fixture.test";
+
+/// Resolve a destination the way the test proxies do: the fixture hostname is
+/// the loopback server, anything else goes to the system resolver.
+#[allow(dead_code)]
+pub fn resolve_for_proxy(host: &str, port: u16) -> (String, u16) {
+    if host == FIXTURE_HOST {
+        ("127.0.0.1".to_owned(), port)
+    } else {
+        (host.to_owned(), port)
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub mod socks5;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod tls;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
 mod local {
     use std::{fmt::Write, io::Cursor, thread, time::Duration};
 
@@ -267,4 +293,5 @@ mod local {
     }
 }
 
+#[allow(unused_imports)]
 pub use local::*;

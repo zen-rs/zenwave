@@ -204,8 +204,11 @@ async fn test_timeout_middleware_success() {
 #[cfg(not(target_arch = "wasm32"))]
 #[test_executors::async_test]
 async fn test_timeout_middleware_triggers_gateway_timeout() {
+    // Both sides are timers; the backend's must stay far behind the timeout
+    // even when the reactor's first wake-up is late (a simulator under a
+    // debugger), because `select` prefers a response that is already ready.
     let mut client = SlowClient {
-        delay: Duration::from_millis(200),
+        delay: Duration::from_secs(5),
         status: StatusCode::OK,
     }
     .timeout(Duration::from_millis(10));

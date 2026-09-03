@@ -1,0 +1,3 @@
+[default.extend-words]
+# Apple's simulator identifier key in `simctl` JSON output.
+udid = "udid"

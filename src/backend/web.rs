@@ -15,10 +15,11 @@ use std::io;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::wasm_bindgen::{JsCast, JsValue};
 
-use crate::{Client, error::HttpErrorResponse};
+use crate::{Client, Transport, error::HttpErrorResponse};
 /// HTTP client backend for browser environments using `fetch`.
 pub struct WebBackend {
     scope: SingleThreaded<FetchScope>,
+    transport: Transport,
 }
 
 /// `globalThis` and the `fetch` it owns.
@@ -124,7 +125,9 @@ impl From<WebError> for crate::Error {
 
 impl fmt::Debug for WebBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WebBackend").finish()
+        f.debug_struct("WebBackend")
+            .field("transport", &self.transport)
+            .finish()
     }
 }
 
@@ -166,24 +169,29 @@ impl<T: Future> Future for SingleThreaded<T> {
 impl WebBackend {
     /// Construct a new `WebBackend` bound to the global scope's `fetch`.
     ///
+    /// The browser owns proxying and trust, so `transport` carries no settings
+    /// here; taking it keeps the constructor shape shared with the native
+    /// backends.
+    ///
     /// # Panics
     ///
     /// Panics when `globalThis` is neither a `Window` nor a
     /// `WorkerGlobalScope`, because there is then no `fetch` to speak through.
-    pub fn new() -> Self {
+    pub fn new(transport: Transport) -> Self {
         let scope = FetchScope::current().expect(
             "globalThis is neither a Window nor a WorkerGlobalScope, so there is no `fetch`",
         );
 
         Self {
             scope: SingleThreaded(scope),
+            transport,
         }
     }
 }
 
 impl Default for WebBackend {
     fn default() -> Self {
-        Self::new()
+        Self::new(Transport::system())
     }
 }
 

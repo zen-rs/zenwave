@@ -1,36 +1,45 @@
 //! Tests for backend implementations
 
-#[cfg(any(feature = "hyper-backend", feature = "curl-backend"))]
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "hyper-backend", feature = "curl-backend")
+))]
 use http_kit::{Endpoint, Method};
-#[cfg(feature = "hyper-backend")]
+#[cfg(default_hyper)]
 use zenwave::backend::HyperBackend;
 
-#[cfg(any(feature = "hyper-backend", feature = "curl-backend"))]
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "hyper-backend", feature = "curl-backend")
+))]
 mod common;
-#[cfg(any(feature = "hyper-backend", feature = "curl-backend"))]
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "hyper-backend", feature = "curl-backend")
+))]
 use common::httpbin_uri;
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg(feature = "hyper-backend")]
+#[cfg(default_hyper)]
 fn test_hyper_backend_creation() {
-    let backend = HyperBackend::new();
+    let backend = HyperBackend::default();
     // Just ensure it can be created
     assert!(!format!("{backend:?}").is_empty());
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg(feature = "hyper-backend")]
+#[cfg(default_hyper)]
 fn test_hyper_backend_default() {
     let backend = HyperBackend::default();
     assert!(!format!("{backend:?}").is_empty());
 }
 
 #[test_executors::async_test]
-#[cfg(feature = "hyper-backend")]
+#[cfg(default_hyper)]
 async fn test_hyper_backend_get_request() {
-    let mut backend = HyperBackend::new();
+    let mut backend = HyperBackend::default();
     let mut request = http::Request::builder()
         .method(Method::GET)
         .uri(httpbin_uri("/get"))
@@ -43,9 +52,9 @@ async fn test_hyper_backend_get_request() {
 }
 
 #[test_executors::async_test]
-#[cfg(feature = "hyper-backend")]
+#[cfg(default_hyper)]
 async fn test_hyper_backend_post_request() {
-    let mut backend = HyperBackend::new();
+    let mut backend = HyperBackend::default();
     let mut request = http::Request::builder()
         .method(Method::POST)
         .uri(httpbin_uri("/post"))
@@ -58,9 +67,9 @@ async fn test_hyper_backend_post_request() {
 }
 
 #[test_executors::async_test]
-#[cfg(feature = "hyper-backend")]
+#[cfg(default_hyper)]
 async fn test_hyper_backend_https_request() {
-    let mut backend = HyperBackend::new();
+    let mut backend = HyperBackend::default();
     let mut request = http::Request::builder()
         .method(Method::GET)
         .uri(httpbin_uri("/get"))
@@ -73,9 +82,9 @@ async fn test_hyper_backend_https_request() {
 }
 
 #[test_executors::async_test]
-#[cfg(feature = "hyper-backend")]
+#[cfg(default_hyper)]
 async fn test_hyper_backend_invalid_uri() {
-    let mut backend = HyperBackend::new();
+    let mut backend = HyperBackend::default();
     let mut request = http::Request::builder()
         .method(Method::GET)
         .uri("invalid-uri")
@@ -86,9 +95,9 @@ async fn test_hyper_backend_invalid_uri() {
 }
 
 #[test_executors::async_test]
-#[cfg(feature = "hyper-backend")]
+#[cfg(default_hyper)]
 async fn test_hyper_backend_http_error_returns_err() {
-    let mut backend = HyperBackend::new();
+    let mut backend = HyperBackend::default();
     let mut request = http::Request::builder()
         .method(Method::GET)
         .uri(httpbin_uri("/status/404"))
@@ -107,7 +116,7 @@ async fn test_hyper_backend_http_error_returns_err() {
 async fn test_curl_backend_http_error_returns_err() {
     use zenwave::backend::CurlBackend;
 
-    let mut backend = CurlBackend::new();
+    let mut backend = CurlBackend::default();
     let mut request = http::Request::builder()
         .method(Method::GET)
         .uri(httpbin_uri("/status/500"))
@@ -123,26 +132,24 @@ async fn test_curl_backend_http_error_returns_err() {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg(feature = "hyper-backend")]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(default_hyper)]
 fn test_hyper_backend_request_cancellation() {}
 
 // Note: WebBackend tests are more challenging to write without a browser environment
 // These would typically require wasm-pack test or a specialized test runner
 #[cfg(target_arch = "wasm32")]
 mod web_backend_tests {
-    use super::*;
     use zenwave::backend::WebBackend;
 
     #[test_executors::async_test]
     async fn test_web_backend_creation() {
-        let backend = WebBackend::new();
-        // Basic creation test - we can't test much without a browser context
+        let backend = WebBackend::new(zenwave::Transport::system());
+        assert!(format!("{backend:?}").starts_with("WebBackend"));
     }
 
     #[test_executors::async_test]
     async fn test_web_backend_default() {
         let backend = WebBackend::default();
-        // Basic default test
+        assert!(format!("{backend:?}").starts_with("WebBackend"));
     }
 }
