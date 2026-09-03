@@ -172,6 +172,11 @@ let client = HyperBackend::new(transport);
 
 Websockets take the same transport: `websocket::connect_with(uri, &transport, config)`.
 
+The curl backend takes a whole CA bundle rather than additional anchors, so
+with extra roots it hands libcurl a PEM bundle of the platform roots (a
+snapshot taken by `rustls-native-certs` when the transport is built) plus the
+extras. Without extra roots libcurl keeps its own view of the platform store.
+
 On Android the platform verifier needs the JVM. zenwave reads it from
 [`ndk-context`](https://crates.io/crates/ndk-context), which `android-activity`
 and `ndk-glue` fill in before `main`; an app that embeds Rust calls
@@ -202,7 +207,8 @@ directly. Proxy URIs may use `http`, `https`, `socks5` (resolve on the client)
 or `socks5h` (resolve on the proxy); the curl backend also understands `socks4`
 and `socks4a`. HTTP proxies see plaintext requests in absolute form and a
 `CONNECT` tunnel for TLS and for websockets, with `Proxy-Authorization` taken
-from the proxy URI's credentials.
+from the proxy URI's credentials. libcurl's own reading of `http_proxy` and
+`no_proxy` is switched off; the transport's rules are the only ones that apply.
 
 ## Backends and feature flags
 
