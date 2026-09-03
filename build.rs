@@ -5,14 +5,15 @@ fn main() {
     cfg_aliases! {
         // Anything that is not the browser/Workers Fetch backend.
         native: { not(target_arch = "wasm32") },
-        // TLS engine compiled into hyper and native websockets.
-        tls_rustls: { all(not(target_arch = "wasm32"), feature = "rustls") },
-        tls_native: { all(not(target_arch = "wasm32"), feature = "native-tls") },
-        tls_engine: { all(not(target_arch = "wasm32"), any(feature = "rustls", feature = "native-tls")) },
         // The shared TCP/TLS connector is needed by hyper and by native websockets.
         connector: { all(not(target_arch = "wasm32"), any(feature = "hyper-backend", feature = "ws")) },
+        // TLS engine compiled into that connector; an engine feature enabled
+        // next to curl or URLSession alone has nothing to serve.
+        tls_rustls: { all(connector, feature = "rustls") },
+        tls_native: { all(connector, feature = "native-tls") },
+        tls_engine: { any(tls_rustls, tls_native) },
         // rustls-platform-verifier needs a JVM handle on Android.
-        android_verifier: { all(target_os = "android", feature = "rustls") },
+        android_verifier: { all(target_os = "android", tls_rustls) },
         // Which backend `DefaultBackend` resolves to: hyper wins, then URLSession, then libcurl.
         apple_backend: { all(target_vendor = "apple", feature = "apple-backend") },
         default_hyper: { all(not(target_arch = "wasm32"), feature = "hyper-backend") },

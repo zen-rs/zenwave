@@ -38,7 +38,6 @@ mod engine {
         extra_roots: &[CertificateDer<'static>],
         provider: Arc<rustls::crypto::CryptoProvider>,
     ) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, Error> {
-        super::super::android::ensure_initialized()?;
         let platform = Verifier::new(Arc::clone(&provider)).map_err(Error::tls)?;
         if extra_roots.is_empty() {
             return Ok(Arc::new(platform));
@@ -82,6 +81,11 @@ mod engine {
         where
             S: AsyncRead + AsyncWrite + Unpin,
         {
+            // The platform verifier needs the JVM; take it from ndk-context on the
+            // first TLS connection so plain HTTP never touches it.
+            #[cfg(android_verifier)]
+            super::super::android::ensure_initialized()?;
+
             let server_name = ServerName::try_from(host.to_owned()).map_err(Error::tls)?;
             self.inner
                 .connect(server_name, stream)

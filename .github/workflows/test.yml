@@ -22,6 +22,9 @@ jobs:
           shared-key: test-${{ matrix.os }}
       - name: Run curl backend tests
         run: cargo test --no-default-features --features curl-backend --workspace
+      - name: Run curl backend tests with websockets
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --no-default-features --features curl-backend,ws,rustls --workspace
 
   hyper-backend:
     name: Hyper backend (${{ matrix.os }})
@@ -96,6 +99,20 @@ jobs:
 
       - name: Run apple backend suite
         run: bash scripts/test-apple.sh
+
+  ios-simulator:
+    name: iOS simulator
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-ios-simulator
+      - name: Run the suite on a simulator
+        run: bash scripts/test-ios.sh
 
   workerd:
     name: Cloudflare Worker (workerd via wrangler)

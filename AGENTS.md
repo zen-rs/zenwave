@@ -90,9 +90,14 @@ release-plz computes the bump and opens a PR to main.
 ## CI
 
 Runs on every push and PR (`.github/workflows/ci.yml` + `test.yml`):
-- `cargo fmt --check` (nightly)
-- Clippy on Linux (all features) and macOS (apple-backend)
-- WASM build check
-- Tests: hyper-backend and curl-backend on Linux/Windows/macOS
-- Tests: apple-backend on macOS
-- Tests: wasm-pack in Chrome, Firefox, Safari
+- `cargo fmt --check`
+- Features: clippy over every valid feature combination (`scripts/check-features.sh`,
+  cargo-hack powerset) on Linux, Windows and macOS, one slice per TLS engine
+- WASM build check; mobile cross-compilation (iOS device/simulator, Android
+  arm64/x86_64/armv7) with tests
+- Tests: hyper (rustls and native-tls) and curl on Linux/Windows/macOS,
+  apple-backend on macOS, the suite on an iOS simulator (`scripts/test-ios.sh`,
+  `simctl spawn`), wasm-pack in Chrome/Firefox/Safari, workerd
+- Android runs on a physical device, not in CI: `scripts/test-android.sh`
+  over adb (never an emulator); TLS on Android needs the JVM and is covered by
+  the instrumented app under `tests/android`

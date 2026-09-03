@@ -36,12 +36,16 @@ pub(crate) fn ensure_initialized() -> Result<(), Error> {
         return Ok(());
     }
 
+    // ndk-context panics with "android context was not initialized" when no
+    // host (android-activity, ndk-glue, or a `JNI_OnLoad` calling
+    // `ndk_context::initialize_android_context`) has registered the JVM: that
+    // is the fail-fast path for a process that opens TLS connections without
+    // an Android context.
     let context = ndk_context::android_context();
     if context.vm().is_null() || context.context().is_null() {
         return Err(Error::tls(
-            "no Android context is registered: initialise `ndk-context` (android-activity and \
-             ndk-glue do so, other hosts call `ndk_context::initialize_android_context`) before \
-             opening TLS connections",
+            "ndk-context holds a null JVM or Android context pointer; the host must register \
+             real ones before TLS connections are opened",
         ));
     }
 
