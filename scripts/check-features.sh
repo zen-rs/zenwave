@@ -35,9 +35,13 @@ with_engine() {
 
 without_engine() {
   echo "::group::feature powerset without a TLS engine"
-  "${powerset[@]}" \
-    --include-features "$engineless_backends" --at-least-one-of "$engineless_backends" \
-    -- -D warnings
+  # `--at-least-one-of` wants two or more features; with a single engineless
+  # backend the powerset (minus the empty set) is that backend alone.
+  local -a nonempty=()
+  if [[ "$engineless_backends" == *,* ]]; then
+    nonempty=(--at-least-one-of "$engineless_backends")
+  fi
+  "${powerset[@]}" --include-features "$engineless_backends" "${nonempty[@]}" -- -D warnings
   echo "::endgroup::"
 
   echo "::group::default features and the engine shorthands"
