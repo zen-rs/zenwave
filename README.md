@@ -177,6 +177,9 @@ with extra roots it hands libcurl a PEM bundle of the platform roots (a
 snapshot taken by `rustls-native-certs` when the transport is built) plus the
 extras. Without extra roots libcurl keeps its own view of the platform store.
 
+The Apple backend adds the extras as anchors of each server's `SecTrust`
+alongside the built-in roots, from the session delegate's challenge handler.
+
 On Android the platform verifier needs the JVM. zenwave reads it from
 [`ndk-context`](https://crates.io/crates/ndk-context), which `android-activity`
 and `ndk-glue` fill in before `main`; an app that embeds Rust calls
@@ -209,6 +212,17 @@ and `socks4a`. HTTP proxies see plaintext requests in absolute form and a
 `CONNECT` tunnel for TLS and for websockets, with `Proxy-Authorization` taken
 from the proxy URI's credentials. libcurl's own reading of `http_proxy` and
 `no_proxy` is switched off; the transport's rules are the only ones that apply.
+
+The Apple backend keeps one `URLSession` per proxy decision: `Proxy::system()`
+is a single session that lets the OS route everything, explicit rules open a
+session per proxy endpoint (plus one for direct traffic) with a pinned
+`connectionProxyDictionary`. `CFNetwork` sets the limits there: proxy URIs may
+be `http` or `socks5`/`socks5h` (which it treats alike, always sending the
+hostname); an `https` proxy is refused as `UnsupportedScheme`; destinations
+written as a loopback or local IP literal are never proxied. Plaintext requests
+carry `Proxy-Authorization` up front, `CONNECT` tunnels answer the proxy's
+challenge from the delegate, and a refused challenge fails at once with
+`ProxyErrorKind::TunnelRejected`.
 
 ## Backends and feature flags
 

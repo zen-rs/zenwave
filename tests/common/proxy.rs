@@ -128,7 +128,11 @@ async fn serve(
     }
 
     if method == "CONNECT" {
-        let Ok(upstream) = TcpStream::connect(target.as_str()).await else {
+        let (host, port) = target
+            .rsplit_once(':')
+            .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, port)))
+            .expect("CONNECT target is host:port");
+        let Ok(upstream) = TcpStream::connect(super::resolve_for_proxy(host, port)).await else {
             let _ = client
                 .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
                 .await;
@@ -150,7 +154,7 @@ async fn serve(
     let url = url::Url::parse(&target).expect("absolute-form target");
     let host = url.host_str().expect("host");
     let port = url.port_or_known_default().expect("port");
-    let Ok(mut upstream) = TcpStream::connect((host, port)).await else {
+    let Ok(mut upstream) = TcpStream::connect(super::resolve_for_proxy(host, port)).await else {
         let _ = client
             .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
             .await;

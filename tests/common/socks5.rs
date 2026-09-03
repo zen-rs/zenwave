@@ -141,7 +141,9 @@ async fn serve(
 
     let upstream = match &destination {
         SocksDestination::Ip(addr) => TcpStream::connect(*addr).await,
-        SocksDestination::Domain(name, port) => TcpStream::connect((name.as_str(), *port)).await,
+        SocksDestination::Domain(name, port) => {
+            TcpStream::connect(super::resolve_for_proxy(name, *port)).await
+        }
     };
     let Ok(upstream) = upstream else {
         client

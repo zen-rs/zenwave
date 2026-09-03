@@ -13,5 +13,15 @@ fn main() {
         connector: { all(not(target_arch = "wasm32"), any(feature = "hyper-backend", feature = "ws")) },
         // rustls-platform-verifier needs a JVM handle on Android.
         android_verifier: { all(target_os = "android", feature = "rustls") },
+        // Which backend `DefaultBackend` resolves to: hyper wins, then URLSession, then libcurl.
+        apple_backend: { all(target_vendor = "apple", feature = "apple-backend") },
+        default_hyper: { all(not(target_arch = "wasm32"), feature = "hyper-backend") },
+        default_apple: { all(target_vendor = "apple", feature = "apple-backend", not(feature = "hyper-backend")) },
+        default_curl: { all(
+            not(target_arch = "wasm32"),
+            feature = "curl-backend",
+            not(feature = "hyper-backend"),
+            not(all(target_vendor = "apple", feature = "apple-backend"))
+        ) },
     }
 }

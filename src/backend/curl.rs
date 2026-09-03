@@ -1,8 +1,6 @@
 use std::{mem::replace, str};
 
 use anyhow::{Context, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use blocking::unblock;
 use curl::easy::{Easy2, Handler, List, ProxyType, ReadError, SslOpt, WriteError};
 use http::{
@@ -12,7 +10,11 @@ use http::{
 use http_kit::{Body, Endpoint, HttpError, Request, Response, StatusCode};
 use thiserror::Error;
 
-use crate::{Client, Transport, error::HttpErrorResponse, transport::proxy::Intercept};
+use crate::{
+    Client, Transport,
+    error::HttpErrorResponse,
+    transport::proxy::{self, Intercept},
+};
 
 /// HTTP backend implemented with libcurl.
 #[derive(Debug, Clone)]
@@ -303,29 +305,13 @@ fn resolve_proxy(intercept: &Intercept) -> anyhow::Result<ResolvedProxy> {
         "socks5h" => ProxyType::Socks5Hostname,
         other => return Err(anyhow!("unsupported proxy scheme `{other}`")),
     };
-    let credentials = match kind {
-        ProxyType::Http => intercept.basic_auth().and_then(decode_basic_auth),
-        _ => intercept
-            .raw_auth()
-            .map(|(user, pass)| (user.to_owned(), pass.to_owned())),
-    };
+    let credentials = proxy::credentials(intercept);
 
     Ok(ResolvedProxy {
         endpoint,
         kind,
         credentials,
     })
-}
-
-fn decode_basic_auth(value: &HeaderValue) -> Option<(String, String)> {
-    let text = value.to_str().ok()?;
-    let encoded = text.strip_prefix("Basic ")?;
-    let decoded = BASE64_STANDARD.decode(encoded).ok()?;
-    let creds = String::from_utf8(decoded).ok()?;
-    let mut parts = creds.splitn(2, ':');
-    let user = parts.next()?.to_string();
-    let pass = parts.next().unwrap_or("").to_string();
-    Some((user, pass))
 }
 
 #[derive(Debug)]

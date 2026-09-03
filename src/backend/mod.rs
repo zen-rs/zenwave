@@ -32,9 +32,9 @@ mod curl;
 #[cfg(all(not(target_arch = "wasm32"), feature = "curl-backend"))]
 pub use curl::CurlBackend;
 
-#[cfg(all(target_vendor = "apple", feature = "apple-backend"))]
+#[cfg(apple_backend)]
 mod apple;
-#[cfg(all(target_vendor = "apple", feature = "apple-backend"))]
+#[cfg(apple_backend)]
 pub use apple::AppleBackend;
 
 // ============================================================================
@@ -92,7 +92,7 @@ pub type DefaultBackend = WebBackend;
 
 #[cfg(all(
     not(target_arch = "wasm32"),
-    not(all(target_vendor = "apple", feature = "apple-backend")),
+    not(apple_backend),
     not(feature = "hyper-backend"),
     not(feature = "curl-backend")
 ))]

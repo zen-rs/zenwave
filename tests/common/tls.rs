@@ -32,7 +32,7 @@ pub struct TlsFixture {
 }
 
 impl TlsFixture {
-    /// `https://localhost:<port>/<path>` on the JSON server.
+    /// `https://localhost:<port>/<path>` on the JSON server, for direct connections.
     pub fn https_uri(&self, path: &str) -> String {
         format!(
             "https://localhost:{}/{}",
@@ -41,10 +41,27 @@ impl TlsFixture {
         )
     }
 
-    /// `wss://localhost:<port>` on the echo server.
+    /// The JSON server under [`FIXTURE_HOST`](super::FIXTURE_HOST): reachable
+    /// only through the test proxies, which resolve that name.
+    pub fn proxied_https_uri(&self, path: &str) -> String {
+        format!(
+            "https://{}:{}/{}",
+            super::FIXTURE_HOST,
+            self.https_addr.port(),
+            path.trim_start_matches('/')
+        )
+    }
+
+    /// `wss://localhost:<port>` on the echo server, for direct connections.
     #[cfg(feature = "ws")]
     pub fn wss_uri(&self) -> String {
         format!("wss://localhost:{}", self.wss_addr.port())
+    }
+
+    /// The echo server under [`FIXTURE_HOST`](super::FIXTURE_HOST).
+    #[cfg(feature = "ws")]
+    pub fn proxied_wss_uri(&self) -> String {
+        format!("wss://{}:{}", super::FIXTURE_HOST, self.wss_addr.port())
     }
 }
 
@@ -69,9 +86,12 @@ fn start() -> TlsFixture {
     let issuer = Issuer::new(ca_params, ca_key);
 
     let leaf_key = KeyPair::generate().expect("generate leaf key");
-    let mut leaf_params =
-        CertificateParams::new(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
-            .expect("leaf params");
+    let mut leaf_params = CertificateParams::new(vec![
+        "localhost".to_owned(),
+        "127.0.0.1".to_owned(),
+        super::FIXTURE_HOST.to_owned(),
+    ])
+    .expect("leaf params");
     leaf_params
         .distinguished_name
         .push(DnType::CommonName, "localhost");
