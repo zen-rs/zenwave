@@ -4,7 +4,7 @@ use anyhow::{Context, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use blocking::unblock;
-use curl::easy::{Easy2, Handler, List, ProxyType, ReadError, WriteError};
+use curl::easy::{Easy2, Handler, List, ProxyType, ReadError, SslOpt, WriteError};
 use http::{
     HeaderMap, Method,
     header::{HeaderName, HeaderValue},
@@ -185,6 +185,12 @@ fn perform(request: PreparedRequest) -> Result<Response, CurlError> {
     if let Some(bundle) = &request.ca_bundle {
         easy.ssl_cainfo_blob(bundle).map_err(map_curl_error)?;
     }
+    // Revocation is checked when the information is reachable and skipped
+    // when it is not (no distribution point, offline responder), which is how
+    // the platform verifiers behind the rustls and native-tls engines behave.
+    // Only Schannel interprets this flag; the other TLS libraries ignore it.
+    easy.ssl_options(SslOpt::new().revoke_best_effort(true))
+        .map_err(map_curl_error)?;
 
     easy.perform().map_err(map_curl_error)?;
 
