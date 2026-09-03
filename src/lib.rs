@@ -119,11 +119,11 @@ pub struct DefaultClient {
 }
 
 impl DefaultClient {
-    /// Create a default client with redirect following enabled.
+    /// A client over `transport` with redirect following enabled.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(transport: Transport) -> Self {
         Self {
-            inner: DefaultBackend::default().follow_redirect(),
+            inner: DefaultBackend::new(transport).follow_redirect(),
         }
     }
 
@@ -133,16 +133,20 @@ impl DefaultClient {
         self.inner.disable_redirect()
     }
 
-    /// Create a raw backend without redirect middleware.
+    /// The bare platform backend over `transport`, without redirect middleware.
+    // Not every backend's constructor is `const` (URLSession sessions are
+    // opened lazily into a map), so this stays a plain fn on every target.
+    #[allow(clippy::missing_const_for_fn)]
     #[must_use]
-    pub fn raw() -> DefaultBackend {
-        DefaultBackend::default()
+    pub fn raw(transport: Transport) -> DefaultBackend {
+        DefaultBackend::new(transport)
     }
 }
 
 impl Default for DefaultClient {
+    /// The system transport: OS proxy settings and OS root certificates.
     fn default() -> Self {
-        Self::new()
+        Self::new(Transport::system())
     }
 }
 
@@ -156,16 +160,18 @@ impl Endpoint for DefaultClient {
 
 impl Client for DefaultClient {}
 
-/// Create a default HTTP client backend.
+/// The default client over the system transport: the operating system's
+/// proxy settings and root certificates, redirects followed.
 #[must_use]
 pub fn client() -> DefaultClient {
-    DefaultClient::new()
+    DefaultClient::default()
 }
 
-/// Create a raw default backend without redirect middleware.
+/// The default client over a transport of your own: explicit proxy rules,
+/// extra root certificates. See [`Transport::builder`].
 #[must_use]
-pub fn raw_client() -> DefaultBackend {
-    DefaultClient::raw()
+pub fn client_with(transport: Transport) -> DefaultClient {
+    DefaultClient::new(transport)
 }
 
 /// Create a default HTTP client backend.
