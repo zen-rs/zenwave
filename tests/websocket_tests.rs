@@ -125,9 +125,13 @@ async fn websocket_respects_max_message_size_config() {
     });
 
     let config = WebSocketConfig::default().with_max_message_size(Some(1024));
-    let client = zenwave::websocket::connect_with_config(format!("ws://{addr}"), config)
-        .await
-        .unwrap();
+    let client = zenwave::websocket::connect_with(
+        format!("ws://{addr}"),
+        &zenwave::Transport::system(),
+        config,
+    )
+    .await
+    .unwrap();
 
     match client.recv().await {
         Err(WebSocketError::ConnectionFailed(_)) => {}

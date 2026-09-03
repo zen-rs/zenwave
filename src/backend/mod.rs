@@ -14,12 +14,13 @@
 //! ## Native Platforms
 //! On native platforms, users can choose their preferred backend:
 //!
-//! - **`hyper-backend`** (default): Uses hyper with async-io/async-net. Supports
-//!   both `rustls` (default) and `native-tls` for TLS.
+//! - **`hyper-backend`** (default): Uses hyper with async-io/async-net. TLS comes
+//!   from exactly one of the `rustls` (default) or `native-tls` features.
 //! - **`curl-backend`**: Uses libcurl via the `curl` crate. Includes proxy support.
 //! - **`apple-backend`**: Uses Apple's native `NSURLSession` (macOS/iOS only).
 //!
-//! The default configuration uses `hyper-backend` with `rustls` TLS.
+//! Every backend is built from a [`crate::Transport`], which carries the
+//! trusted roots; `Default` uses [`crate::Transport::system`].
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "hyper-backend"))]
 mod hyper;

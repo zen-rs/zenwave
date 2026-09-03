@@ -18,6 +18,14 @@ pub enum WebSocketError {
     #[error("Invalid URI: {0}")]
     InvalidUri(#[from] url::ParseError),
 
+    /// The URI parsed but names no reachable target.
+    #[error("Invalid websocket target: {0}")]
+    InvalidTarget(&'static str),
+
+    /// Connecting through the [`crate::Transport`] failed (DNS, TCP, TLS, proxy).
+    #[error("{0}")]
+    Transport(#[source] Box<crate::Error>),
+
     /// Underlying websocket connection failed.
     #[error("Connection failed: {0}")]
     ConnectionFailed(#[source] Box<dyn std::error::Error + Send + Sync>),
@@ -27,6 +35,7 @@ impl HttpError for WebSocketError {
     fn status(&self) -> StatusCode {
         match self {
             Self::ConnectionFailed(_) => StatusCode::BAD_GATEWAY,
+            Self::Transport(error) => error.status(),
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -45,6 +54,8 @@ impl From<WebSocketError> for crate::Error {
                 Self::WebSocket(WebSocketErrorKind::UnsupportedScheme(s))
             }
             WebSocketError::InvalidUri(e) => Self::InvalidUri(e.to_string()),
+            WebSocketError::InvalidTarget(message) => Self::InvalidUri(message.to_string()),
+            WebSocketError::Transport(error) => *error,
             WebSocketError::ConnectionFailed(e) => {
                 Self::WebSocket(WebSocketErrorKind::ConnectionFailed(e.to_string()))
             }
@@ -112,7 +123,6 @@ where
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use async_lock::Mutex;
-    use async_net::TcpStream;
     use async_tungstenite::{
         WebSocketReceiver as AsyncReceiver, WebSocketSender as AsyncSender, WebSocketStream,
         client_async_with_config,
@@ -121,87 +131,24 @@ mod native {
             protocol::WebSocketConfig as TungsteniteConfig,
         },
     };
-    use futures_io::{AsyncRead, AsyncWrite};
     use futures_util::StreamExt;
     use http_kit::utils::{ByteStr, Bytes};
-    #[cfg(feature = "rustls")]
-    use rustls::pki_types::ServerName;
-    use std::{
-        fmt, io,
-        pin::Pin,
-        sync::Arc,
-        task::{Context, Poll},
-    };
+    use std::{fmt, sync::Arc};
     use url::Url;
+
+    use crate::{
+        Transport,
+        transport::{
+            connect::{Target, connect as connect_stream},
+            stream::Stream,
+        },
+    };
 
     use super::{WebSocketConfig, WebSocketError, WebSocketMessage, serialize_payload};
 
-    type NativeSocket = WebSocketStream<MaybeTlsStream>;
-    type NativeSender = AsyncSender<MaybeTlsStream>;
-    type NativeReceiver = AsyncReceiver<MaybeTlsStream>;
-
-    #[derive(Debug)]
-    enum MaybeTlsStream {
-        Plain(TcpStream),
-        #[cfg(feature = "rustls")]
-        Rustls(Box<futures_rustls::client::TlsStream<TcpStream>>),
-        #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
-        Native(async_native_tls::TlsStream<TcpStream>),
-    }
-
-    impl Unpin for MaybeTlsStream {}
-
-    impl AsyncRead for MaybeTlsStream {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &mut [u8],
-        ) -> Poll<io::Result<usize>> {
-            match &mut *self {
-                Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
-                #[cfg(feature = "rustls")]
-                Self::Rustls(stream) => Pin::new(stream).poll_read(cx, buf),
-                #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
-                Self::Native(stream) => Pin::new(stream).poll_read(cx, buf),
-            }
-        }
-    }
-
-    impl AsyncWrite for MaybeTlsStream {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            match &mut *self {
-                Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
-                #[cfg(feature = "rustls")]
-                Self::Rustls(stream) => Pin::new(stream).poll_write(cx, buf),
-                #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
-                Self::Native(stream) => Pin::new(stream).poll_write(cx, buf),
-            }
-        }
-
-        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            match &mut *self {
-                Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
-                #[cfg(feature = "rustls")]
-                Self::Rustls(stream) => Pin::new(stream).poll_flush(cx),
-                #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
-                Self::Native(stream) => Pin::new(stream).poll_flush(cx),
-            }
-        }
-
-        fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            match &mut *self {
-                Self::Plain(stream) => Pin::new(stream).poll_close(cx),
-                #[cfg(feature = "rustls")]
-                Self::Rustls(stream) => Pin::new(stream).poll_close(cx),
-                #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
-                Self::Native(stream) => Pin::new(stream).poll_close(cx),
-            }
-        }
-    }
+    type NativeSocket = WebSocketStream<Stream>;
+    type NativeSender = AsyncSender<Stream>;
+    type NativeReceiver = AsyncReceiver<Stream>;
 
     #[derive(Debug)]
     struct SharedSocket {
@@ -251,133 +198,51 @@ mod native {
         }
     }
 
-    /// Establish a websocket connection to the provided URI.
+    /// Establish a websocket connection to the provided URI through the
+    /// system transport with default options.
     ///
     /// # Errors
     ///
     /// Returns an error if the URI is invalid or the connection attempt fails.
     pub async fn connect(uri: impl AsRef<str>) -> Result<WebSocket, WebSocketError> {
-        connect_with_config(uri, WebSocketConfig::default()).await
+        connect_with(uri, &Transport::system(), WebSocketConfig::default()).await
     }
 
-    /// Establish a websocket connection to the provided URI with custom configuration.
+    /// Establish a websocket connection to the provided URI through `transport`.
     ///
     /// # Errors
     ///
     /// Returns an error if the URI is invalid or the connection attempt fails.
-    pub async fn connect_with_config(
+    pub async fn connect_with(
         uri: impl AsRef<str>,
+        transport: &Transport,
         websocket_config: WebSocketConfig,
     ) -> Result<WebSocket, WebSocketError> {
         let url = Url::parse(uri.as_ref())?;
-        match url.scheme() {
-            "ws" | "wss" => {}
+        let tls = match url.scheme() {
+            "ws" => false,
+            "wss" => true,
             other => return Err(WebSocketError::UnsupportedScheme(other.to_string())),
-        }
-        let request: String = url.into();
+        };
+        let host = url
+            .host_str()
+            .ok_or_else(|| WebSocketError::InvalidTarget("websocket URI is missing a host"))?;
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| WebSocketError::InvalidTarget("websocket URI does not imply a port"))?;
+        let stream = connect_stream(transport, Target { host, port, tls })
+            .await
+            .map_err(|error| WebSocketError::Transport(Box::new(error)))?;
+
         let mut config = TungsteniteConfig::default();
         config.max_message_size = websocket_config.max_message_size;
         config.max_frame_size = websocket_config.max_frame_size;
-        let stream = connect_stream(uri.as_ref()).await?;
+        let request: String = url.into();
         let (ws_stream, _) = client_async_with_config(request, stream, Some(config))
             .await
             .map_err(|e| WebSocketError::ConnectionFailed(Box::new(e)))?;
 
         Ok(WebSocket::from_socket(ws_stream))
-    }
-
-    async fn connect_stream(uri: &str) -> Result<MaybeTlsStream, WebSocketError> {
-        let url = Url::parse(uri)?;
-        let host = url.host_str().ok_or_else(|| {
-            WebSocketError::ConnectionFailed(Box::new(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "websocket URI is missing a host",
-            )))
-        })?;
-        let port = url.port_or_known_default().ok_or_else(|| {
-            WebSocketError::ConnectionFailed(Box::new(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "websocket URI does not imply a port",
-            )))
-        })?;
-        let stream = TcpStream::connect((host, port))
-            .await
-            .map_err(|error| WebSocketError::ConnectionFailed(Box::new(error)))?;
-
-        match url.scheme() {
-            "ws" => Ok(MaybeTlsStream::Plain(stream)),
-            "wss" => connect_secure(host, stream).await,
-            other => Err(WebSocketError::UnsupportedScheme(other.to_string())),
-        }
-    }
-
-    async fn connect_secure(
-        host: &str,
-        stream: TcpStream,
-    ) -> Result<MaybeTlsStream, WebSocketError> {
-        #[cfg(feature = "rustls")]
-        {
-            return connect_rustls(host, stream).await;
-        }
-
-        #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
-        {
-            return connect_native_tls(host, stream).await;
-        }
-
-        #[cfg(not(any(feature = "rustls", feature = "native-tls")))]
-        {
-            let _ = host;
-            let _ = stream;
-            Err(WebSocketError::ConnectionFailed(Box::new(
-                io::Error::other("wss requires either the `rustls` or `native-tls` feature"),
-            )))
-        }
-    }
-
-    #[cfg(feature = "rustls")]
-    async fn connect_rustls(
-        host: &str,
-        stream: TcpStream,
-    ) -> Result<MaybeTlsStream, WebSocketError> {
-        use std::sync::Arc as SyncArc;
-
-        use futures_rustls::TlsConnector;
-
-        let mut root_store = rustls::RootCertStore::empty();
-        let cert_result = rustls_native_certs::load_native_certs();
-        for cert in cert_result.certs {
-            let _ = root_store.add(cert);
-        }
-
-        if root_store.is_empty() {
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        }
-
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        let connector = TlsConnector::from(SyncArc::new(config));
-        let server_name = ServerName::try_from(host.to_string())
-            .map_err(|error| WebSocketError::ConnectionFailed(Box::new(io::Error::other(error))))?;
-        let stream = connector
-            .connect(server_name, stream)
-            .await
-            .map_err(|error| WebSocketError::ConnectionFailed(Box::new(io::Error::other(error))))?;
-        Ok(MaybeTlsStream::Rustls(Box::new(stream)))
-    }
-
-    #[cfg(all(not(feature = "rustls"), feature = "native-tls"))]
-    async fn connect_native_tls(
-        host: &str,
-        stream: TcpStream,
-    ) -> Result<MaybeTlsStream, WebSocketError> {
-        let connector = async_native_tls::TlsConnector::new();
-        let stream = connector
-            .connect(host, stream)
-            .await
-            .map_err(|error| WebSocketError::ConnectionFailed(Box::new(io::Error::other(error))))?;
-        Ok(MaybeTlsStream::Native(stream))
     }
 
     impl WebSocket {
@@ -582,6 +447,7 @@ mod wasm {
     };
 
     use super::{WebSocketConfig, WebSocketError, WebSocketMessage, serialize_payload};
+    use crate::Transport;
 
     type Result<T> = core::result::Result<T, WebSocketError>;
 
@@ -648,16 +514,20 @@ mod wasm {
     ///
     /// Returns an error if the browser reports an error or the connection fails.
     pub async fn connect(uri: impl AsRef<str>) -> Result<WebSocket> {
-        connect_with_config(uri, WebSocketConfig::default()).await
+        connect_with(uri, &Transport::system(), WebSocketConfig::default()).await
     }
 
-    /// Establish a websocket connection from the browser environment using the provided config.
+    /// Establish a websocket connection from the browser environment.
+    ///
+    /// The browser owns proxying and trust, so `transport` carries nothing
+    /// here; the parameter exists so cross-platform code has one signature.
     ///
     /// # Errors
     ///
     /// Returns an error if the browser reports an error or the connection fails.
-    pub async fn connect_with_config(
+    pub async fn connect_with(
         uri: impl AsRef<str>,
+        _transport: &Transport,
         _config: WebSocketConfig,
     ) -> Result<WebSocket> {
         let socket = BrowserWebSocket::new(uri.as_ref())
@@ -921,7 +791,7 @@ mod wasm {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{WebSocket, WebSocketReceiver, WebSocketSender, connect, connect_with_config};
+pub use native::{WebSocket, WebSocketReceiver, WebSocketSender, connect, connect_with};
 
 #[cfg(target_arch = "wasm32")]
-pub use wasm::{WebSocket, WebSocketReceiver, WebSocketSender, connect, connect_with_config};
+pub use wasm::{WebSocket, WebSocketReceiver, WebSocketSender, connect, connect_with};

@@ -195,6 +195,12 @@ pub enum WebSocketErrorKind {
 }
 
 impl Error {
+    /// Wrap a TLS engine or trust-store failure.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn tls(source: impl Into<Box<dyn StdError + Send + Sync>>) -> Self {
+        Self::Tls(source.into())
+    }
+
     /// Check if this is a network transport error.
     #[must_use]
     pub const fn is_network_error(&self) -> bool {

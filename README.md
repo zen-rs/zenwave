@@ -150,9 +150,37 @@ let (sender, receiver) = socket.split();
 # }
 ```
 
+## Trust and transport
+
+Every backend is built from a `Transport`. `zenwave::client()` uses
+`Transport::system()`: the operating system's trust store, verified by the
+platform itself (Security.framework on macOS/iOS, CryptoAPI on Windows, the
+Android trust manager, the system CA bundle on Linux), and in a browser or a
+Cloudflare Worker whatever the runtime trusts. It is built once per process and
+shared.
+
+To trust a private CA in addition to the platform roots:
+
+```rust
+use zenwave::{Transport, backend::HyperBackend};
+
+let transport = Transport::builder()
+    .extra_root_certificates_pem(&std::fs::read("corp-root.pem")?)?
+    .build()?;
+let client = HyperBackend::new(transport);
+```
+
+Websockets take the same transport: `websocket::connect_with(uri, &transport, config)`.
+
+On Android the platform verifier needs the JVM. zenwave reads it from
+[`ndk-context`](https://crates.io/crates/ndk-context), which `android-activity`
+and `ndk-glue` fill in before `main`; an app that embeds Rust calls
+`ndk_context::initialize_android_context` from `JNI_OnLoad`. The Kotlin half of
+`rustls-platform-verifier` must be on the class path; see that crate's README.
+
 ## Proxy support
 
-Available with the `hyper-backend` or `curl-backend` features (native only).
+Available with the `curl-backend` feature (native only).
 
 ```rust
 use zenwave::Proxy;
@@ -172,26 +200,26 @@ let proxy = Proxy::builder()
 On wasm32, the built-in Fetch backend is used automatically. No feature selection
 needed or available.
 
-On native, pick a backend:
+On native, pick a backend, and for hyper exactly one TLS engine:
 
 | Feature | Backend | TLS | Notes |
 |---|---|---|---|
-| `hyper-backend` + `rustls` | Hyper | rustls | **Default.** |
+| `hyper-backend` + `rustls` | Hyper | rustls, verified by the OS (`rustls-platform-verifier`) | **Default.** |
 | `hyper-backend` + `native-tls` | Hyper | Platform native | OpenSSL / SChannel / Security.framework |
 | `curl-backend` | libcurl | libcurl's | Smaller binary if you have system libcurl |
 | `apple-backend` | URLSession | Security.framework | Experimental. macOS/iOS only |
 
-The `default` feature enables `hyper-backend`, both TLS implementations (the right
-one is selected at compile time based on target), and `ws`.
+`rustls` and `native-tls` are mutually exclusive; `ws` (websockets) uses the same
+engine as hyper. The `default` feature enables `hyper-backend`, `rustls` and `ws`.
 
 Common dependency lines:
 
 ```toml
-# Default — hyper + platform-appropriate TLS + websockets
+# Default — hyper + rustls with platform verification + websockets
 zenwave = "0.5"
 
-# Hyper with only rustls
-zenwave = { version = "0.5", default-features = false, features = ["hyper-rustls", "ws"] }
+# Hyper with the platform's native TLS library
+zenwave = { version = "0.5", default-features = false, features = ["hyper-native-tls", "ws"] }
 
 # Curl backend
 zenwave = { version = "0.5", default-features = false, features = ["curl-backend"] }
@@ -200,7 +228,8 @@ zenwave = { version = "0.5", default-features = false, features = ["curl-backend
 zenwave = { version = "0.5", default-features = false, features = ["apple-backend"] }
 ```
 
-Other features: `proxy` (auto-enabled by `curl-backend`), `ws` (websocket support).
+Other features: `hyper-rustls` / `hyper-native-tls` (shorthands), `proxy`
+(auto-enabled by `curl-backend`).
 
 ## Testing
 

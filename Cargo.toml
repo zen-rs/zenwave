@@ -33,50 +33,46 @@ test_executors = "0.4"
 tiny_http = "0.12"
 futures-executor = "0.3"
 
+[build-dependencies]
+cfg_aliases = "0.2"
+
 [features]
-# Default: platform-dependent backend selection.
-# - On Apple platforms (macOS/iOS): hyper + native-tls
-# - On other native platforms: hyper + rustls with system certificates
-# - On wasm32: built-in web backend using Fetch API (automatic, no configuration needed)
-default = ["default-backend", "ws"]
+# Default: hyper transport, rustls verified by the operating system's trust
+# store (`rustls-platform-verifier`), websockets. On wasm32 the built-in Fetch
+# backend is always used and none of the native features apply.
+default = ["hyper-backend", "rustls", "ws"]
 
-# Default backend configuration with platform-dependent TLS selection.
-# On native platforms, both TLS implementations are included; the appropriate one
-# is selected at compile time based on the target platform.
-default-backend = ["hyper-backend", "native-tls", "rustls"]
-
-# Explicit backend selections (native platforms only).
-# On wasm32, using any of these will result in a compile error - the web backend
-# is always used automatically.
+# HTTP backends (native platforms only). At least one must be enabled.
 #
-# hyper + native-tls: Uses the platform's native TLS (OpenSSL, SChannel, or Security.framework)
-hyper-native-tls = ["hyper-backend", "native-tls"]
-# hyper + rustls: Uses rustls with system certificates
-hyper-rustls = ["hyper-backend", "rustls"]
-# Apple's NSURLSession (macOS/iOS only)
-apple-backend = []
-# libcurl backend with proxy support
+# hyper over async-io/async-net. Needs exactly one TLS engine (`rustls` or `native-tls`).
+hyper-backend = ["dep:hyper", "dep:http-body-util"]
+# libcurl via the `curl` crate. libcurl brings its own TLS engine.
 curl-backend = ["dep:curl", "dep:blocking", "proxy"]
-# Websocket support (async-tungstenite on native, web-sys WebSocket on wasm)
-ws = ["dep:async-tungstenite"]
+# Apple's NSURLSession (macOS/iOS only). Security.framework does the TLS.
+apple-backend = []
 
-# TLS implementations (internal features, prefer using hyper-native-tls or hyper-rustls)
-native-tls = ["dep:async-native-tls", "dep:native-tls"]
+# TLS engines for `hyper-backend` and native websockets. Exactly one may be enabled.
+#
+# rustls, with certificate verification delegated to the platform
+# (Security.framework, CryptoAPI, Android Trust Manager, or the system CA bundle on Linux).
 rustls = [
     "dep:futures-rustls",
     "dep:rustls",
-    "dep:webpki-roots",
-    "dep:rustls-native-certs",
+    "dep:rustls-platform-verifier",
+    "dep:jni",
+    "dep:ndk-context",
 ]
+# The platform's native TLS library (OpenSSL, SChannel, or Security.framework).
+native-tls = ["dep:async-native-tls", "dep:native-tls"]
 
-# Core hyper backend (internal)
-hyper-backend = [
-    "dep:hyper",
-    "dep:http-body-util",
-    "dep:dns-lookup",
-]
+# Shorthands.
+hyper-rustls = ["hyper-backend", "rustls"]
+hyper-native-tls = ["hyper-backend", "native-tls"]
 
-# Proxy support for hyper-backend and curl-backend (native platforms only).
+# Websocket support (async-tungstenite on native, web-sys WebSocket on wasm).
+ws = ["dep:async-tungstenite"]
+
+# Proxy support for curl-backend (native platforms only).
 proxy = []
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -103,22 +99,25 @@ wasm-bindgen-test = "0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 smol = "2.0"
+rcgen = "0.14"
+futures-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 async-io = "2.4"
 async-net = "2.0"
 blocking = { version = "1.6", optional = true }
 curl = { version = "0.4", optional = true }
-dns-lookup = { version = "3.0", optional = true }
+dns-lookup = "3.0"
 executor-core = { version = "0.7.0" }
 hyper = { version = "1.8", default-features = false, features = ["client", "http1"], optional = true }
 http-body-util = { version = "0.1.3", optional = true }
 async-native-tls = { version = "0.5.0", optional = true, default-features = false, features = ["runtime-async-std"] }
 futures-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
-rustls-native-certs = { version = "0.8", optional = true }
+rustls-platform-verifier = { version = "0.7", optional = true }
+rustls-pki-types = { version = "1.12", features = ["std"] }
 native-tls = { version = "0.2", optional = true }
-webpki-roots = { version = "1.0", optional = true }
 async-tungstenite = { version = "0.34.0", default-features = false, features = ["smol-runtime"], optional = true }
 async-fs = { version = "2.2.0", default-features = false }
 dirs = "6.0"
@@ -129,6 +128,10 @@ tower-service = "0.3"
 [target.'cfg(target_vendor = "apple")'.dependencies]
 block = "0.1"
 objc = "0.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.22", optional = true }
+ndk-context = { version = "0.1", optional = true }
 
 
 [[example]]
