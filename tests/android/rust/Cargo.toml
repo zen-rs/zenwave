@@ -1,7 +1,7 @@
 # The Rust half of the instrumented Android test app under `tests/android`: a
-# cdylib the Kotlin test loads, which registers the Android context with
-# ndk-context and then runs zenwave's TLS cases against the shared fixtures in
-# `tests/common`. Not published, not a workspace member.
+# cdylib the Kotlin test loads to run zenwave's TLS cases, from a real
+# application process, against the shared fixtures in `tests/common`. Not
+# published, not a workspace member.
 [package]
 name = "zenwave-android-tests"
 version = "0.0.0"
@@ -21,7 +21,6 @@ ws = ["zenwave/ws", "dep:async-tungstenite"]
 [dependencies]
 zenwave = { path = "../../..", default-features = false, features = ["hyper-backend", "rustls"] }
 jni = "0.22"
-ndk-context = "0.1"
 
 # What `tests/common` needs.
 async-net = "2.0"

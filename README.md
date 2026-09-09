@@ -191,18 +191,18 @@ a server that only the extra roots vouch for needs an `NSExceptionDomains`
 entry with `NSExceptionAllowsInsecureHTTPLoads` for its hostname in
 `Info.plist` (or `NSAllowsArbitraryLoads`).
 
-On Android the platform verifier needs the JVM. zenwave reads it from
-[`ndk-context`](https://crates.io/crates/ndk-context), which `android-activity`
-and `ndk-glue` fill in before `main`; an app that embeds Rust calls
-`ndk_context::initialize_android_context` from `JNI_OnLoad`. The Kotlin half of
-`rustls-platform-verifier` must be on the class path; see that crate's README.
-The JVM is first touched on the first TLS connection, so plain HTTP works
-without it; a TLS connection in a process that never registered the context
-panics with ndk-context's `android context was not initialized`. The
-instrumented app under `tests/android` shows the whole wiring (the Gradle
-repository for the Kotlin half, the proguard rule, a native method that hands
-the JVM and `Context` to ndk-context) and is what `scripts/test-android.sh`
-runs on a real device.
+On Android the extras join the system trust anchors in one webpki store.
+zenwave reads those anchors from disk (`/apex/com.android.conscrypt/cacerts`
+on Android 14 and newer, `/system/etc/security/cacerts` before that) instead
+of going through the platform verifier, which reports every certificate whose
+issuer publishes revocation only through a CRL as revoked
+(rustls/rustls-platform-verifier#221) — Let's Encrypt, Google Trust Services
+and SSL.com included. Revocation is not checked on Android, as with every
+webpki client, and certificates the user installed are not trusted, Android's
+own default for applications. Nothing has to be wired on the Java side. The
+instrumented app under `tests/android` runs the TLS cases from a real
+application process and is what `scripts/test-android.sh` runs on a device
+after the plain test binaries.
 
 ## Proxy support
 

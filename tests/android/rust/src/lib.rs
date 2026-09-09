@@ -1,7 +1,7 @@
-//! JNI entry points of the instrumented test app: `initialize` hands the JVM
-//! and the application context to `ndk-context`, exactly as an app embedding
-//! zenwave does from `JNI_OnLoad`; `runSuite` runs the TLS cases and returns
-//! the failures, one per line, empty on success.
+//! JNI entry point of the instrumented test app: `runSuite` runs the TLS
+//! cases from a real application process — the one that reads the system
+//! trust anchors under the app's own SELinux domain — and returns the
+//! failures, one per line, empty on success.
 
 #[allow(dead_code)]
 #[path = "../../../common/mod.rs"]
@@ -11,28 +11,8 @@ mod suite;
 use jni::{
     EnvUnowned,
     errors::{Error, ThrowRuntimeExAndDefault},
-    objects::{JClass, JObject, JString},
+    objects::{JClass, JString},
 };
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_cool_lexo_zenwave_androidtest_ZenwaveNative_initialize<'frame>(
-    mut env: EnvUnowned<'frame>,
-    _class: JClass<'frame>,
-    context: JObject<'frame>,
-) {
-    env.with_env(|env| -> Result<(), Error> {
-        let vm = env.get_java_vm()?;
-        let context = env.new_global_ref(&context)?;
-        // SAFETY: both pointers come from the running JVM; the global
-        // reference is handed over for the lifetime of the process, which is
-        // what ndk-context expects.
-        unsafe {
-            ndk_context::initialize_android_context(vm.get_raw().cast(), context.into_raw().cast());
-        }
-        Ok(())
-    })
-    .resolve::<ThrowRuntimeExAndDefault>();
-}
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_cool_lexo_zenwave_androidtest_ZenwaveNative_runSuite<'frame>(

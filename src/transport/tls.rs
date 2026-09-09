@@ -10,6 +10,7 @@ mod engine {
     use futures_io::{AsyncRead, AsyncWrite};
     use rustls::{ClientConfig, crypto::ring, pki_types::ServerName};
     use rustls_pki_types::CertificateDer;
+    #[cfg(not(android_verifier))]
     use rustls_platform_verifier::Verifier;
 
     use crate::Error;
@@ -31,29 +32,22 @@ mod engine {
         Ok(Arc::new(verifier))
     }
 
-    /// The Android trust manager cannot take extra anchors, so extra roots are
-    /// checked by webpki when the platform rejects a chain.
+    /// The system anchors read from disk plus `extra_roots`, verified by webpki;
+    /// see the `android` module for why the platform verifier is not used.
     #[cfg(android_verifier)]
     fn verifier(
         extra_roots: &[CertificateDer<'static>],
         provider: Arc<rustls::crypto::CryptoProvider>,
     ) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, Error> {
-        let platform = Verifier::new(Arc::clone(&provider)).map_err(Error::tls)?;
-        if extra_roots.is_empty() {
-            return Ok(Arc::new(platform));
-        }
-        let mut store = rustls::RootCertStore::empty();
+        let mut store = super::super::android::system_roots()?;
         for root in extra_roots {
             store.add(root.clone()).map_err(Error::tls)?;
         }
-        let extra =
+        let verifier =
             rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(store), provider)
                 .build()
                 .map_err(Error::tls)?;
-        Ok(Arc::new(super::super::android::PlatformOrExtraRoots {
-            platform,
-            extra,
-        }))
+        Ok(verifier)
     }
 
     /// rustls with certificate verification delegated to the operating system.
@@ -81,11 +75,6 @@ mod engine {
         where
             S: AsyncRead + AsyncWrite + Unpin,
         {
-            // The platform verifier needs the JVM; take it from ndk-context on the
-            // first TLS connection so plain HTTP never touches it.
-            #[cfg(android_verifier)]
-            super::super::android::ensure_initialized()?;
-
             let server_name = ServerName::try_from(host.to_owned()).map_err(Error::tls)?;
             self.inner
                 .connect(server_name, stream)
