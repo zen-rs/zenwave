@@ -1,6 +1,7 @@
-// The instrumented Android test app for zenwave's TLS path: `rustls-platform-verifier`
-// needs the JVM, which the plain test binary run by `scripts/test-android.sh` does
-// not have. Not a Cargo workspace member; driven by that script on a real device.
+// The instrumented Android test app for zenwave's TLS path: it runs the TLS cases
+// from a real application process, which reads the system trust anchors under the
+// app's own SELinux domain rather than the shell's the plain test binaries get.
+// Not a Cargo workspace member; driven by `scripts/test-android.sh` on a real device.
 pluginManagement {
     repositories {
         google()

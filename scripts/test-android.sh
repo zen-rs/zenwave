@@ -6,9 +6,9 @@
 # `adb connect <ip>:<port>` first). ANDROID_NDK_HOME is taken from the SDK's
 # newest NDK when unset.
 #
-# The plain test binaries have no JVM, so the TLS cases are gated off them;
-# the instrumented app under `tests/android` runs those afterwards through
-# Gradle (`connectedDebugAndroidTest`), which needs `gradle` on the PATH.
+# The instrumented app under `tests/android` then runs the TLS cases from a
+# real application process through Gradle (`connectedDebugAndroidTest`), which
+# needs `gradle` on the PATH.
 set -euo pipefail
 
 features=${1:-hyper-backend,rustls,ws}
@@ -43,8 +43,8 @@ echo "::group::plain test binaries on $ANDROID_SERIAL ($abi) with features $feat
 cargo dinghy -d "$ANDROID_SERIAL" -p "$platform" test --no-default-features --features "$features"
 echo "::endgroup::"
 
-# TLS through the platform verifier needs the JVM: the instrumented app under
-# tests/android registers the context with ndk-context and runs those cases.
+# The plain binaries read the system anchors as the shell user; the instrumented
+# app under tests/android runs the TLS cases under the app's own SELinux domain.
 echo "::group::instrumented TLS suite (tests/android)"
 export ANDROID_HOME=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}
 command -v gradle >/dev/null || { echo "gradle is required for the instrumented suite" >&2; exit 1; }

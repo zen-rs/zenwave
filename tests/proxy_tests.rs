@@ -5,7 +5,6 @@
 mod common;
 
 use base64::Engine as _;
-#[cfg(not(target_os = "android"))]
 use common::{FIXTURE_HOST, tls::tls_fixture};
 use common::{
     httpbin_uri,
@@ -21,7 +20,6 @@ fn transport(proxy: Proxy) -> Transport {
         .expect("transport builds")
 }
 
-#[cfg(not(target_os = "android"))]
 fn transport_with_test_ca(proxy: Proxy) -> Transport {
     Transport::builder()
         .proxy(proxy)
@@ -100,7 +98,6 @@ async fn proxy_none_ignores_everything() {
 
 // The plain Android test binary has no JVM for the platform verifier; TLS on
 // Android is exercised by the instrumented app under `tests/android`.
-#[cfg(not(target_os = "android"))]
 #[test_executors::async_test]
 async fn https_target_is_tunnelled_with_connect() {
     let proxy = HttpProxy::start_requiring(&basic("bob", "hunter2"));
@@ -131,7 +128,6 @@ async fn https_target_is_tunnelled_with_connect() {
     assert_eq!(tunnel.proxy_authorization, Some(basic("bob", "hunter2")));
 }
 
-#[cfg(not(target_os = "android"))]
 #[test_executors::async_test]
 async fn rejected_tunnel_is_an_error() {
     let proxy = HttpProxy::start_requiring(&basic("bob", "hunter2"));
@@ -183,7 +179,6 @@ async fn socks5_resolves_locally_and_authenticates() {
     );
 }
 
-#[cfg(not(target_os = "android"))]
 #[test_executors::async_test]
 async fn socks5h_sends_the_hostname_to_the_proxy() {
     let proxy = Socks5Proxy::start_requiring("erin", "pw");
@@ -229,7 +224,7 @@ async fn socks4_is_refused() {
 }
 
 // TLS needs the JVM on Android; see `tests/android`.
-#[cfg(all(feature = "ws", not(target_os = "android")))]
+#[cfg(feature = "ws")]
 mod websocket {
     use zenwave::{
         Proxy,
