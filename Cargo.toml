@@ -129,8 +129,9 @@ objc = { version = "0.2", optional = true }
 security-framework = { version = "3.7", optional = true }
 core-foundation = { version = "0.10", optional = true }
 
-# Android verifies against the system anchors on disk instead (src/transport/android.rs).
-[target.'cfg(not(target_os = "android"))'.dependencies]
+# Android verifies against the system anchors on disk instead (src/transport/android.rs);
+# wasm32 never links rustls at all.
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))'.dependencies]
 rustls-platform-verifier = { version = "0.7", optional = true }
 
 
