@@ -34,8 +34,11 @@
 //! ### Default
 //! `hyper-backend` + `rustls` + `ws`. rustls verifies certificates through the
 //! operating system (`rustls-platform-verifier`): Security.framework on
-//! Apple platforms, `CryptoAPI` on Windows, the Android trust manager, and the
-//! system CA bundle on Linux. See [`Transport`] for adding roots.
+//! Apple platforms, `CryptoAPI` on Windows, and the system CA bundle on Linux.
+//! On Android it verifies with webpki against the system trust anchors read
+//! from disk, because the platform verifier there reports every CRL-only
+//! certificate as revoked (rustls/rustls-platform-verifier#221). See
+//! [`Transport`] for adding roots.
 //!
 //! ### Features
 //! - **`hyper-backend`**: hyper over async-io. Needs `rustls` or `native-tls`.
