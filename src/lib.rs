@@ -42,7 +42,8 @@
 //!
 //! ### Features
 //! - **`hyper-backend`**: hyper over async-io. Needs `rustls` or `native-tls`.
-//! - **`rustls`** / **`native-tls`**: the TLS engine for hyper and websockets. Exactly one.
+//! - **`rustls`** / **`native-tls`**: the TLS engine for hyper and websockets.
+//!   Both may be enabled; `rustls` takes precedence.
 //! - **`curl-backend`**: libcurl-based backend with its own TLS.
 //! - **`apple-backend`**: Apple's native `NSURLSession` (macOS/iOS only).
 //! - **`ws`**: websocket support.
@@ -56,17 +57,6 @@
 //! ```
 
 #![allow(clippy::multiple_crate_versions)]
-
-// Exactly one TLS engine serves hyper and native websockets.
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    feature = "rustls",
-    feature = "native-tls"
-))]
-compile_error!(
-    "`rustls` and `native-tls` are mutually exclusive TLS engines; enable exactly one \
-     (the default feature set enables `rustls`)."
-);
 
 #[cfg(all(
     not(target_arch = "wasm32"),

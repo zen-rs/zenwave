@@ -8,9 +8,10 @@ fn main() {
         // The shared TCP/TLS connector is needed by hyper and by native websockets.
         connector: { all(not(target_arch = "wasm32"), any(feature = "hyper-backend", feature = "ws")) },
         // TLS engine compiled into that connector; an engine feature enabled
-        // next to curl or URLSession alone has nothing to serve.
+        // next to curl or URLSession alone has nothing to serve. Features are
+        // additive, so `rustls` wins when both engines are enabled.
         tls_rustls: { all(connector, feature = "rustls") },
-        tls_native: { all(connector, feature = "native-tls") },
+        tls_native: { all(connector, feature = "native-tls", not(feature = "rustls")) },
         tls_engine: { any(tls_rustls, tls_native) },
         // rustls-platform-verifier needs a JVM handle on Android.
         android_verifier: { all(target_os = "android", tls_rustls) },

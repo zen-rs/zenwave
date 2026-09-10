@@ -15,7 +15,7 @@
 //! On native platforms, users can choose their preferred backend:
 //!
 //! - **`hyper-backend`** (default): Uses hyper with async-io/async-net. TLS comes
-//!   from exactly one of the `rustls` (default) or `native-tls` features.
+//!   from `rustls` (default) or `native-tls`; `rustls` wins when both are on.
 //! - **`curl-backend`**: Uses libcurl via the `curl` crate. Includes proxy support.
 //! - **`apple-backend`**: Uses Apple's native `NSURLSession` (macOS/iOS only).
 //!
