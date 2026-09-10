@@ -247,7 +247,7 @@ challenge from the delegate, and a refused challenge fails at once with
 On wasm32, the built-in Fetch backend is used automatically. No feature selection
 needed or available.
 
-On native, pick a backend, and for hyper exactly one TLS engine:
+On native, pick a backend, and for hyper a TLS engine:
 
 | Feature | Backend | TLS | Notes |
 |---|---|---|---|
@@ -256,8 +256,9 @@ On native, pick a backend, and for hyper exactly one TLS engine:
 | `curl-backend` | libcurl | libcurl's | Smaller binary if you have system libcurl |
 | `apple-backend` | URLSession | Security.framework | Experimental. macOS/iOS only |
 
-`rustls` and `native-tls` are mutually exclusive; `ws` (websockets) uses the same
-engine as hyper. The `default` feature enables `hyper-backend`, `rustls` and `ws`.
+`ws` (websockets) uses the same engine as hyper. When `rustls` and `native-tls`
+are both enabled, `rustls` takes precedence. The `default` feature enables
+`hyper-backend`, `rustls` and `ws`.
 
 Common dependency lines:
 

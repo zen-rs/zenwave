@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Clippy over every feature combination that is valid on this host.
 #
-# hyper and websockets need exactly one TLS engine, so the powerset is taken
+# hyper and websockets need a TLS engine, so the powerset is taken
 # once per engine with that engine pinned, and once more without any engine
 # over the backends that bring their own TLS. `apple-backend` only exists on
 # Apple hosts. CI runs one slice per job:

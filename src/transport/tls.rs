@@ -1,4 +1,5 @@
 //! The TLS engine selected by the `rustls` or `native-tls` feature.
+//! `rustls` takes precedence when both are enabled.
 //!
 //! Both engines expose the same two operations: build a connector from the
 //! extra roots once, and wrap an established byte stream in TLS.
