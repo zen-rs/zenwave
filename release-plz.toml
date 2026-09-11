@@ -8,8 +8,3 @@ changelog_update = true
 
 [[package]]
 name = "zenwave"
-# The published 0.6.0 cannot be built with every feature enabled (its TLS
-# engines were mutually exclusive, #55), and cargo-semver-checks builds that
-# baseline with every feature, so the check cannot run until the first
-# additive release is out. Remove this line once 0.6.1 is on crates.io.
-semver_check = false
