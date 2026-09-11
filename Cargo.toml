@@ -45,14 +45,15 @@ default = ["hyper-backend", "rustls", "ws"]
 
 # HTTP backends (native platforms only). At least one must be enabled.
 #
-# hyper over async-io/async-net. Needs exactly one TLS engine (`rustls` or `native-tls`).
+# hyper over async-io/async-net. Needs a TLS engine (`rustls` or `native-tls`).
 hyper-backend = []
 # libcurl via the `curl` crate. libcurl brings its own TLS engine.
 curl-backend = ["dep:curl", "dep:blocking", "dep:rustls-native-certs", "dep:pem"]
 # Apple's NSURLSession (macOS/iOS only). Security.framework does the TLS.
 apple-backend = ["dep:block", "dep:objc", "dep:security-framework", "dep:core-foundation"]
 
-# TLS engines for `hyper-backend` and native websockets. Exactly one may be enabled.
+# TLS engines for `hyper-backend` and native websockets. Features are additive:
+# when both are enabled, `rustls` takes precedence.
 #
 # rustls, with certificate verification delegated to the platform
 # (Security.framework, CryptoAPI, Android Trust Manager, or the system CA bundle on Linux).
