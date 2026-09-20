@@ -77,8 +77,9 @@ async fn test_basic_auth_no_password() {
     let response = response.unwrap();
     let body = response.into_body().into_string().await.unwrap();
 
-    // Check that the Authorization header is present
-    assert!(body.contains("Authorization"));
+    // Check that the Authorization header is present (the fixture echoes
+    // headers as a JSON object keyed by lowercase name).
+    assert!(body.contains("authorization"));
     assert!(body.contains("Basic"));
 }
 
