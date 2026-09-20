@@ -45,6 +45,8 @@ mod ca_bundle;
 #[cfg(connector)]
 pub(crate) mod connect;
 #[cfg(connector)]
+pub(crate) mod dns;
+#[cfg(connector)]
 mod happy_eyeballs;
 #[cfg(native)]
 pub mod proxy;

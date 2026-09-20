@@ -48,6 +48,9 @@ src/
     tunnel.rs     — HTTP CONNECT through hyper's upgrade machinery
     socks5.rs     — SOCKS5 CONNECT client (RFC 1928/1929)
     happy_eyeballs.rs — RFC 8305 TCP connection racing
+    dns.rs        — HTTPS/SVCB record lookup for HTTP/3 discovery (RFC 9460)
+    dns/runtime.rs — hickory RuntimeProvider on async-io/async-net
+    dns/android.rs — android.net.DnsResolver.rawQuery over JNI
     android.rs    — hands the JVM from ndk-context to the platform verifier
   ext.rs          — ResponseExt trait (into_json, into_string, etc.)
   cache.rs        — HTTP caching middleware (Cache-Control, ETag)
