@@ -50,8 +50,16 @@ pub(crate) mod connect;
 pub(crate) mod dns;
 #[cfg(connector)]
 mod happy_eyeballs;
+// Kept `crate::`-free so `tests/common` can include the same file for its
+// hyper test server.
+#[cfg(connector)]
+pub(crate) mod hyper_io;
 #[cfg(tls_native)]
 pub(crate) mod native_tls_stream;
+// The hyper backend's per-origin connection pool; other backends pool through
+// their platform.
+#[cfg(all(connector, feature = "hyper-backend"))]
+pub(crate) mod pool;
 #[cfg(native)]
 pub mod proxy;
 // Consumed by the hyper backend's h3 connections and, for the endpoint, the
@@ -96,6 +104,9 @@ struct Inner {
     ca_bundle: Option<Vec<u8>>,
     #[cfg(tls_engine)]
     tls: tls::TlsConnector,
+    /// Connections the hyper backend reuses, keyed by origin.
+    #[cfg(all(connector, feature = "hyper-backend"))]
+    pool: pool::Pool,
     /// QUIC endpoint shared by every h3 connection, bound on first use.
     #[cfg(http3)]
     #[allow(dead_code)] // read through `quic_endpoint`, used by the pool (#69)
@@ -173,6 +184,13 @@ impl Transport {
     #[cfg(feature = "curl-backend")]
     pub(crate) fn ca_bundle(&self) -> Option<&[u8]> {
         self.inner.ca_bundle.as_deref()
+    }
+
+    /// The connection pool hyper backends check out of; shared by every
+    /// backend and `zenwave` convenience call over this transport.
+    #[cfg(all(connector, feature = "hyper-backend"))]
+    pub(crate) fn pool(&self) -> &pool::Pool {
+        &self.inner.pool
     }
 
     /// The QUIC endpoint h3 connections share, bound on first use. `spawn`
@@ -321,6 +339,8 @@ impl TransportBuilder {
                     ca_bundle,
                     #[cfg(tls_engine)]
                     tls,
+                    #[cfg(all(connector, feature = "hyper-backend"))]
+                    pool: pool::Pool::new(),
                     #[cfg(http3)]
                     quic: once_cell::sync::OnceCell::new(),
                     #[cfg(connector)]
