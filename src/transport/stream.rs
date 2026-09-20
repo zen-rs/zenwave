@@ -32,9 +32,14 @@ impl fmt::Debug for Stream {
 impl Stream {
     /// The ALPN protocol negotiated on the innermost TLS layer, or `None` for
     /// plaintext connections and peers that picked no protocol.
-    pub fn negotiated_alpn(&self) -> Option<Vec<u8>> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the TLS engine's error when it cannot report the negotiated
+    /// protocol (native-tls only; rustls is infallible).
+    pub fn negotiated_alpn(&self) -> Result<Option<Vec<u8>>, crate::Error> {
         match self {
-            Self::Tcp(_) => None,
+            Self::Tcp(_) => Ok(None),
             Self::Tls(stream) => tls::negotiated_alpn(stream),
             Self::TlsOverTls(stream) => tls::negotiated_alpn(stream),
         }

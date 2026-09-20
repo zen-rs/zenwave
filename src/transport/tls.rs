@@ -129,9 +129,11 @@ mod engine {
     }
 
     /// The protocol `stream`'s TLS session negotiated through ALPN, if any.
-    pub fn negotiated_alpn<S>(stream: &TlsStream<S>) -> Option<Vec<u8>> {
+    ///
+    /// Infallible for rustls — the signature matches the native-tls engine.
+    pub fn negotiated_alpn<S>(stream: &TlsStream<S>) -> Result<Option<Vec<u8>>, Error> {
         let (_, connection) = stream.get_ref();
-        connection.alpn_protocol().map(<[u8]>::to_vec)
+        Ok(connection.alpn_protocol().map(<[u8]>::to_vec))
     }
 }
 
@@ -201,11 +203,11 @@ mod engine {
     }
 
     /// The protocol `stream`'s TLS session negotiated through ALPN, if any.
-    pub fn negotiated_alpn<S>(stream: &TlsStream<S>) -> Option<Vec<u8>>
+    pub fn negotiated_alpn<S>(stream: &TlsStream<S>) -> Result<Option<Vec<u8>>, Error>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        stream.negotiated_alpn()
+        stream.negotiated_alpn().map_err(Error::tls)
     }
 }
 

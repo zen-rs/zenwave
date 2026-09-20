@@ -125,8 +125,13 @@ where
     }
 
     /// The ALPN protocol the peer picked, when it picked one.
-    pub fn negotiated_alpn(&self) -> Option<Vec<u8>> {
-        self.0.negotiated_alpn().ok().flatten()
+    ///
+    /// # Errors
+    ///
+    /// Returns the `native-tls` error when the platform TLS layer cannot
+    /// report the negotiated protocol.
+    pub fn negotiated_alpn(&self) -> Result<Option<Vec<u8>>, Error> {
+        self.0.negotiated_alpn()
     }
 }
 

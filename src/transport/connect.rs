@@ -76,7 +76,7 @@ pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connec
     let Some(intercept) = transport.proxy().intercept(&destination_uri(target)?) else {
         let tcp = tcp(target.host, target.port).await?;
         let stream = finish(transport, target, tcp).await?;
-        return Ok(connection(stream, Via::Direct, target));
+        return connection(stream, Via::Direct, target);
     };
 
     let proxy_uri = intercept.uri();
@@ -104,13 +104,13 @@ pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connec
                 } else {
                     Stream::Tcp(tcp)
                 };
-                return Ok(connection(
+                return connection(
                     stream,
                     Via::HttpProxy {
                         authorization: intercept.basic_auth().cloned(),
                     },
                     target,
-                ));
+                );
             }
 
             let authority = authority(target.host, target.port);
@@ -135,7 +135,7 @@ pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connec
                 let tunneled = tunnel::connect(tcp, &authority, intercept.basic_auth()).await?;
                 finish(transport, target, tunneled).await?
             };
-            Ok(connection(stream, Via::Direct, target))
+            connection(stream, Via::Direct, target)
         }
         "socks5" | "socks5h" => {
             let proxy_port = proxy_uri.port_u16().unwrap_or(1080);
@@ -149,7 +149,7 @@ pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connec
             )
             .await?;
             let stream = finish(transport, target, tcp).await?;
-            Ok(connection(stream, Via::Direct, target))
+            connection(stream, Via::Direct, target)
         }
         other => Err(ProxyErrorKind::UnsupportedScheme(other.to_owned()).into()),
     }
@@ -157,17 +157,17 @@ pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connec
 
 /// The protocol a freshly built stream will speak: the innermost TLS layer's
 /// negotiated ALPN for TLS targets, always [`Protocol::Http1`] for plaintext.
-fn connection(stream: Stream, via: Via, target: Target<'_>) -> Connection {
-    let protocol = match (target.tls, stream.negotiated_alpn().as_deref()) {
+fn connection(stream: Stream, via: Via, target: Target<'_>) -> Result<Connection, Error> {
+    let protocol = match (target.tls, stream.negotiated_alpn()?.as_deref()) {
         #[cfg(feature = "http2")]
         (true, Some(b"h2")) => Protocol::Http2,
         _ => Protocol::Http1,
     };
-    Connection {
+    Ok(Connection {
         stream,
         via,
         protocol,
-    }
+    })
 }
 
 /// Wrap a TCP stream that already reaches the target in TLS when asked.
