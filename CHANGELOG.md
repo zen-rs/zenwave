@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/zen-rs/zenwave/compare/v0.6.0...v0.6.1) - 2026-09-11
+
+### Fixed
+
+- make the TLS engine features additive
+- *(android)* keep rustls-platform-verifier off wasm32 as well
+- *(android)* verify against the system trust anchors on disk
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into android/system-anchors
+
 ## [0.6.0](https://github.com/zen-rs/zenwave/compare/v0.5.3...v0.6.0) - 2026-09-03
 
 ### Added
