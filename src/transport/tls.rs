@@ -71,6 +71,9 @@ mod engine {
     /// rustls with certificate verification delegated to the operating system.
     #[derive(Clone)]
     pub struct TlsConnector {
+        /// The ALPN-less base configuration; QUIC clones it and sets `h3`.
+        #[cfg_attr(not(http3), allow(dead_code))]
+        base: Arc<ClientConfig>,
         http1: futures_rustls::TlsConnector,
         http2_or_http1: futures_rustls::TlsConnector,
     }
@@ -87,12 +90,21 @@ mod engine {
                 .with_no_client_auth();
             let mut http1 = base.clone();
             http1.alpn_protocols = alpn_protocols(Protocols::Http1);
-            let mut http2_or_http1 = base;
+            let mut http2_or_http1 = base.clone();
             http2_or_http1.alpn_protocols = alpn_protocols(Protocols::Http2OrHttp1);
             Ok(Self {
+                base: Arc::new(base),
                 http1: futures_rustls::TlsConnector::from(Arc::new(http1)),
                 http2_or_http1: futures_rustls::TlsConnector::from(Arc::new(http2_or_http1)),
             })
+        }
+
+        /// The shared client configuration; `transport::quic` clones it with
+        /// ALPN `h3` for QUIC connections.
+        #[cfg(http3)]
+        #[allow(dead_code)] // the h3 dial path (#69) reads it
+        pub const fn client_config(&self) -> &Arc<ClientConfig> {
+            &self.base
         }
 
         pub async fn connect<S>(

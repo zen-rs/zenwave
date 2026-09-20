@@ -43,7 +43,7 @@ async fn test_cookie_store_middleware() {
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn test_cookie_store_creation() {
     let cookie_store = CookieStore::default();
-    assert!(!format!("{cookie_store:?}").is_empty());
+    assert_ne!(format!("{cookie_store:?}"), "");
 }
 
 #[test_executors::async_test]

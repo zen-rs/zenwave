@@ -50,6 +50,11 @@ mod happy_eyeballs;
 pub(crate) mod native_tls_stream;
 #[cfg(native)]
 pub mod proxy;
+// Consumed by the hyper backend's h3 connections and, for the endpoint, the
+// connection pool (#69).
+#[cfg(http3)]
+#[allow(dead_code)]
+pub(crate) mod quic;
 #[cfg(connector)]
 mod socks5;
 #[cfg(connector)]
@@ -81,6 +86,10 @@ struct Inner {
     ca_bundle: Option<Vec<u8>>,
     #[cfg(tls_engine)]
     tls: tls::TlsConnector,
+    /// QUIC endpoint shared by every h3 connection, bound on first use.
+    #[cfg(http3)]
+    #[allow(dead_code)] // read through `quic_endpoint`, used by the pool (#69)
+    quic: once_cell::sync::OnceCell<quinn::Endpoint>,
 }
 
 impl Transport {
@@ -145,6 +154,14 @@ impl Transport {
     #[cfg(feature = "curl-backend")]
     pub(crate) fn ca_bundle(&self) -> Option<&[u8]> {
         self.inner.ca_bundle.as_deref()
+    }
+
+    /// The QUIC endpoint h3 connections share, bound on first use. `spawn`
+    /// schedules the futures quinn drives in the background.
+    #[cfg(http3)]
+    #[allow(dead_code)] // the connection pool (#69) calls this per h3 dial
+    pub(crate) fn quic_endpoint(&self, spawn: quic::Spawn) -> Result<&quinn::Endpoint, Error> {
+        self.inner.quic.get_or_try_init(|| quic::endpoint(spawn))
     }
 }
 
@@ -242,6 +259,8 @@ impl TransportBuilder {
                     ca_bundle,
                     #[cfg(tls_engine)]
                     tls,
+                    #[cfg(http3)]
+                    quic: once_cell::sync::OnceCell::new(),
                 }),
             })
         }
