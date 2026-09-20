@@ -38,9 +38,22 @@ pub mod runtime;
 
 /// The resolver configuration a [`Transport`](crate::Transport) carries: the
 /// system's, read once at build so no blocking `fs::read` ever runs per
-/// lookup.
+/// lookup — or the reason it could not be read.
 #[cfg(not(target_os = "android"))]
-pub struct Config {
+pub enum Config {
+    /// The parsed system configuration, or a test's override.
+    System(Box<SystemConfig>),
+    /// Why the system configuration could not be read — `read_system_conf`'s
+    /// error text (`Error` is not `Clone`). A host without one still
+    /// resolves names through `getaddrinfo`, so this is a per-lookup
+    /// failure of `https_record`, not a broken transport.
+    Unavailable(String),
+}
+
+/// A `ResolverConfig`/`ResolverOpts` pair — boxed so [`Config`] stays small
+/// on hosts without a resolver configuration.
+#[cfg(not(target_os = "android"))]
+pub struct SystemConfig {
     config: ResolverConfig,
     options: ResolverOpts,
 }
@@ -58,30 +71,43 @@ pub type HickoryResolver = Resolver<AsyncIoRuntimeProvider>;
 
 #[cfg(not(target_os = "android"))]
 impl Config {
-    /// The system's resolver configuration. A host without one is
-    /// misconfigured, so failing here is a `build()`-time error like a
-    /// broken trust store, not a per-request condition.
-    pub fn system() -> Result<Self, Error> {
-        let (config, options) =
-            system_conf::read_system_conf().map_err(|error| Error::Transport(Box::new(error)))?;
-        Ok(Self { config, options })
+    /// The system's resolver configuration, or the reason it could not be
+    /// read.
+    pub fn system() -> Self {
+        match system_conf::read_system_conf() {
+            Ok((config, options)) => Self::System(Box::new(SystemConfig { config, options })),
+            Err(error) => Self::Unavailable(error.to_string()),
+        }
     }
 
     /// An explicit configuration — the `TransportBuilder::dns_config`
     /// override for tests.
-    pub const fn new(config: ResolverConfig, options: ResolverOpts) -> Self {
-        Self { config, options }
+    #[allow(dead_code)] // only the dns unit tests construct one
+    pub fn new(config: ResolverConfig, options: ResolverOpts) -> Self {
+        Self::System(Box::new(SystemConfig { config, options }))
     }
 
-    /// The resolver over this configuration on the in-tree runtime.
-    /// `Resolver::build` only constructs the pool and cache — sockets open
-    /// lazily at the first query — so this is not a blocking call.
-    fn build_resolver(&self, spawn: Spawn) -> Result<HickoryResolver, Error> {
-        Resolver::builder_with_config(self.config.clone(), AsyncIoRuntimeProvider::new(spawn))
-            .with_options(self.options.clone())
-            .build()
-            .map_err(|error| Error::Transport(Box::new(error)))
+    /// An unavailable configuration — only the tests construct one; at
+    /// runtime `Unavailable` comes from `system()`.
+    #[allow(dead_code)]
+    pub(crate) fn unavailable(reason: &str) -> Self {
+        Self::Unavailable(reason.to_owned())
     }
+}
+
+/// The resolver over `config`/`options` on the in-tree runtime.
+/// `Resolver::build` only constructs the pool and cache — sockets open
+/// lazily at the first query — so this is not a blocking call.
+#[cfg(not(target_os = "android"))]
+fn build_resolver(
+    config: &ResolverConfig,
+    options: &ResolverOpts,
+    spawn: Spawn,
+) -> Result<HickoryResolver, Error> {
+    Resolver::builder_with_config(config.clone(), AsyncIoRuntimeProvider::new(spawn))
+        .with_options(options.clone())
+        .build()
+        .map_err(|error| Error::Transport(Box::new(error)))
 }
 
 /// What a usable HTTPS record offers for an origin.
@@ -128,9 +154,18 @@ pub(super) async fn https_record(
     }
     #[cfg(not(target_os = "android"))]
     {
-        let resolver = inner
-            .resolver
-            .get_or_try_init(|| inner.dns.build_resolver(spawn))?;
+        let resolver = match &inner.dns {
+            Config::System(system) => inner
+                .resolver
+                .get_or_try_init(|| build_resolver(&system.config, &system.options, spawn))?,
+            // The resolver only feeds h3 discovery; the caller (#69) decides
+            // what a missing configuration means for the origin.
+            Config::Unavailable(reason) => {
+                return Err(Error::Transport(Box::new(std::io::Error::other(
+                    reason.clone(),
+                ))));
+            }
+        };
         resolve(host, port, |domain| lookup_https(resolver, domain)).await
     }
 }
@@ -251,8 +286,8 @@ mod tests {
     };
 
     use super::{
-        HTTPS_DEFAULT_PORT, HttpsRecord, Name, RData, Record, RecordType, SVCB, SvcParamKey,
-        SvcParamValue,
+        Config, HTTPS_DEFAULT_PORT, HttpsRecord, Name, RData, Record, RecordType, SVCB,
+        SvcParamKey, SvcParamValue,
     };
     use crate::{
         Error,
@@ -352,7 +387,7 @@ mod tests {
     fn lookup(server: SocketAddr, host: &str, port: u16) -> Result<Option<HttpsRecord>, Error> {
         let (config, options) = config(server);
         let transport = Transport::builder()
-            .dns_config(config, options)
+            .dns_config(Config::new(config, options))
             .build()
             .expect("transport builds");
         async_io::block_on(transport.https_record(spawn(), host, port))
@@ -427,6 +462,22 @@ mod tests {
         let record = lookup(server, "example.test", HTTPS_DEFAULT_PORT).expect("lookup");
 
         assert!(record.is_none());
+    }
+
+    #[test]
+    fn unavailable_resolver_is_a_per_lookup_error() {
+        // A host without resolver configuration still builds a working
+        // transport — A/AAAA go through `getaddrinfo` — and only the
+        // HTTPS-record lookup reports it.
+        let transport = Transport::builder()
+            .dns_config(Config::unavailable("no system resolver configuration"))
+            .build()
+            .expect("transport builds without resolver configuration");
+
+        let result =
+            async_io::block_on(transport.https_record(spawn(), "example.test", HTTPS_DEFAULT_PORT));
+
+        assert!(matches!(result, Err(Error::Transport(_))));
     }
 
     #[test]

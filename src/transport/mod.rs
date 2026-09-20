@@ -35,8 +35,6 @@ use std::sync::Arc;
 #[cfg(connector)]
 use std::{future::Future, pin::Pin};
 
-#[cfg(all(connector, not(target_os = "android")))]
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 #[cfg(native)]
 use rustls_pki_types::{CertificateDer, pem::PemObject};
 
@@ -271,13 +269,13 @@ impl TransportBuilder {
         self
     }
 
-    /// Resolve through `config`/`options` instead of the system resolver
+    /// Resolve through `config` instead of the system resolver
     /// configuration — a constructor for tests, not a runtime hook.
     #[cfg(all(connector, not(target_os = "android")))]
     #[allow(dead_code)] // only the dns unit tests override the configuration
     #[must_use]
-    pub(crate) fn dns_config(mut self, config: ResolverConfig, options: ResolverOpts) -> Self {
-        self.dns = Some(dns::Config::new(config, options));
+    pub(crate) fn dns_config(mut self, config: dns::Config) -> Self {
+        self.dns = Some(config);
         self
     }
 
@@ -298,14 +296,19 @@ impl TransportBuilder {
             } else {
                 Some(ca_bundle::platform_roots_with(&self.extra_roots)?)
             };
+            // HTTPS records only feed HTTP/3 discovery: a host without a
+            // resolver configuration (minimal containers, musl static
+            // binaries) still resolves names through `getaddrinfo`, so
+            // `build` records the failure and `https_record` reports it
+            // per lookup.
             #[cfg(all(connector, not(target_os = "android")))]
-            let dns = match self.dns {
-                Some(config) => config,
-                // A host without a resolver configuration is a misconfigured
-                // system: `build` fails on it the way a broken trust store
-                // does, rather than at the first lookup.
-                None => dns::Config::system()?,
-            };
+            let dns = self.dns.unwrap_or_else(|| {
+                let config = dns::Config::system();
+                if let dns::Config::Unavailable(reason) = &config {
+                    tracing::warn!("system DNS resolver configuration unavailable: {reason}");
+                }
+                config
+            });
             #[cfg(all(connector, target_os = "android"))]
             let dns = dns::Config;
             Ok(Transport {
