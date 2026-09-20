@@ -5,6 +5,12 @@
 //! test suite needs. On wasm targets we fall back to the real service unless
 //! `ZENWAVE_TEST_BASE_URL` is provided.
 
+// The production `futures-io` → `hyper::rt` adapter, shared with the test
+// server rather than duplicated.
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "../../src/transport/hyper_io.rs"]
+mod hyper_io;
+
 #[cfg(not(target_arch = "wasm32"))]
 pub mod proxy;
 
@@ -36,10 +42,11 @@ mod local {
     use std::{
         convert::Infallible,
         fmt::Write as _,
-        io,
-        net::{TcpListener, TcpStream},
-        pin::Pin,
-        task::{Context, Poll},
+        net::TcpListener,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         thread,
         time::Duration,
     };
@@ -47,7 +54,6 @@ mod local {
     use async_io::Async;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
-    use futures_util::{AsyncRead, AsyncWrite};
     use http_body_util::{BodyExt as _, Full};
     use hyper::{
         body::{Bytes, Incoming},
@@ -56,62 +62,7 @@ mod local {
     use once_cell::sync::OnceCell;
     use url::Url;
 
-    /// `Async<TcpStream>` as a hyper `rt` IO — the same adapter as
-    /// `transport::stream::HyperIo`, which is `pub(crate)` and unreachable
-    /// from integration tests.
-    struct TestIo(Async<TcpStream>);
-
-    impl hyper::rt::Read for TestIo {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            mut buf: hyper::rt::ReadBufCursor<'_>,
-        ) -> Poll<io::Result<()>> {
-            // SAFETY: the cursor hands out its uninitialised tail; `poll_read`
-            // only writes into it and `advance` is called with the count it
-            // reported.
-            let slice = unsafe { buf.as_mut() };
-            let bytes = unsafe { &mut *(std::ptr::from_mut(slice) as *mut [u8]) };
-            match Pin::new(&mut self.0).poll_read(cx, bytes) {
-                Poll::Ready(Ok(n)) => {
-                    unsafe { buf.advance(n) };
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                Poll::Pending => Poll::Pending,
-            }
-        }
-    }
-
-    impl hyper::rt::Write for TestIo {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            Pin::new(&mut self.0).poll_write(cx, buf)
-        }
-
-        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.0).poll_flush(cx)
-        }
-
-        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.0).poll_close(cx)
-        }
-
-        fn is_write_vectored(&self) -> bool {
-            true
-        }
-
-        fn poll_write_vectored(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            bufs: &[io::IoSlice<'_>],
-        ) -> Poll<io::Result<usize>> {
-            Pin::new(&mut self.0).poll_write_vectored(cx, bufs)
-        }
-    }
+    use super::hyper_io::HyperIo;
 
     /// A parsed request, everything the router needs of it.
     struct TestRequest {
@@ -149,6 +100,9 @@ mod local {
     #[derive(Debug)]
     pub struct TestServer {
         base: String,
+        /// Connections the accept loop has taken; a pooled client reusing a
+        /// connection does not add to it.
+        accepted: Arc<AtomicUsize>,
         // Keep the thread alive for the duration of the tests.
         _thread: thread::JoinHandle<()>,
     }
@@ -173,13 +127,34 @@ mod local {
     }
 
     impl TestServer {
+        /// A dedicated server instance: the shared `test_server()` is used by
+        /// tests running in parallel, so accepts on it cannot be attributed
+        /// to one test.
+        pub fn standalone() -> Self {
+            Self::start()
+        }
+
+        /// Build a full URL against this server instance.
+        pub fn uri(&self, path: &str) -> String {
+            format!("{}/{}", self.base, path.trim_start_matches('/'))
+        }
+
+        /// Connections accepted so far. Requests served on a pooled
+        /// connection do not move it.
+        pub fn accepted(&self) -> usize {
+            self.accepted.load(Ordering::Relaxed)
+        }
+
         fn start() -> Self {
             let listener = TcpListener::bind(("127.0.0.1", 0)).expect("start test server");
             let base = format!("http://{}", listener.local_addr().expect("server address"));
-            let thread = thread::spawn(move || run_server(&listener));
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&accepted);
+            let thread = thread::spawn(move || run_server(&listener, &counter));
 
             Self {
                 base,
+                accepted,
                 _thread: thread,
             }
         }
@@ -189,11 +164,12 @@ mod local {
     /// its whole keep-alive lifetime, so dispatching connections through a
     /// bounded worker pool can strand a task; dedicating a thread per
     /// connection cannot.
-    fn run_server(listener: &TcpListener) {
+    fn run_server(listener: &TcpListener, accepted: &AtomicUsize) {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { break };
+            accepted.fetch_add(1, Ordering::Relaxed);
             thread::spawn(move || {
-                let io = TestIo(Async::new(stream).expect("async socket wrapper"));
+                let io = HyperIo(Async::new(stream).expect("async socket wrapper"));
                 let conn = hyper::server::conn::http1::Builder::new()
                     .keep_alive(true)
                     .serve_connection(io, service_fn(route));
@@ -289,6 +265,10 @@ mod local {
                 json_response(200, r#"{"result":"ok","server":"httpbin-local"}"#)
             }
             "/gzip" => bytes_response(200, b"gzip response"),
+            // Bigger than hyper's maximum read buffer (≈408 KiB): a body
+            // dropped after one chunk still has bytes on the socket, so the
+            // h1 connection cannot be drained and reused.
+            "/stream" => bytes_response(200, vec![0xA5; 1024 * 1024]),
             "/delay/1" => {
                 // Small delay to emulate a slow endpoint.
                 thread::sleep(Duration::from_millis(10));

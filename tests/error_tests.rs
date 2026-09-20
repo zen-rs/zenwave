@@ -99,29 +99,77 @@ async fn test_empty_response_handling() {
 
 /// The h1 pool must return its connection on every response path: error
 /// statuses consume the body into the error, a 204's empty body may never be
-/// polled, and an unread body releases on drop. If any of them leaked the
-/// lease, sequential requests would exhaust the origin's slots and the next
-/// checkout would never complete.
+/// polled, a streamed body is read to the end, and a `POST` carries a body.
+/// The fixture's accept counter proves each of them reused the single
+/// connection the first request dialed — a dropped lease would free its
+/// slot without returning the connection, forcing a visible redial. Only a
+/// body abandoned mid-stream legitimately dials again: unread bytes make
+/// the h1 connection unusable.
 #[cfg(not(target_arch = "wasm32"))]
 #[test_executors::async_test]
 async fn test_pooled_connection_released_on_every_path() {
-    use futures_util::future::{self, Either};
-    use std::time::Duration;
+    use futures_util::StreamExt as _;
 
+    // A dedicated server: the shared fixture serves every test in the binary
+    // in parallel, so accepts on it cannot be attributed to this sequence.
+    let server = common::TestServer::standalone();
+    let before = server.accepted();
+
+    // Every fully-consumed path reuses the connection the first request
+    // dialed: error statuses (the backend reads the body into the error), a
+    // 204's empty body, and a streamed body read to the end.
     for path in [
-        "/status/500",
+        "/status/200",
         "/status/204",
+        "/stream",
+        "/status/500",
         "/status/404",
-        "/status/204",
-        "/status/500",
     ] {
-        drop(get(httpbin_uri(path)).await);
+        if let Ok(response) = get(server.uri(path)).await {
+            response
+                .into_body()
+                .into_bytes()
+                .await
+                .expect("the response body must read to the end");
+        }
+    }
+    let mut client = client();
+    let response = client
+        .post(server.uri("/post"))
+        .expect("post request must build")
+        .bytes_body(b"reused".to_vec())
+        .await
+        .expect("post must succeed");
+    response
+        .into_body()
+        .into_bytes()
+        .await
+        .expect("the post response body must read");
+
+    // A body abandoned mid-stream poisons its connection: the lease returns,
+    // sees the dead sender, and the next request dials a fresh connection.
+    let abandoned = ["/stream"];
+    for path in abandoned {
+        let mut body = get(server.uri(path))
+            .await
+            .expect("request must succeed")
+            .into_body();
+        drop(body.next().await);
+        drop(body);
+        get(server.uri("/status/200"))
+            .await
+            .expect("the redialed request must succeed")
+            .into_body()
+            .into_bytes()
+            .await
+            .expect("the redialed body must read");
     }
 
-    let sixth = get(httpbin_uri("/status/200"));
-    let bound = async_io::Timer::after(Duration::from_secs(30));
-    let Either::Left((result, _)) = future::select(Box::pin(sixth), Box::pin(bound)).await else {
-        panic!("request did not complete within the bound");
-    };
-    assert!(result.is_ok());
+    // One dial for all the reused paths, plus one redial per abandoned body.
+    let expected = 1 + abandoned.len();
+    assert_eq!(
+        server.accepted() - before,
+        expected,
+        "consumed bodies must reuse the pooled connection; abandoned ones redial"
+    );
 }
