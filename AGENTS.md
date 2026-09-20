@@ -72,6 +72,13 @@ src/
   websocket.rs    — cross-platform WebSocket client
   multipart.rs    — multipart/form-data
   error.rs        — error types
+tests/
+  common/
+    fixture.rs    — local httpbin fixture: hyper server, thread-per-connection,
+                    CORS on every response; shared by the native suites and the
+                    standalone binary (kept free of `crate::` paths)
+  fixture-server/ — zenwave-test-fixture: standalone binary serving the fixture
+                    for the wasm and workerd lanes (own workspace, not a member)
 ```
 
 ## Architecture
