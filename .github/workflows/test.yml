@@ -20,11 +20,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test-${{ matrix.os }}
+      - uses: taiki-e/install-action@nextest
       - name: Run curl backend tests
-        run: cargo test --no-default-features --features curl-backend --workspace
+        run: cargo nextest run --no-default-features --features curl-backend --workspace
+      - name: Run curl backend doctests
+        run: cargo test --doc --no-default-features --features curl-backend --workspace
       - name: Run curl backend tests with websockets
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test --no-default-features --features curl-backend,ws,rustls --workspace
+        run: cargo nextest run --no-default-features --features curl-backend,ws,rustls --workspace
 
   hyper-backend:
     name: Hyper backend (${{ matrix.os }})
@@ -39,10 +42,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test-${{ matrix.os }}
+      - uses: taiki-e/install-action@nextest
       - name: Run hyper backend tests (rustls)
-        run: cargo test --no-default-features --features hyper-backend,rustls,ws --workspace
+        run: cargo nextest run --no-default-features --features hyper-backend,rustls,ws --workspace
       - name: Run hyper backend tests (native-tls)
-        run: cargo test --no-default-features --features hyper-backend,native-tls,ws --workspace
+        run: cargo nextest run --no-default-features --features hyper-backend,native-tls,ws --workspace
+      - name: Run hyper backend doctests
+        run: cargo test --doc --no-default-features --features hyper-backend,rustls,ws --workspace
 
   wasm-linux:
     name: wasm-pack (Linux - ${{ matrix.browser }})
@@ -96,6 +102,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test-macos
+      - uses: taiki-e/install-action@nextest
 
       - name: Run apple backend suite
         run: bash scripts/test-apple.sh

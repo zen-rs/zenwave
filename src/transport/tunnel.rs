@@ -13,7 +13,7 @@ use http::{
 use http_body_util::Empty;
 use hyper::body::Bytes;
 
-use super::stream::HyperIo;
+use super::hyper_io::HyperIo;
 use crate::{Error, error::ProxyErrorKind};
 
 /// Ask the proxy on `stream` for a tunnel to `authority` (`host:port`) and

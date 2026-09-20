@@ -93,7 +93,7 @@ async fn proxy_none_ignores_everything() {
         .expect("valid request")
         .await
         .expect("direct request succeeds");
-    assert!(proxy.requests().is_empty());
+    assert_eq!(proxy.requests(), [] as [common::proxy::ProxiedRequest; 0]);
 }
 
 // The plain Android test binary has no JVM for the platform verifier; TLS on
@@ -220,6 +220,86 @@ async fn socks4_is_refused() {
             zenwave::Error::Proxy(zenwave::error::ProxyErrorKind::UnsupportedScheme(ref scheme)) if scheme == "socks4"
         ),
         "{error:?}"
+    );
+}
+
+/// HTTP/3 is never dialed to a proxied origin: the target may advertise
+/// `h3`, and a correct client still sends it no UDP datagram. The counting
+/// socket is dual-stack so a stray racer shows up whichever address family
+/// `localhost` resolves to first.
+#[cfg(http3)]
+#[test_executors::async_test]
+async fn proxied_origins_never_dial_quic() {
+    use std::{
+        net::UdpSocket,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
+
+    let datagrams = Arc::new(AtomicUsize::new(0));
+    let udp_port = {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .expect("counting socket");
+        socket.set_only_v6(false).expect("dual stack");
+        socket
+            .bind(&"[::]:0".parse::<std::net::SocketAddr>().unwrap().into())
+            .expect("counting socket binds");
+        let udp: UdpSocket = socket.into();
+        let port = udp.local_addr().expect("counting address").port();
+        thread::spawn({
+            let datagrams = datagrams.clone();
+            move || {
+                let mut buffer = [0_u8; 2048];
+                while udp.recv(&mut buffer).is_ok() {
+                    datagrams.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        port
+    };
+
+    let (ca_pem, tls_addr) = common::tls::alt_svc_server(format!("h3=\":{udp_port}\""));
+    let proxy = HttpProxy::start();
+    let rules = Proxy::builder().https(proxy.uri()).build();
+    let transport = Transport::builder()
+        .proxy(rules)
+        .extra_root_certificates_pem(&ca_pem)
+        .expect("test CA parses")
+        .build()
+        .expect("transport builds");
+    let mut client = DefaultBackend::new(transport);
+    let uri = format!("https://localhost:{}/", tls_addr.port());
+
+    for _ in 0..2 {
+        client
+            .get(uri.clone())
+            .expect("valid request")
+            .await
+            .expect("request through the proxy succeeds");
+    }
+    assert!(
+        proxy
+            .requests()
+            .iter()
+            .all(|request| request.method == "CONNECT"),
+        "{:?}",
+        proxy.requests()
+    );
+    // A stray QUIC dial would have fired during either request; let one show
+    // up if it exists.
+    smol::Timer::after(Duration::from_millis(200)).await;
+    assert_eq!(
+        datagrams.load(Ordering::SeqCst),
+        0,
+        "a proxied origin must never be offered QUIC"
     );
 }
 

@@ -77,8 +77,9 @@ async fn test_basic_auth_no_password() {
     let response = response.unwrap();
     let body = response.into_body().into_string().await.unwrap();
 
-    // Check that the Authorization header is present
-    assert!(body.contains("Authorization"));
+    // Check that the Authorization header is present (the fixture echoes
+    // headers as a JSON object keyed by lowercase name).
+    assert!(body.contains("authorization"));
     assert!(body.contains("Basic"));
 }
 
@@ -86,17 +87,17 @@ async fn test_basic_auth_no_password() {
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn test_bearer_auth_creation() {
     let bearer_auth = BearerAuth::new("my-token");
-    assert!(!format!("{bearer_auth:?}").is_empty());
+    assert_ne!(format!("{bearer_auth:?}"), "");
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn test_basic_auth_creation() {
     let basic_auth = BasicAuth::new("username", Some("password"));
-    assert!(!format!("{basic_auth:?}").is_empty());
+    assert_ne!(format!("{basic_auth:?}"), "");
 
     let basic_auth_no_pass = BasicAuth::new("username", None::<String>);
-    assert!(!format!("{basic_auth_no_pass:?}").is_empty());
+    assert_ne!(format!("{basic_auth_no_pass:?}"), "");
 }
 
 #[test_executors::async_test]

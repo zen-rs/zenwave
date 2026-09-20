@@ -35,19 +35,31 @@ src/
     download.rs   — resumable file downloads (native only)
   backend/
     mod.rs        — DefaultBackend type alias based on features
-    hyper.rs      — Hyper + async-net backend
+    hyper/
+      mod.rs      — Hyper + async-net backend; ALPN picks h1 or h2 per connection
+      rt.rs       — hyper::rt::Executor/Timer over the backend spawner + async-io
+      h3.rs       — HTTP/3 connection over QUIC (h3 + h3-quinn; http3 feature)
+      alt_svc.rs  — RFC 7838 Alt-Svc parsing and the per-origin h3 advertisement
+      test_support.rs — shared test fixtures: throwaway CA, TLS and h3 servers
     curl.rs       — libcurl backend
     apple.rs      — URLSession backend (Apple platforms)
     web.rs        — Fetch API backend (wasm32)
   transport/
     mod.rs        — Transport / TransportBuilder (proxy rules + trusted roots; all targets)
     proxy.rs      — Proxy / ProxyBuilder over hyper-util's matcher (env + OS settings)
-    tls.rs        — TLS engine: rustls + rustls-platform-verifier, or native-tls
-    stream.rs     — Stream (TCP / TLS / TLS-in-TLS) and the hyper I/O adapter
+    tls.rs        — TLS engine: rustls + rustls-platform-verifier, or native-tls (one config per ALPN offer)
+    native_tls_stream.rs — in-tree futures-io adapter for native-tls (ALPN access)
+    stream.rs     — Stream (TCP / TLS / TLS-in-TLS)
+    hyper_io.rs   — futures-io → hyper::rt adapter (also included by the hyper test server)
     connect.rs    — connect(transport, target): direct, HTTP proxy, CONNECT tunnel, SOCKS5
     tunnel.rs     — HTTP CONNECT through hyper's upgrade machinery
     socks5.rs     — SOCKS5 CONNECT client (RFC 1928/1929)
     happy_eyeballs.rs — RFC 8305 TCP connection racing
+    pool.rs       — per-origin connection pool for the hyper backend (h1 leases, shared h2, dial coalescing)
+    dns.rs        — HTTPS/SVCB record lookup for HTTP/3 discovery (RFC 9460)
+    dns/runtime.rs — hickory RuntimeProvider on async-io/async-net
+    dns/android.rs — android.net.DnsResolver.rawQuery over JNI
+    quic.rs       — quinn::Runtime on async-io, shared QUIC endpoint (http3 feature)
     android.rs    — hands the JVM from ndk-context to the platform verifier
   ext.rs          — ResponseExt trait (into_json, into_string, etc.)
   cache.rs        — HTTP caching middleware (Cache-Control, ETag)
@@ -60,6 +72,13 @@ src/
   websocket.rs    — cross-platform WebSocket client
   multipart.rs    — multipart/form-data
   error.rs        — error types
+tests/
+  common/
+    fixture.rs    — local httpbin fixture: hyper server, thread-per-connection,
+                    CORS on every response; shared by the native suites and the
+                    standalone binary (kept free of `crate::` paths)
+  fixture-server/ — zenwave-test-fixture: standalone binary serving the fixture
+                    for the wasm and workerd lanes (own workspace, not a member)
 ```
 
 ## Architecture
@@ -70,7 +89,9 @@ Each middleware wraps the inner client and transforms requests/responses.
 backend over `Transport::system()` wrapped in `FollowRedirect`;
 `zenwave::client_with(transport)` does the same over an explicit `Transport`. Backends are constructed from a
 `Transport` (trusted roots, TLS engine); `Transport::system()` is built once
-per process. `cfg` aliases (`native`, `tls_rustls`, `tls_native`,
+per process. The hyper backend's connections are pooled per origin on the
+`Transport` (`transport/pool.rs`), so clients sharing one transport reuse
+them. `cfg` aliases (`native`, `tls_rustls`, `tls_native`,
 `tls_engine`, `connector`, `android_verifier`) come from `build.rs`.
 
 The `http-kit` crate (separate dependency) defines `Endpoint`, `Middleware`,

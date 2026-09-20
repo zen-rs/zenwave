@@ -8,6 +8,29 @@ use http::{HeaderValue, Uri};
 use super::{Transport, happy_eyeballs, socks5, stream::Stream, tunnel};
 use crate::{Error, error::ProxyErrorKind};
 
+/// The HTTP versions a TLS connection may offer the server through ALPN.
+#[derive(Clone, Copy, Debug)]
+pub enum Protocols {
+    /// Offer `http/1.1` only: plaintext connections, websockets, and the TLS
+    /// leg to a forward proxy (hyper's h2 client cannot speak absolute-form).
+    Http1,
+    /// Offer `h2` and `http/1.1`, letting the server pick. Without the `http2`
+    /// feature this offers `http/1.1` alone.
+    #[cfg_attr(not(feature = "hyper-backend"), allow(dead_code))]
+    // only the hyper backend asks for h2; websockets never do
+    Http2OrHttp1,
+}
+
+/// The HTTP version a [`Connection`] negotiated, or will speak.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Protocol {
+    /// HTTP/1.1 — always the answer for plaintext connections.
+    Http1,
+    /// HTTP/2, negotiated through ALPN on the innermost TLS layer.
+    #[cfg(feature = "http2")]
+    Http2,
+}
+
 /// Where a connection should end up.
 #[derive(Clone, Copy, Debug)]
 pub struct Target<'a> {
@@ -18,6 +41,8 @@ pub struct Target<'a> {
     /// Through an HTTP proxy, tunnel even a plaintext target with `CONNECT`
     /// instead of sending absolute-form requests. Websockets need this.
     pub tunnel_plaintext: bool,
+    /// The HTTP versions offered to the target through ALPN.
+    pub protocols: Protocols,
 }
 
 /// How requests on a [`Connection`] must be written.
@@ -39,6 +64,22 @@ pub enum Via {
 pub struct Connection {
     pub stream: Stream,
     pub via: Via,
+    /// What the innermost TLS layer negotiated, [`Protocol::Http1`] for plaintext.
+    #[cfg_attr(not(feature = "hyper-backend"), allow(dead_code))]
+    // only the hyper backend acts on the negotiated protocol; websockets and
+    // the CONNECT tunnel only need the stream
+    pub protocol: Protocol,
+}
+
+/// Whether a connection to `target` would go through a proxy — HTTP/3 is
+/// never dialed to a proxied origin: QUIC bypasses the proxy, so the pool
+/// keeps such origins on TCP regardless of what they advertise.
+#[cfg(http3)]
+pub fn proxied(transport: &Transport, target: Target<'_>) -> Result<bool, Error> {
+    Ok(transport
+        .proxy()
+        .intercept(&destination_uri(target)?)
+        .is_some())
 }
 
 /// Connect to `target` following the transport's proxy rules.
@@ -46,10 +87,7 @@ pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connec
     let Some(intercept) = transport.proxy().intercept(&destination_uri(target)?) else {
         let tcp = tcp(target.host, target.port).await?;
         let stream = finish(transport, target, tcp).await?;
-        return Ok(Connection {
-            stream,
-            via: Via::Direct,
-        });
+        return connection(stream, Via::Direct, target);
     };
 
     let proxy_uri = intercept.uri();
@@ -65,27 +103,41 @@ pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connec
             let tcp = tcp(proxy_host, proxy_port).await?;
 
             if !target.tls && !target.tunnel_plaintext {
+                // Absolute-form requests to a forward proxy are HTTP/1.1, so
+                // the TLS leg to the proxy offers no h2.
                 let stream = if proxy_tls {
-                    Stream::Tls(Box::new(transport.tls().connect(proxy_host, tcp).await?))
+                    Stream::Tls(Box::new(
+                        transport
+                            .tls()
+                            .connect(proxy_host, tcp, Protocols::Http1)
+                            .await?,
+                    ))
                 } else {
                     Stream::Tcp(tcp)
                 };
-                return Ok(Connection {
+                return connection(
                     stream,
-                    via: Via::HttpProxy {
+                    Via::HttpProxy {
                         authorization: intercept.basic_auth().cloned(),
                     },
-                });
+                    target,
+                );
             }
 
             let authority = authority(target.host, target.port);
             let stream = if proxy_tls {
-                let to_proxy = transport.tls().connect(proxy_host, tcp).await?;
+                let to_proxy = transport
+                    .tls()
+                    .connect(proxy_host, tcp, Protocols::Http1)
+                    .await?;
                 let tunneled =
                     tunnel::connect(to_proxy, &authority, intercept.basic_auth()).await?;
                 if target.tls {
                     Stream::TlsOverTls(Box::new(
-                        transport.tls().connect(target.host, tunneled).await?,
+                        transport
+                            .tls()
+                            .connect(target.host, tunneled, target.protocols)
+                            .await?,
                     ))
                 } else {
                     Stream::Tls(Box::new(tunneled))
@@ -94,10 +146,7 @@ pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connec
                 let tunneled = tunnel::connect(tcp, &authority, intercept.basic_auth()).await?;
                 finish(transport, target, tunneled).await?
             };
-            Ok(Connection {
-                stream,
-                via: Via::Direct,
-            })
+            connection(stream, Via::Direct, target)
         }
         "socks5" | "socks5h" => {
             let proxy_port = proxy_uri.port_u16().unwrap_or(1080);
@@ -111,13 +160,25 @@ pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connec
             )
             .await?;
             let stream = finish(transport, target, tcp).await?;
-            Ok(Connection {
-                stream,
-                via: Via::Direct,
-            })
+            connection(stream, Via::Direct, target)
         }
         other => Err(ProxyErrorKind::UnsupportedScheme(other.to_owned()).into()),
     }
+}
+
+/// The protocol a freshly built stream will speak: the innermost TLS layer's
+/// negotiated ALPN for TLS targets, always [`Protocol::Http1`] for plaintext.
+fn connection(stream: Stream, via: Via, target: Target<'_>) -> Result<Connection, Error> {
+    let protocol = match (target.tls, stream.negotiated_alpn()?.as_deref()) {
+        #[cfg(feature = "http2")]
+        (true, Some(b"h2")) => Protocol::Http2,
+        _ => Protocol::Http1,
+    };
+    Ok(Connection {
+        stream,
+        via,
+        protocol,
+    })
 }
 
 /// Wrap a TCP stream that already reaches the target in TLS when asked.
@@ -128,7 +189,10 @@ async fn finish(
 ) -> Result<Stream, Error> {
     if target.tls {
         Ok(Stream::Tls(Box::new(
-            transport.tls().connect(target.host, tcp).await?,
+            transport
+                .tls()
+                .connect(target.host, tcp, target.protocols)
+                .await?,
         )))
     } else {
         Ok(Stream::Tcp(tcp))

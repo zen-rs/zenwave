@@ -9,11 +9,30 @@ use skyzen::utils::{Bytes, Json};
 use skyzen::{Body, Response, StatusCode};
 use zenwave::Client as _;
 
-const ECHO: &str = "https://httpbingo.org";
+/// The local httpbin fixture, baked in at build time: a Worker cannot read a
+/// runtime environment here, and reaching the public internet made the lane
+/// depend on httpbingo being up. `scripts/test-workerd.sh` starts the
+/// fixture and exports the variable before `skyzen build`.
+const ECHO: &str = match option_env!("ZENWAVE_TEST_BASE_URL") {
+    Some(base) => base,
+    None => panic!(
+        "ZENWAVE_TEST_BASE_URL must be set when building the worker; \
+         scripts/test-workerd.sh starts the fixture and exports it"
+    ),
+};
 
-/// httpbingo refuses requests that carry no `User-Agent` (402), and a Worker's
-/// `fetch` sends none by itself, so every request names this test.
+/// A Worker's `fetch` sends no `User-Agent` by itself, so every request names
+/// this test.
 const USER_AGENT: &str = "zenwave-workerd-smoke";
+
+/// The fixture URL plus a path; `ECHO` may carry a trailing slash.
+fn echo(path: &str) -> String {
+    format!(
+        "{}/{}",
+        ECHO.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
 
 async fn relay(outcome: Result<Value, zenwave::Error>) -> Response {
     match outcome {
@@ -38,7 +57,7 @@ async fn get() -> Response {
     let outcome = async {
         let mut client = zenwave::client();
         let response = client
-            .get(format!("{ECHO}/get"))?
+            .get(echo("/get"))?
             .header("User-Agent", USER_AGENT)?
             .await?;
         response.into_body().into_json::<Value>().await.map_err(Into::into)
@@ -52,7 +71,7 @@ async fn post(Json(payload): Json<Value>) -> Response {
     let outcome = async {
         let mut client = zenwave::client();
         let response = client
-            .post(format!("{ECHO}/post"))?
+            .post(echo("/post"))?
             .header("User-Agent", USER_AGENT)?
             .json_body(&payload)?
             .await?;
@@ -67,7 +86,7 @@ async fn bytes(body: Bytes) -> Response {
     let outcome = async {
         let mut client = zenwave::client();
         let response = client
-            .put(format!("{ECHO}/put"))?
+            .put(echo("/put"))?
             .header("User-Agent", USER_AGENT)?
             .header("Content-Type", "text/plain")?
             .bytes_body(body.to_vec())

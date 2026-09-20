@@ -155,7 +155,8 @@ jobs:
         with:
           shared-key: ci-ubuntu
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov --features curl-backend --workspace --lcov --output-path lcov.info
+      - uses: taiki-e/install-action@nextest
+      - run: cargo llvm-cov nextest --features curl-backend --workspace --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v4
         with:
           use_oidc: true

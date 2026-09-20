@@ -27,8 +27,11 @@ powerset=(
 
 with_engine() {
   echo "::group::feature powerset with $1"
+  local include="$backends,ws,http2"
+  # http3 needs QUIC-capable TLS, so it only exists in the rustls slice.
+  [[ "$1" == rustls ]] && include="$include,http3"
   "${powerset[@]}" --features "$1" \
-    --include-features "$backends,ws" --at-least-one-of "$backends" \
+    --include-features "$include" --at-least-one-of "$backends" \
     -- -D warnings
   echo "::endgroup::"
 }

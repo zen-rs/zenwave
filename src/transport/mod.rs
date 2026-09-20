@@ -32,6 +32,8 @@
 use std::fmt;
 #[cfg(native)]
 use std::sync::Arc;
+#[cfg(http3)]
+use std::{future::Future, pin::Pin};
 
 #[cfg(native)]
 use rustls_pki_types::{CertificateDer, pem::PemObject};
@@ -44,10 +46,28 @@ mod android;
 mod ca_bundle;
 #[cfg(connector)]
 pub(crate) mod connect;
+// HTTPS records only feed HTTP/3 discovery, so the resolver exists only
+// where the hyper backend can dial QUIC.
+#[cfg(http3)]
+pub(crate) mod dns;
 #[cfg(connector)]
-mod happy_eyeballs;
+pub(crate) mod happy_eyeballs;
+// Kept `crate::`-free so `tests/common` can include the same file for its
+// hyper test server.
+#[cfg(connector)]
+pub(crate) mod hyper_io;
+#[cfg(tls_native)]
+pub(crate) mod native_tls_stream;
+// The hyper backend's per-origin connection pool; other backends pool through
+// their platform.
+#[cfg(all(connector, feature = "hyper-backend"))]
+pub(crate) mod pool;
 #[cfg(native)]
 pub mod proxy;
+// Consumed by the hyper backend's h3 connections and, for the endpoint, the
+// connection pool.
+#[cfg(http3)]
+pub(crate) mod quic;
 #[cfg(connector)]
 mod socks5;
 #[cfg(connector)]
@@ -59,6 +79,12 @@ mod tunnel;
 
 #[cfg(native)]
 pub use proxy::{Proxy, ProxyBuilder};
+
+/// Schedules the futures a DNS resolver or QUIC driver runs in the
+/// background. The backend supplies its own spawner so that work runs
+/// wherever connection drivers already run; [`dns`] and [`quic`] share it.
+#[cfg(http3)]
+pub(crate) type Spawn = Arc<dyn Fn(Pin<Box<dyn Future<Output = ()> + Send>>) + Send + Sync>;
 
 /// How connections are established: trusted roots and, on native platforms,
 /// the TLS engine configured with them.
@@ -79,6 +105,21 @@ struct Inner {
     ca_bundle: Option<Vec<u8>>,
     #[cfg(tls_engine)]
     tls: tls::TlsConnector,
+    /// Connections the hyper backend reuses, keyed by origin.
+    #[cfg(all(connector, feature = "hyper-backend"))]
+    pool: pool::Pool,
+    /// QUIC endpoint shared by every h3 connection, bound on first use.
+    #[cfg(http3)]
+    quic: once_cell::sync::OnceCell<quinn::Endpoint>,
+    /// The resolver configuration read once at build; on Android the unit
+    /// config — `DnsResolver` is configured by the OS.
+    #[cfg(http3)]
+    dns: dns::Config,
+    /// The hickory resolver over `dns`, built on first lookup so its runtime
+    /// takes the caller's [`Spawn`]; kept for its pooled name-server
+    /// connections and TTL response cache.
+    #[cfg(all(http3, not(target_os = "android")))]
+    resolver: once_cell::sync::OnceCell<dns::HickoryResolver>,
 }
 
 impl Transport {
@@ -144,6 +185,33 @@ impl Transport {
     pub(crate) fn ca_bundle(&self) -> Option<&[u8]> {
         self.inner.ca_bundle.as_deref()
     }
+
+    /// The connection pool hyper backends check out of; shared by every
+    /// backend and `zenwave` convenience call over this transport.
+    #[cfg(all(connector, feature = "hyper-backend"))]
+    pub(crate) fn pool(&self) -> &pool::Pool {
+        &self.inner.pool
+    }
+
+    /// The QUIC endpoint h3 connections share, bound on first use. `spawn`
+    /// schedules the futures quinn drives in the background.
+    #[cfg(http3)]
+    pub(crate) fn quic_endpoint(&self, spawn: Spawn) -> Result<&quinn::Endpoint, Error> {
+        self.inner.quic.get_or_try_init(|| quic::endpoint(spawn))
+    }
+
+    /// The HTTPS (SVCB) record for `host`:`port`, resolved through the
+    /// transport's DNS resolver. `spawn` schedules the futures the resolver
+    /// drives in the background.
+    #[cfg(http3)]
+    pub(crate) async fn https_record(
+        &self,
+        spawn: Spawn,
+        host: &str,
+        port: u16,
+    ) -> Result<Option<dns::HttpsRecord>, Error> {
+        dns::https_record(&self.inner, spawn, host, port).await
+    }
 }
 
 impl fmt::Debug for Transport {
@@ -168,6 +236,10 @@ pub struct TransportBuilder {
     proxy: Option<Proxy>,
     #[cfg(native)]
     extra_roots: Vec<CertificateDer<'static>>,
+    /// Resolver configuration override — tests point it at an in-process
+    /// DNS server instead of the system's.
+    #[cfg(all(http3, not(target_os = "android")))]
+    dns: Option<dns::Config>,
 }
 
 impl fmt::Debug for TransportBuilder {
@@ -215,6 +287,16 @@ impl TransportBuilder {
         self
     }
 
+    /// Resolve through `config` instead of the system resolver
+    /// configuration — a constructor for tests, not a runtime hook.
+    #[cfg(all(http3, not(target_os = "android")))]
+    #[allow(dead_code)] // only the h3 discovery tests override the configuration
+    #[must_use]
+    pub(crate) fn dns_config(mut self, config: dns::Config) -> Self {
+        self.dns = Some(config);
+        self
+    }
+
     /// Load trust material and configure the TLS engine.
     ///
     /// # Errors
@@ -232,6 +314,21 @@ impl TransportBuilder {
             } else {
                 Some(ca_bundle::platform_roots_with(&self.extra_roots)?)
             };
+            // HTTPS records only feed HTTP/3 discovery: a host without a
+            // resolver configuration (minimal containers, musl static
+            // binaries) still resolves names through `getaddrinfo`, so
+            // `build` records the failure and `https_record` reports it
+            // per lookup.
+            #[cfg(all(http3, not(target_os = "android")))]
+            let dns = self.dns.unwrap_or_else(|| {
+                let config = dns::Config::system();
+                if let dns::Config::Unavailable(reason) = &config {
+                    tracing::warn!("system DNS resolver configuration unavailable: {reason}");
+                }
+                config
+            });
+            #[cfg(all(http3, target_os = "android"))]
+            let dns = dns::Config;
             Ok(Transport {
                 inner: Arc::new(Inner {
                     proxy: self.proxy.unwrap_or_else(Proxy::system),
@@ -240,6 +337,14 @@ impl TransportBuilder {
                     ca_bundle,
                     #[cfg(tls_engine)]
                     tls,
+                    #[cfg(all(connector, feature = "hyper-backend"))]
+                    pool: pool::Pool::new(),
+                    #[cfg(http3)]
+                    quic: once_cell::sync::OnceCell::new(),
+                    #[cfg(http3)]
+                    dns,
+                    #[cfg(all(http3, not(target_os = "android")))]
+                    resolver: once_cell::sync::OnceCell::new(),
                 }),
             })
         }

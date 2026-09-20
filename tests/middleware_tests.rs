@@ -43,7 +43,7 @@ async fn test_cookie_store_middleware() {
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn test_cookie_store_creation() {
     let cookie_store = CookieStore::default();
-    assert!(!format!("{cookie_store:?}").is_empty());
+    assert_ne!(format!("{cookie_store:?}"), "");
 }
 
 #[test_executors::async_test]
@@ -130,7 +130,7 @@ async fn test_middleware_with_custom_middleware() {
 
     let response = response.unwrap();
     let body = response.into_body().into_string().await.unwrap();
-    assert!(body.contains("X-Test"));
+    assert!(body.contains("x-test"));
     assert!(body.contains("middleware-test"));
 }
 

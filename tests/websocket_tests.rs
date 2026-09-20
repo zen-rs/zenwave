@@ -201,6 +201,7 @@ async fn websocket_handles_server_ping() {
             .await
             .unwrap();
         let _ = ws.close(None).await;
+        while let Some(Ok(_)) = ws.next().await {}
     });
 
     let client = zenwave::websocket::connect(format!("ws://{addr}"))
