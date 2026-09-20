@@ -35,7 +35,9 @@ src/
     download.rs   — resumable file downloads (native only)
   backend/
     mod.rs        — DefaultBackend type alias based on features
-    hyper.rs      — Hyper + async-net backend
+    hyper/
+      mod.rs      — Hyper + async-net backend
+      h3.rs       — HTTP/3 connection over QUIC (h3 + h3-quinn; http3 feature)
     curl.rs       — libcurl backend
     apple.rs      — URLSession backend (Apple platforms)
     web.rs        — Fetch API backend (wasm32)
@@ -51,6 +53,7 @@ src/
     dns.rs        — HTTPS/SVCB record lookup for HTTP/3 discovery (RFC 9460)
     dns/runtime.rs — hickory RuntimeProvider on async-io/async-net
     dns/android.rs — android.net.DnsResolver.rawQuery over JNI
+    quic.rs       — quinn::Runtime on async-io, shared QUIC endpoint (http3 feature)
     android.rs    — hands the JVM from ndk-context to the platform verifier
   ext.rs          — ResponseExt trait (into_json, into_string, etc.)
   cache.rs        — HTTP caching middleware (Cache-Control, ETag)

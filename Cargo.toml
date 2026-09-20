@@ -39,9 +39,9 @@ cfg_aliases = "0.2"
 
 [features]
 # Default: hyper transport, rustls verified by the operating system's trust
-# store (`rustls-platform-verifier`), websockets. On wasm32 the built-in Fetch
-# backend is always used and none of the native features apply.
-default = ["hyper-backend", "rustls", "ws"]
+# store (`rustls-platform-verifier`), websockets, HTTP/3. On wasm32 the
+# built-in Fetch backend is always used and none of the native features apply.
+default = ["hyper-backend", "rustls", "ws", "http3"]
 
 # HTTP backends (native platforms only). At least one must be enabled.
 #
@@ -71,6 +71,10 @@ hyper-native-tls = ["hyper-backend", "native-tls"]
 
 # Websocket support (async-tungstenite on native, web-sys WebSocket on wasm).
 ws = ["dep:async-tungstenite"]
+
+# HTTP/3 over QUIC for the hyper backend. QUIC needs a QUIC-capable TLS
+# library, so it requires the `rustls` engine.
+http3 = ["rustls", "dep:bytes", "dep:h3", "dep:h3-quinn", "dep:quinn"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-sys = { version = "0.3", features = [
@@ -121,6 +125,12 @@ rustls-native-certs = { version = "0.8", optional = true }
 pem = { version = "4", optional = true }
 native-tls = { version = "0.2", optional = true }
 async-tungstenite = { version = "0.34.0", default-features = false, features = ["smol-runtime"], optional = true }
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring"], optional = true }
+h3 = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.10", optional = true }
+# Nonblocking socket work in `transport::dns::runtime` and `transport::quic`.
+socket2 = "0.6"
+bytes = { version = "1", optional = true }
 async-fs = { version = "2.2.0", default-features = false }
 dirs = "6.0"
 once_cell = "1.19"
@@ -145,8 +155,6 @@ core-foundation = { version = "0.10", optional = true }
 # wasm32 never links rustls at all.
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))'.dependencies]
 rustls-platform-verifier = { version = "0.7", optional = true }
-# Nonblocking `connect` on an explicitly bound socket in `transport::dns::runtime`.
-socket2 = "0.6"
 
 # `EINPROGRESS` from a nonblocking `connect` in `transport::dns::runtime`.
 [target.'cfg(all(unix, not(target_os = "android")))'.dependencies]

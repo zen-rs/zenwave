@@ -25,7 +25,7 @@ use common::httpbin_uri;
 fn test_hyper_backend_creation() {
     let backend = HyperBackend::default();
     // Just ensure it can be created
-    assert!(!format!("{backend:?}").is_empty());
+    assert_ne!(format!("{backend:?}"), "");
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
@@ -33,7 +33,7 @@ fn test_hyper_backend_creation() {
 #[cfg(default_hyper)]
 fn test_hyper_backend_default() {
     let backend = HyperBackend::default();
-    assert!(!format!("{backend:?}").is_empty());
+    assert_ne!(format!("{backend:?}"), "");
 }
 
 #[test_executors::async_test]

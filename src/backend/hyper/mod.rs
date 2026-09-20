@@ -19,6 +19,11 @@ use crate::{
     },
 };
 
+// Consumed by the connection pool (#69); today only its own tests dial h3.
+#[cfg(http3)]
+#[allow(dead_code)]
+pub mod h3;
+
 /// Hyper-based HTTP client backend powered by `async-io`/`async-net`.
 #[derive(Debug)]
 pub struct HyperBackend {
@@ -66,6 +71,8 @@ impl Default for HyperBackend {
 #[derive(Debug)]
 pub enum HyperError {
     Connection(hyper::Error),
+    #[cfg(http3)]
+    Http3(Box<dyn core::error::Error + Send + Sync>),
     InvalidUri(String),
     Remote {
         status: StatusCode,
@@ -74,10 +81,21 @@ pub enum HyperError {
     },
 }
 
+impl HyperError {
+    /// Wrap a QUIC or h3 protocol error.
+    #[cfg(http3)]
+    #[allow(dead_code)] // used by `h3` once the pool (#69) dials h3 connections
+    pub(crate) fn http3(error: impl Into<Box<dyn core::error::Error + Send + Sync>>) -> Self {
+        Self::Http3(error.into())
+    }
+}
+
 impl core::fmt::Display for HyperError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Connection(err) => write!(f, "connection error: {err}"),
+            #[cfg(http3)]
+            Self::Http3(err) => write!(f, "http/3 error: {err}"),
             Self::InvalidUri(uri) => write!(f, "invalid uri: {uri}"),
             Self::Remote { status, body, .. } => {
                 if let Some(body) = body {
@@ -123,6 +141,8 @@ impl From<HyperError> for crate::Error {
                 }),
             },
             HyperError::Connection(e) => Self::Transport(Box::new(e)),
+            #[cfg(http3)]
+            HyperError::Http3(e) => Self::Transport(e),
             HyperError::InvalidUri(uri) => Self::InvalidUri(uri),
         }
     }
