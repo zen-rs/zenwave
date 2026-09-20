@@ -10,6 +10,21 @@ publish = false
 
 [workspace]
 
+# The whole binary is `#[path]`-included from `tests/common/fixture.rs`, so
+# cargo-machete — which scans this package's own `src/` for uses — sees none
+# of these crates named. Every one of them is used by that file.
+[package.metadata.cargo-machete]
+ignored = [
+    "hyper",
+    "http-body-util",
+    "async-io",
+    "futures-util",
+    "futures-io",
+    "base64",
+    "serde_json",
+    "url",
+]
+
 # The dependencies of `tests/common/fixture.rs`, pinned as in the root
 # manifest.
 [dependencies]
