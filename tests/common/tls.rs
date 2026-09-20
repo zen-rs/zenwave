@@ -4,6 +4,8 @@
 //! servers when it was handed the CA through `Transport::extra_root_certificates_pem`.
 #![allow(dead_code)]
 
+#[cfg(feature = "ws")]
+use std::sync::Mutex;
 use std::{net::SocketAddr, sync::Arc, thread};
 
 use async_net::TcpListener;
@@ -29,6 +31,9 @@ pub struct TlsFixture {
     https_addr: SocketAddr,
     #[cfg(feature = "ws")]
     wss_addr: SocketAddr,
+    /// The ALPN protocol negotiated on the latest wss connection, if any.
+    #[cfg(feature = "ws")]
+    wss_alpn: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl TlsFixture {
@@ -62,6 +67,15 @@ impl TlsFixture {
     #[cfg(feature = "ws")]
     pub fn proxied_wss_uri(&self) -> String {
         format!("wss://{}:{}", super::FIXTURE_HOST, self.wss_addr.port())
+    }
+
+    /// The ALPN protocol negotiated on the most recent wss connection.
+    ///
+    /// The wss listener offers `h2` and `http/1.1`, so this reports what the
+    /// client asked for: websockets must negotiate `http/1.1` only.
+    #[cfg(feature = "ws")]
+    pub fn wss_alpn(&self) -> Option<Vec<u8>> {
+        self.wss_alpn.lock().expect("wss ALPN lock").clone()
     }
 }
 
@@ -109,6 +123,16 @@ fn start() -> TlsFixture {
         .with_no_client_auth()
         .with_single_cert(vec![leaf.der().clone()], key)
         .expect("server certificate");
+
+    // The wss listener offers h2 alongside http/1.1 so tests can assert the
+    // client only asked for http/1.1 — the websocket handshake is an HTTP/1.1
+    // upgrade and must not negotiate h2.
+    #[cfg(feature = "ws")]
+    let wss_acceptor = {
+        let mut wss_config = config.clone();
+        wss_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        TlsAcceptor::from(Arc::new(wss_config))
+    };
     let acceptor = TlsAcceptor::from(Arc::new(config));
 
     let (https_listener, https_addr) = bind();
@@ -116,15 +140,20 @@ fn start() -> TlsFixture {
     let (wss_listener, wss_addr) = bind();
 
     #[cfg(feature = "ws")]
+    let wss_alpn = Arc::new(Mutex::new(None));
+    #[cfg(feature = "ws")]
     {
-        let wss_acceptor = acceptor.clone();
+        let recorded = wss_alpn.clone();
         thread::spawn(move || {
             smol::block_on(async move {
                 loop {
                     let (stream, _) = wss_listener.accept().await.expect("accept WSS");
                     let acceptor = wss_acceptor.clone();
+                    let recorded = recorded.clone();
                     smol::spawn(async move {
                         if let Ok(tls) = acceptor.accept(stream).await {
+                            *recorded.lock().expect("wss ALPN lock") =
+                                tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
                             echo_websocket(tls).await;
                         }
                     })
@@ -154,6 +183,8 @@ fn start() -> TlsFixture {
         https_addr,
         #[cfg(feature = "ws")]
         wss_addr,
+        #[cfg(feature = "ws")]
+        wss_alpn,
     }
 }
 

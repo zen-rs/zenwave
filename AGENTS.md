@@ -36,7 +36,8 @@ src/
   backend/
     mod.rs        — DefaultBackend type alias based on features
     hyper/
-      mod.rs      — Hyper + async-net backend
+      mod.rs      — Hyper + async-net backend; ALPN picks h1 or h2 per connection
+      rt.rs       — hyper::rt::Executor/Timer over the backend spawner + async-io
       h3.rs       — HTTP/3 connection over QUIC (h3 + h3-quinn; http3 feature)
     curl.rs       — libcurl backend
     apple.rs      — URLSession backend (Apple platforms)
@@ -44,7 +45,8 @@ src/
   transport/
     mod.rs        — Transport / TransportBuilder (proxy rules + trusted roots; all targets)
     proxy.rs      — Proxy / ProxyBuilder over hyper-util's matcher (env + OS settings)
-    tls.rs        — TLS engine: rustls + rustls-platform-verifier, or native-tls
+    tls.rs        — TLS engine: rustls + rustls-platform-verifier, or native-tls (one config per ALPN offer)
+    native_tls_stream.rs — in-tree futures-io adapter for native-tls (ALPN access)
     stream.rs     — Stream (TCP / TLS / TLS-in-TLS) and the hyper I/O adapter
     connect.rs    — connect(transport, target): direct, HTTP proxy, CONNECT tunnel, SOCKS5
     tunnel.rs     — HTTP CONNECT through hyper's upgrade machinery

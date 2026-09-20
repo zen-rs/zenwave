@@ -258,7 +258,12 @@ On native, pick a backend, and for hyper a TLS engine:
 
 `ws` (websockets) uses the same engine as hyper. When `rustls` and `native-tls`
 are both enabled, `rustls` takes precedence. The `default` feature enables
-`hyper-backend`, `rustls` and `ws`.
+`hyper-backend`, `rustls`, `ws` and `http2`.
+
+The hyper backend negotiates HTTP/2 through ALPN by default on every TLS
+connection that allows it (`http2` feature); servers that only speak HTTP/1.1
+keep working unchanged. Disable with `default-features = false` for a smaller
+build.
 
 Common dependency lines:
 

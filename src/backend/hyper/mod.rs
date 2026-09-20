@@ -1,23 +1,34 @@
-use core::future::Future;
-use std::{mem::replace, thread};
+mod rt;
 
-use async_io::block_on;
+use core::future::Future;
+use std::mem::replace;
+#[cfg(feature = "http2")]
+use std::time::Duration;
+
 use executor_core::{AnyExecutor, Executor};
 use futures_util::TryStreamExt;
 use http::StatusCode;
 use http_body_util::BodyDataStream;
 use http_kit::{Endpoint, HttpError, Method, Request, Response};
 use hyper::http;
+use rt::Spawner;
 use tracing::{debug, warn};
 
 use crate::{
     Client, Transport,
     error::HttpErrorResponse,
     transport::{
-        connect::{Target, Via, connect},
+        connect::{Protocol, Protocols, Target, Via, connect},
         stream::HyperIo,
     },
 };
+
+/// h2 keepalive: a PING every 30 s, the connection dropped 10 s after a
+/// ping goes unanswered.
+#[cfg(feature = "http2")]
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(feature = "http2")]
+const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Consumed by the connection pool (#69); today only its own tests dial h3.
 #[cfg(http3)]
@@ -28,16 +39,16 @@ pub mod h3;
 #[derive(Debug)]
 pub struct HyperBackend {
     transport: Transport,
-    executor: Option<AnyExecutor>,
+    spawner: Spawner,
 }
 
 impl HyperBackend {
     /// Create a backend that connects through `transport`.
     #[must_use]
-    pub const fn new(transport: Transport) -> Self {
+    pub fn new(transport: Transport) -> Self {
         Self {
             transport,
-            executor: None,
+            spawner: Spawner::new(None),
         }
     }
 
@@ -47,17 +58,7 @@ impl HyperBackend {
     pub fn with_executor(transport: Transport, executor: impl Executor + 'static) -> Self {
         Self {
             transport,
-            executor: Some(AnyExecutor::new(executor)),
-        }
-    }
-
-    fn spawn_background(&self, fut: impl Future<Output = ()> + Send + 'static) {
-        if let Some(executor) = &self.executor {
-            executor.spawn(fut).detach();
-        } else {
-            thread::spawn(move || {
-                block_on(fut);
-            });
+            spawner: Spawner::new(Some(AnyExecutor::new(executor))),
         }
     }
 }
@@ -156,15 +157,8 @@ impl Endpoint for HyperBackend {
             .uri("/")
             .body(http_kit::Body::empty())
             .unwrap();
-        let mut request: http::Request<http_kit::Body> = replace(request, dummy_request);
+        let request: http::Request<http_kit::Body> = replace(request, dummy_request);
 
-        // Ensure Host header is present (required by hyper 1.0 / HTTP 1.1)
-        if request.headers().get(http::header::HOST).is_none()
-            && let Some(authority) = request.uri().authority()
-            && let Ok(value) = http::header::HeaderValue::from_str(authority.as_str())
-        {
-            request.headers_mut().insert(http::header::HOST, value);
-        }
         let connection = {
             let uri = request.uri();
             let host = uri
@@ -183,46 +177,16 @@ impl Endpoint for HyperBackend {
                     port,
                     tls,
                     tunnel_plaintext: false,
+                    protocols: Protocols::Http2OrHttp1,
                 },
             )
             .await?
         };
-        match connection.via {
-            Via::Direct => {
-                let origin_form = request
-                    .uri()
-                    .path_and_query()
-                    .map_or("/", http::uri::PathAndQuery::as_str);
-                *request.uri_mut() = origin_form
-                    .parse()
-                    .map_err(|err| HyperError::InvalidUri(format!("{origin_form}: {err}")))?;
-            }
-            Via::HttpProxy { authorization } => {
-                // Absolute-form request line: the proxy needs the full URI.
-                if let Some(authorization) = authorization {
-                    request
-                        .headers_mut()
-                        .insert(http::header::PROXY_AUTHORIZATION, authorization);
-                }
-            }
-        }
-        let stream = connection.stream;
-        let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
-            .handshake(HyperIo(stream))
-            .await
-            .map_err(HyperError::Connection)?;
-
-        // Drive the connection in the background while the caller consumes its body.
-        self.spawn_background(async move {
-            if let Err(err) = connection.await {
-                warn!(error = %err, "hyper connection error");
-            }
-        });
-
-        let response = sender
-            .send_request(request)
-            .await
-            .map_err(HyperError::Connection)?;
+        let response = match connection.protocol {
+            Protocol::Http1 => self.send_http1(connection, request).await?,
+            #[cfg(feature = "http2")]
+            Protocol::Http2 => self.send_http2(connection, request).await?,
+        };
 
         let mut response = response.map(|body| {
             let stream = BodyDataStream::new(body)
@@ -254,6 +218,90 @@ impl Endpoint for HyperBackend {
         }
 
         Ok(response)
+    }
+}
+
+impl HyperBackend {
+    /// Send `request` over an HTTP/1.1 connection, shaping it for the path it
+    /// took: origin-form and a `Host` header direct, absolute-form through a
+    /// forward proxy.
+    async fn send_http1(
+        &self,
+        connection: crate::transport::connect::Connection,
+        mut request: http::Request<http_kit::Body>,
+    ) -> Result<http::Response<hyper::body::Incoming>, HyperError> {
+        if request.headers().get(http::header::HOST).is_none()
+            && let Some(authority) = request.uri().authority()
+            && let Ok(value) = http::header::HeaderValue::from_str(authority.as_str())
+        {
+            request.headers_mut().insert(http::header::HOST, value);
+        }
+        match connection.via {
+            Via::Direct => {
+                let origin_form = request
+                    .uri()
+                    .path_and_query()
+                    .map_or("/", http::uri::PathAndQuery::as_str);
+                *request.uri_mut() = origin_form
+                    .parse()
+                    .map_err(|err| HyperError::InvalidUri(format!("{origin_form}: {err}")))?;
+            }
+            Via::HttpProxy { authorization } => {
+                // Absolute-form request line: the proxy needs the full URI.
+                if let Some(authorization) = authorization {
+                    request
+                        .headers_mut()
+                        .insert(http::header::PROXY_AUTHORIZATION, authorization);
+                }
+            }
+        }
+        let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
+            .handshake(HyperIo(connection.stream))
+            .await
+            .map_err(HyperError::Connection)?;
+
+        // Drive the connection in the background while the caller consumes its body.
+        self.spawner.spawn(drive(connection));
+
+        sender
+            .send_request(request)
+            .await
+            .map_err(HyperError::Connection)
+    }
+
+    /// Send `request` over an HTTP/2 connection. The URI stays in absolute
+    /// form: hyper derives `:scheme` and `:authority` from it, and h2 has no
+    /// `Host` header.
+    #[cfg(feature = "http2")]
+    async fn send_http2(
+        &self,
+        connection: crate::transport::connect::Connection,
+        request: http::Request<http_kit::Body>,
+    ) -> Result<http::Response<hyper::body::Incoming>, HyperError> {
+        let mut builder = hyper::client::conn::http2::Builder::new(self.spawner.clone());
+        builder
+            .timer(rt::Timer)
+            .keep_alive_interval(KEEP_ALIVE_INTERVAL)
+            .keep_alive_timeout(KEEP_ALIVE_TIMEOUT);
+        let (mut sender, connection) = builder
+            .handshake(HyperIo(connection.stream))
+            .await
+            .map_err(HyperError::Connection)?;
+
+        self.spawner.spawn(drive(connection));
+
+        sender
+            .send_request(request)
+            .await
+            .map_err(HyperError::Connection)
+    }
+}
+
+/// Drive a hyper connection future to completion in the background while the
+/// caller consumes its response body.
+async fn drive(connection: impl Future<Output = Result<(), hyper::Error>>) {
+    if let Err(err) = connection.await {
+        warn!(error = %err, "hyper connection error");
     }
 }
 
@@ -344,7 +392,7 @@ mod tests {
             .expect("response tail must write");
     }
 
-    fn read_http_request(socket: &mut std::net::TcpStream) {
+    fn read_http_request(socket: &mut std::net::TcpStream) -> Vec<u8> {
         let mut request = [0_u8; 4_096];
         let mut filled = 0_usize;
         loop {
@@ -357,13 +405,45 @@ mod tests {
                 .windows(4)
                 .any(|window| window == b"\r\n\r\n")
             {
-                return;
+                return request[..filled].to_vec();
             }
             assert!(
                 filled < request.len(),
                 "test request exceeded its explicit header bound"
             );
         }
+    }
+
+    #[test]
+    fn plaintext_requests_speak_http1_in_origin_form() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("test server must bind");
+        let address = listener.local_addr().expect("test address must exist");
+        let worker = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("test request must arrive");
+            let request = read_http_request(&mut socket);
+            let head = String::from_utf8(request).expect("request head is ASCII");
+            let request_line = head.lines().next().expect("request has a first line");
+            assert_eq!(request_line, "GET /plaintext HTTP/1.1");
+            assert!(
+                head.lines()
+                    .any(|line| line.to_ascii_lowercase().starts_with("host: ")),
+                "h1 requests must carry a Host header"
+            );
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("response must write");
+        });
+
+        let mut client = HyperBackend::default();
+        let response = futures_executor::block_on(async {
+            client
+                .get(format!("http://{address}/plaintext"))
+                .expect("test request must build")
+                .await
+        })
+        .expect("plaintext request must succeed");
+        assert_eq!(response.status(), http::StatusCode::OK);
+        worker.join().expect("test server must finish");
     }
 
     #[test]
@@ -444,5 +524,255 @@ mod tests {
         assert!(futures_executor::block_on(body.next()).is_none());
         body_worker.join().expect("body worker must finish");
         server.finish();
+    }
+
+    #[cfg(feature = "http2")]
+    mod http2 {
+        use std::{
+            convert::Infallible,
+            net::SocketAddr,
+            sync::{Arc, mpsc},
+            thread,
+            time::Duration,
+        };
+
+        use async_io::block_on;
+        use async_net::{TcpListener, TcpStream};
+        use futures_rustls::TlsAcceptor;
+        use http::{Version, header::HOST};
+        use http_body_util::{BodyExt, Full};
+        use hyper::{
+            body::{Bytes, Incoming},
+            service::service_fn,
+        };
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+            KeyPair,
+        };
+        use rustls::{
+            ServerConfig,
+            crypto::ring,
+            pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+        };
+        use time::{Duration as TimeDelta, OffsetDateTime};
+
+        use super::super::{HyperBackend, rt::Spawner};
+        use crate::{Client as _, ResponseExt as _, Transport, transport::stream::HyperIo};
+
+        const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+        /// What the server observed on one request.
+        #[derive(Debug)]
+        struct Observed {
+            version: Version,
+            authority: Option<String>,
+            host: Option<String>,
+            body: Vec<u8>,
+        }
+
+        /// A TLS server that speaks h2 or h1 depending on the negotiated ALPN
+        /// and reports every request it sees.
+        struct AlpnServer {
+            address: SocketAddr,
+            ca_der: Vec<u8>,
+            observed: mpsc::Receiver<Observed>,
+        }
+
+        impl AlpnServer {
+            /// Start a server offering `alpn_protocols`, in preference order.
+            fn start(alpn_protocols: &[&[u8]]) -> Self {
+                let (ca_der, mut config) = server_config();
+                config.alpn_protocols = alpn_protocols
+                    .iter()
+                    .map(|protocol| protocol.to_vec())
+                    .collect();
+                let acceptor = TlsAcceptor::from(Arc::new(config));
+                let (listener, address) = block_on(async {
+                    let listener = TcpListener::bind("127.0.0.1:0")
+                        .await
+                        .expect("test listener must bind");
+                    let address = listener.local_addr().expect("test address must exist");
+                    (listener, address)
+                });
+                let (observed_tx, observed) = mpsc::channel();
+                thread::spawn(move || {
+                    block_on(async move {
+                        while let Ok((tcp, _)) = listener.accept().await {
+                            let acceptor = acceptor.clone();
+                            let observed_tx = observed_tx.clone();
+                            thread::spawn(move || block_on(serve(acceptor, tcp, observed_tx)));
+                        }
+                    });
+                });
+                Self {
+                    address,
+                    ca_der,
+                    observed,
+                }
+            }
+
+            fn transport(&self) -> Transport {
+                Transport::builder()
+                    .extra_root_certificate_der(self.ca_der.clone())
+                    .build()
+                    .expect("test transport must build")
+            }
+
+            fn uri(&self, path: &str) -> String {
+                format!("https://localhost:{}{}", self.address.port(), path)
+            }
+
+            /// The next request the server saw.
+            fn next_request(&self) -> Observed {
+                self.observed
+                    .recv_timeout(TEST_TIMEOUT)
+                    .expect("server must see the request")
+            }
+        }
+
+        /// A throwaway CA and a leaf certificate for localhost, signed by it.
+        fn server_config() -> (Vec<u8>, ServerConfig) {
+            let now = OffsetDateTime::now_utc();
+            let ca_key = KeyPair::generate().expect("generate CA key");
+            let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+            ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            ca_params
+                .distinguished_name
+                .push(DnType::CommonName, "zenwave test CA");
+            ca_params.not_before = now - TimeDelta::days(1);
+            ca_params.not_after = now + TimeDelta::days(365);
+            let ca_cert = ca_params.self_signed(&ca_key).expect("self-sign CA");
+            let issuer = Issuer::new(ca_params, ca_key);
+
+            let leaf_key = KeyPair::generate().expect("generate leaf key");
+            let mut leaf_params =
+                CertificateParams::new(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
+                    .expect("leaf params");
+            leaf_params
+                .distinguished_name
+                .push(DnType::CommonName, "localhost");
+            leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+            leaf_params.not_before = now - TimeDelta::days(1);
+            leaf_params.not_after = now + TimeDelta::days(365);
+            let leaf = leaf_params
+                .signed_by(&leaf_key, &issuer)
+                .expect("sign leaf certificate");
+
+            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+            let config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("protocol versions")
+                .with_no_client_auth()
+                .with_single_cert(vec![leaf.der().clone()], key)
+                .expect("server certificate");
+            (ca_cert.der().to_vec(), config)
+        }
+
+        /// Accept TLS on `tcp` and serve every request on the connection with
+        /// the HTTP version ALPN negotiated.
+        async fn serve(acceptor: TlsAcceptor, tcp: TcpStream, observed: mpsc::Sender<Observed>) {
+            let Ok(tls) = acceptor.accept(tcp).await else {
+                return;
+            };
+            let negotiated = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+            let service = service_fn(move |request: hyper::Request<Incoming>| {
+                let observed = observed.clone();
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let body = body
+                        .collect()
+                        .await
+                        .expect("request body must be readable")
+                        .to_bytes()
+                        .to_vec();
+                    observed
+                        .send(Observed {
+                            version: parts.version,
+                            authority: parts
+                                .uri
+                                .authority()
+                                .map(|authority| authority.as_str().to_owned()),
+                            host: parts
+                                .headers
+                                .get(HOST)
+                                .map(|value| value.to_str().expect("Host is ASCII").to_owned()),
+                            body,
+                        })
+                        .expect("observed channel must be open");
+                    Ok::<_, Infallible>(hyper::Response::new(Full::new(Bytes::from_static(
+                        b"zenwave",
+                    ))))
+                }
+            });
+            let io = HyperIo(tls);
+            let _ = match negotiated.as_deref() {
+                Some(b"h2") => {
+                    hyper::server::conn::http2::Builder::new(Spawner::new(None))
+                        .serve_connection(io, service)
+                        .await
+                }
+                _ => {
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service)
+                        .await
+                }
+            };
+        }
+
+        #[test]
+        fn https_requests_negotiate_http2_through_alpn() {
+            let server = AlpnServer::start(&[b"h2", b"http/1.1"]);
+            let mut client = HyperBackend::new(server.transport());
+
+            block_on(async {
+                let response = client
+                    .post(server.uri("/echo"))
+                    .expect("test request must build")
+                    .bytes_body(b"streaming body".to_vec())
+                    .await
+                    .expect("h2 request must succeed");
+                assert_eq!(
+                    &*response.into_string().await.expect("body must read"),
+                    "zenwave"
+                );
+                // A second request negotiates h2 again (connection reuse is
+                // issue #68's connection pool, not part of this change).
+                client
+                    .get(server.uri("/second"))
+                    .expect("test request must build")
+                    .await
+                    .expect("second h2 request must succeed");
+            });
+
+            let first = server.next_request();
+            assert_eq!(first.version, Version::HTTP_2);
+            assert_eq!(
+                first.authority.as_deref(),
+                Some(format!("localhost:{}", server.address.port()).as_str()),
+                "the server must see :authority, derived from the absolute URI"
+            );
+            assert_eq!(first.host, None, "h2 requests carry no Host header");
+            assert_eq!(first.body, b"streaming body");
+
+            let second = server.next_request();
+            assert_eq!(second.version, Version::HTTP_2);
+        }
+
+        #[test]
+        fn http1_only_servers_still_work() {
+            let server = AlpnServer::start(&[b"http/1.1"]);
+            let mut client = HyperBackend::new(server.transport());
+
+            block_on(async {
+                client
+                    .get(server.uri("/"))
+                    .expect("test request must build")
+                    .await
+                    .expect("h1 request must succeed");
+            });
+
+            let observed = server.next_request();
+            assert_eq!(observed.version, Version::HTTP_11);
+        }
     }
 }

@@ -139,7 +139,7 @@ mod native {
     use crate::{
         Transport,
         transport::{
-            connect::{Connection, Target, Via, connect as connect_stream},
+            connect::{Connection, Protocols, Target, Via, connect as connect_stream},
             stream::Stream,
         },
     };
@@ -230,13 +230,16 @@ mod native {
         let port = url
             .port_or_known_default()
             .ok_or_else(|| WebSocketError::InvalidTarget("websocket URI does not imply a port"))?;
-        let Connection { stream, via } = connect_stream(
+        // The websocket handshake is an HTTP/1.1 upgrade, so the TLS layer
+        // must not offer h2.
+        let Connection { stream, via, .. } = connect_stream(
             transport,
             Target {
                 host,
                 port,
                 tls,
                 tunnel_plaintext: true,
+                protocols: Protocols::Http1,
             },
         )
         .await

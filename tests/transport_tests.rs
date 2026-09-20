@@ -106,4 +106,24 @@ mod websocket {
         assert_eq!(echoed, WebSocketMessage::Text("over tls".into()));
         socket.close().await.expect("close");
     }
+
+    #[test_executors::async_test]
+    async fn websockets_offer_only_http1_through_alpn() {
+        let fixture = tls_fixture();
+        let transport = Transport::builder()
+            .extra_root_certificates_pem(&fixture.ca_pem)
+            .expect("test CA parses")
+            .build()
+            .expect("transport builds");
+        let socket =
+            websocket::connect_with(fixture.wss_uri(), &transport, WebSocketConfig::default())
+                .await
+                .expect("the test CA is trusted");
+        assert_eq!(
+            fixture.wss_alpn().as_deref(),
+            Some(b"http/1.1".as_slice()),
+            "the wss listener offers h2, but a websocket handshake must stay on HTTP/1.1"
+        );
+        socket.close().await.expect("close");
+    }
 }
