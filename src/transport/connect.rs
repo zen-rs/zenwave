@@ -16,6 +16,8 @@ pub enum Protocols {
     Http1,
     /// Offer `h2` and `http/1.1`, letting the server pick. Without the `http2`
     /// feature this offers `http/1.1` alone.
+    #[cfg_attr(not(feature = "hyper-backend"), allow(dead_code))]
+    // only the hyper backend asks for h2; websockets never do
     Http2OrHttp1,
 }
 
