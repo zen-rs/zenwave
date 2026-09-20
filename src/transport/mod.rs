@@ -30,10 +30,10 @@
 //! ```
 
 use std::fmt;
-#[cfg(connector)]
-use std::{future::Future, pin::Pin};
 #[cfg(native)]
 use std::sync::Arc;
+#[cfg(connector)]
+use std::{future::Future, pin::Pin};
 
 #[cfg(native)]
 use rustls_pki_types::{CertificateDer, pem::PemObject};
@@ -50,6 +50,10 @@ pub(crate) mod connect;
 pub(crate) mod dns;
 #[cfg(connector)]
 mod happy_eyeballs;
+// Kept `crate::`-free so `tests/common` can include the same file for its
+// hyper test server.
+#[cfg(connector)]
+pub(crate) mod hyper_io;
 #[cfg(tls_native)]
 pub(crate) mod native_tls_stream;
 // The hyper backend's per-origin connection pool; other backends pool through

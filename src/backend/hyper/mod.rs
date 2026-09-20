@@ -23,8 +23,8 @@ use crate::{
     error::HttpErrorResponse,
     transport::{
         connect::{Protocol, Protocols, Target, Via, connect},
-        pool::{Checkout, DialPermit, H1Lease, Origin, Pool},
-        stream::HyperIo,
+        hyper_io::HyperIo,
+        pool::{Checkout, DialPermit, H1Lease, Origin, Pool, Reuse},
     },
 };
 
@@ -120,7 +120,7 @@ impl HyperBackend {
                 // Ready before pooling: the handle is shared as soon as it
                 // is stored.
                 sender.ready().await.map_err(HyperError::Connection)?;
-                Pool::insert_h2(permit, sender.clone()).await;
+                Pool::insert_h2(permit, sender.clone());
                 let response = sender
                     .try_send_request(request)
                     .await
@@ -251,7 +251,20 @@ impl Endpoint for HyperBackend {
 
         let mut retried = false;
         let (response, lease) = loop {
-            let checkout = self.transport.pool().checkout(origin.clone()).await;
+            // The retry after a pooled connection refused the request dials
+            // fresh rather than reusing another connection from the pool.
+            let checkout = self
+                .transport
+                .pool()
+                .checkout(
+                    origin.clone(),
+                    if retried {
+                        Reuse::FreshDial
+                    } else {
+                        Reuse::Pooled
+                    },
+                )
+                .await;
             match checkout {
                 #[cfg(feature = "http2")]
                 // The URI stays absolute: hyper derives `:scheme` and
@@ -863,11 +876,21 @@ mod tests {
             // Abandon the body; the lease returns, sees the dead sender, and
             // the next request dials a fresh connection.
             drop(response);
-            client
+            let second = client
                 .get(format!("http://{address}/"))
                 .expect("test request must build")
-                .await
-                .expect("request after a dropped body must succeed");
+                .into_future();
+            futures_util::pin_mut!(second);
+            let timeout = async_io::Timer::after(STREAMING_TEST_TIMEOUT);
+            futures_util::pin_mut!(timeout);
+            match futures_util::future::select(second, timeout).await {
+                Either::Left((response, _)) => {
+                    response.expect("request after a dropped body must succeed");
+                }
+                Either::Right(_) => {
+                    panic!("request after a dropped body did not complete")
+                }
+            }
         });
         assert_eq!(
             accepts.load(Ordering::SeqCst),
@@ -911,7 +934,7 @@ mod tests {
         use time::{Duration as TimeDelta, OffsetDateTime};
 
         use super::super::{HyperBackend, rt::Spawner};
-        use crate::{Client as _, ResponseExt as _, Transport, transport::stream::HyperIo};
+        use crate::{Client as _, ResponseExt as _, Transport, transport::hyper_io::HyperIo};
 
         const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 

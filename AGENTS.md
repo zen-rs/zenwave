@@ -47,7 +47,8 @@ src/
     proxy.rs      — Proxy / ProxyBuilder over hyper-util's matcher (env + OS settings)
     tls.rs        — TLS engine: rustls + rustls-platform-verifier, or native-tls (one config per ALPN offer)
     native_tls_stream.rs — in-tree futures-io adapter for native-tls (ALPN access)
-    stream.rs     — Stream (TCP / TLS / TLS-in-TLS) and the hyper I/O adapter
+    stream.rs     — Stream (TCP / TLS / TLS-in-TLS)
+    hyper_io.rs   — futures-io → hyper::rt adapter (also included by the hyper test server)
     connect.rs    — connect(transport, target): direct, HTTP proxy, CONNECT tunnel, SOCKS5
     tunnel.rs     — HTTP CONNECT through hyper's upgrade machinery
     socks5.rs     — SOCKS5 CONNECT client (RFC 1928/1929)

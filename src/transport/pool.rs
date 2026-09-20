@@ -13,11 +13,11 @@
 use std::{
     collections::HashMap,
     fmt,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use async_lock::{Mutex, MutexGuardArc, Semaphore, SemaphoreGuardArc};
+use async_lock::{MutexGuardArc, Semaphore, SemaphoreGuardArc};
 use http::{Request, Response, uri::Scheme};
 #[cfg(feature = "http2")]
 use hyper::client::conn::http2;
@@ -54,7 +54,8 @@ pub struct Origin {
     pub port: u16,
 }
 
-/// Per-origin connection state.
+/// Per-origin connection state. The synchronous mutexes are never held
+/// across an `.await`; `dialing` and `h1_slots` are the only async waits.
 struct OriginEntry {
     /// Idle h1 senders, each an exclusive checkout. Idle connections hold no
     /// slot permit — the slot is freed when the connection is parked — so
@@ -66,24 +67,54 @@ struct OriginEntry {
     /// The origin's shared h2 handle; clones multiplex over one connection.
     #[cfg(feature = "http2")]
     h2: Mutex<Option<http2::SendRequest<http_kit::Body>>>,
-    /// The protocol the last dial negotiated, so a known-h1 origin dials in
-    /// parallel under `h1_slots` while anything else serializes on `dialing`.
+    /// The protocol the origin speaks: `Some` once a dial negotiated it, or
+    /// immediately for plaintext — `http` has no ALPN, so it can only be h1.
+    /// A known-h1 origin dials in parallel under `h1_slots` while anything
+    /// else serializes on `dialing`.
     protocol: Mutex<Option<Protocol>>,
     /// Held while dialing an origin that is or may be h2, so concurrent first
     /// requests open one connection instead of N.
-    dialing: Arc<Mutex<()>>,
+    dialing: Arc<async_lock::Mutex<()>>,
 }
 
 impl OriginEntry {
-    fn new() -> Self {
+    fn new(origin: &Origin) -> Self {
         Self {
             h1_idle: Mutex::new(Vec::new()),
             h1_slots: Arc::new(Semaphore::new(MAX_H1_PER_ORIGIN)),
             #[cfg(feature = "http2")]
             h2: Mutex::new(None),
-            protocol: Mutex::new(None),
-            dialing: Arc::new(Mutex::new(())),
+            protocol: Mutex::new((origin.scheme == Scheme::HTTP).then_some(Protocol::Http1)),
+            dialing: Arc::new(async_lock::Mutex::new(())),
         }
+    }
+
+    /// Whether the entry still holds a usable connection — an idle h1 sender
+    /// that is neither closed nor expired, or a live h2 handle. Dead and
+    /// expired connections are evicted along the way. Connections leased
+    /// out or still dialing do not appear here; they keep the entry alive
+    /// through their own `Arc` instead.
+    fn has_live_connections(&self, idle_timeout: Duration) -> bool {
+        {
+            let mut idle = self.h1_idle.lock().expect("pool state poisoned");
+            idle.retain(|idle| {
+                !idle.sender.is_closed() && idle.idle_since.elapsed() < idle_timeout
+            });
+            if !idle.is_empty() {
+                return true;
+            }
+        }
+        #[cfg(feature = "http2")]
+        {
+            let mut h2 = self.h2.lock().expect("pool state poisoned");
+            if h2.as_ref().is_some_and(http2::SendRequest::is_closed) {
+                *h2 = None;
+            }
+            if h2.is_some() {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -101,6 +132,17 @@ struct IdleH1 {
     /// How the connection was reached; reapplied to every reused request.
     via: Via,
     idle_since: Instant,
+}
+
+/// Whether [`Pool::checkout`] may reuse a pooled connection.
+pub enum Reuse {
+    /// Anything pooled is fair game: a live h2 handle or an idle h1
+    /// connection.
+    Pooled,
+    /// Nothing pooled: dial a fresh connection. The one retry after a
+    /// pooled connection refused a request goes out this way — reusing
+    /// another connection from the same pool could hit the same failure.
+    FreshDial,
 }
 
 /// What [`Pool::checkout`] found for an origin.
@@ -171,17 +213,19 @@ impl H1Lease {
             via,
             permit,
         } = self;
-        // The lock is held only briefly elsewhere; if a checkout happens to
-        // hold it right now the connection is simply closed — reuse is an
-        // optimisation, never required.
-        if !sender.is_closed()
-            && let Some(mut idle) = entry.h1_idle.try_lock()
-        {
-            idle.push(IdleH1 {
-                sender,
-                via,
-                idle_since: Instant::now(),
-            });
+        // The lock is never held across an await, so a healthy connection is
+        // always parked — never dropped because the mutex happened to be
+        // contended.
+        if !sender.is_closed() {
+            entry
+                .h1_idle
+                .lock()
+                .expect("pool state poisoned")
+                .push(IdleH1 {
+                    sender,
+                    via,
+                    idle_since: Instant::now(),
+                });
         }
         drop(permit);
     }
@@ -229,23 +273,36 @@ impl Pool {
 
     /// Check out a connection for `origin`: a clone of a live h2 handle, a
     /// lease on an idle h1 connection, or a [`DialPermit`] to dial a new one.
-    pub async fn checkout(&self, origin: Origin) -> Checkout {
-        let entry = self.entry(&origin).await;
+    /// `reuse` says whether pooled connections may be reused; `FreshDial`
+    /// skips them so the retry after a refused request opens a new
+    /// connection.
+    pub async fn checkout(&self, origin: Origin, reuse: Reuse) -> Checkout {
+        let entry = self.entry(&origin);
+        let pooled = matches!(reuse, Reuse::Pooled);
         loop {
             #[cfg(feature = "http2")]
-            if let Some(sender) = live_h2(&entry).await {
+            if pooled && let Some(sender) = live_h2(&entry) {
                 return Checkout::H2(sender);
             }
             // An idle h1 connection exists only after `insert_h1` recorded
             // the protocol, so `h1_idle` only has to be consulted on the
             // known-h1 path.
-            if matches!(*entry.protocol.lock().await, Some(Protocol::Http1)) {
+            if matches!(
+                *entry.protocol.lock().expect("pool state poisoned"),
+                Some(Protocol::Http1)
+            ) {
                 // A known-h1 origin: h1 connections are exclusive, so
                 // parallel requests dial in parallel up to the slot limit,
                 // then wait for a connection to come back. The slot is
                 // acquired first and pairs with a parked connection if one
                 // is reusable, or with the dial's permit otherwise.
                 let permit = entry.h1_slots.acquire_arc().await;
+                if !pooled {
+                    return Checkout::Dial(DialPermit {
+                        entry,
+                        hold: DialHold::H1(permit),
+                    });
+                }
                 match self.lease_idle(&entry, permit).await {
                     Ok(lease) => return Checkout::H1(lease),
                     Err(permit) => {
@@ -261,10 +318,13 @@ impl Pool {
             // dials so one handshake serves every waiter.
             let dialing = entry.dialing.lock_arc().await;
             #[cfg(feature = "http2")]
-            if let Some(sender) = live_h2(&entry).await {
+            if pooled && let Some(sender) = live_h2(&entry) {
                 return Checkout::H2(sender);
             }
-            if matches!(*entry.protocol.lock().await, Some(Protocol::Http1)) {
+            if matches!(
+                *entry.protocol.lock().expect("pool state poisoned"),
+                Some(Protocol::Http1)
+            ) {
                 // The dial ahead of this one learned the origin speaks h1;
                 // take the semaphore path instead of holding `dialing`.
                 drop(dialing);
@@ -285,7 +345,7 @@ impl Pool {
         via: Via,
     ) -> H1Lease {
         let entry = permit.entry;
-        *entry.protocol.lock().await = Some(Protocol::Http1);
+        *entry.protocol.lock().expect("pool state poisoned") = Some(Protocol::Http1);
         let slot = match permit.hold {
             DialHold::H1(slot) => slot,
             DialHold::Coalesced(dialing) => {
@@ -307,20 +367,34 @@ impl Pool {
     /// origin's shared connection. `permit` still holds `dialing`, so the
     /// waiters re-check and find the handle as soon as it is stored.
     #[cfg(feature = "http2")]
-    pub async fn insert_h2(permit: DialPermit, sender: http2::SendRequest<http_kit::Body>) {
-        *permit.entry.protocol.lock().await = Some(Protocol::Http2);
-        *permit.entry.h2.lock().await = Some(sender);
+    pub fn insert_h2(permit: DialPermit, sender: http2::SendRequest<http_kit::Body>) {
+        *permit.entry.protocol.lock().expect("pool state poisoned") = Some(Protocol::Http2);
+        *permit.entry.h2.lock().expect("pool state poisoned") = Some(sender);
+        // Idle h1 connections the dial replaces can never be checked out
+        // again; drop them rather than leaving their drivers parked.
+        permit
+            .entry
+            .h1_idle
+            .lock()
+            .expect("pool state poisoned")
+            .clear();
         drop(permit);
     }
 
-    /// The entry for `origin`, created on first contact.
-    async fn entry(&self, origin: &Origin) -> Arc<OriginEntry> {
-        self.origins
-            .lock()
-            .await
-            .entry(origin.clone())
-            .or_insert_with(|| Arc::new(OriginEntry::new()))
-            .clone()
+    /// The entry for `origin`, created on first contact. Inserting a new
+    /// origin sweeps the table: an entry referenced only by the map that
+    /// holds no live connection is finished and removed.
+    fn entry(&self, origin: &Origin) -> Arc<OriginEntry> {
+        let mut origins = self.origins.lock().expect("pool state poisoned");
+        if let Some(entry) = origins.get(origin) {
+            return entry.clone();
+        }
+        let entry = Arc::new(OriginEntry::new(origin));
+        origins.insert(origin.clone(), entry.clone());
+        origins.retain(|_, entry| {
+            Arc::strong_count(entry) > 1 || entry.has_live_connections(self.idle_timeout)
+        });
+        entry
     }
 
     /// Lease the next reusable idle h1 connection for `entry` under the
@@ -333,21 +407,22 @@ impl Pool {
     ) -> Result<H1Lease, SemaphoreGuardArc> {
         loop {
             let idle = {
-                let mut idle = entry.h1_idle.lock().await;
+                let mut idle = entry.h1_idle.lock().expect("pool state poisoned");
                 idle.retain(|idle| {
                     !idle.sender.is_closed() && idle.idle_since.elapsed() < self.idle_timeout
                 });
                 idle.pop()
             };
-            let Some(IdleH1 { sender, via, .. }) = idle else {
+            let Some(IdleH1 {
+                mut sender, via, ..
+            }) = idle
+            else {
                 return Err(permit);
             };
-            // A parked connection's driver is waiting on the dispatch
-            // channel, so `is_ready` is a snapshot of whether it can take a
-            // request right now. One that cannot — dead driver, closed
-            // socket — is dropped rather than awaited: checkout never
-            // blocks on an idle connection's state while holding a slot.
-            if sender.is_ready() {
+            // The sender is out of the idle set, so this wait holds no pool
+            // lock. A connection that died while parked makes `ready` error;
+            // it is dropped and the loop looks at the next.
+            if sender.ready().await.is_ok() {
                 return Ok(H1Lease {
                     sender,
                     entry: entry.clone(),
@@ -363,8 +438,8 @@ impl Pool {
 /// the next checkout re-dials. `is_closed` is the whole liveness check: the
 /// h2 dispatcher is always ready to accept a stream while it is open.
 #[cfg(feature = "http2")]
-async fn live_h2(entry: &OriginEntry) -> Option<http2::SendRequest<http_kit::Body>> {
-    let mut h2 = entry.h2.lock().await;
+fn live_h2(entry: &OriginEntry) -> Option<http2::SendRequest<http_kit::Body>> {
+    let mut h2 = entry.h2.lock().expect("pool state poisoned");
     match h2.as_ref() {
         Some(sender) if sender.is_closed() => {
             *h2 = None;
@@ -387,20 +462,21 @@ mod tests {
         collections::HashMap,
         io::Read as _,
         net::TcpListener,
+        sync::Mutex,
         thread,
         time::{Duration, Instant},
     };
 
-    use async_lock::Mutex;
     use async_net::TcpStream;
     use futures_executor::block_on;
     use http::uri::Scheme;
     use hyper::client::conn::http1;
 
-    use super::{Checkout, IdleH1, Origin, Pool};
+    use super::{Checkout, IdleH1, Origin, Pool, Reuse};
     use crate::transport::{
         connect::{Protocol, Via},
-        stream::{HyperIo, Stream},
+        hyper_io::HyperIo,
+        stream::Stream,
     };
 
     /// A real h1 sender on a loopback connection the peer holds open.
@@ -441,14 +517,18 @@ mod tests {
     }
 
     /// Park `sender` on the entry for `origin`, as a completed h1 dial would.
-    async fn park_idle(pool: &Pool, origin: &Origin, sender: http1::SendRequest<http_kit::Body>) {
-        let entry = pool.entry(origin).await;
-        *entry.protocol.lock().await = Some(Protocol::Http1);
-        entry.h1_idle.lock().await.push(IdleH1 {
-            sender,
-            via: Via::Direct,
-            idle_since: Instant::now(),
-        });
+    fn park_idle(pool: &Pool, origin: &Origin, sender: http1::SendRequest<http_kit::Body>) {
+        let entry = pool.entry(origin);
+        *entry.protocol.lock().expect("pool state poisoned") = Some(Protocol::Http1);
+        entry
+            .h1_idle
+            .lock()
+            .expect("pool state poisoned")
+            .push(IdleH1 {
+                sender,
+                via: Via::Direct,
+                idle_since: Instant::now(),
+            });
     }
 
     #[test]
@@ -456,10 +536,26 @@ mod tests {
         block_on(async {
             let pool = Pool::new();
             let origin = origin();
-            park_idle(&pool, &origin, h1_sender().await).await;
+            park_idle(&pool, &origin, h1_sender().await);
             assert!(
-                matches!(pool.checkout(origin).await, Checkout::H1(_)),
+                matches!(pool.checkout(origin, Reuse::Pooled).await, Checkout::H1(_)),
                 "a live idle connection must be leased, not dialed past"
+            );
+        });
+    }
+
+    #[test]
+    fn fresh_dial_skips_idle_connections() {
+        block_on(async {
+            let pool = Pool::new();
+            let origin = origin();
+            park_idle(&pool, &origin, h1_sender().await);
+            assert!(
+                matches!(
+                    pool.checkout(origin, Reuse::FreshDial).await,
+                    Checkout::Dial(_)
+                ),
+                "a fresh-dial checkout must ignore idle connections"
             );
         });
     }
@@ -472,14 +568,21 @@ mod tests {
                 idle_timeout: Duration::ZERO,
             };
             let origin = origin();
-            park_idle(&pool, &origin, h1_sender().await).await;
-            let entry = pool.entry(&origin).await;
+            park_idle(&pool, &origin, h1_sender().await);
+            let entry = pool.entry(&origin);
             assert!(
-                matches!(pool.checkout(origin).await, Checkout::Dial(_)),
+                matches!(
+                    pool.checkout(origin, Reuse::Pooled).await,
+                    Checkout::Dial(_)
+                ),
                 "an expired idle connection must be evicted, not leased"
             );
             assert!(
-                entry.h1_idle.lock().await.is_empty(),
+                entry
+                    .h1_idle
+                    .lock()
+                    .expect("pool state poisoned")
+                    .is_empty(),
                 "the expired entry must be gone"
             );
         });
@@ -490,16 +593,71 @@ mod tests {
         block_on(async {
             let pool = Pool::new();
             let origin = origin();
-            let Checkout::Dial(permit) = pool.checkout(origin.clone()).await else {
+            let Checkout::Dial(permit) = pool.checkout(origin.clone(), Reuse::Pooled).await else {
                 panic!("an empty pool must hand out a dial permit");
             };
             Pool::insert_h1(permit, h1_sender().await, Via::Direct)
                 .await
                 .release();
             assert!(
-                matches!(pool.checkout(origin).await, Checkout::H1(_)),
+                matches!(pool.checkout(origin, Reuse::Pooled).await, Checkout::H1(_)),
                 "a released connection must come back out of idle"
             );
+        });
+    }
+
+    #[test]
+    fn finished_origins_are_swept_on_insert() {
+        block_on(async {
+            let pool = Pool {
+                origins: Mutex::new(HashMap::new()),
+                idle_timeout: Duration::ZERO,
+            };
+            for port in [9_u16, 10, 11] {
+                let origin = Origin { port, ..origin() };
+                park_idle(&pool, &origin, h1_sender().await);
+            }
+            // An entry kept alive by something else — here a checkout's dial
+            // permit — must survive the sweep.
+            let held = Origin {
+                port: 12,
+                ..origin()
+            };
+            let Checkout::Dial(permit) = pool.checkout(held.clone(), Reuse::Pooled).await else {
+                panic!("an empty origin must hand out a dial permit");
+            };
+
+            pool.entry(&Origin {
+                port: 13,
+                ..origin()
+            });
+            let origins = pool.origins.lock().expect("pool state poisoned");
+            assert!(
+                !origins.contains_key(&origin())
+                    && !origins.contains_key(&Origin {
+                        port: 10,
+                        ..origin()
+                    })
+                    && !origins.contains_key(&Origin {
+                        port: 11,
+                        ..origin()
+                    }),
+                "expired, unreferenced entries must be swept"
+            );
+            assert!(
+                origins.contains_key(&held),
+                "an entry still referenced by a permit must survive"
+            );
+            assert!(
+                origins.contains_key(&Origin {
+                    port: 13,
+                    ..origin()
+                }),
+                "the newly inserted origin must survive"
+            );
+            assert_eq!(origins.len(), 2);
+            drop(origins);
+            drop(permit);
         });
     }
 }
