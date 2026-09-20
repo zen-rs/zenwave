@@ -34,29 +34,93 @@ pub mod tls;
 #[allow(dead_code)]
 mod local {
     use std::{
+        convert::Infallible,
         fmt::Write as _,
-        io::{Read as _, Write as _},
+        io,
         net::{TcpListener, TcpStream},
+        pin::Pin,
+        task::{Context, Poll},
         thread,
         time::Duration,
     };
 
+    use async_io::Async;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
+    use futures_util::{AsyncRead, AsyncWrite};
+    use http_body_util::{BodyExt as _, Full};
+    use hyper::{
+        body::{Bytes, Incoming},
+        service::service_fn,
+    };
     use once_cell::sync::OnceCell;
     use url::Url;
 
-    /// A parsed request, everything the router needs of it.
-    struct TestRequest {
-        method: String,
-        /// The raw request target: origin-form or absolute-form.
-        target: String,
-        headers: Vec<(String, String)>,
-        /// `Connection: close`, or HTTP/1.0 without an explicit keep-alive.
-        close: bool,
+    /// `Async<TcpStream>` as a hyper `rt` IO — the same adapter as
+    /// `transport::stream::HyperIo`, which is `pub(crate)` and unreachable
+    /// from integration tests.
+    struct TestIo(Async<TcpStream>);
+
+    impl hyper::rt::Read for TestIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            mut buf: hyper::rt::ReadBufCursor<'_>,
+        ) -> Poll<io::Result<()>> {
+            // SAFETY: the cursor hands out its uninitialised tail; `poll_read`
+            // only writes into it and `advance` is called with the count it
+            // reported.
+            let slice = unsafe { buf.as_mut() };
+            let bytes = unsafe { &mut *(std::ptr::from_mut(slice) as *mut [u8]) };
+            match Pin::new(&mut self.0).poll_read(cx, bytes) {
+                Poll::Ready(Ok(n)) => {
+                    unsafe { buf.advance(n) };
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
     }
 
-    /// The response a route produces, serialized by [`serve_connection`].
+    impl hyper::rt::Write for TestIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_close(cx)
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write_vectored(cx, bufs)
+        }
+    }
+
+    /// A parsed request, everything the router needs of it.
+    struct TestRequest {
+        /// The request target, origin-form (`/path?query`).
+        target: String,
+        headers: Vec<(String, String)>,
+    }
+
+    /// The response a route produces; hyper serializes and frames it.
     struct TestResponse {
         status: u16,
         headers: Vec<(String, String)>,
@@ -67,6 +131,18 @@ mod local {
         fn with_header(mut self, name: &str, value: impl Into<String>) -> Self {
             self.headers.push((name.to_owned(), value.into()));
             self
+        }
+    }
+
+    impl From<TestResponse> for hyper::Response<Full<Bytes>> {
+        fn from(response: TestResponse) -> Self {
+            let mut builder = hyper::Response::builder().status(response.status);
+            for (name, value) in &response.headers {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+            builder
+                .body(Full::new(Bytes::from(response.body)))
+                .expect("response must build")
         }
     }
 
@@ -109,191 +185,47 @@ mod local {
         }
     }
 
-    /// One thread per connection. A pooled client pins a reader for the
-    /// connection's whole keep-alive lifetime, so dispatching connections
-    /// through a bounded worker pool can strand a task; dedicating a thread
-    /// per connection cannot.
+    /// One thread per connection. A pooled client keeps a connection open for
+    /// its whole keep-alive lifetime, so dispatching connections through a
+    /// bounded worker pool can strand a task; dedicating a thread per
+    /// connection cannot.
     fn run_server(listener: &TcpListener) {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { break };
-            thread::spawn(move || serve_connection(stream));
+            thread::spawn(move || {
+                let io = TestIo(Async::new(stream).expect("async socket wrapper"));
+                let conn = hyper::server::conn::http1::Builder::new()
+                    .keep_alive(true)
+                    .serve_connection(io, service_fn(route));
+                let _ = async_io::block_on(conn);
+            });
         }
     }
 
-    fn serve_connection(mut stream: TcpStream) {
-        // Bytes read past the head belong to the body or the next request.
-        let mut pending = Vec::new();
-        while let Some(request) = read_request(&mut stream, &mut pending) {
-            let response = handle_request(&request);
-            if write_response(&mut stream, &request, &response).is_err() || request.close {
-                return;
-            }
-        }
-    }
-
-    /// Pull bytes from `stream` until `buffer` contains `needle`; returns the
-    /// offset one past it.
-    fn fill_until(stream: &mut TcpStream, buffer: &mut Vec<u8>, needle: &[u8]) -> Option<usize> {
-        loop {
-            if let Some(pos) = buffer
-                .windows(needle.len())
-                .position(|window| window == needle)
-            {
-                return Some(pos + needle.len());
-            }
-            let mut chunk = [0_u8; 8192];
-            match stream.read(&mut chunk) {
-                Ok(0) | Err(_) => return None,
-                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
-            }
-        }
-    }
-
-    /// Consume exactly `n` bytes off `buffer` then `stream`.
-    fn drain(stream: &mut TcpStream, buffer: &mut Vec<u8>, mut n: usize) -> Option<()> {
-        while n > 0 {
-            if buffer.is_empty() {
-                let mut chunk = [0_u8; 8192];
-                match stream.read(&mut chunk) {
-                    Ok(0) | Err(_) => return None,
-                    Ok(read) => buffer.extend_from_slice(&chunk[..read]),
-                }
-            }
-            let take = n.min(buffer.len());
-            buffer.drain(..take);
-            n -= take;
-        }
-        Some(())
-    }
-
-    /// Consume the next CRLF-terminated line off `buffer` then `stream`.
-    fn read_line(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
-        let end = fill_until(stream, buffer, b"\r\n")?;
-        let line = buffer[..end - 2].to_vec();
-        buffer.drain(..end);
-        Some(line)
-    }
-
-    /// Read one request: head, then its body. `None` on EOF or a malformed
-    /// request — the connection is closed either way.
-    fn read_request(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Option<TestRequest> {
-        let head_len = fill_until(stream, buffer, b"\r\n\r\n")?;
-        let (method, target, http10, headers) = {
-            let mut parsed_headers = [httparse::EMPTY_HEADER; 64];
-            let mut parsed = httparse::Request::new(&mut parsed_headers);
-            let Ok(httparse::Status::Complete(_)) = parsed.parse(&buffer[..head_len]) else {
-                return None;
-            };
-            (
-                parsed.method.unwrap_or_default().to_owned(),
-                parsed.path.unwrap_or_default().to_owned(),
-                parsed.version == Some(0),
-                parsed
-                    .headers
-                    .iter()
-                    .map(|header| {
-                        (
-                            header.name.to_owned(),
-                            String::from_utf8_lossy(header.value).into_owned(),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            )
+    /// Route one request: drain the body so the connection stays aligned for
+    /// keep-alive reuse, then produce the response.
+    async fn route(
+        request: hyper::Request<Incoming>,
+    ) -> Result<hyper::Response<Full<Bytes>>, Infallible> {
+        let (parts, body) = request.into_parts();
+        let _ = body.collect().await;
+        let request = TestRequest {
+            target: parts
+                .uri
+                .path_and_query()
+                .map_or_else(|| parts.uri.path().to_owned(), ToString::to_string),
+            headers: parts
+                .headers
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_owned(),
+                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                    )
+                })
+                .collect(),
         };
-        buffer.drain(..head_len);
-        let header = |name: &str| header_value(&headers, name);
-
-        if header("expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue")) {
-            stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").ok()?;
-        }
-
-        // Consume the body so the next request on this connection parses.
-        if let Some(length) = header("content-length").and_then(|v| v.parse::<usize>().ok()) {
-            drain(stream, buffer, length)?;
-        } else if header("transfer-encoding").is_some_and(|v| {
-            v.split(',')
-                .any(|t| t.trim().eq_ignore_ascii_case("chunked"))
-        }) {
-            loop {
-                let size = usize::from_str_radix(
-                    std::str::from_utf8(&read_line(stream, buffer)?)
-                        .ok()?
-                        .split(';')
-                        .next()
-                        .unwrap_or_default()
-                        .trim(),
-                    16,
-                )
-                .ok()?;
-                if size == 0 {
-                    // Trailers, through the blank line.
-                    while !read_line(stream, buffer)?.is_empty() {}
-                    break;
-                }
-                drain(stream, buffer, size + 2)?; // chunk data + CRLF
-            }
-        }
-
-        let connection = header("connection").unwrap_or_default();
-        let close = connection.eq_ignore_ascii_case("close")
-            || (http10 && !connection.eq_ignore_ascii_case("keep-alive"));
-        Some(TestRequest {
-            method,
-            target,
-            headers,
-            close,
-        })
-    }
-
-    fn write_response(
-        stream: &mut TcpStream,
-        request: &TestRequest,
-        response: &TestResponse,
-    ) -> std::io::Result<()> {
-        let mut head = format!(
-            "HTTP/1.1 {} {}\r\n",
-            response.status,
-            reason_phrase(response.status)
-        );
-        for (name, value) in &response.headers {
-            let _ = write!(head, "{name}: {value}\r\n");
-        }
-        // 1xx/204/304 carry no body; HEAD sends the headers only.
-        let bodyless = matches!(response.status, 100..=199 | 204 | 304);
-        if !bodyless {
-            let _ = write!(head, "content-length: {}\r\n", response.body.len());
-        }
-        if request.close {
-            head.push_str("connection: close\r\n");
-        }
-        head.push_str("\r\n");
-        stream.write_all(head.as_bytes())?;
-        if !bodyless && request.method != "HEAD" {
-            stream.write_all(&response.body)?;
-        }
-        stream.flush()
-    }
-
-    const fn reason_phrase(status: u16) -> &'static str {
-        match status {
-            200 => "OK",
-            201 => "Created",
-            204 => "No Content",
-            301 => "Moved Permanently",
-            302 => "Found",
-            304 => "Not Modified",
-            400 => "Bad Request",
-            401 => "Unauthorized",
-            403 => "Forbidden",
-            404 => "Not Found",
-            405 => "Method Not Allowed",
-            418 => "I'm a Teapot",
-            429 => "Too Many Requests",
-            500 => "Internal Server Error",
-            502 => "Bad Gateway",
-            503 => "Service Unavailable",
-            _ => "Status",
-        }
+        Ok(handle_request(&request).into())
     }
 
     fn handle_request(request: &TestRequest) -> TestResponse {
