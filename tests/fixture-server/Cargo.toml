@@ -1,0 +1,38 @@
+# Standalone binary that serves the shared httpbin fixture
+# (tests/common/fixture.rs) over TCP, so the wasm-pack and workerd lanes can
+# reach it from the browser or the Workers runtime. Not a workspace member:
+# like tests/workerd it is built on demand by the scripts that need it.
+[package]
+name = "zenwave-test-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+# The whole binary is `#[path]`-included from `tests/common/fixture.rs`, so
+# cargo-machete — which scans this package's own `src/` for uses — sees none
+# of these crates named. Every one of them is used by that file.
+[package.metadata.cargo-machete]
+ignored = [
+    "hyper",
+    "http-body-util",
+    "async-io",
+    "futures-util",
+    "futures-io",
+    "base64",
+    "serde_json",
+    "url",
+]
+
+# The dependencies of `tests/common/fixture.rs`, pinned as in the root
+# manifest.
+[dependencies]
+hyper = { version = "1.8", features = ["server", "http1", "http2"] }
+http-body-util = "0.1.3"
+async-io = "2.4"
+futures-util = "0.3"
+futures-io = "0.3"
+base64 = "0.22"
+serde_json = "1.0"
+url = "2.5"

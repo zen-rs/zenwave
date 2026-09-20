@@ -130,7 +130,7 @@ async fn test_middleware_with_custom_middleware() {
 
     let response = response.unwrap();
     let body = response.into_body().into_string().await.unwrap();
-    assert!(body.contains("X-Test"));
+    assert!(body.contains("x-test"));
     assert!(body.contains("middleware-test"));
 }
 
