@@ -96,3 +96,32 @@ async fn test_empty_response_handling() {
     let body_str = body.unwrap();
     assert!(body_str.is_empty());
 }
+
+/// The h1 pool must return its connection on every response path: error
+/// statuses consume the body into the error, a 204's empty body may never be
+/// polled, and an unread body releases on drop. If any of them leaked the
+/// lease, sequential requests would exhaust the origin's slots and the next
+/// checkout would never complete.
+#[cfg(not(target_arch = "wasm32"))]
+#[test_executors::async_test]
+async fn test_pooled_connection_released_on_every_path() {
+    use futures_util::future::{self, Either};
+    use std::time::Duration;
+
+    for path in [
+        "/status/500",
+        "/status/204",
+        "/status/404",
+        "/status/204",
+        "/status/500",
+    ] {
+        drop(get(httpbin_uri(path)).await);
+    }
+
+    let sixth = get(httpbin_uri("/status/200"));
+    let bound = async_io::Timer::after(Duration::from_secs(30));
+    let Either::Left((result, _)) = future::select(Box::pin(sixth), Box::pin(bound)).await else {
+        panic!("request did not complete within the bound");
+    };
+    assert!(result.is_ok());
+}

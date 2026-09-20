@@ -30,6 +30,8 @@
 //! ```
 
 use std::fmt;
+#[cfg(connector)]
+use std::{future::Future, pin::Pin};
 #[cfg(native)]
 use std::sync::Arc;
 
@@ -48,6 +50,10 @@ pub(crate) mod connect;
 mod happy_eyeballs;
 #[cfg(tls_native)]
 pub(crate) mod native_tls_stream;
+// The hyper backend's per-origin connection pool; other backends pool through
+// their platform.
+#[cfg(all(connector, feature = "hyper-backend"))]
+pub(crate) mod pool;
 #[cfg(native)]
 pub mod proxy;
 // Consumed by the hyper backend's h3 connections and, for the endpoint, the
@@ -66,6 +72,12 @@ mod tunnel;
 
 #[cfg(native)]
 pub use proxy::{Proxy, ProxyBuilder};
+
+/// Schedules the futures a DNS resolver or QUIC driver runs in the
+/// background. The backend supplies its own spawner so that work runs
+/// wherever connection drivers already run; [`dns`] and [`quic`] share it.
+#[cfg(connector)]
+pub(crate) type Spawn = Arc<dyn Fn(Pin<Box<dyn Future<Output = ()> + Send>>) + Send + Sync>;
 
 /// How connections are established: trusted roots and, on native platforms,
 /// the TLS engine configured with them.
@@ -86,6 +98,9 @@ struct Inner {
     ca_bundle: Option<Vec<u8>>,
     #[cfg(tls_engine)]
     tls: tls::TlsConnector,
+    /// Connections the hyper backend reuses, keyed by origin.
+    #[cfg(all(connector, feature = "hyper-backend"))]
+    pool: pool::Pool,
     /// QUIC endpoint shared by every h3 connection, bound on first use.
     #[cfg(http3)]
     #[allow(dead_code)] // read through `quic_endpoint`, used by the pool (#69)
@@ -156,11 +171,18 @@ impl Transport {
         self.inner.ca_bundle.as_deref()
     }
 
+    /// The connection pool hyper backends check out of; shared by every
+    /// backend and `zenwave` convenience call over this transport.
+    #[cfg(all(connector, feature = "hyper-backend"))]
+    pub(crate) fn pool(&self) -> &pool::Pool {
+        &self.inner.pool
+    }
+
     /// The QUIC endpoint h3 connections share, bound on first use. `spawn`
     /// schedules the futures quinn drives in the background.
     #[cfg(http3)]
     #[allow(dead_code)] // the connection pool (#69) calls this per h3 dial
-    pub(crate) fn quic_endpoint(&self, spawn: quic::Spawn) -> Result<&quinn::Endpoint, Error> {
+    pub(crate) fn quic_endpoint(&self, spawn: Spawn) -> Result<&quinn::Endpoint, Error> {
         self.inner.quic.get_or_try_init(|| quic::endpoint(spawn))
     }
 }
@@ -259,6 +281,8 @@ impl TransportBuilder {
                     ca_bundle,
                     #[cfg(tls_engine)]
                     tls,
+                    #[cfg(all(connector, feature = "hyper-backend"))]
+                    pool: pool::Pool::new(),
                     #[cfg(http3)]
                     quic: once_cell::sync::OnceCell::new(),
                 }),

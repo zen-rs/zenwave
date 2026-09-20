@@ -33,13 +33,42 @@ pub mod tls;
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 mod local {
-    use std::{fmt::Write, io::Cursor, thread, time::Duration};
+    use std::{
+        fmt::Write as _,
+        io::{Read as _, Write as _},
+        net::{TcpListener, TcpStream},
+        thread,
+        time::Duration,
+    };
 
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use once_cell::sync::OnceCell;
-    use tiny_http::{Header, ListenAddr, Request, Response, Server, StatusCode};
     use url::Url;
+
+    /// A parsed request, everything the router needs of it.
+    struct TestRequest {
+        method: String,
+        /// The raw request target: origin-form or absolute-form.
+        target: String,
+        headers: Vec<(String, String)>,
+        /// `Connection: close`, or HTTP/1.0 without an explicit keep-alive.
+        close: bool,
+    }
+
+    /// The response a route produces, serialized by [`serve_connection`].
+    struct TestResponse {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl TestResponse {
+        fn with_header(mut self, name: &str, value: impl Into<String>) -> Self {
+            self.headers.push((name.to_owned(), value.into()));
+            self
+        }
+    }
 
     #[derive(Debug)]
     pub struct TestServer {
@@ -69,10 +98,9 @@ mod local {
 
     impl TestServer {
         fn start() -> Self {
-            let server = Server::http("127.0.0.1:0").expect("start test server");
-            let addr: ListenAddr = server.server_addr();
-            let base = format!("http://{addr}");
-            let thread = thread::spawn(move || run_server(&server));
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("start test server");
+            let base = format!("http://{}", listener.local_addr().expect("server address"));
+            let thread = thread::spawn(move || run_server(&listener));
 
             Self {
                 base,
@@ -81,16 +109,197 @@ mod local {
         }
     }
 
-    fn run_server(server: &Server) {
-        for request in server.incoming_requests() {
-            let response = handle_request(&request);
-            let _ = request.respond(response);
+    /// One thread per connection. A pooled client pins a reader for the
+    /// connection's whole keep-alive lifetime, so dispatching connections
+    /// through a bounded worker pool can strand a task; dedicating a thread
+    /// per connection cannot.
+    fn run_server(listener: &TcpListener) {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            thread::spawn(move || serve_connection(stream));
         }
     }
 
-    fn handle_request(request: &Request) -> Response<Cursor<Vec<u8>>> {
-        // tiny_http only provides the path/query, so prefix with a dummy scheme/host.
-        let url = Url::parse(&format!("http://localhost{}", request.url())).unwrap();
+    fn serve_connection(mut stream: TcpStream) {
+        // Bytes read past the head belong to the body or the next request.
+        let mut pending = Vec::new();
+        while let Some(request) = read_request(&mut stream, &mut pending) {
+            let response = handle_request(&request);
+            if write_response(&mut stream, &request, &response).is_err() || request.close {
+                return;
+            }
+        }
+    }
+
+    /// Pull bytes from `stream` until `buffer` contains `needle`; returns the
+    /// offset one past it.
+    fn fill_until(stream: &mut TcpStream, buffer: &mut Vec<u8>, needle: &[u8]) -> Option<usize> {
+        loop {
+            if let Some(pos) = buffer
+                .windows(needle.len())
+                .position(|window| window == needle)
+            {
+                return Some(pos + needle.len());
+            }
+            let mut chunk = [0_u8; 8192];
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return None,
+                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+            }
+        }
+    }
+
+    /// Consume exactly `n` bytes off `buffer` then `stream`.
+    fn drain(stream: &mut TcpStream, buffer: &mut Vec<u8>, mut n: usize) -> Option<()> {
+        while n > 0 {
+            if buffer.is_empty() {
+                let mut chunk = [0_u8; 8192];
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => return None,
+                    Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                }
+            }
+            let take = n.min(buffer.len());
+            buffer.drain(..take);
+            n -= take;
+        }
+        Some(())
+    }
+
+    /// Consume the next CRLF-terminated line off `buffer` then `stream`.
+    fn read_line(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+        let end = fill_until(stream, buffer, b"\r\n")?;
+        let line = buffer[..end - 2].to_vec();
+        buffer.drain(..end);
+        Some(line)
+    }
+
+    /// Read one request: head, then its body. `None` on EOF or a malformed
+    /// request — the connection is closed either way.
+    fn read_request(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Option<TestRequest> {
+        let head_len = fill_until(stream, buffer, b"\r\n\r\n")?;
+        let (method, target, http10, headers) = {
+            let mut parsed_headers = [httparse::EMPTY_HEADER; 64];
+            let mut parsed = httparse::Request::new(&mut parsed_headers);
+            let Ok(httparse::Status::Complete(_)) = parsed.parse(&buffer[..head_len]) else {
+                return None;
+            };
+            (
+                parsed.method.unwrap_or_default().to_owned(),
+                parsed.path.unwrap_or_default().to_owned(),
+                parsed.version == Some(0),
+                parsed
+                    .headers
+                    .iter()
+                    .map(|header| {
+                        (
+                            header.name.to_owned(),
+                            String::from_utf8_lossy(header.value).into_owned(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        buffer.drain(..head_len);
+        let header = |name: &str| header_value(&headers, name);
+
+        if header("expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue")) {
+            stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").ok()?;
+        }
+
+        // Consume the body so the next request on this connection parses.
+        if let Some(length) = header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+            drain(stream, buffer, length)?;
+        } else if header("transfer-encoding").is_some_and(|v| {
+            v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("chunked"))
+        }) {
+            loop {
+                let size = usize::from_str_radix(
+                    std::str::from_utf8(&read_line(stream, buffer)?)
+                        .ok()?
+                        .split(';')
+                        .next()
+                        .unwrap_or_default()
+                        .trim(),
+                    16,
+                )
+                .ok()?;
+                if size == 0 {
+                    // Trailers, through the blank line.
+                    while !read_line(stream, buffer)?.is_empty() {}
+                    break;
+                }
+                drain(stream, buffer, size + 2)?; // chunk data + CRLF
+            }
+        }
+
+        let connection = header("connection").unwrap_or_default();
+        let close = connection.eq_ignore_ascii_case("close")
+            || (http10 && !connection.eq_ignore_ascii_case("keep-alive"));
+        Some(TestRequest {
+            method,
+            target,
+            headers,
+            close,
+        })
+    }
+
+    fn write_response(
+        stream: &mut TcpStream,
+        request: &TestRequest,
+        response: &TestResponse,
+    ) -> std::io::Result<()> {
+        let mut head = format!(
+            "HTTP/1.1 {} {}\r\n",
+            response.status,
+            reason_phrase(response.status)
+        );
+        for (name, value) in &response.headers {
+            let _ = write!(head, "{name}: {value}\r\n");
+        }
+        // 1xx/204/304 carry no body; HEAD sends the headers only.
+        let bodyless = matches!(response.status, 100..=199 | 204 | 304);
+        if !bodyless {
+            let _ = write!(head, "content-length: {}\r\n", response.body.len());
+        }
+        if request.close {
+            head.push_str("connection: close\r\n");
+        }
+        head.push_str("\r\n");
+        stream.write_all(head.as_bytes())?;
+        if !bodyless && request.method != "HEAD" {
+            stream.write_all(&response.body)?;
+        }
+        stream.flush()
+    }
+
+    const fn reason_phrase(status: u16) -> &'static str {
+        match status {
+            200 => "OK",
+            201 => "Created",
+            204 => "No Content",
+            301 => "Moved Permanently",
+            302 => "Found",
+            304 => "Not Modified",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            404 => "Not Found",
+            405 => "Method Not Allowed",
+            418 => "I'm a Teapot",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            502 => "Bad Gateway",
+            503 => "Service Unavailable",
+            _ => "Status",
+        }
+    }
+
+    fn handle_request(request: &TestRequest) -> TestResponse {
+        // The request target only provides the path/query, so prefix with a
+        // dummy scheme/host.
+        let url = Url::parse(&format!("http://localhost{}", request.target)).unwrap();
         let mut path = url.path().to_string();
         // Some clients send absolute-form URLs; strip the leading host portion.
         if let Some(rest) = path.strip_prefix("//") {
@@ -107,56 +316,53 @@ mod local {
 
         match path.as_str() {
             "/bearer" => {
-                if let Some(auth) = header_value(request, "authorization")
+                if let Some(auth) = header_value(&request.headers, "authorization")
                     && auth.to_ascii_lowercase().starts_with("bearer ")
                 {
-                    return text_response(StatusCode(200), "authorized");
+                    return text_response(200, "authorized");
                 }
-                text_response(StatusCode(401), "unauthorized")
+                text_response(401, "unauthorized")
             }
             "/headers" => {
                 let mut body = String::from("headers:\n");
-                for header in request.headers() {
-                    let name = header.field.to_string();
-                    let value = String::from_utf8_lossy(header.value.as_ref());
+                for (name, value) in &request.headers {
                     writeln!(&mut body, "{name}: {value}").unwrap();
                 }
-                if let Some(auth) = header_value(request, "authorization") {
+                if let Some(auth) = header_value(&request.headers, "authorization") {
                     writeln!(&mut body, "Authorization: {auth}").unwrap();
                 }
-                if let Some(custom) = header_value(request, "x-test") {
+                if let Some(custom) = header_value(&request.headers, "x-test") {
                     writeln!(&mut body, "X-Test: {custom}").unwrap();
                 }
-                text_response(StatusCode(200), body)
+                text_response(200, body)
             }
             "/cookies" => {
-                let cookie_header = header_value(request, "cookie").unwrap_or_default();
-                text_response(StatusCode(200), format!("cookies: {cookie_header}"))
+                let cookie_header = header_value(&request.headers, "cookie").unwrap_or_default();
+                text_response(200, format!("cookies: {cookie_header}"))
             }
             "/json" => json_response(
-                StatusCode(200),
+                200,
                 r#"{"slideshow":{"title":"httpbin local","author":"zenwave"}}"#,
             ),
             "/user-agent" => {
-                let ua = header_value(request, "user-agent")
+                let ua = header_value(&request.headers, "user-agent")
                     .unwrap_or_else(|| "zenwave-test-agent".to_string());
-                text_response(StatusCode(200), format!("user-agent: {ua}"))
+                text_response(200, format!("user-agent: {ua}"))
             }
             "/get" => json_response(
-                StatusCode(200),
+                200,
                 r#"{"url":"http://httpbin.local/get","origin":"httpbin"}"#,
             ),
-            "/post" | "/put" | "/delete" | "/patch" => json_response(
-                StatusCode(200),
-                r#"{"result":"ok","server":"httpbin-local"}"#,
-            ),
-            "/gzip" => bytes_response(StatusCode(200), b"gzip response"),
+            "/post" | "/put" | "/delete" | "/patch" => {
+                json_response(200, r#"{"result":"ok","server":"httpbin-local"}"#)
+            }
+            "/gzip" => bytes_response(200, b"gzip response"),
             "/delay/1" => {
                 // Small delay to emulate a slow endpoint.
                 thread::sleep(Duration::from_millis(10));
-                text_response(StatusCode(200), "delayed")
+                text_response(200, "delayed")
             }
-            "/html" => text_response(StatusCode(200), "<html><body>not json</body></html>"),
+            "/html" => text_response(200, "<html><body>not json</body></html>"),
             _ => {
                 if let Some(stripped) = path.strip_prefix("/basic-auth/") {
                     return handle_basic_auth(request, stripped);
@@ -176,68 +382,65 @@ mod local {
                 if path == "/redirect-to" {
                     return handle_redirect_to(&query);
                 }
-                text_response(StatusCode(404), format!("no route for {path}"))
+                text_response(404, format!("no route for {path}"))
             }
         }
     }
 
-    fn handle_basic_auth(request: &Request, path: &str) -> Response<Cursor<Vec<u8>>> {
+    fn handle_basic_auth(request: &TestRequest, path: &str) -> TestResponse {
         let mut parts = path.split('/');
         let user = parts.next().unwrap_or_default();
         let pass = parts.next().unwrap_or_default();
         let expected = format!("Basic {}", BASE64.encode(format!("{user}:{pass}")));
 
-        if let Some(auth) = header_value(request, "authorization")
+        if let Some(auth) = header_value(&request.headers, "authorization")
             && auth == expected
         {
-            return text_response(StatusCode(200), "authenticated");
+            return text_response(200, "authenticated");
         }
-        text_response(StatusCode(401), "unauthorized")
+        text_response(401, "unauthorized")
     }
 
-    fn handle_set_cookie(path: &str) -> Response<Cursor<Vec<u8>>> {
+    fn handle_set_cookie(path: &str) -> TestResponse {
         let mut parts = path.split('/');
         let name = parts.next().unwrap_or_default();
         let value = parts.next().unwrap_or_default();
-        let header = Header::from_bytes("Set-Cookie", format!("{name}={value}")).unwrap();
-        text_response(StatusCode(200), "cookie set").with_header(header)
+        text_response(200, "cookie set").with_header("Set-Cookie", format!("{name}={value}"))
     }
 
-    fn handle_status(code: &str) -> Response<Cursor<Vec<u8>>> {
+    fn handle_status(code: &str) -> TestResponse {
         let status = code.parse::<u16>().unwrap_or(400);
         if status == 204 {
-            return Response::new(
-                StatusCode(status),
-                vec![],
-                Cursor::new(Vec::new()),
-                None,
-                None,
-            );
+            return TestResponse {
+                status,
+                headers: vec![],
+                body: Vec::new(),
+            };
         }
-        text_response(StatusCode(status), format!("status {status}"))
+        text_response(status, format!("status {status}"))
     }
 
-    fn handle_base64(data: &str) -> Response<Cursor<Vec<u8>>> {
+    fn handle_base64(data: &str) -> TestResponse {
         BASE64.decode(data).map_or_else(
-            |_| text_response(StatusCode(400), "invalid base64"),
-            |bytes| bytes_response(StatusCode(200), bytes),
+            |_| text_response(400, "invalid base64"),
+            |bytes| bytes_response(200, bytes),
         )
     }
 
-    fn handle_redirect(path: &str) -> Response<Cursor<Vec<u8>>> {
+    fn handle_redirect(path: &str) -> TestResponse {
         let steps = path
             .trim_start_matches("/redirect/")
             .parse::<i32>()
             .unwrap_or(0);
         if steps <= 0 {
-            return text_response(StatusCode(200), "redirect complete");
+            return text_response(200, "redirect complete");
         }
 
         let next = format!("/redirect/{}", steps - 1);
         redirect_response(&next)
     }
 
-    fn handle_redirect_to(query: &[(String, String)]) -> Response<Cursor<Vec<u8>>> {
+    fn handle_redirect_to(query: &[(String, String)]) -> TestResponse {
         let target = query
             .iter()
             .find(|(key, _)| key == "url")
@@ -245,34 +448,42 @@ mod local {
         redirect_response(target)
     }
 
-    fn redirect_response(location: &str) -> Response<Cursor<Vec<u8>>> {
-        let location_header = Header::from_bytes("Location", location).unwrap();
-        Response::from_string("redirect")
-            .with_status_code(StatusCode(302))
-            .with_header(location_header)
+    fn redirect_response(location: &str) -> TestResponse {
+        text_response(302, "redirect").with_header("Location", location)
     }
 
-    fn header_value(request: &Request, name: &str) -> Option<String> {
-        request
-            .headers()
+    fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
+        headers
             .iter()
-            .find(|header| header.field.to_string().eq_ignore_ascii_case(name))
-            .map(|header| String::from_utf8_lossy(header.value.as_ref()).into_owned())
+            .find(|(field, _)| field.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
     }
 
-    fn json_response(status: StatusCode, body: &str) -> Response<Cursor<Vec<u8>>> {
-        let content_type = Header::from_bytes("Content-Type", "application/json").unwrap();
-        Response::from_string(body.to_string())
-            .with_status_code(status)
-            .with_header(content_type)
+    fn json_response(status: u16, body: &str) -> TestResponse {
+        TestResponse {
+            status,
+            headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+            body: body.as_bytes().to_vec(),
+        }
     }
 
-    fn text_response(status: StatusCode, body: impl Into<String>) -> Response<Cursor<Vec<u8>>> {
-        Response::from_string(body.into()).with_status_code(status)
+    fn text_response(status: u16, body: impl Into<String>) -> TestResponse {
+        TestResponse {
+            status,
+            headers: vec![(
+                "Content-Type".to_owned(),
+                "text/plain; charset=UTF-8".to_owned(),
+            )],
+            body: body.into().into_bytes(),
+        }
     }
 
-    fn bytes_response(status: StatusCode, body: impl Into<Vec<u8>>) -> Response<Cursor<Vec<u8>>> {
-        Response::from_data(body.into()).with_status_code(status)
+    fn bytes_response(status: u16, body: impl Into<Vec<u8>>) -> TestResponse {
+        TestResponse {
+            status,
+            headers: vec![],
+            body: body.into(),
+        }
     }
 }
 
