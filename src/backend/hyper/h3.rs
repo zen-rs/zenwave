@@ -13,7 +13,7 @@ use futures_util::{StreamExt, stream};
 use tracing::debug;
 
 use super::HyperError;
-use crate::{Error, transport::quic::Spawn};
+use crate::{Error, transport::Spawn};
 
 /// One HTTP/3 connection to an origin: an h3 send-request handle over a QUIC
 /// connection whose driver runs in the background.
@@ -139,7 +139,10 @@ mod tests {
     use super::H3Connection;
     use crate::{
         Transport,
-        transport::quic::{self, AsyncIoRuntime, Spawn},
+        transport::{
+            Spawn,
+            quic::{self, AsyncIoRuntime},
+        },
     };
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
