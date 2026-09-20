@@ -34,8 +34,6 @@ use std::fmt;
 use std::{future::Future, pin::Pin};
 #[cfg(native)]
 use std::sync::Arc;
-#[cfg(connector)]
-use std::{future::Future, pin::Pin};
 
 #[cfg(native)]
 use rustls_pki_types::{CertificateDer, pem::PemObject};

@@ -52,6 +52,7 @@ src/
     tunnel.rs     — HTTP CONNECT through hyper's upgrade machinery
     socks5.rs     — SOCKS5 CONNECT client (RFC 1928/1929)
     happy_eyeballs.rs — RFC 8305 TCP connection racing
+    pool.rs       — per-origin connection pool for the hyper backend (h1 leases, shared h2, dial coalescing)
     dns.rs        — HTTPS/SVCB record lookup for HTTP/3 discovery (RFC 9460)
     dns/runtime.rs — hickory RuntimeProvider on async-io/async-net
     dns/android.rs — android.net.DnsResolver.rawQuery over JNI
@@ -78,7 +79,9 @@ Each middleware wraps the inner client and transforms requests/responses.
 backend over `Transport::system()` wrapped in `FollowRedirect`;
 `zenwave::client_with(transport)` does the same over an explicit `Transport`. Backends are constructed from a
 `Transport` (trusted roots, TLS engine); `Transport::system()` is built once
-per process. `cfg` aliases (`native`, `tls_rustls`, `tls_native`,
+per process. The hyper backend's connections are pooled per origin on the
+`Transport` (`transport/pool.rs`), so clients sharing one transport reuse
+them. `cfg` aliases (`native`, `tls_rustls`, `tls_native`,
 `tls_engine`, `connector`, `android_verifier`) come from `build.rs`.
 
 The `http-kit` crate (separate dependency) defines `Endpoint`, `Middleware`,
