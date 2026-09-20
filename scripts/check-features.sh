@@ -28,7 +28,7 @@ powerset=(
 with_engine() {
   echo "::group::feature powerset with $1"
   "${powerset[@]}" --features "$1" \
-    --include-features "$backends,ws" --at-least-one-of "$backends" \
+    --include-features "$backends,ws,http2" --at-least-one-of "$backends" \
     -- -D warnings
   echo "::endgroup::"
 }

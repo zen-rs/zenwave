@@ -46,6 +46,8 @@ mod ca_bundle;
 pub(crate) mod connect;
 #[cfg(connector)]
 mod happy_eyeballs;
+#[cfg(tls_native)]
+pub(crate) mod native_tls_stream;
 #[cfg(native)]
 pub mod proxy;
 #[cfg(connector)]

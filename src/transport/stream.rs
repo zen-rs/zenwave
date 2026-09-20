@@ -9,7 +9,7 @@ use std::{
 use async_net::TcpStream;
 use futures_io::{AsyncRead, AsyncWrite};
 
-use super::tls::TlsStream;
+use super::tls::{self, TlsStream};
 
 /// A connected stream: plain TCP, TLS over TCP, or TLS to the target inside
 /// TLS to an HTTPS proxy.
@@ -25,6 +25,18 @@ impl fmt::Debug for Stream {
             Self::Tcp(_) => f.write_str("Stream::Tcp"),
             Self::Tls(_) => f.write_str("Stream::Tls"),
             Self::TlsOverTls(_) => f.write_str("Stream::TlsOverTls"),
+        }
+    }
+}
+
+impl Stream {
+    /// The ALPN protocol negotiated on the innermost TLS layer, or `None` for
+    /// plaintext connections and peers that picked no protocol.
+    pub fn negotiated_alpn(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Tcp(_) => None,
+            Self::Tls(stream) => tls::negotiated_alpn(stream),
+            Self::TlsOverTls(stream) => tls::negotiated_alpn(stream),
         }
     }
 }
