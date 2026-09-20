@@ -24,6 +24,10 @@ use hickory_resolver::net::runtime::{
 
 use crate::transport::Spawn;
 
+/// The `connect_tcp` timeout when hickory asks for none — the same default
+/// hickory's bundled providers apply (`hickory_net::xfer::CONNECT_TIMEOUT`).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Runs hickory's resolver on async-io/async-net.
 ///
 /// Cheap to clone: the provider is only a spawn closure.
@@ -64,10 +68,7 @@ impl RuntimeProvider for AsyncIoRuntimeProvider {
                 stream.set_nodelay(true)?;
                 Ok(AsyncIoTcpStream(stream))
             };
-            match wait_for {
-                Some(timeout) => AsyncIoTime::timeout(timeout, connect).await?,
-                None => connect.await,
-            }
+            AsyncIoTime::timeout(wait_for.unwrap_or(CONNECT_TIMEOUT), connect).await?
         })
     }
 

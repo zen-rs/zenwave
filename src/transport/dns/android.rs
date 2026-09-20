@@ -7,9 +7,17 @@
 //! the Java side: the callback delivers the raw DNS message on an executor
 //! thread, and a `oneshot` hands it to the async caller without blocking.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
+use async_io::Timer;
 use futures_channel::oneshot;
+use futures_util::{
+    FutureExt,
+    future::{Either, select},
+};
 use hickory_proto::{
     op::{Message, ResponseCode},
     rr::Record,
@@ -29,6 +37,9 @@ const CLASS_IN: i32 = 1;
 const TYPE_HTTPS: i32 = 65;
 /// `DnsResolver` exists since API 29.
 const DNS_RESOLVER_MIN_API: i32 = 29;
+/// How long a `rawQuery` may take before the lookup fails — hickory's
+/// `ResolverOpts::default().timeout`, so both paths bound a query alike.
+const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What the callback delivers: the raw response message, or the
 /// `DnsException`'s text from `onError`.
@@ -50,21 +61,21 @@ pub(super) async fn query_https(domain: String) -> Result<Vec<Record>, Error> {
         return Ok(Vec::new());
     };
 
-    let answer = receiver.await;
-    // The callback fired; the executor thread and the proxy's Rust handler
-    // are no longer needed.
+    // A timed-out lookup is an error, as on the hickory path.
+    let answer = match select(receiver.fuse(), Timer::after(DNS_QUERY_TIMEOUT).fuse()).await {
+        Either::Left((answer, _)) => {
+            answer.unwrap_or_else(|_| Err("the DNS query never delivered an answer".to_owned()))
+        }
+        Either::Right(_) => Err("the DNS query timed out".to_owned()),
+    };
+    // The query is over either way; the executor thread and the proxy's
+    // Rust handler are no longer needed.
     let released = vm.attach_current_thread(|env| pending.release(env));
     let bytes = match answer {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(message)) => {
+        Ok(bytes) => bytes,
+        Err(message) => {
             let _ = released;
             return Err(Error::Transport(Box::new(std::io::Error::other(message))));
-        }
-        Err(_cancelled) => {
-            let _ = released;
-            return Err(Error::Transport(Box::new(std::io::Error::other(
-                "the DNS query never delivered an answer",
-            ))));
         }
     };
     released.map_err(|error| Error::Transport(Box::new(error)))?;
