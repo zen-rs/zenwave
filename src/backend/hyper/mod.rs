@@ -213,10 +213,7 @@ impl HyperBackend {
                     // The in-flight TCP dial closes when the loser future
                     // drops with this scope.
                     Pool::insert_h3(permit, connection.clone());
-                    let response = connection
-                        .request(request)
-                        .await
-                        .map_err(h3::SendError::into_error)?;
+                    let response = connection.request(request).await?;
                     Ok((response, None))
                 }
                 Err(error) => {
@@ -243,10 +240,7 @@ impl HyperBackend {
                 Err(error) => match quic.await {
                     Ok(mut connection) => {
                         Pool::insert_h3(permit, connection.clone());
-                        let response = connection
-                            .request(request)
-                            .await
-                            .map_err(h3::SendError::into_error)?;
+                        let response = connection.request(request).await?;
                         Ok((response, None))
                     }
                     Err(quic_error) => {
@@ -266,9 +260,9 @@ impl HyperBackend {
     #[cfg(http3)]
     fn start_h3_discovery(&self, origin: &Origin, permit: &DialPermit) {
         let entry = permit.entry();
-        if !entry.begin_h3_discovery(Instant::now()) {
+        let Some(discovery) = entry.begin_h3_discovery(Instant::now()) else {
             return;
-        }
+        };
         let transport = self.transport.clone();
         let spawn = self.spawner.as_spawn();
         let host = origin.host.clone();
@@ -287,8 +281,10 @@ impl HyperBackend {
                     HttpsRr::negative(now)
                 }
             };
-            entry.insert_https_rr(rr);
-            entry.finish_h3_discovery();
+            // The guard marks the entry Done however this task ends — a
+            // dropped future leaves the origin discoverable again instead of
+            // stuck InFlight.
+            discovery.insert_https_rr(rr);
         });
     }
 }
@@ -346,12 +342,24 @@ async fn quic_dial(
     h3_port: u16,
     timeout: Duration,
 ) -> Result<h3::H3Connection, crate::Error> {
-    let addrs = happy_eyeballs::resolve(host, h3_port)
-        .await
-        .map_err(|error| crate::Error::Transport(Box::new(error)))?;
+    // The deadline covers resolution too: the detached loser is bounded by
+    // `timeout` end to end, not just across the handshakes.
+    let deadline = Instant::now() + timeout;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let addrs = {
+        let resolve = happy_eyeballs::resolve(host, h3_port);
+        let timer = async_io::Timer::after(remaining);
+        pin_mut!(resolve);
+        pin_mut!(timer);
+        match select(resolve, timer).await {
+            Either::Left((result, _)) => {
+                result.map_err(|error| crate::Error::Transport(Box::new(error)))?
+            }
+            Either::Right(_) => Vec::new(),
+        }
+    };
     let endpoint = transport.quic_endpoint(spawn.clone())?;
     let config = quic::client_config(transport.tls().client_config())?;
-    let deadline = Instant::now() + timeout;
     let mut last_error = None;
     for addr in addrs {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -480,20 +488,32 @@ impl HyperBackend {
     /// Feed the response's `Alt-Svc` headers into the origin's entry — an
     /// advertisement only counts where QUIC could ever be dialed, and a
     /// malformed value is logged and ignored, never a request failure.
+    /// Repeated `Alt-Svc` fields are one comma-joined list (RFC 9110), so a
+    /// field carrying `clear` or no usable h3 does not erase what its
+    /// siblings advertised.
     #[cfg(http3)]
     fn record_alt_svc(&self, origin: &Origin, h3: H3, response: &http_kit::Response) {
         if !matches!(h3, H3::Allowed) {
             return;
         }
-        let entry = self.transport.pool().entry(origin);
-        let now = Instant::now();
+        let mut joined = String::new();
         for value in response.headers().get_all(http::header::ALT_SVC) {
             if let Ok(value) = value.to_str() {
-                entry.insert_alt_svc(&origin.host, value, now);
+                if !joined.is_empty() {
+                    joined.push(',');
+                }
+                joined.push_str(value);
             } else {
                 debug!(?value, "ignoring non-ASCII Alt-Svc header");
             }
         }
+        if joined.is_empty() {
+            return;
+        }
+        self.transport
+            .pool()
+            .entry(origin)
+            .insert_alt_svc(&origin.host, &joined, Instant::now());
     }
 
     /// Wrap the h1 lease around its body's tail, harvest `Alt-Svc`, and turn
@@ -582,16 +602,12 @@ impl Endpoint for HyperBackend {
             match checkout {
                 #[cfg(http3)]
                 // The URI stays absolute: h3 requests carry `:scheme` and
-                // `:authority`.
+                // `:authority`. A checkout only hands out a live handle —
+                // `is_closed` evicts a dead one — and a send failure is
+                // final: `h3`'s `StreamError` cannot prove the request never
+                // reached the wire, so it is never replayed.
                 Checkout::H3(mut connection) => {
-                    match send_or_retry(connection.request(request).await, retried)? {
-                        Sent::Done(response) => break (response, None),
-                        Sent::Retry(unsent) => {
-                            retried = true;
-                            request = *unsent;
-                            *request.uri_mut() = uri.clone();
-                        }
-                    }
+                    break (connection.request(request).await?, None);
                 }
                 #[cfg(feature = "http2")]
                 // The URI stays absolute: hyper derives `:scheme` and
@@ -671,8 +687,7 @@ enum Sent<T> {
 }
 
 /// A send failure that can hand the request back when the connection died
-/// before writing it — hyper's `TrySendError` and h3's `SendError` share
-/// the shape.
+/// before writing it — hyper's `TrySendError` shape.
 trait Unsent {
     /// The request, when nothing of it reached the connection.
     fn take_request(&mut self) -> Option<http::Request<http_kit::Body>>;
@@ -687,17 +702,6 @@ impl Unsent for TrySendError<http::Request<http_kit::Body>> {
 
     fn into_error(self) -> crate::Error {
         HyperError::Connection(self.into_error()).into()
-    }
-}
-
-#[cfg(http3)]
-impl Unsent for h3::SendError {
-    fn take_request(&mut self) -> Option<http::Request<http_kit::Body>> {
-        self.take_request()
-    }
-
-    fn into_error(self) -> crate::Error {
-        self.into_error()
     }
 }
 
@@ -1422,7 +1426,7 @@ mod tests {
             let tcp = TlsServer::serve(
                 &ca,
                 &[b"h2", b"http/1.1"],
-                Some(format!(r#"h3=":{}"; ma=60"#, h3.addr().port())),
+                vec![format!(r#"h3=":{}"; ma=60"#, h3.addr().port())],
                 TCP_STALL,
             );
             let mut client = HyperBackend::new(ca.transport());
@@ -1463,6 +1467,44 @@ mod tests {
             });
         }
 
+        /// RFC 9110: repeated `Alt-Svc` header fields are one comma-joined
+        /// list — an `h2`-only field must not erase the `h3` its sibling
+        /// advertised, which a per-field overwrite would do.
+        #[test]
+        fn split_alt_svc_fields_still_upgrade_the_origin() {
+            let ca = TestCa::new();
+            let h3 = H3Server::start(&ca);
+            let tcp = TlsServer::serve(
+                &ca,
+                &[b"h2", b"http/1.1"],
+                vec![
+                    format!(r#"h3=":{}"; ma=60"#, h3.addr().port()),
+                    r#"h2=":443""#.to_owned(),
+                ],
+                TCP_STALL,
+            );
+            let mut client = HyperBackend::new(ca.transport());
+
+            block_on_test(async {
+                client
+                    .get(tcp.uri("/hello"))
+                    .expect("test request must build")
+                    .await
+                    .expect("first request must succeed over TCP");
+                let second = client
+                    .get(tcp.uri("/hello"))
+                    .expect("test request must build")
+                    .await
+                    .expect("the h3 racer must serve the second request");
+                assert_eq!(
+                    protocol(&second),
+                    Some("h3".to_owned()),
+                    "the h3 in the first field must survive the second field"
+                );
+                wait_until(|| h3.served() == 1).await;
+            });
+        }
+
         /// b. HTTPS-record discovery upgrades the origin. A `localhost`
         /// name cannot carry a wire HTTPS answer — RFC 6761 resolvers
         /// (hickory included) answer `*.localhost` in-process — so the first
@@ -1475,7 +1517,7 @@ mod tests {
         fn https_record_upgrades_the_origin_to_h3() {
             let ca = TestCa::new();
             let h3 = H3Server::start(&ca);
-            let tcp = TlsServer::serve(&ca, &[b"h2", b"http/1.1"], None, TCP_STALL);
+            let tcp = TlsServer::serve(&ca, &[b"h2", b"http/1.1"], Vec::new(), TCP_STALL);
             let tcp_port = tcp.addr().port();
 
             // The resolver only has to be reachable for the lookup to land;
@@ -1554,7 +1596,7 @@ mod tests {
             let tcp = TlsServer::serve(
                 &ca,
                 &[b"h2", b"http/1.1"],
-                Some(format!(r#"h3=":{udp_port}"; ma=60"#)),
+                vec![format!(r#"h3=":{udp_port}"; ma=60"#)],
                 Duration::ZERO,
             );
             let transport = ca.transport();
@@ -1608,7 +1650,7 @@ mod tests {
             let tcp = TlsServer::serve(
                 &ca,
                 &[b"h2", b"http/1.1"],
-                Some(format!(r#"h3=":{}"; ma=60"#, h3.addr().port())),
+                vec![format!(r#"h3=":{}"; ma=60"#, h3.addr().port())],
                 TCP_STALL,
             );
             let transport = ca.transport();

@@ -170,6 +170,30 @@ enum H3Discovery {
     Done,
 }
 
+/// The in-flight HTTPS record lookup [`OriginEntry::begin_h3_discovery`]
+/// marked. Dropping the guard — on success, on failure, or when the spawned
+/// lookup future is dropped with a shutting-down executor — returns the
+/// entry's discovery state to `Done`, so a lost lookup can never wedge the
+/// origin into `InFlight` forever.
+#[cfg(http3)]
+pub struct DiscoveryGuard(Arc<OriginEntry>);
+
+#[cfg(http3)]
+impl DiscoveryGuard {
+    /// Store the lookup's answer and end discovery: the guard drops at the
+    /// end of this call, marking the entry `Done`.
+    pub(crate) fn insert_https_rr(self, rr: HttpsRr) {
+        self.0.insert_https_rr(rr);
+    }
+}
+
+#[cfg(http3)]
+impl Drop for DiscoveryGuard {
+    fn drop(&mut self) {
+        *self.0.h3_discovery.lock().expect("pool state poisoned") = H3Discovery::Done;
+    }
+}
+
 impl OriginEntry {
     fn new(origin: &Origin) -> Self {
         Self {
@@ -224,16 +248,57 @@ impl OriginEntry {
             }
         }
         #[cfg(http3)]
-        {
+        let live = self.has_live_h3();
+        #[cfg(not(http3))]
+        let live = false;
+        live
+    }
+
+    /// Whether the entry holds a usable h3 handle or h3 knowledge the next
+    /// request would need: an unexpired Alt-Svc or HTTPS answer — a negative
+    /// one included — or an active QUIC backoff, all of which suppress work
+    /// the request would otherwise repeat. Dead handles and expired values
+    /// are evicted as they are read.
+    #[cfg(http3)]
+    fn has_live_h3(&self) -> bool {
+        let live = {
             let mut h3 = self.h3.lock().expect("pool state poisoned");
             if h3.as_ref().is_some_and(H3Connection::is_closed) {
                 *h3 = None;
             }
-            if h3.is_some() {
+            h3.is_some()
+        };
+        live || self.has_live_h3_knowledge(Instant::now())
+    }
+
+    /// Whether the entry still holds h3 state the next request would need:
+    /// an unexpired `alt_svc` or `https_rr`, or an active
+    /// `h3_broken_until`. Expired values are evicted as they are read,
+    /// exactly as [`Self::h3_candidate`] does.
+    #[cfg(http3)]
+    fn has_live_h3_knowledge(&self, now: Instant) -> bool {
+        if self
+            .h3_broken_until
+            .lock()
+            .expect("pool state poisoned")
+            .is_some_and(|until| until > now)
+        {
+            return true;
+        }
+        {
+            let mut alt_svc = self.alt_svc.lock().expect("pool state poisoned");
+            if alt_svc.as_ref().is_some_and(|alt| alt.expires <= now) {
+                *alt_svc = None;
+            }
+            if alt_svc.is_some() {
                 return true;
             }
         }
-        false
+        let mut https_rr = self.https_rr.lock().expect("pool state poisoned");
+        if https_rr.as_ref().is_some_and(|rr| rr.expires <= now) {
+            *https_rr = None;
+        }
+        https_rr.is_some()
     }
 
     /// The UDP port an h3 dial to this origin should race for, or `None`
@@ -287,30 +352,28 @@ impl OriginEntry {
         *self.https_rr.lock().expect("pool state poisoned") = Some(rr);
     }
 
-    /// Whether an HTTPS record lookup is owed — none issued, or the cached
-    /// answer is stale — and marks it in flight when so.
+    /// Mark an HTTPS record lookup in flight and hand out the guard that
+    /// owns it, when one is owed — none issued, or the cached answer is
+    /// stale. `None` means a lookup is running or the fresh answer stands.
     #[cfg(http3)]
-    pub(crate) fn begin_h3_discovery(&self, now: Instant) -> bool {
-        let mut discovery = self.h3_discovery.lock().expect("pool state poisoned");
-        let due = match *discovery {
-            H3Discovery::NotStarted => true,
-            H3Discovery::InFlight => false,
-            H3Discovery::Done => self
-                .https_rr
-                .lock()
-                .expect("pool state poisoned")
-                .is_none_or(|rr| rr.expires <= now),
-        };
-        if due {
+    pub(crate) fn begin_h3_discovery(self: &Arc<Self>, now: Instant) -> Option<DiscoveryGuard> {
+        {
+            let mut discovery = self.h3_discovery.lock().expect("pool state poisoned");
+            let due = match *discovery {
+                H3Discovery::NotStarted => true,
+                H3Discovery::InFlight => false,
+                H3Discovery::Done => self
+                    .https_rr
+                    .lock()
+                    .expect("pool state poisoned")
+                    .is_none_or(|rr| rr.expires <= now),
+            };
+            if !due {
+                return None;
+            }
             *discovery = H3Discovery::InFlight;
         }
-        due
-    }
-
-    /// The in-flight lookup landed; `https_rr` holds its answer.
-    #[cfg(http3)]
-    pub(crate) fn finish_h3_discovery(&self) {
-        *self.h3_discovery.lock().expect("pool state poisoned") = H3Discovery::Done;
+        Some(DiscoveryGuard(self.clone()))
     }
 
     /// The cached HTTPS record answer, when it is still fresh — tests read
@@ -1190,5 +1253,89 @@ mod tests {
                 "once the dial lands its h3 handle, the waiter must ride it"
             );
         });
+    }
+
+    /// h3 knowledge, not just connections, keeps an entry alive through the
+    /// sweep: an entry holding only an unexpired Alt-Svc survives, one whose
+    /// Alt-Svc expired on arrival does not.
+    #[cfg(http3)]
+    #[test]
+    fn h3_knowledge_survives_the_origin_sweep() {
+        let pool = Pool::new();
+        let now = Instant::now();
+        let fresh = Origin {
+            port: 20,
+            ..https_origin()
+        };
+        let stale = Origin {
+            port: 21,
+            ..https_origin()
+        };
+        // Each `entry` Arc drops at the end of its statement, leaving the
+        // map as the only owner — the sweep's eviction case.
+        pool.entry(&fresh)
+            .insert_alt_svc(&fresh.host, r#"h3=":9443"; ma=60"#, now);
+        pool.entry(&stale)
+            .insert_alt_svc(&stale.host, r#"h3=":9443"; ma=0"#, now);
+
+        pool.entry(&Origin {
+            port: 22,
+            ..https_origin()
+        });
+
+        let origins = pool.origins.lock().expect("pool state poisoned");
+        assert!(
+            origins.contains_key(&fresh),
+            "an unexpired Alt-Svc must keep its entry"
+        );
+        assert!(
+            !origins.contains_key(&stale),
+            "an expired Alt-Svc must not keep its entry"
+        );
+        drop(origins);
+    }
+
+    /// `begin_h3_discovery` issues one lookup at a time, stands down while a
+    /// fresh answer is cached, re-issues once it expires — and a lookup lost
+    /// without an answer (a dropped task) leaves the origin reissuable.
+    #[cfg(http3)]
+    #[test]
+    fn h3_discovery_is_issued_once_and_recovers() {
+        let pool = Pool::new();
+        let entry = pool.entry(&https_origin());
+        let now = Instant::now();
+
+        let guard = entry
+            .begin_h3_discovery(now)
+            .expect("the first lookup must be issued");
+        assert!(
+            entry.begin_h3_discovery(now).is_none(),
+            "a lookup in flight must not be issued again"
+        );
+
+        drop(guard);
+        let guard = entry
+            .begin_h3_discovery(now)
+            .expect("a lookup dropped without an answer must be reissuable");
+
+        guard.insert_https_rr(HttpsRr {
+            h3: false,
+            port: None,
+            expires: now + Duration::from_secs(60),
+        });
+        assert!(
+            entry.begin_h3_discovery(now).is_none(),
+            "a fresh answer must not be re-queried"
+        );
+
+        entry.insert_https_rr(HttpsRr {
+            h3: false,
+            port: None,
+            expires: now,
+        });
+        assert!(
+            entry.begin_h3_discovery(now).is_some(),
+            "an expired answer must be re-queried"
+        );
     }
 }

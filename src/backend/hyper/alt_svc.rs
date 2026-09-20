@@ -129,6 +129,13 @@ fn alt_value(value: &str) -> Result<Alternative, AltSvcError> {
     let (quoted, rest) = quoted_string(rest.trim_start())?;
     let (host, port) = authority(quoted.as_str())?;
 
+    // Parameters follow the authority only behind a `;` — `h3=":443" ma=60`
+    // is not an alternative with a parameter, it is malformed.
+    let rest = rest.trim_start();
+    if !rest.is_empty() && !rest.starts_with(';') {
+        return Err(AltSvcError::MalformedAlternative);
+    }
+
     let mut max_age = ALT_SVC_DEFAULT_MAX_AGE;
     for parameter in split_quoted(rest, ';') {
         let parameter = parameter.trim();
@@ -378,6 +385,11 @@ mod tests {
             Err(AltSvcError::InvalidAuthority)
         );
         assert_eq!(parse(r#"=":443""#), Err(AltSvcError::InvalidProtocolId));
+        assert_eq!(
+            parse(r#"h3=":443" ma=60"#),
+            Err(AltSvcError::MalformedAlternative),
+            "parameters need a `;` separator"
+        );
     }
 
     #[test]

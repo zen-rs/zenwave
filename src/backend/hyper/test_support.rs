@@ -186,17 +186,17 @@ impl TlsServer {
     /// Start a server offering `alpn_protocols`, in preference order.
     #[cfg(feature = "http2")]
     pub(crate) fn start(ca: &TestCa, alpn_protocols: &[&[u8]]) -> Self {
-        Self::serve(ca, alpn_protocols, None, Duration::ZERO)
+        Self::serve(ca, alpn_protocols, Vec::new(), Duration::ZERO)
     }
 
-    /// Start a server that advertises `alt_svc` as the `Alt-Svc` header on
-    /// every response, and stalls each TLS handshake by `handshake_delay` —
-    /// enough for a racing QUIC dial to the same origin to win
-    /// deterministically on loopback.
+    /// Start a server that emits each `alt_svc` value as its own `Alt-Svc`
+    /// header field on every response, and stalls each TLS handshake by
+    /// `handshake_delay` — enough for a racing QUIC dial to the same origin
+    /// to win deterministically on loopback.
     pub(crate) fn serve(
         ca: &TestCa,
         alpn_protocols: &[&[u8]],
-        alt_svc: Option<String>,
+        alt_svc: Vec<String>,
         handshake_delay: Duration,
     ) -> Self {
         let (leaf, key) = ca.leaf();
@@ -282,13 +282,14 @@ impl TlsServer {
 
 /// Accept TLS on `tcp` — after `handshake_delay`, so a racing QUIC dial can
 /// win — and serve every request on the connection with the HTTP version
-/// ALPN negotiated. `alt_svc` is emitted on every response when set.
+/// ALPN negotiated. Each `alt_svc` value goes out as its own header field on
+/// every response.
 #[cfg(any(feature = "http2", http3))]
 async fn serve_tls(
     acceptor: TlsAcceptor,
     tcp: async_net::TcpStream,
     #[cfg(feature = "http2")] observed: mpsc::Sender<Observed>,
-    alt_svc: Option<String>,
+    alt_svc: Vec<String>,
     handshake_delay: Duration,
 ) {
     if !handshake_delay.is_zero() {
@@ -331,10 +332,10 @@ async fn serve_tls(
             #[cfg(not(feature = "http2"))]
             drop((parts, body));
             let mut response = hyper::Response::new(Full::new(Bytes::from_static(b"zenwave")));
-            if let Some(alt_svc) = alt_svc {
-                response.headers_mut().insert(
+            for value in &alt_svc {
+                response.headers_mut().append(
                     http::header::ALT_SVC,
-                    http::header::HeaderValue::from_str(&alt_svc)
+                    http::header::HeaderValue::from_str(value)
                         .expect("Alt-Svc test value must be a header value"),
                 );
             }

@@ -93,48 +93,32 @@ impl H3Connection {
     /// `:authority`. `http_kit::Body` has no trailer surface, so response
     /// trailers are consumed and dropped.
     ///
-    /// A failure before the request was written returns it inside
-    /// [`SendError`] so the caller can retry it on another connection.
+    /// A send failure is final — never retried by the caller: the `h3`
+    /// crate's `StreamError` does not expose which `send_request` failures
+    /// happened before the HEADERS block was written (`RemoteClosing` is
+    /// `#[non_exhaustive]` and unmatchable), so replaying the request could
+    /// duplicate one the peer already saw. A connection that died while
+    /// idle never gets this far — `is_closed` evicts it at checkout.
     pub async fn request(
         &mut self,
         request: http::Request<http_kit::Body>,
-    ) -> Result<http::Response<http_kit::Body>, SendError> {
+    ) -> Result<http::Response<http_kit::Body>, Error> {
         let (parts, mut body) = request.into_parts();
-        let mut stream = match self
+        let mut stream = self
             .sender
-            .send_request(http::Request::from_parts(parts.clone(), ()))
+            .send_request(http::Request::from_parts(parts, ()))
             .await
-        {
-            Ok(stream) => stream,
-            Err(error) => {
-                return Err(SendError {
-                    error: HyperError::http3(error).into(),
-                    unsent: Some(Box::new(http::Request::from_parts(parts, body))),
-                });
-            }
-        };
+            .map_err(HyperError::http3)?;
 
         while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|error| SendError {
-                error: Error::from(error),
-                unsent: None,
-            })?;
+            let chunk = chunk?;
             if !chunk.is_empty() {
-                stream.send_data(chunk).await.map_err(|error| SendError {
-                    error: HyperError::http3(error).into(),
-                    unsent: None,
-                })?;
+                stream.send_data(chunk).await.map_err(HyperError::http3)?;
             }
         }
-        stream.finish().await.map_err(|error| SendError {
-            error: HyperError::http3(error).into(),
-            unsent: None,
-        })?;
+        stream.finish().await.map_err(HyperError::http3)?;
 
-        let response = stream.recv_response().await.map_err(|error| SendError {
-            error: HyperError::http3(error).into(),
-            unsent: None,
-        })?;
+        let response = stream.recv_response().await.map_err(HyperError::http3)?;
         let (parts, ()) = response.into_parts();
         // Fused: body readers may poll a stream once more after `None` —
         // `unfold` alone panics on that.
@@ -157,47 +141,6 @@ impl H3Connection {
             .fuse(),
         );
         Ok(http::Response::from_parts(parts, body))
-    }
-}
-
-/// A failed request on an h3 connection. When the connection died before the
-/// request was written, the request rides inside so the caller can retry it
-/// on another connection — the shape `hyper::client::conn::TrySendError` has.
-pub struct SendError {
-    error: Error,
-    unsent: Option<Box<http::Request<http_kit::Body>>>,
-}
-
-impl SendError {
-    /// The request, when the connection died before it was sent.
-    pub(crate) fn take_request(&mut self) -> Option<http::Request<http_kit::Body>> {
-        self.unsent.take().map(|request| *request)
-    }
-
-    /// The error itself.
-    pub(crate) fn into_error(self) -> Error {
-        self.error
-    }
-}
-
-impl fmt::Debug for SendError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SendError")
-            .field("error", &self.error)
-            .field("unsent", &self.unsent.is_some())
-            .finish()
-    }
-}
-
-impl fmt::Display for SendError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.error, f)
-    }
-}
-
-impl core::error::Error for SendError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        Some(&self.error)
     }
 }
 
