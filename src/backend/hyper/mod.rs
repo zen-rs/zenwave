@@ -1,8 +1,10 @@
 mod rt;
 
 use core::future::Future;
-#[cfg(feature = "http2")]
+#[cfg(any(feature = "http2", http3))]
 use std::time::Duration;
+#[cfg(http3)]
+use std::time::Instant;
 use std::{
     mem::replace,
     pin::Pin,
@@ -11,6 +13,11 @@ use std::{
 
 use executor_core::{AnyExecutor, Executor};
 use futures_util::{Stream, TryStreamExt};
+#[cfg(http3)]
+use futures_util::{
+    future::{Either, select},
+    pin_mut,
+};
 use http::{StatusCode, uri::Scheme};
 use http_body_util::BodyDataStream;
 use http_kit::{Endpoint, HttpError, Method, Request, Response};
@@ -18,6 +25,14 @@ use hyper::{body::Incoming, client::conn::TrySendError, http};
 use rt::Spawner;
 use tracing::{debug, warn};
 
+#[cfg(http3)]
+use crate::transport::{
+    Spawn,
+    connect::proxied,
+    happy_eyeballs,
+    pool::{H3, HttpsRr},
+    quic,
+};
 use crate::{
     Client, Transport,
     error::HttpErrorResponse,
@@ -35,10 +50,12 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(feature = "http2")]
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
-// Consumed by the connection pool (#69); today only its own tests dial h3.
 #[cfg(http3)]
-#[allow(dead_code)]
+pub mod alt_svc;
+#[cfg(http3)]
 pub mod h3;
+#[cfg(all(test, any(feature = "http2", http3)))]
+pub mod test_support;
 
 /// Hyper-based HTTP client backend powered by `async-io`/`async-net`.
 #[derive(Debug)]
@@ -67,16 +84,31 @@ impl HyperBackend {
         }
     }
 
-    /// Dial a fresh connection for `origin` under `permit`, run the
-    /// negotiated handshake on it, pool it, and send `request`. A failure on
-    /// a fresh connection surfaces to the caller — only reuse failures retry,
-    /// and the caller owns that decision.
+    /// Dial a fresh connection for `origin` under `permit` — a QUIC/TCP race
+    /// when the origin advertised h3, plain TCP otherwise — then pool the
+    /// winner and send `request`. A failure on a fresh connection surfaces
+    /// to the caller — only reuse failures retry, and the caller owns that
+    /// decision.
     async fn dial_and_send(
         &self,
         origin: &Origin,
         permit: DialPermit,
-        mut request: http::Request<http_kit::Body>,
-    ) -> Result<(http::Response<Incoming>, Option<H1Lease>), crate::Error> {
+        request: http::Request<http_kit::Body>,
+        #[cfg(http3)] h3_port: Option<u16>,
+    ) -> Result<(http::Response<http_kit::Body>, Option<H1Lease>), crate::Error> {
+        #[cfg(http3)]
+        if let Some(h3_port) = h3_port {
+            return self
+                .race_dial_and_send(origin, permit, h3_port, request)
+                .await;
+        }
+        let dialed = self.dial_tcp(origin).await?;
+        self.send_on_dialed(permit, dialed, request).await
+    }
+
+    /// Connect to `origin` over TCP — through a proxy when the rules say so —
+    /// and run the negotiated hyper handshake.
+    async fn dial_tcp(&self, origin: &Origin) -> Result<DialedTcp, crate::Error> {
         let connection = connect(
             &self.transport,
             Target {
@@ -97,13 +129,10 @@ impl HyperBackend {
                 // The driver runs once for the connection's life, not per
                 // request.
                 self.spawner.spawn(drive(driver));
-                let lease = Pool::insert_h1(permit, sender, connection.via).await;
-                shape_h1_request(&mut request, lease.via())?;
-                lease
-                    .send(request)
-                    .await
-                    .map(|(response, lease)| (response, Some(lease)))
-                    .map_err(|error| HyperError::Connection(error.into_error()).into())
+                Ok(DialedTcp::H1 {
+                    sender,
+                    via: connection.via,
+                })
             }
             #[cfg(feature = "http2")]
             Protocol::Http2 => {
@@ -120,14 +149,143 @@ impl HyperBackend {
                 // Ready before pooling: the handle is shared as soon as it
                 // is stored.
                 sender.ready().await.map_err(HyperError::Connection)?;
+                Ok(DialedTcp::H2 { sender })
+            }
+        }
+    }
+
+    /// Pool `dialed` under `permit` and send `request` on it.
+    async fn send_on_dialed(
+        &self,
+        permit: DialPermit,
+        dialed: DialedTcp,
+        mut request: http::Request<http_kit::Body>,
+    ) -> Result<(http::Response<http_kit::Body>, Option<H1Lease>), crate::Error> {
+        match dialed {
+            DialedTcp::H1 { sender, via } => {
+                shape_h1_request(&mut request, &via)?;
+                let (response, lease) = Pool::insert_h1(permit, sender, via)
+                    .await
+                    .send(request)
+                    .await
+                    .map_err(|error| HyperError::Connection(error.into_error()))?;
+                Ok((into_body(response), Some(lease)))
+            }
+            #[cfg(feature = "http2")]
+            DialedTcp::H2 { mut sender } => {
                 Pool::insert_h2(permit, sender.clone());
                 let response = sender
                     .try_send_request(request)
                     .await
                     .map_err(|error| HyperError::Connection(error.into_error()))?;
-                Ok((response, None))
+                Ok((into_body(response), None))
             }
         }
+    }
+
+    /// Race a QUIC handshake against the TCP dial for `origin`; the first
+    /// success serves the request. A TCP loser is dropped; a QUIC loser is
+    /// detached and finishes inside the connect timeout — a win lands in the
+    /// pool, a loss puts the origin into QUIC backoff.
+    #[cfg(http3)]
+    async fn race_dial_and_send(
+        &self,
+        origin: &Origin,
+        permit: DialPermit,
+        h3_port: u16,
+        request: http::Request<http_kit::Body>,
+    ) -> Result<(http::Response<http_kit::Body>, Option<H1Lease>), crate::Error> {
+        let entry = permit.entry();
+        // The QUIC side owns everything it needs: if TCP wins, the loser
+        // keeps running detached until its deadline.
+        let quic = Box::pin({
+            let transport = self.transport.clone();
+            let spawn = self.spawner.as_spawn();
+            let host = origin.host.clone();
+            let timeout = entry.h3_connect_timeout();
+            async move { quic_dial(&transport, spawn, &host, h3_port, timeout).await }
+        });
+        let tcp = self.dial_tcp(origin);
+        pin_mut!(tcp);
+        match select(quic, tcp).await {
+            Either::Left((result, tcp)) => match result {
+                Ok(mut connection) => {
+                    // The in-flight TCP dial closes when the loser future
+                    // drops with this scope.
+                    Pool::insert_h3(permit, connection.clone());
+                    let response = connection.request(request).await?;
+                    Ok((response, None))
+                }
+                Err(error) => {
+                    debug!(%error, "QUIC dial lost; finishing over TCP");
+                    entry.mark_h3_broken(Instant::now());
+                    self.send_on_dialed(permit, tcp.await?, request).await
+                }
+            },
+            Either::Right((dialed, quic)) => match dialed {
+                Ok(dialed) => {
+                    // The QUIC loser keeps running detached: a dead UDP path
+                    // only becomes visible when its deadline passes.
+                    self.spawner.spawn(async move {
+                        match quic.await {
+                            Ok(connection) => entry.insert_h3(connection),
+                            Err(error) => {
+                                debug!(%error, "detached QUIC dial failed");
+                                entry.mark_h3_broken(Instant::now());
+                            }
+                        }
+                    });
+                    self.send_on_dialed(permit, dialed, request).await
+                }
+                Err(error) => match quic.await {
+                    Ok(mut connection) => {
+                        Pool::insert_h3(permit, connection.clone());
+                        let response = connection.request(request).await?;
+                        Ok((response, None))
+                    }
+                    Err(quic_error) => {
+                        debug!(error = %quic_error, "QUIC dial failed with TCP");
+                        entry.mark_h3_broken(Instant::now());
+                        Err(error)
+                    }
+                },
+            },
+        }
+    }
+
+    /// Issue `origin`'s HTTPS record lookup when the pool marks discovery
+    /// due. It runs concurrently with the dial that triggered it and lands
+    /// in the entry for a later checkout; a failed lookup caches a negative
+    /// answer rather than failing the request.
+    #[cfg(http3)]
+    fn start_h3_discovery(&self, origin: &Origin, permit: &DialPermit) {
+        let entry = permit.entry();
+        let Some(discovery) = entry.begin_h3_discovery(Instant::now()) else {
+            return;
+        };
+        let transport = self.transport.clone();
+        let spawn = self.spawner.as_spawn();
+        let host = origin.host.clone();
+        let port = origin.port;
+        self.spawner.spawn(async move {
+            let now = Instant::now();
+            let rr = match transport.https_record(spawn, &host, port).await {
+                Ok(Some(record)) => HttpsRr {
+                    h3: record.alpn.iter().any(|alpn| alpn == "h3"),
+                    port: record.port,
+                    expires: now + record.ttl,
+                },
+                Ok(None) => HttpsRr::negative(now),
+                Err(error) => {
+                    debug!(%host, port, %error, "HTTPS record lookup failed");
+                    HttpsRr::negative(now)
+                }
+            };
+            // The guard marks the entry Done however this task ends — a
+            // dropped future leaves the origin discoverable again instead of
+            // stuck InFlight.
+            discovery.insert_https_rr(rr);
+        });
     }
 }
 
@@ -153,10 +311,79 @@ pub enum HyperError {
 impl HyperError {
     /// Wrap a QUIC or h3 protocol error.
     #[cfg(http3)]
-    #[allow(dead_code)] // used by `h3` once the pool (#69) dials h3 connections
     pub(crate) fn http3(error: impl Into<Box<dyn core::error::Error + Send + Sync>>) -> Self {
         Self::Http3(error.into())
     }
+}
+
+/// A freshly connected TCP connection after its hyper handshake.
+enum DialedTcp {
+    /// HTTP/1.1 — exclusive; pooled by leasing.
+    H1 {
+        sender: hyper::client::conn::http1::SendRequest<http_kit::Body>,
+        via: Via,
+    },
+    /// HTTP/2 — shared; pooled by cloning.
+    #[cfg(feature = "http2")]
+    H2 {
+        sender: hyper::client::conn::http2::SendRequest<http_kit::Body>,
+    },
+}
+
+/// A QUIC handshake to `host`:`h3_port` on the transport's shared endpoint.
+/// The resolved addresses are tried in the order `happy_eyeballs` would dial
+/// TCP — getaddrinfo's RFC 6724 ordering — with `timeout` covering all of
+/// them together.
+#[cfg(http3)]
+async fn quic_dial(
+    transport: &Transport,
+    spawn: Spawn,
+    host: &str,
+    h3_port: u16,
+    timeout: Duration,
+) -> Result<h3::H3Connection, crate::Error> {
+    // The deadline covers resolution too: the detached loser is bounded by
+    // `timeout` end to end, not just across the handshakes.
+    let deadline = Instant::now() + timeout;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let addrs = {
+        let resolve = happy_eyeballs::resolve(host, h3_port);
+        let timer = async_io::Timer::after(remaining);
+        pin_mut!(resolve);
+        pin_mut!(timer);
+        match select(resolve, timer).await {
+            Either::Left((result, _)) => {
+                result.map_err(|error| crate::Error::Transport(Box::new(error)))?
+            }
+            Either::Right(_) => Vec::new(),
+        }
+    };
+    let endpoint = transport.quic_endpoint(spawn.clone())?;
+    let config = quic::client_config(transport.tls().client_config())?;
+    let mut last_error = None;
+    for addr in addrs {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let attempt = h3::H3Connection::connect(endpoint, config.clone(), addr, host, &spawn);
+        let timer = async_io::Timer::after(remaining);
+        pin_mut!(attempt);
+        pin_mut!(timer);
+        match select(attempt, timer).await {
+            Either::Left((result, _)) => match result {
+                Ok(connection) => return Ok(connection),
+                Err(error) => last_error = Some(error),
+            },
+            Either::Right(_) => break,
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        crate::Error::Transport(Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("QUIC connect to {host}:{h3_port} timed out"),
+        )))
+    }))
 }
 
 impl core::fmt::Display for HyperError {
@@ -217,95 +444,95 @@ impl From<HyperError> for crate::Error {
     }
 }
 
-impl Endpoint for HyperBackend {
-    type Error = crate::Error;
-    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-        let dummy_request = http::Request::builder()
-            .method(Method::GET)
-            .uri("/")
-            .body(http_kit::Body::empty())
-            .unwrap();
-        let mut request: http::Request<http_kit::Body> = replace(request, dummy_request);
-        // The absolute URI, kept so a request taken back from a dead
-        // connection can be reshaped for whichever checkout serves the retry.
-        let uri = request.uri().clone();
+/// The request's authority as a pool origin.
+fn request_origin(uri: &http::Uri) -> Result<Origin, HyperError> {
+    let host = uri
+        .host()
+        .ok_or_else(|| HyperError::InvalidUri(uri.to_string()))?;
+    let scheme = match uri.scheme_str().unwrap_or("http") {
+        "https" => Scheme::HTTPS,
+        "http" => Scheme::HTTP,
+        other => return Err(HyperError::InvalidUri(other.to_string())),
+    };
+    Ok(Origin {
+        host: host.to_owned(),
+        port: uri
+            .port_u16()
+            .unwrap_or(if scheme == Scheme::HTTPS { 443 } else { 80 }),
+        scheme,
+    })
+}
 
-        let origin = {
-            let uri = request.uri();
-            let host = uri
-                .host()
-                .ok_or_else(|| HyperError::InvalidUri(uri.to_string()))?;
-            let scheme = match uri.scheme_str().unwrap_or("http") {
-                "https" => Scheme::HTTPS,
-                "http" => Scheme::HTTP,
-                other => return Err(HyperError::InvalidUri(other.to_string()).into()),
-            };
-            Origin {
-                host: host.to_owned(),
-                port: uri
-                    .port_u16()
-                    .unwrap_or(if scheme == Scheme::HTTPS { 443 } else { 80 }),
-                scheme,
-            }
-        };
+impl HyperBackend {
+    /// h3 only ever serves a direct TLS origin: QUIC bypasses proxies, so a
+    /// proxied or plaintext request never sees the pool's h3 paths.
+    #[cfg(http3)]
+    fn h3_gate(&self, origin: &Origin) -> Result<H3, crate::Error> {
+        let proxied = proxied(
+            &self.transport,
+            Target {
+                host: &origin.host,
+                port: origin.port,
+                tls: true,
+                tunnel_plaintext: false,
+                protocols: Protocols::Http2OrHttp1,
+            },
+        )?;
+        Ok(if origin.scheme == Scheme::HTTPS && !proxied {
+            H3::Allowed
+        } else {
+            H3::Blocked
+        })
+    }
 
-        let mut retried = false;
-        let (response, lease) = loop {
-            // The retry after a pooled connection refused the request dials
-            // fresh rather than reusing another connection from the pool.
-            let checkout = self
-                .transport
-                .pool()
-                .checkout(
-                    origin.clone(),
-                    if retried {
-                        Reuse::FreshDial
-                    } else {
-                        Reuse::Pooled
-                    },
-                )
-                .await;
-            match checkout {
-                #[cfg(feature = "http2")]
-                // The URI stays absolute: hyper derives `:scheme` and
-                // `:authority` from it.
-                Checkout::H2(mut sender) => {
-                    match send_or_retry(sender.try_send_request(request).await, retried)? {
-                        Sent::Done(response) => break (response, None),
-                        Sent::Retry(unsent) => {
-                            retried = true;
-                            request = *unsent;
-                            *request.uri_mut() = uri.clone();
-                        }
-                    }
+    /// Feed the response's `Alt-Svc` headers into the origin's entry — an
+    /// advertisement only counts where QUIC could ever be dialed, and a
+    /// malformed value is logged and ignored, never a request failure.
+    /// Repeated `Alt-Svc` fields are one comma-joined list (RFC 9110), so a
+    /// field carrying `clear` or no usable h3 does not erase what its
+    /// siblings advertised.
+    #[cfg(http3)]
+    fn record_alt_svc(&self, origin: &Origin, h3: H3, response: &http_kit::Response) {
+        if !matches!(h3, H3::Allowed) {
+            return;
+        }
+        let mut joined = String::new();
+        for value in response.headers().get_all(http::header::ALT_SVC) {
+            if let Ok(value) = value.to_str() {
+                if !joined.is_empty() {
+                    joined.push(',');
                 }
-                Checkout::H1(lease) => {
-                    shape_h1_request(&mut request, lease.via())?;
-                    let sent = send_or_retry(lease.send(request).await, retried)?;
-                    match sent {
-                        Sent::Done((response, lease)) => break (response, Some(lease)),
-                        Sent::Retry(unsent) => {
-                            retried = true;
-                            request = *unsent;
-                            *request.uri_mut() = uri.clone();
-                        }
-                    }
-                }
-                Checkout::Dial(permit) => {
-                    break self.dial_and_send(&origin, permit, request).await?;
-                }
+                joined.push_str(value);
+            } else {
+                debug!(?value, "ignoring non-ASCII Alt-Svc header");
             }
-        };
+        }
+        if joined.is_empty() {
+            return;
+        }
+        self.transport
+            .pool()
+            .entry(origin)
+            .insert_alt_svc(&origin.host, &joined, Instant::now());
+    }
 
-        let mut response = response.map(|body| {
-            let stream = BodyDataStream::new(body)
-                .map_err(|error| http_kit::BodyError::Other(Box::new(error)));
-            match lease {
-                // The h1 connection is reusable once the body is finished or
-                // dropped, so the lease rides along with it.
-                Some(lease) => http_kit::Body::from_stream(LeaseReturn::new(stream, lease)),
-                None => http_kit::Body::from_stream(stream),
-            }
+    /// Wrap the h1 lease around its body's tail, harvest `Alt-Svc`, and turn
+    /// an error status into [`HyperError::Remote`].
+    async fn finish_response(
+        &self,
+        #[cfg(http3)] origin: &Origin,
+        #[cfg(http3)] h3: H3,
+        response: http::Response<http_kit::Body>,
+        lease: Option<H1Lease>,
+    ) -> Result<Response, crate::Error> {
+        #[cfg(http3)]
+        self.record_alt_svc(origin, h3, &response);
+
+        let mut response = response.map(|body| match lease {
+            // The h1 connection is reusable once the body is finished or
+            // dropped, so the lease rides along with it.
+            Some(lease) => http_kit::Body::from_stream(LeaseReturn::new(body, lease)),
+            None => body,
         });
 
         debug!(
@@ -315,7 +542,6 @@ impl Endpoint for HyperBackend {
         );
 
         let is_error = response.status().is_client_error() || response.status().is_server_error();
-
         if is_error {
             let error_msg: Option<String> = response
                 .body_mut()
@@ -335,28 +561,162 @@ impl Endpoint for HyperBackend {
     }
 }
 
+impl Endpoint for HyperBackend {
+    type Error = crate::Error;
+    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+        let dummy_request = http::Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(http_kit::Body::empty())
+            .unwrap();
+        let mut request: http::Request<http_kit::Body> = replace(request, dummy_request);
+        // The absolute URI, kept so a request taken back from a dead
+        // connection can be reshaped for whichever checkout serves the retry.
+        let uri = request.uri().clone();
+
+        let origin = request_origin(&uri)?;
+
+        #[cfg(http3)]
+        let h3 = self.h3_gate(&origin)?;
+
+        let mut retried = false;
+        let (response, lease) = loop {
+            // The retry after a pooled connection refused the request dials
+            // fresh rather than reusing another connection from the pool.
+            let checkout = self
+                .transport
+                .pool()
+                .checkout(
+                    origin.clone(),
+                    if retried {
+                        Reuse::FreshDial
+                    } else {
+                        Reuse::Pooled
+                    },
+                    #[cfg(http3)]
+                    h3,
+                )
+                .await;
+            #[cfg(http3)]
+            let h3_port = checkout.h3_port();
+            match checkout {
+                #[cfg(http3)]
+                // The URI stays absolute: h3 requests carry `:scheme` and
+                // `:authority`. A checkout only hands out a live handle —
+                // `is_closed` evicts a dead one — and a send failure is
+                // final: `h3`'s `StreamError` cannot prove the request never
+                // reached the wire, so it is never replayed.
+                Checkout::H3(mut connection) => {
+                    break (connection.request(request).await?, None);
+                }
+                #[cfg(feature = "http2")]
+                // The URI stays absolute: hyper derives `:scheme` and
+                // `:authority` from it.
+                Checkout::H2(mut sender) => {
+                    match send_or_retry(sender.try_send_request(request).await, retried)? {
+                        Sent::Done(response) => break (into_body(response), None),
+                        Sent::Retry(unsent) => {
+                            retried = true;
+                            request = *unsent;
+                            *request.uri_mut() = uri.clone();
+                        }
+                    }
+                }
+                Checkout::H1(lease) => {
+                    shape_h1_request(&mut request, lease.via())?;
+                    let sent = send_or_retry(lease.send(request).await, retried)?;
+                    match sent {
+                        Sent::Done((response, lease)) => break (into_body(response), Some(lease)),
+                        Sent::Retry(unsent) => {
+                            retried = true;
+                            request = *unsent;
+                            *request.uri_mut() = uri.clone();
+                        }
+                    }
+                }
+                Checkout::Dial { permit, .. } => {
+                    // A first dial to a direct TLS origin kicks off its HTTPS
+                    // record lookup; the answer lands in the pool for later
+                    // checkouts.
+                    #[cfg(http3)]
+                    if matches!(h3, H3::Allowed) {
+                        self.start_h3_discovery(&origin, &permit);
+                    }
+                    break self
+                        .dial_and_send(
+                            &origin,
+                            permit,
+                            request,
+                            #[cfg(http3)]
+                            h3_port,
+                        )
+                        .await?;
+                }
+            }
+        };
+
+        self.finish_response(
+            #[cfg(http3)]
+            &origin,
+            #[cfg(http3)]
+            h3,
+            response,
+            lease,
+        )
+        .await
+    }
+}
+
+/// A response body repacked as `http_kit::Body`.
+fn into_body(response: http::Response<Incoming>) -> http::Response<http_kit::Body> {
+    response.map(|body| {
+        http_kit::Body::from_stream(
+            BodyDataStream::new(body).map_err(|error| http_kit::BodyError::Other(Box::new(error))),
+        )
+    })
+}
+
 /// The outcome of a send on a pooled connection.
 enum Sent<T> {
     /// The send completed. For h1 the payload pairs the response with the
-    /// returned lease; for h2 it is just the response.
+    /// returned lease; for h2 and h3 it is just the response.
     Done(T),
     /// The pooled connection died before the request was written and this
     /// was the first reuse failure — retry once on a fresh dial.
     Retry(Box<http::Request<http_kit::Body>>),
 }
 
+/// A send failure that can hand the request back when the connection died
+/// before writing it — hyper's `TrySendError` shape.
+trait Unsent {
+    /// The request, when nothing of it reached the connection.
+    fn take_request(&mut self) -> Option<http::Request<http_kit::Body>>;
+    /// The error itself, as a crate error.
+    fn into_error(self) -> crate::Error;
+}
+
+impl Unsent for TrySendError<http::Request<http_kit::Body>> {
+    fn take_request(&mut self) -> Option<http::Request<http_kit::Body>> {
+        self.take_message()
+    }
+
+    fn into_error(self) -> crate::Error {
+        HyperError::Connection(self.into_error()).into()
+    }
+}
+
 /// Classify a pooled-connection send: the success payload, the request back
-/// when hyper never wrote it (`TrySendError::take_message` only yields it
-/// for unstarted requests), or a hard error.
-fn send_or_retry<T>(
-    result: Result<T, TrySendError<http::Request<http_kit::Body>>>,
+/// when the connection never wrote it (`take_request` only yields it for
+/// unstarted requests), or a hard error.
+fn send_or_retry<T, E: Unsent>(
+    result: Result<T, E>,
     retried: bool,
-) -> Result<Sent<T>, HyperError> {
+) -> Result<Sent<T>, crate::Error> {
     match result {
         Ok(done) => Ok(Sent::Done(done)),
-        Err(mut error) => match error.take_message() {
+        Err(mut error) => match error.take_request() {
             Some(unsent) if !retried => Ok(Sent::Retry(Box::new(unsent))),
-            _ => Err(HyperError::Connection(error.into_error())),
+            _ => Err(error.into_error()),
         },
     }
 }
@@ -901,215 +1261,20 @@ mod tests {
 
     #[cfg(feature = "http2")]
     mod http2 {
-        use std::{
-            convert::Infallible,
-            net::SocketAddr,
-            sync::{
-                Arc,
-                atomic::{AtomicUsize, Ordering},
-                mpsc,
-            },
-            thread,
-            time::Duration,
-        };
-
         use async_io::block_on;
-        use async_net::{TcpListener, TcpStream};
-        use futures_rustls::TlsAcceptor;
-        use http::{Version, header::HOST};
-        use http_body_util::{BodyExt, Full};
-        use hyper::{
-            body::{Bytes, Incoming},
-            service::service_fn,
+        use http::Version;
+
+        use super::super::{
+            HyperBackend,
+            test_support::{TestCa, TlsServer},
         };
-        use rcgen::{
-            BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
-            KeyPair,
-        };
-        use rustls::{
-            ServerConfig,
-            crypto::ring,
-            pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
-        };
-        use time::{Duration as TimeDelta, OffsetDateTime};
-
-        use super::super::{HyperBackend, rt::Spawner};
-        use crate::{Client as _, ResponseExt as _, Transport, transport::hyper_io::HyperIo};
-
-        const TEST_TIMEOUT: Duration = Duration::from_secs(10);
-
-        /// What the server observed on one request.
-        #[derive(Debug)]
-        struct Observed {
-            version: Version,
-            authority: Option<String>,
-            host: Option<String>,
-            body: Vec<u8>,
-        }
-
-        /// A TLS server that speaks h2 or h1 depending on the negotiated ALPN
-        /// and reports every request it sees.
-        struct AlpnServer {
-            address: SocketAddr,
-            ca_der: Vec<u8>,
-            accepts: Arc<AtomicUsize>,
-            observed: mpsc::Receiver<Observed>,
-        }
-
-        impl AlpnServer {
-            /// Start a server offering `alpn_protocols`, in preference order.
-            fn start(alpn_protocols: &[&[u8]]) -> Self {
-                let (ca_der, mut config) = server_config();
-                config.alpn_protocols = alpn_protocols
-                    .iter()
-                    .map(|protocol| protocol.to_vec())
-                    .collect();
-                let acceptor = TlsAcceptor::from(Arc::new(config));
-                let (listener, address) = block_on(async {
-                    let listener = TcpListener::bind("127.0.0.1:0")
-                        .await
-                        .expect("test listener must bind");
-                    let address = listener.local_addr().expect("test address must exist");
-                    (listener, address)
-                });
-                let (observed_tx, observed) = mpsc::channel();
-                let accepts = Arc::new(AtomicUsize::new(0));
-                let accept_count = accepts.clone();
-                thread::spawn(move || {
-                    block_on(async move {
-                        while let Ok((tcp, _)) = listener.accept().await {
-                            accept_count.fetch_add(1, Ordering::SeqCst);
-                            let acceptor = acceptor.clone();
-                            let observed_tx = observed_tx.clone();
-                            thread::spawn(move || block_on(serve(acceptor, tcp, observed_tx)));
-                        }
-                    });
-                });
-                Self {
-                    address,
-                    ca_der,
-                    accepts,
-                    observed,
-                }
-            }
-
-            /// How many TCP connections the server has accepted.
-            fn accept_count(&self) -> usize {
-                self.accepts.load(Ordering::SeqCst)
-            }
-
-            fn transport(&self) -> Transport {
-                Transport::builder()
-                    .extra_root_certificate_der(self.ca_der.clone())
-                    .build()
-                    .expect("test transport must build")
-            }
-
-            fn uri(&self, path: &str) -> String {
-                format!("https://localhost:{}{}", self.address.port(), path)
-            }
-
-            /// The next request the server saw.
-            fn next_request(&self) -> Observed {
-                self.observed
-                    .recv_timeout(TEST_TIMEOUT)
-                    .expect("server must see the request")
-            }
-        }
-
-        /// A throwaway CA and a leaf certificate for localhost, signed by it.
-        fn server_config() -> (Vec<u8>, ServerConfig) {
-            let now = OffsetDateTime::now_utc();
-            let ca_key = KeyPair::generate().expect("generate CA key");
-            let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
-            ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-            ca_params
-                .distinguished_name
-                .push(DnType::CommonName, "zenwave test CA");
-            ca_params.not_before = now - TimeDelta::days(1);
-            ca_params.not_after = now + TimeDelta::days(365);
-            let ca_cert = ca_params.self_signed(&ca_key).expect("self-sign CA");
-            let issuer = Issuer::new(ca_params, ca_key);
-
-            let leaf_key = KeyPair::generate().expect("generate leaf key");
-            let mut leaf_params =
-                CertificateParams::new(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
-                    .expect("leaf params");
-            leaf_params
-                .distinguished_name
-                .push(DnType::CommonName, "localhost");
-            leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-            leaf_params.not_before = now - TimeDelta::days(1);
-            leaf_params.not_after = now + TimeDelta::days(365);
-            let leaf = leaf_params
-                .signed_by(&leaf_key, &issuer)
-                .expect("sign leaf certificate");
-
-            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
-            let config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
-                .with_safe_default_protocol_versions()
-                .expect("protocol versions")
-                .with_no_client_auth()
-                .with_single_cert(vec![leaf.der().clone()], key)
-                .expect("server certificate");
-            (ca_cert.der().to_vec(), config)
-        }
-
-        /// Accept TLS on `tcp` and serve every request on the connection with
-        /// the HTTP version ALPN negotiated.
-        async fn serve(acceptor: TlsAcceptor, tcp: TcpStream, observed: mpsc::Sender<Observed>) {
-            let Ok(tls) = acceptor.accept(tcp).await else {
-                return;
-            };
-            let negotiated = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
-            let service = service_fn(move |request: hyper::Request<Incoming>| {
-                let observed = observed.clone();
-                async move {
-                    let (parts, body) = request.into_parts();
-                    let body = body
-                        .collect()
-                        .await
-                        .expect("request body must be readable")
-                        .to_bytes()
-                        .to_vec();
-                    observed
-                        .send(Observed {
-                            version: parts.version,
-                            authority: parts
-                                .uri
-                                .authority()
-                                .map(|authority| authority.as_str().to_owned()),
-                            host: parts
-                                .headers
-                                .get(HOST)
-                                .map(|value| value.to_str().expect("Host is ASCII").to_owned()),
-                            body,
-                        })
-                        .expect("observed channel must be open");
-                    Ok::<_, Infallible>(hyper::Response::new(Full::new(Bytes::from_static(
-                        b"zenwave",
-                    ))))
-                }
-            });
-            let io = HyperIo(tls);
-            let _ = match negotiated.as_deref() {
-                Some(b"h2") => {
-                    hyper::server::conn::http2::Builder::new(Spawner::new(None))
-                        .serve_connection(io, service)
-                        .await
-                }
-                _ => {
-                    hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, service)
-                        .await
-                }
-            };
-        }
+        use crate::{Client as _, ResponseExt as _};
 
         #[test]
         fn https_requests_negotiate_http2_through_alpn() {
-            let server = AlpnServer::start(&[b"h2", b"http/1.1"]);
-            let mut client = HyperBackend::new(server.transport());
+            let ca = TestCa::new();
+            let server = TlsServer::start(&ca, &[b"h2", b"http/1.1"]);
+            let mut client = HyperBackend::new(ca.transport());
 
             block_on(async {
                 let response = client
@@ -1135,7 +1300,7 @@ mod tests {
             assert_eq!(first.version, Version::HTTP_2);
             assert_eq!(
                 first.authority.as_deref(),
-                Some(format!("localhost:{}", server.address.port()).as_str()),
+                Some(format!("localhost:{}", server.addr().port()).as_str()),
                 "the server must see :authority, derived from the absolute URI"
             );
             assert_eq!(first.host, None, "h2 requests carry no Host header");
@@ -1147,8 +1312,9 @@ mod tests {
 
         #[test]
         fn http1_only_servers_still_work() {
-            let server = AlpnServer::start(&[b"http/1.1"]);
-            let mut client = HyperBackend::new(server.transport());
+            let ca = TestCa::new();
+            let server = TlsServer::start(&ca, &[b"http/1.1"]);
+            let mut client = HyperBackend::new(ca.transport());
 
             block_on(async {
                 client
@@ -1165,8 +1331,9 @@ mod tests {
         #[test]
         fn concurrent_h2_requests_coalesce_on_one_connection() {
             const CONCURRENT: usize = 4;
-            let server = AlpnServer::start(&[b"h2"]);
-            let transport = server.transport();
+            let ca = TestCa::new();
+            let server = TlsServer::start(&ca, &[b"h2"]);
+            let transport = ca.transport();
             let uri = server.uri("/");
 
             block_on(async {
@@ -1192,6 +1359,342 @@ mod tests {
                 1,
                 "concurrent h2 requests must share one connection"
             );
+        }
+    }
+
+    /// The QUIC/TCP race tests of issue #69: Alt-Svc and HTTPS-RR discovery,
+    /// QUIC failure backoff, and eviction of a dead h3 handle.
+    #[cfg(http3)]
+    mod h3_discovery {
+        use std::{
+            net::UdpSocket,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            thread,
+            time::{Duration, Instant},
+        };
+
+        use hickory_proto::op::ResponseCode;
+        use http::uri::Scheme;
+
+        use super::super::{
+            HyperBackend,
+            test_support::{H3Server, TestCa, TlsServer, block_on_test, wait_until},
+        };
+        use crate::{
+            Client as _, Proxy, Transport,
+            transport::{
+                dns::{
+                    self,
+                    test_support::{answer, resolver_config, serve},
+                },
+                pool::{HttpsRr, Origin},
+            },
+        };
+
+        /// The TCP leg's TLS handshake stalls this long, so the QUIC racer
+        /// to a live h3 server wins deterministically on loopback.
+        const TCP_STALL: Duration = Duration::from_millis(500);
+
+        fn https_origin(host: &str, port: u16) -> Origin {
+            Origin {
+                scheme: Scheme::HTTPS,
+                host: host.to_owned(),
+                port,
+            }
+        }
+
+        /// The `x-zenwave-protocol` the fixture answered with — `Some("h3")`
+        /// from the QUIC server, absent over TCP.
+        fn protocol(response: &http_kit::Response) -> Option<String> {
+            response
+                .headers()
+                .get("x-zenwave-protocol")
+                .map(|value| value.to_str().expect("marker header is ASCII").to_owned())
+        }
+
+        /// a. An `Alt-Svc` advertisement upgrades the origin: the first
+        /// request rides TCP and caches the advertisement, the second races
+        /// QUIC — which wins while the TCP handshake is stalled — and the
+        /// third reuses the pooled h3 handle.
+        #[test]
+        fn alt_svc_upgrades_the_origin_to_h3() {
+            let ca = TestCa::new();
+            let h3 = H3Server::start(&ca);
+            let tcp = TlsServer::serve(
+                &ca,
+                &[b"h2", b"http/1.1"],
+                vec![format!(r#"h3=":{}"; ma=60"#, h3.addr().port())],
+                TCP_STALL,
+            );
+            let mut client = HyperBackend::new(ca.transport());
+
+            block_on_test(async {
+                let first = client
+                    .get(tcp.uri("/hello"))
+                    .expect("test request must build")
+                    .await
+                    .expect("first request must succeed over TCP");
+                assert_eq!(protocol(&first), None, "the first request rides TCP");
+
+                let second = client
+                    .get(tcp.uri("/hello"))
+                    .expect("test request must build")
+                    .await
+                    .expect("the h3 racer must serve the second request");
+                assert_eq!(
+                    protocol(&second),
+                    Some("h3".to_owned()),
+                    "the advertised h3 must win the race"
+                );
+                wait_until(|| h3.served() == 1).await;
+                assert_eq!(h3.connection_count(), 1);
+
+                let third = client
+                    .get(tcp.uri("/hello"))
+                    .expect("test request must build")
+                    .await
+                    .expect("the pooled h3 handle must serve the third request");
+                assert_eq!(protocol(&third), Some("h3".to_owned()));
+                wait_until(|| h3.served() == 2).await;
+                assert_eq!(
+                    h3.connection_count(),
+                    1,
+                    "the pooled h3 handle multiplexes instead of redialing"
+                );
+            });
+        }
+
+        /// RFC 9110: repeated `Alt-Svc` header fields are one comma-joined
+        /// list — an `h2`-only field must not erase the `h3` its sibling
+        /// advertised, which a per-field overwrite would do.
+        #[test]
+        fn split_alt_svc_fields_still_upgrade_the_origin() {
+            let ca = TestCa::new();
+            let h3 = H3Server::start(&ca);
+            let tcp = TlsServer::serve(
+                &ca,
+                &[b"h2", b"http/1.1"],
+                vec![
+                    format!(r#"h3=":{}"; ma=60"#, h3.addr().port()),
+                    r#"h2=":443""#.to_owned(),
+                ],
+                TCP_STALL,
+            );
+            let mut client = HyperBackend::new(ca.transport());
+
+            block_on_test(async {
+                client
+                    .get(tcp.uri("/hello"))
+                    .expect("test request must build")
+                    .await
+                    .expect("first request must succeed over TCP");
+                let second = client
+                    .get(tcp.uri("/hello"))
+                    .expect("test request must build")
+                    .await
+                    .expect("the h3 racer must serve the second request");
+                assert_eq!(
+                    protocol(&second),
+                    Some("h3".to_owned()),
+                    "the h3 in the first field must survive the second field"
+                );
+                wait_until(|| h3.served() == 1).await;
+            });
+        }
+
+        /// b. HTTPS-record discovery upgrades the origin. A `localhost`
+        /// name cannot carry a wire HTTPS answer — RFC 6761 resolvers
+        /// (hickory included) answer `*.localhost` in-process — so the first
+        /// dial's lookup lands a negative answer, which is itself the
+        /// observable that discovery ran. A positive answer is then planted
+        /// exactly as the lookup lands it, and the next request must ride
+        /// h3. The wire side — the `_port._https.` query name and answer
+        /// parsing — is covered by the dns module's own tests.
+        #[test]
+        fn https_record_upgrades_the_origin_to_h3() {
+            let ca = TestCa::new();
+            let h3 = H3Server::start(&ca);
+            let tcp = TlsServer::serve(&ca, &[b"h2", b"http/1.1"], Vec::new(), TCP_STALL);
+            let tcp_port = tcp.addr().port();
+
+            // The resolver only has to be reachable for the lookup to land;
+            // `localhost`'s answer is generated before the wire anyway.
+            let (dns_server, _queried) =
+                serve(|query| answer(query, ResponseCode::NoError, vec![]));
+            let (config, options) = resolver_config(dns_server);
+            let transport = Transport::builder()
+                .proxy(Proxy::none())
+                .extra_root_certificate_der(ca.ca_der.to_vec())
+                .dns_config(dns::Config::new(config, options))
+                .build()
+                .expect("transport builds");
+            let mut client = HyperBackend::new(transport.clone());
+            let entry = transport.pool().entry(&https_origin("localhost", tcp_port));
+
+            block_on_test(async {
+                client
+                    .get(tcp.uri("/hello"))
+                    .expect("test request must build")
+                    .await
+                    .expect("first request must succeed over TCP");
+                // The lookup runs detached; its answer lands on the entry.
+                wait_until(|| entry.https_rr().is_some()).await;
+
+                // A positive answer — as `insert_https_rr` receives it from
+                // the lookup — makes the origin an h3 candidate.
+                entry.insert_https_rr(HttpsRr {
+                    h3: true,
+                    port: Some(h3.addr().port()),
+                    expires: Instant::now() + Duration::from_secs(60),
+                });
+
+                let second = client
+                    .get(tcp.uri("/hello"))
+                    .expect("test request must build")
+                    .await
+                    .expect("the discovered h3 must serve the second request");
+                assert_eq!(protocol(&second), Some("h3".to_owned()));
+                wait_until(|| h3.served() == 1).await;
+
+                let third = client
+                    .get(tcp.uri("/hello"))
+                    .expect("test request must build")
+                    .await
+                    .expect("the pooled h3 handle must serve the third request");
+                assert_eq!(protocol(&third), Some("h3".to_owned()));
+                assert_eq!(
+                    h3.connection_count(),
+                    1,
+                    "the pooled h3 handle multiplexes instead of redialing"
+                );
+            });
+        }
+
+        /// c. QUIC to a dead UDP port loses to TCP; the detached loser's
+        /// failure puts the origin into backoff and the next request sends
+        /// no datagram at all. The origin is an IPv4 literal so the racer's
+        /// datagrams always land on the counting socket.
+        #[test]
+        fn a_dead_udp_port_falls_back_and_backs_off() {
+            let ca = TestCa::new();
+            let udp = UdpSocket::bind(("127.0.0.1", 0)).expect("counting socket binds");
+            let udp_port = udp.local_addr().expect("counting address").port();
+            let datagrams = Arc::new(AtomicUsize::new(0));
+            thread::spawn({
+                let datagrams = datagrams.clone();
+                move || {
+                    let mut buffer = [0_u8; 2048];
+                    while udp.recv(&mut buffer).is_ok() {
+                        datagrams.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            });
+
+            let tcp = TlsServer::serve(
+                &ca,
+                &[b"h2", b"http/1.1"],
+                vec![format!(r#"h3=":{udp_port}"; ma=60"#)],
+                Duration::ZERO,
+            );
+            let transport = ca.transport();
+            let origin = https_origin("127.0.0.1", tcp.addr().port());
+            let entry = transport.pool().entry(&origin);
+            entry.set_h3_timeouts(Duration::from_millis(300), Duration::from_secs(60));
+            let mut client = HyperBackend::new(transport);
+            let uri = format!("https://127.0.0.1:{}/", tcp.addr().port());
+
+            block_on_test(async {
+                client
+                    .get(uri.clone())
+                    .expect("test request must build")
+                    .await
+                    .expect("first request must succeed over TCP");
+                // The advertisement is cached now; this request races QUIC
+                // against TCP. TCP wins at once and the QUIC loser runs
+                // detached to its injected deadline.
+                client
+                    .get(uri.clone())
+                    .expect("test request must build")
+                    .await
+                    .expect("the race must fall back to TCP");
+                wait_until(|| entry.h3_broken_until().is_some()).await;
+                let sent = datagrams.load(Ordering::SeqCst);
+                assert!(sent > 0, "the QUIC racer must have sent Initial datagrams");
+
+                client
+                    .get(uri)
+                    .expect("test request must build")
+                    .await
+                    .expect("the backoff request must succeed over TCP");
+                // Give a stray dial a moment to show up, then check nothing
+                // left the endpoint.
+                async_io::Timer::after(Duration::from_millis(100)).await;
+                assert_eq!(
+                    datagrams.load(Ordering::SeqCst),
+                    sent,
+                    "QUIC backoff must keep the origin on TCP"
+                );
+            });
+        }
+
+        /// e. When the h3 server's QUIC endpoint closes, the pooled handle's
+        /// driver ends, `is_closed` evicts it at the next checkout, and the
+        /// request is served over TCP.
+        #[test]
+        fn a_dead_h3_connection_is_evicted_and_tcp_serves() {
+            let ca = TestCa::new();
+            let h3 = H3Server::start(&ca);
+            let tcp = TlsServer::serve(
+                &ca,
+                &[b"h2", b"http/1.1"],
+                vec![format!(r#"h3=":{}"; ma=60"#, h3.addr().port())],
+                TCP_STALL,
+            );
+            let transport = ca.transport();
+            let entry = transport
+                .pool()
+                .entry(&https_origin("localhost", tcp.addr().port()));
+            let mut client = HyperBackend::new(transport);
+
+            block_on_test(async {
+                client
+                    .get(tcp.uri("/hello"))
+                    .expect("test request must build")
+                    .await
+                    .expect("first request must succeed over TCP");
+                let second = client
+                    .get(tcp.uri("/hello"))
+                    .expect("test request must build")
+                    .await
+                    .expect("the upgrade must reach h3");
+                assert_eq!(protocol(&second), Some("h3".to_owned()));
+
+                h3.close();
+                wait_until(|| {
+                    entry
+                        .h3_connection()
+                        .is_some_and(|connection| connection.is_closed())
+                })
+                .await;
+
+                let third = client
+                    .get(tcp.uri("/hello"))
+                    .expect("test request must build")
+                    .await
+                    .expect("the fallback must succeed");
+                assert_eq!(
+                    protocol(&third),
+                    None,
+                    "a dead h3 connection must fall back to TCP"
+                );
+                assert!(
+                    entry.h3_connection().is_none(),
+                    "the dead handle must be evicted at checkout"
+                );
+            });
         }
     }
 }

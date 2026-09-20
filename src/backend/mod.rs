@@ -26,6 +26,12 @@
 mod hyper;
 #[cfg(all(not(target_arch = "wasm32"), feature = "hyper-backend"))]
 pub use hyper::HyperBackend;
+// The connection pool stores the h3 handle and applies the Alt-Svc parser.
+#[cfg(http3)]
+pub(crate) use hyper::{alt_svc, h3};
+// The h3 fixtures also serve the pool's coalescing test.
+#[cfg(all(test, http3))]
+pub(crate) use hyper::test_support;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "curl-backend"))]
 mod curl;

@@ -31,6 +31,30 @@ const MIN_CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(100);
 const MAX_CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Resolve `host`:`port` to socket addresses in the order [`connect`] would
+/// attempt them — getaddrinfo's RFC 6724 ordering where the system reports
+/// it, otherwise the RFC 8305 interleave. QUIC dials share the result: a UDP
+/// handshake races in the same address order TCP would have used.
+#[cfg(http3)]
+pub async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let mut state = HappyEyeballsState::new();
+    let mut resolver = start_resolution(host, port);
+    while let Some(event) = resolver.next().await {
+        state.apply_resolution(event);
+    }
+    state.mark_resolution_stream_closed();
+
+    let ordered = state.ordered_candidates();
+    if ordered.is_empty() {
+        return Err(state.into_connect_error());
+    }
+    Ok(ordered)
+}
+
 pub async fn connect(host: &str, port: u16) -> io::Result<TcpStream> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         let addr = SocketAddr::new(ip, port);

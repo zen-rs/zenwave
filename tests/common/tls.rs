@@ -84,7 +84,9 @@ pub fn tls_fixture() -> &'static TlsFixture {
     INSTANCE.get_or_init(start)
 }
 
-fn start() -> TlsFixture {
+/// A throwaway CA and a leaf `ServerConfig` covering `sans`, signed by it.
+/// Returns the CA certificate in PEM for `extra_root_certificates_pem`.
+fn signed_server_config(sans: Vec<String>) -> (Vec<u8>, ServerConfig) {
     let now = OffsetDateTime::now_utc();
 
     let ca_key = KeyPair::generate().expect("generate CA key");
@@ -100,12 +102,7 @@ fn start() -> TlsFixture {
     let issuer = Issuer::new(ca_params, ca_key);
 
     let leaf_key = KeyPair::generate().expect("generate leaf key");
-    let mut leaf_params = CertificateParams::new(vec![
-        "localhost".to_owned(),
-        "127.0.0.1".to_owned(),
-        super::FIXTURE_HOST.to_owned(),
-    ])
-    .expect("leaf params");
+    let mut leaf_params = CertificateParams::new(sans).expect("leaf params");
     leaf_params
         .distinguished_name
         .push(DnType::CommonName, "localhost");
@@ -123,6 +120,45 @@ fn start() -> TlsFixture {
         .with_no_client_auth()
         .with_single_cert(vec![leaf.der().clone()], key)
         .expect("server certificate");
+    (ca_pem, config)
+}
+
+/// A TLS endpoint that answers like [`tls_fixture`]'s HTTPS server plus an
+/// `Alt-Svc: <alt_svc>` header on every response — the HTTP/3-through-a-proxy
+/// test advertises a counting UDP socket and asserts it stays silent.
+/// Returns the CA in PEM and the listen address.
+pub fn alt_svc_server(alt_svc: String) -> (Vec<u8>, SocketAddr) {
+    let (ca_pem, config) = signed_server_config(vec![
+        "localhost".to_owned(),
+        "127.0.0.1".to_owned(),
+        super::FIXTURE_HOST.to_owned(),
+    ]);
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    let (listener, addr) = bind();
+    thread::spawn(move || {
+        smol::block_on(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept HTTPS");
+                let acceptor = acceptor.clone();
+                let alt_svc = alt_svc.clone();
+                smol::spawn(async move {
+                    if let Ok(tls) = acceptor.accept(stream).await {
+                        serve_json(tls, Some(&alt_svc)).await;
+                    }
+                })
+                .detach();
+            }
+        });
+    });
+    (ca_pem, addr)
+}
+
+fn start() -> TlsFixture {
+    let (ca_pem, config) = signed_server_config(vec![
+        "localhost".to_owned(),
+        "127.0.0.1".to_owned(),
+        super::FIXTURE_HOST.to_owned(),
+    ]);
 
     // The wss listener offers h2 alongside http/1.1 so tests can assert the
     // client only asked for http/1.1 — the websocket handshake is an HTTP/1.1
@@ -170,7 +206,7 @@ fn start() -> TlsFixture {
                 let acceptor = acceptor.clone();
                 smol::spawn(async move {
                     if let Ok(tls) = acceptor.accept(stream).await {
-                        serve_json(tls).await;
+                        serve_json(tls, None).await;
                     }
                 })
                 .detach();
@@ -198,7 +234,7 @@ fn bind() -> (TcpListener, SocketAddr) {
     })
 }
 
-async fn serve_json<S: AsyncReadExt + AsyncWriteExt + Unpin>(mut stream: S) {
+async fn serve_json<S: AsyncReadExt + AsyncWriteExt + Unpin>(mut stream: S, alt_svc: Option<&str>) {
     let mut request = Vec::new();
     let mut chunk = [0_u8; 1024];
     while !request.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -211,8 +247,9 @@ async fn serve_json<S: AsyncReadExt + AsyncWriteExt + Unpin>(mut stream: S) {
         request.extend_from_slice(&chunk[..read]);
     }
     let body = br#"{"secure":true}"#;
+    let alt_svc = alt_svc.map_or(String::new(), |value| format!("Alt-Svc: {value}\r\n"));
     let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{alt_svc}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(head.as_bytes()).await;

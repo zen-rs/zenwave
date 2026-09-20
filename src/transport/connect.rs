@@ -71,6 +71,17 @@ pub struct Connection {
     pub protocol: Protocol,
 }
 
+/// Whether a connection to `target` would go through a proxy — HTTP/3 is
+/// never dialed to a proxied origin: QUIC bypasses the proxy, so the pool
+/// keeps such origins on TCP regardless of what they advertise.
+#[cfg(http3)]
+pub fn proxied(transport: &Transport, target: Target<'_>) -> Result<bool, Error> {
+    Ok(transport
+        .proxy()
+        .intercept(&destination_uri(target)?)
+        .is_some())
+}
+
 /// Connect to `target` following the transport's proxy rules.
 pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connection, Error> {
     let Some(intercept) = transport.proxy().intercept(&destination_uri(target)?) else {
