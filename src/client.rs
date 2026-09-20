@@ -567,7 +567,8 @@ pub trait Client: Endpoint + Sized {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::InvalidUri`] when `uri` cannot be parsed, or
+    /// Returns [`crate::Error::InvalidUri`] when `uri` cannot be parsed or
+    /// its scheme is neither `http` nor `https`, or
     /// [`crate::Error::InvalidRequest`] when the request cannot be constructed.
     fn method<U>(
         &mut self,
@@ -579,6 +580,16 @@ pub trait Client: Endpoint + Sized {
         U::Error: Display,
     {
         let uri = uri.try_into().map_err(invalid_uri)?;
+        // Every backend speaks HTTP only; a URI for another protocol is
+        // refused here so no backend (libcurl speaks FTP) reaches the
+        // network with it.
+        if let Some(scheme) = uri.scheme_str()
+            && !matches!(scheme, "http" | "https")
+        {
+            return Err(invalid_uri(format_args!(
+                "unsupported scheme `{scheme}`: only http and https are supported"
+            )));
+        }
         let request = http::Request::builder()
             .method(method)
             .uri(uri)

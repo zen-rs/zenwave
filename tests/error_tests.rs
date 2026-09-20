@@ -13,10 +13,15 @@ async fn test_invalid_url_error() {
 
 #[test_executors::async_test]
 async fn test_invalid_scheme_error() {
-    let _result = get("ftp://example.com").await;
-    // This actually succeeds but may fail later during connection
-    // The validation happens at HTTP client level, not URI parsing
-    // assert!(result.is_err());
+    // Refused while building the request: no backend may reach the network
+    // for a protocol it does not speak (libcurl would happily talk FTP).
+    let error = get("ftp://example.com")
+        .await
+        .expect_err("a non-HTTP scheme must be refused");
+    assert!(
+        matches!(error, zenwave::Error::InvalidUri(_)),
+        "unexpected error: {error}"
+    );
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
@@ -104,8 +109,9 @@ async fn test_empty_response_handling() {
 /// connection the first request dialed — a dropped lease would free its
 /// slot without returning the connection, forcing a visible redial. Only a
 /// body abandoned mid-stream legitimately dials again: unread bytes make
-/// the h1 connection unusable.
-#[cfg(not(target_arch = "wasm32"))]
+/// the h1 connection unusable. The pool is the hyper backend's; the curl
+/// and Apple backends reuse connections on their own terms.
+#[cfg(all(feature = "hyper-backend", not(target_arch = "wasm32")))]
 #[test_executors::async_test]
 async fn test_pooled_connection_released_on_every_path() {
     use futures_util::StreamExt as _;
