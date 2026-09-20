@@ -10,7 +10,7 @@ use std::{fmt, net::SocketAddr};
 
 use bytes::{Buf, Bytes};
 use futures_util::{StreamExt, stream};
-use tracing::warn;
+use tracing::debug;
 
 use super::HyperError;
 use crate::{Error, transport::quic::Spawn};
@@ -56,8 +56,11 @@ impl H3Connection {
             .await
             .map_err(HyperError::http3)?;
         (spawn)(Box::pin(async move {
+            // `wait_idle` resolves with the reason every connection ends —
+            // idle timeouts and graceful closes included — so it is not a
+            // warning.
             let error = driver.wait_idle().await;
-            warn!(error = %error, "h3 connection closed");
+            debug!(error = %error, "h3 connection closed");
         }));
         Ok(Self { sender })
     }
