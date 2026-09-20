@@ -131,6 +131,7 @@ mod engine {
     /// The protocol `stream`'s TLS session negotiated through ALPN, if any.
     ///
     /// Infallible for rustls — the signature matches the native-tls engine.
+    #[allow(clippy::unnecessary_wraps)] // the native-tls engine can fail here
     pub fn negotiated_alpn<S>(stream: &TlsStream<S>) -> Result<Option<Vec<u8>>, Error> {
         let (_, connection) = stream.get_ref();
         Ok(connection.alpn_protocol().map(<[u8]>::to_vec))
