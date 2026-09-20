@@ -8,10 +8,10 @@
 //! `happy_eyeballs`, and turning a record into an HTTP/3 decision is the
 //! connection pool's job (issue #69); this module only resolves it.
 
-use std::net::IpAddr;
+use std::{future::Future, net::IpAddr};
 
 #[cfg(not(target_os = "android"))]
-use std::{future::Future, pin::Pin, str::FromStr, sync::Arc};
+use std::str::FromStr;
 
 #[cfg(not(target_os = "android"))]
 use hickory_proto::rr::RecordType;
@@ -28,17 +28,61 @@ use hickory_resolver::{
 #[cfg(not(target_os = "android"))]
 use runtime::AsyncIoRuntimeProvider;
 
+use super::{Inner, Spawn};
 use crate::Error;
 
 #[cfg(target_os = "android")]
 mod android;
 #[cfg(not(target_os = "android"))]
-mod runtime;
+pub mod runtime;
 
-/// How the resolver's background tasks are spawned. Issue #66 defines the
-/// identical type for the QUIC runtime; issue #69 unifies the two.
+/// The resolver configuration a [`Transport`](crate::Transport) carries: the
+/// system's, read once at build so no blocking `fs::read` ever runs per
+/// lookup.
 #[cfg(not(target_os = "android"))]
-pub type Spawn = Arc<dyn Fn(Pin<Box<dyn Future<Output = ()> + Send>>) + Send + Sync>;
+pub struct Config {
+    config: ResolverConfig,
+    options: ResolverOpts,
+}
+
+/// The unit resolver configuration: Android's `DnsResolver` is configured by
+/// the OS and consulted through the JVM.
+#[cfg(target_os = "android")]
+pub struct Config;
+
+/// The hickory resolver a `Transport` owns. It is built on first use so its
+/// runtime provider can take the caller's [`Spawn`], then reused so its
+/// pooled name-server connections and TTL response cache survive lookups.
+#[cfg(not(target_os = "android"))]
+pub type HickoryResolver = Resolver<AsyncIoRuntimeProvider>;
+
+#[cfg(not(target_os = "android"))]
+impl Config {
+    /// The system's resolver configuration. A host without one is
+    /// misconfigured, so failing here is a `build()`-time error like a
+    /// broken trust store, not a per-request condition.
+    pub fn system() -> Result<Self, Error> {
+        let (config, options) =
+            system_conf::read_system_conf().map_err(|error| Error::Transport(Box::new(error)))?;
+        Ok(Self { config, options })
+    }
+
+    /// An explicit configuration — the `TransportBuilder::dns_config`
+    /// override for tests.
+    pub const fn new(config: ResolverConfig, options: ResolverOpts) -> Self {
+        Self { config, options }
+    }
+
+    /// The resolver over this configuration on the in-tree runtime.
+    /// `Resolver::build` only constructs the pool and cache — sockets open
+    /// lazily at the first query — so this is not a blocking call.
+    fn build_resolver(&self, spawn: Spawn) -> Result<HickoryResolver, Error> {
+        Resolver::builder_with_config(self.config.clone(), AsyncIoRuntimeProvider::new(spawn))
+            .with_options(self.options.clone())
+            .build()
+            .map_err(|error| Error::Transport(Box::new(error)))
+    }
+}
 
 /// What a usable HTTPS record offers for an origin.
 #[allow(dead_code)] // consumed by the connection pool's h3 discovery (issue #69)
@@ -57,62 +101,47 @@ const HTTPS_DEFAULT_PORT: u16 = 443;
 /// `AliasMode` answers are chased at most once (RFC 9460 §2.4.2).
 const MAX_ALIAS_HOPS: u8 = 1;
 
-/// Look up the HTTPS (SVCB) record for `host`:`port`.
+/// Look up the HTTPS (SVCB) record for `host`:`port` through the transport's
+/// resolver; `spawn` schedules the futures the resolver drives in the
+/// background.
 ///
 /// Returns `Ok(None)` when the host is an IP literal, when no record exists
 /// (NODATA or NXDOMAIN), or on platforms that cannot answer the query (Android
 /// before API 29). Every other failure — timeout, SERVFAIL, no resolver
 /// configured — is `Err`; the caller decides whether it is fatal.
-#[allow(dead_code)] // consumed by the connection pool's h3 discovery (issue #69)
-pub async fn https_record(host: &str, port: u16) -> Result<Option<HttpsRecord>, Error> {
+pub(super) async fn https_record(
+    inner: &Inner,
+    spawn: Spawn,
+    host: &str,
+    port: u16,
+) -> Result<Option<HttpsRecord>, Error> {
     if host.parse::<IpAddr>().is_ok() {
         return Ok(None);
     }
 
     #[cfg(target_os = "android")]
     {
+        // `DnsResolver` is configured by the OS and schedules its own
+        // callbacks; the stored configuration and `spawn` serve hickory.
+        let _ = (&inner.dns, spawn);
         resolve(host, port, android::query_https).await
     }
     #[cfg(not(target_os = "android"))]
     {
-        let (config, options) =
-            system_conf::read_system_conf().map_err(|error| Error::Transport(Box::new(error)))?;
-        https_record_with(config, options, host, port).await
+        let resolver = inner
+            .resolver
+            .get_or_try_init(|| inner.dns.build_resolver(spawn))?;
+        resolve(host, port, |domain| lookup_https(resolver, domain)).await
     }
-}
-
-/// The lookup against an explicit resolver configuration, so tests can point
-/// at an in-process DNS server instead of the system's.
-#[cfg(not(target_os = "android"))]
-async fn https_record_with(
-    config: ResolverConfig,
-    options: ResolverOpts,
-    host: &str,
-    port: u16,
-) -> Result<Option<HttpsRecord>, Error> {
-    let resolver = resolver(config, options)?;
-    resolve(host, port, |domain| lookup_https(&resolver, domain)).await
-}
-
-#[cfg(not(target_os = "android"))]
-fn resolver(
-    config: ResolverConfig,
-    options: ResolverOpts,
-) -> Result<Resolver<AsyncIoRuntimeProvider>, Error> {
-    Resolver::builder_with_config(config, AsyncIoRuntimeProvider::thread_per_task())
-        .with_options(options)
-        .build()
-        .map_err(|error| Error::Transport(Box::new(error)))
 }
 
 /// One hickory `lookup` call as an answer set; NODATA and NXDOMAIN both
 /// surface as `NoRecordsFound` — a definitive "there is no record", not a
 /// failure — and come back as an empty set.
 #[cfg(not(target_os = "android"))]
-async fn lookup_https(
-    resolver: &Resolver<AsyncIoRuntimeProvider>,
-    domain: String,
-) -> Result<Vec<Record>, Error> {
+async fn lookup_https(resolver: &HickoryResolver, domain: String) -> Result<Vec<Record>, Error> {
+    // A name that does not even parse is a caller error, not a transport
+    // failure.
     let name =
         Name::from_str(&domain).map_err(|error| Error::InvalidUri(format!("{domain}: {error}")))?;
     match resolver.lookup(name, RecordType::HTTPS).await {
@@ -205,7 +234,10 @@ fn https_record_of(svcb: &SVCB) -> HttpsRecord {
 mod tests {
     use std::{
         net::{SocketAddr, UdpSocket},
-        sync::mpsc::{self, Receiver},
+        sync::{
+            Arc,
+            mpsc::{self, Receiver},
+        },
         thread,
         time::Duration,
     };
@@ -220,9 +252,12 @@ mod tests {
 
     use super::{
         HTTPS_DEFAULT_PORT, HttpsRecord, Name, RData, Record, RecordType, SVCB, SvcParamKey,
-        SvcParamValue, https_record_with,
+        SvcParamValue,
     };
-    use crate::Error;
+    use crate::{
+        Error,
+        transport::{Spawn, Transport},
+    };
 
     /// TTL of the synthetic records.
     const TTL: u32 = 300;
@@ -304,9 +339,23 @@ mod tests {
         )
     }
 
+    /// A spawner that runs every background task on a dedicated thread —
+    /// the same fallback `HyperBackend` uses when no executor is supplied.
+    fn spawn() -> Spawn {
+        Arc::new(|future| {
+            thread::spawn(move || {
+                async_io::block_on(future);
+            });
+        })
+    }
+
     fn lookup(server: SocketAddr, host: &str, port: u16) -> Result<Option<HttpsRecord>, Error> {
         let (config, options) = config(server);
-        async_io::block_on(https_record_with(config, options, host, port))
+        let transport = Transport::builder()
+            .dns_config(config, options)
+            .build()
+            .expect("transport builds");
+        async_io::block_on(transport.https_record(spawn(), host, port))
     }
 
     fn queried_name(queried: &Receiver<(Name, RecordType)>) -> (Name, RecordType) {

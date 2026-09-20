@@ -32,7 +32,11 @@
 use std::fmt;
 #[cfg(native)]
 use std::sync::Arc;
+#[cfg(connector)]
+use std::{future::Future, pin::Pin};
 
+#[cfg(all(connector, not(target_os = "android")))]
+use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 #[cfg(native)]
 use rustls_pki_types::{CertificateDer, pem::PemObject};
 
@@ -67,6 +71,12 @@ mod tunnel;
 #[cfg(native)]
 pub use proxy::{Proxy, ProxyBuilder};
 
+/// Schedules the futures a DNS resolver or QUIC driver runs in the
+/// background. The backend supplies its own spawner so that work runs
+/// wherever connection drivers already run; [`dns`] and [`quic`] share it.
+#[cfg(connector)]
+pub(crate) type Spawn = Arc<dyn Fn(Pin<Box<dyn Future<Output = ()> + Send>>) + Send + Sync>;
+
 /// How connections are established: trusted roots and, on native platforms,
 /// the TLS engine configured with them.
 ///
@@ -90,6 +100,15 @@ struct Inner {
     #[cfg(http3)]
     #[allow(dead_code)] // read through `quic_endpoint`, used by the pool (#69)
     quic: once_cell::sync::OnceCell<quinn::Endpoint>,
+    /// The resolver configuration read once at build; on Android the unit
+    /// config — `DnsResolver` is configured by the OS.
+    #[cfg(connector)]
+    dns: dns::Config,
+    /// The hickory resolver over `dns`, built on first lookup so its runtime
+    /// takes the caller's [`Spawn`]; kept for its pooled name-server
+    /// connections and TTL response cache.
+    #[cfg(all(connector, not(target_os = "android")))]
+    resolver: once_cell::sync::OnceCell<dns::HickoryResolver>,
 }
 
 impl Transport {
@@ -160,8 +179,22 @@ impl Transport {
     /// schedules the futures quinn drives in the background.
     #[cfg(http3)]
     #[allow(dead_code)] // the connection pool (#69) calls this per h3 dial
-    pub(crate) fn quic_endpoint(&self, spawn: quic::Spawn) -> Result<&quinn::Endpoint, Error> {
+    pub(crate) fn quic_endpoint(&self, spawn: Spawn) -> Result<&quinn::Endpoint, Error> {
         self.inner.quic.get_or_try_init(|| quic::endpoint(spawn))
+    }
+
+    /// The HTTPS (SVCB) record for `host`:`port`, resolved through the
+    /// transport's DNS resolver. `spawn` schedules the futures the resolver
+    /// drives in the background.
+    #[cfg(connector)]
+    #[allow(dead_code)] // the connection pool's h3 discovery calls this (#69)
+    pub(crate) async fn https_record(
+        &self,
+        spawn: Spawn,
+        host: &str,
+        port: u16,
+    ) -> Result<Option<dns::HttpsRecord>, Error> {
+        dns::https_record(&self.inner, spawn, host, port).await
     }
 }
 
@@ -187,6 +220,10 @@ pub struct TransportBuilder {
     proxy: Option<Proxy>,
     #[cfg(native)]
     extra_roots: Vec<CertificateDer<'static>>,
+    /// Resolver configuration override — tests point it at an in-process
+    /// DNS server instead of the system's.
+    #[cfg(all(connector, not(target_os = "android")))]
+    dns: Option<dns::Config>,
 }
 
 impl fmt::Debug for TransportBuilder {
@@ -234,6 +271,16 @@ impl TransportBuilder {
         self
     }
 
+    /// Resolve through `config`/`options` instead of the system resolver
+    /// configuration — a constructor for tests, not a runtime hook.
+    #[cfg(all(connector, not(target_os = "android")))]
+    #[allow(dead_code)] // only the dns unit tests override the configuration
+    #[must_use]
+    pub(crate) fn dns_config(mut self, config: ResolverConfig, options: ResolverOpts) -> Self {
+        self.dns = Some(dns::Config::new(config, options));
+        self
+    }
+
     /// Load trust material and configure the TLS engine.
     ///
     /// # Errors
@@ -251,6 +298,16 @@ impl TransportBuilder {
             } else {
                 Some(ca_bundle::platform_roots_with(&self.extra_roots)?)
             };
+            #[cfg(all(connector, not(target_os = "android")))]
+            let dns = match self.dns {
+                Some(config) => config,
+                // A host without a resolver configuration is a misconfigured
+                // system: `build` fails on it the way a broken trust store
+                // does, rather than at the first lookup.
+                None => dns::Config::system()?,
+            };
+            #[cfg(all(connector, target_os = "android"))]
+            let dns = dns::Config;
             Ok(Transport {
                 inner: Arc::new(Inner {
                     proxy: self.proxy.unwrap_or_else(Proxy::system),
@@ -261,6 +318,10 @@ impl TransportBuilder {
                     tls,
                     #[cfg(http3)]
                     quic: once_cell::sync::OnceCell::new(),
+                    #[cfg(connector)]
+                    dns,
+                    #[cfg(all(connector, not(target_os = "android")))]
+                    resolver: once_cell::sync::OnceCell::new(),
                 }),
             })
         }

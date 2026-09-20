@@ -21,12 +21,8 @@ use std::{
 use async_io::Async;
 use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
 
+use super::Spawn;
 use crate::Error;
-
-/// Schedules the futures quinn needs driven in the background. The backend
-/// supplies its own spawner so QUIC work runs wherever h1/h2 connection
-/// drivers already run.
-pub type Spawn = Arc<dyn Fn(Pin<Box<dyn Future<Output = ()> + Send>>) + Send + Sync>;
 
 /// `quinn::Runtime` over async-io: `async_io::Timer` for timers, an
 /// `Async<UdpSocket>` wrapper for datagrams, `spawn` for tasks.

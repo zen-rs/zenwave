@@ -10,7 +10,6 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    thread,
     time::Duration,
 };
 
@@ -23,27 +22,20 @@ use hickory_resolver::net::runtime::{
     DnsTcpStream, DnsUdpSocket, RuntimeProvider, Spawn as HickorySpawn, Time,
 };
 
-use super::Spawn;
+use crate::transport::Spawn;
 
 /// Runs hickory's resolver on async-io/async-net.
 ///
 /// Cheap to clone: the provider is only a spawn closure.
 #[derive(Clone)]
-pub(super) struct AsyncIoRuntimeProvider {
+pub struct AsyncIoRuntimeProvider {
     spawn: Spawn,
 }
 
 impl AsyncIoRuntimeProvider {
-    /// A provider that runs every background task on a dedicated thread —
-    /// the same fallback `HyperBackend` uses when no executor is supplied.
-    pub(super) fn thread_per_task() -> Self {
-        Self {
-            spawn: Arc::new(|future| {
-                thread::spawn(move || {
-                    async_io::block_on(future);
-                });
-            }),
-        }
+    /// A provider whose background tasks run on `spawn`.
+    pub(super) fn new(spawn: Spawn) -> Self {
+        Self { spawn }
     }
 }
 
@@ -129,7 +121,7 @@ fn in_progress(error: &io::Error) -> bool {
 
 /// The hickory `Handle`: hands background tasks to the spawn closure.
 #[derive(Clone)]
-pub(super) struct AsyncIoHandle(Spawn);
+pub struct AsyncIoHandle(Spawn);
 
 impl HickorySpawn for AsyncIoHandle {
     fn spawn_bg(&mut self, future: impl Future<Output = ()> + Send + 'static) {
@@ -139,7 +131,7 @@ impl HickorySpawn for AsyncIoHandle {
 
 /// `async_io::Timer` as hickory's `Time`.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct AsyncIoTime;
+pub struct AsyncIoTime;
 
 #[async_trait]
 impl Time for AsyncIoTime {
@@ -166,7 +158,7 @@ impl Time for AsyncIoTime {
 
 /// `async_net::UdpSocket` adapted to hickory's `DnsUdpSocket`. The inner
 /// `Async` is kept for poll access, which the async wrappers don't expose.
-pub(super) struct AsyncIoUdpSocket(Arc<Async<std::net::UdpSocket>>);
+pub struct AsyncIoUdpSocket(Arc<Async<std::net::UdpSocket>>);
 
 #[async_trait]
 impl DnsUdpSocket for AsyncIoUdpSocket {
@@ -213,7 +205,7 @@ impl DnsUdpSocket for AsyncIoUdpSocket {
 }
 
 /// `async_net::TcpStream` adapted to hickory's `DnsTcpStream`.
-pub(super) struct AsyncIoTcpStream(TcpStream);
+pub struct AsyncIoTcpStream(TcpStream);
 
 impl AsyncRead for AsyncIoTcpStream {
     fn poll_read(
