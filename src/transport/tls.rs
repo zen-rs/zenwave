@@ -54,7 +54,7 @@ mod engine {
     /// rustls with certificate verification delegated to the operating system.
     #[derive(Clone)]
     pub struct TlsConnector {
-        inner: futures_rustls::TlsConnector,
+        config: Arc<ClientConfig>,
     }
 
     impl TlsConnector {
@@ -68,8 +68,16 @@ mod engine {
                 .with_custom_certificate_verifier(verifier)
                 .with_no_client_auth();
             Ok(Self {
-                inner: futures_rustls::TlsConnector::from(Arc::new(config)),
+                config: Arc::new(config),
             })
+        }
+
+        /// The shared client configuration; `transport::quic` clones it with
+        /// ALPN `h3` for QUIC connections.
+        #[cfg(http3)]
+        #[allow(dead_code)] // the h3 dial path (#69) reads it
+        pub const fn client_config(&self) -> &Arc<ClientConfig> {
+            &self.config
         }
 
         pub async fn connect<S>(&self, host: &str, stream: S) -> Result<TlsStream<S>, Error>
@@ -77,7 +85,7 @@ mod engine {
             S: AsyncRead + AsyncWrite + Unpin,
         {
             let server_name = ServerName::try_from(host.to_owned()).map_err(Error::tls)?;
-            self.inner
+            futures_rustls::TlsConnector::from(Arc::clone(&self.config))
                 .connect(server_name, stream)
                 .await
                 .map_err(Error::tls)
