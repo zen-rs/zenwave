@@ -152,9 +152,10 @@ async fn test_pooled_connection_released_on_every_path() {
         .await
         .expect("the post response body must read");
 
-    // A body abandoned mid-stream poisons its connection: the lease returns,
-    // sees the dead sender, and the next request dials a fresh connection.
-    let abandoned = ["/stream"];
+    // A body abandoned mid-stream poisons its connection: hyper cannot drain
+    // a body that never ends, so it closes the connection; the lease returns
+    // a dead sender and the next request dials a fresh connection.
+    let abandoned = ["/stream/stalled"];
     for path in abandoned {
         let mut body = get(server.uri(path))
             .await

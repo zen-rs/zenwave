@@ -54,9 +54,10 @@ mod local {
     use async_io::Async;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
-    use http_body_util::{BodyExt as _, Full};
+    use futures_util::{StreamExt as _, stream};
+    use http_body_util::{BodyExt as _, Full, StreamBody, combinators::BoxBody};
     use hyper::{
-        body::{Bytes, Incoming},
+        body::{Bytes, Frame, Incoming},
         service::service_fn,
     };
     use once_cell::sync::OnceCell;
@@ -75,7 +76,30 @@ mod local {
     struct TestResponse {
         status: u16,
         headers: Vec<(String, String)>,
-        body: Vec<u8>,
+        body: TestBody,
+    }
+
+    /// How a route's body reaches the wire.
+    enum TestBody {
+        /// The whole body, framed with `Content-Length`.
+        Full(Vec<u8>),
+        /// One chunk, then a body that never ends: the connection can only
+        /// finish when the client abandons it, which is what a test of an
+        /// abandoned body needs — the bytes it did not read cannot be
+        /// drained, whatever the kernel and hyper buffer.
+        Stalled(Vec<u8>),
+    }
+
+    impl From<TestBody> for BoxBody<Bytes, Infallible> {
+        fn from(body: TestBody) -> Self {
+            match body {
+                TestBody::Full(bytes) => Self::new(Full::new(Bytes::from(bytes))),
+                TestBody::Stalled(first) => Self::new(StreamBody::new(
+                    stream::once(async move { Ok(Frame::data(Bytes::from(first))) })
+                        .chain(stream::pending()),
+                )),
+            }
+        }
     }
 
     impl TestResponse {
@@ -85,14 +109,14 @@ mod local {
         }
     }
 
-    impl From<TestResponse> for hyper::Response<Full<Bytes>> {
+    impl From<TestResponse> for hyper::Response<BoxBody<Bytes, Infallible>> {
         fn from(response: TestResponse) -> Self {
             let mut builder = hyper::Response::builder().status(response.status);
             for (name, value) in &response.headers {
                 builder = builder.header(name.as_str(), value.as_str());
             }
             builder
-                .body(Full::new(Bytes::from(response.body)))
+                .body(response.body.into())
                 .expect("response must build")
         }
     }
@@ -182,7 +206,7 @@ mod local {
     /// keep-alive reuse, then produce the response.
     async fn route(
         request: hyper::Request<Incoming>,
-    ) -> Result<hyper::Response<Full<Bytes>>, Infallible> {
+    ) -> Result<hyper::Response<BoxBody<Bytes, Infallible>>, Infallible> {
         let (parts, body) = request.into_parts();
         let _ = body.collect().await;
         let request = TestRequest {
@@ -265,10 +289,14 @@ mod local {
                 json_response(200, r#"{"result":"ok","server":"httpbin-local"}"#)
             }
             "/gzip" => bytes_response(200, b"gzip response"),
-            // Bigger than hyper's maximum read buffer (≈408 KiB): a body
-            // dropped after one chunk still has bytes on the socket, so the
-            // h1 connection cannot be drained and reused.
-            "/stream" => bytes_response(200, vec![0xA5; 1024 * 1024]),
+            // A body that arrives in several reads.
+            "/stream" => bytes_response(200, vec![0xA5; 256 * 1024]),
+            // A body that never completes; see `TestBody::Stalled`.
+            "/stream/stalled" => TestResponse {
+                status: 200,
+                headers: vec![],
+                body: TestBody::Stalled(vec![0x5A; 16 * 1024]),
+            },
             "/delay/1" => {
                 // Small delay to emulate a slow endpoint.
                 thread::sleep(Duration::from_millis(10));
@@ -326,7 +354,7 @@ mod local {
             return TestResponse {
                 status,
                 headers: vec![],
-                body: Vec::new(),
+                body: TestBody::Full(Vec::new()),
             };
         }
         text_response(status, format!("status {status}"))
@@ -375,7 +403,7 @@ mod local {
         TestResponse {
             status,
             headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
-            body: body.as_bytes().to_vec(),
+            body: TestBody::Full(body.as_bytes().to_vec()),
         }
     }
 
@@ -386,7 +414,7 @@ mod local {
                 "Content-Type".to_owned(),
                 "text/plain; charset=UTF-8".to_owned(),
             )],
-            body: body.into().into_bytes(),
+            body: TestBody::Full(body.into().into_bytes()),
         }
     }
 
@@ -394,7 +422,7 @@ mod local {
         TestResponse {
             status,
             headers: vec![],
-            body: body.into(),
+            body: TestBody::Full(body.into()),
         }
     }
 }
