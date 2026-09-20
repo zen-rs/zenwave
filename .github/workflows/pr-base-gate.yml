@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: main only accepts merges from dev
+      - name: main only accepts merges from dev and from release-plz
         env:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
@@ -24,10 +24,17 @@ jobs:
             echo "::error::Pull requests into 'main' must come from this repository, not a fork."
             exit 1
           fi
-          if [ "${HEAD_REF}" != "dev" ]; then
-            echo "::error::Pull requests into 'main' are only allowed from 'dev'. Retarget this pull request at 'dev' instead."
-            exit 1
-          fi
+          # release-plz opens the version bump and changelog pull request from
+          # a `release-plz-<timestamp>` branch of this repository straight into
+          # `main`, which is how a release reaches crates.io; only `dev` and
+          # that branch may target `main`.
+          case "${HEAD_REF}" in
+            dev | release-plz-*) ;;
+            *)
+              echo "::error::Pull requests into 'main' are only allowed from 'dev' or release-plz. Retarget this pull request at 'dev' instead."
+              exit 1
+              ;;
+          esac
           echo "'${HEAD_REF}' -> 'main': source branch allowed."
 
       # This check doubles as the single required check on main: instead of
