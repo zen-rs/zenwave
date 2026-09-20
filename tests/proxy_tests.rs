@@ -93,7 +93,7 @@ async fn proxy_none_ignores_everything() {
         .expect("valid request")
         .await
         .expect("direct request succeeds");
-    assert!(proxy.requests().is_empty());
+    assert_eq!(proxy.requests(), [] as [common::proxy::ProxiedRequest; 0]);
 }
 
 // The plain Android test binary has no JVM for the platform verifier; TLS on
