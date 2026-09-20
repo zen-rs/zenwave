@@ -25,8 +25,15 @@ use hyper::{
     body::Incoming,
     client::conn::{TrySendError, http1},
 };
+#[cfg(http3)]
+use tracing::debug;
 
 use super::connect::{Protocol, Via};
+#[cfg(http3)]
+use crate::backend::{
+    alt_svc::{self, AltSvc},
+    h3::H3Connection,
+};
 
 /// The most HTTP/1.1 connections one origin may have open at once: leased
 /// or dialing — parked idle connections hold no slot and a new lease always
@@ -35,6 +42,25 @@ pub const MAX_H1_PER_ORIGIN: usize = 6;
 
 /// An idle h1 connection is dropped once it has gone unused for this long.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// How long a racing QUIC dial is given to finish before it loses; a detached
+/// loser also ends at this deadline.
+#[cfg(http3)]
+const H3_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// After a QUIC handshake fails, the origin is not offered QUIC again until
+/// this much time has passed.
+#[cfg(http3)]
+// `Duration::from_mins` is not a stable const fn yet.
+#[expect(clippy::duration_suboptimal_units)]
+const H3_BACKOFF: Duration = Duration::from_secs(5 * 60);
+
+/// A "no HTTPS record" answer is retried after this long — short enough to
+/// pick a record up when one appears, long enough not to re-query per request.
+#[cfg(http3)]
+// `Duration::from_mins` is not a stable const fn yet.
+#[expect(clippy::duration_suboptimal_units)]
+const HTTPS_RR_NEGATIVE_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// The connection table a [`Transport`](crate::Transport) owns, keyed by
 /// origin. Backends built over the same transport check out of it together.
@@ -56,7 +82,7 @@ pub struct Origin {
 
 /// Per-origin connection state. The synchronous mutexes are never held
 /// across an `.await`; `dialing` and `h1_slots` are the only async waits.
-struct OriginEntry {
+pub struct OriginEntry {
     /// Idle h1 senders, each an exclusive checkout. Idle connections hold no
     /// slot permit — the slot is freed when the connection is parked — so
     /// `h1_idle.len()` never exceeds the number of free slots.
@@ -72,9 +98,76 @@ struct OriginEntry {
     /// A known-h1 origin dials in parallel under `h1_slots` while anything
     /// else serializes on `dialing`.
     protocol: Mutex<Option<Protocol>>,
+    /// The origin's shared h3 handle; clones multiplex over one QUIC
+    /// connection. Like h2, concurrent dials coalesce through `dialing`.
+    #[cfg(http3)]
+    h3: Mutex<Option<H3Connection>>,
+    /// The h3 alternative the origin last advertised through `Alt-Svc`.
+    #[cfg(http3)]
+    alt_svc: Mutex<Option<AltSvc>>,
+    /// The origin's HTTPS record answer — positive or negative, until its
+    /// TTL runs out.
+    #[cfg(http3)]
+    https_rr: Mutex<Option<HttpsRr>>,
+    /// Whether the HTTPS record lookup is owed, running, or cached.
+    #[cfg(http3)]
+    h3_discovery: Mutex<H3Discovery>,
+    /// QUIC to this origin is refused until this instant: the last QUIC
+    /// handshake failed, so racing it again would just cost a timeout.
+    #[cfg(http3)]
+    h3_broken_until: Mutex<Option<Instant>>,
+    /// How long a racing QUIC dial is given; a test seam shrinks it so a
+    /// dead UDP port falls back fast.
+    #[cfg(http3)]
+    h3_connect_timeout: Mutex<Duration>,
+    /// How long QUIC backoff lasts; a test seam lengthens it so a third
+    /// request provably stays on TCP.
+    #[cfg(http3)]
+    h3_backoff: Mutex<Duration>,
+    /// The origin's port — the implicit `port` of an HTTPS record that
+    /// overrides none.
+    #[cfg(http3)]
+    port: u16,
     /// Held while dialing an origin that is or may be h2, so concurrent first
     /// requests open one connection instead of N.
     dialing: Arc<async_lock::Mutex<()>>,
+}
+
+/// What the origin's HTTPS record says about HTTP/3 — negative answers are
+/// cached for their TTL too.
+#[cfg(http3)]
+#[derive(Clone, Copy, Debug)]
+pub struct HttpsRr {
+    /// The record's ALPN list advertises `h3`.
+    pub h3: bool,
+    /// The record's port override, if any.
+    pub port: Option<u16>,
+    /// When the cached answer stops being valid.
+    pub expires: Instant,
+}
+
+#[cfg(http3)]
+impl HttpsRr {
+    /// A cached negative answer: no record, or the lookup failed.
+    pub(crate) fn negative(now: Instant) -> Self {
+        Self {
+            h3: false,
+            port: None,
+            expires: now + HTTPS_RR_NEGATIVE_TTL,
+        }
+    }
+}
+
+/// Where the entry's HTTPS record lookup stands.
+#[cfg(http3)]
+#[derive(Clone, Copy, Debug)]
+enum H3Discovery {
+    /// No lookup has been issued.
+    NotStarted,
+    /// A lookup is in flight.
+    InFlight,
+    /// The lookup finished; `https_rr` holds the answer until it expires.
+    Done,
 }
 
 impl OriginEntry {
@@ -85,12 +178,28 @@ impl OriginEntry {
             #[cfg(feature = "http2")]
             h2: Mutex::new(None),
             protocol: Mutex::new((origin.scheme == Scheme::HTTP).then_some(Protocol::Http1)),
+            #[cfg(http3)]
+            h3: Mutex::new(None),
+            #[cfg(http3)]
+            alt_svc: Mutex::new(None),
+            #[cfg(http3)]
+            https_rr: Mutex::new(None),
+            #[cfg(http3)]
+            h3_discovery: Mutex::new(H3Discovery::NotStarted),
+            #[cfg(http3)]
+            h3_broken_until: Mutex::new(None),
+            #[cfg(http3)]
+            h3_connect_timeout: Mutex::new(H3_CONNECT_TIMEOUT),
+            #[cfg(http3)]
+            h3_backoff: Mutex::new(H3_BACKOFF),
+            #[cfg(http3)]
+            port: origin.port,
             dialing: Arc::new(async_lock::Mutex::new(())),
         }
     }
 
     /// Whether the entry still holds a usable connection — an idle h1 sender
-    /// that is neither closed nor expired, or a live h2 handle. Dead and
+    /// that is neither closed nor expired, or a live h2/h3 handle. Dead and
     /// expired connections are evicted along the way. Connections leased
     /// out or still dialing do not appear here; they keep the entry alive
     /// through their own `Arc` instead.
@@ -114,7 +223,147 @@ impl OriginEntry {
                 return true;
             }
         }
+        #[cfg(http3)]
+        {
+            let mut h3 = self.h3.lock().expect("pool state poisoned");
+            if h3.as_ref().is_some_and(H3Connection::is_closed) {
+                *h3 = None;
+            }
+            if h3.is_some() {
+                return true;
+            }
+        }
         false
+    }
+
+    /// The UDP port an h3 dial to this origin should race for, or `None`
+    /// when the origin has not advertised h3 (or QUIC is in backoff).
+    /// `Alt-Svc` wins over the DNS answer, as the more recent claim.
+    /// Expired knowledge is evicted as it is read.
+    #[cfg(http3)]
+    fn h3_candidate(&self, now: Instant) -> Option<u16> {
+        if self
+            .h3_broken_until
+            .lock()
+            .expect("pool state poisoned")
+            .is_some_and(|until| until > now)
+        {
+            return None;
+        }
+        {
+            let mut alt_svc = self.alt_svc.lock().expect("pool state poisoned");
+            if alt_svc.as_ref().is_some_and(|alt| alt.expires <= now) {
+                *alt_svc = None;
+            }
+            if let Some(alt) = *alt_svc {
+                return Some(alt.port);
+            }
+        }
+        let mut https_rr = self.https_rr.lock().expect("pool state poisoned");
+        if https_rr.as_ref().is_some_and(|rr| rr.expires <= now) {
+            *https_rr = None;
+        }
+        https_rr.and_then(|rr| rr.h3.then(|| rr.port.unwrap_or(self.port)))
+    }
+
+    /// Store an `Alt-Svc` response header: `accept` picks the origin's own
+    /// h3 alternative out of it, `clear` — and any advertisement with no
+    /// acceptable h3 — drops the cached one. A malformed header is logged
+    /// and ignored: it never fails the response that carried it.
+    #[cfg(http3)]
+    pub(crate) fn insert_alt_svc(&self, origin_host: &str, value: &str, now: Instant) {
+        match alt_svc::parse(value) {
+            Ok(advertised) => {
+                *self.alt_svc.lock().expect("pool state poisoned") =
+                    alt_svc::accept(&advertised, origin_host, now);
+            }
+            Err(error) => debug!(%value, %error, "ignoring malformed Alt-Svc header"),
+        }
+    }
+
+    /// Cache an HTTPS record answer, positive or negative.
+    #[cfg(http3)]
+    pub(crate) fn insert_https_rr(&self, rr: HttpsRr) {
+        *self.https_rr.lock().expect("pool state poisoned") = Some(rr);
+    }
+
+    /// Whether an HTTPS record lookup is owed — none issued, or the cached
+    /// answer is stale — and marks it in flight when so.
+    #[cfg(http3)]
+    pub(crate) fn begin_h3_discovery(&self, now: Instant) -> bool {
+        let mut discovery = self.h3_discovery.lock().expect("pool state poisoned");
+        let due = match *discovery {
+            H3Discovery::NotStarted => true,
+            H3Discovery::InFlight => false,
+            H3Discovery::Done => self
+                .https_rr
+                .lock()
+                .expect("pool state poisoned")
+                .is_none_or(|rr| rr.expires <= now),
+        };
+        if due {
+            *discovery = H3Discovery::InFlight;
+        }
+        due
+    }
+
+    /// The in-flight lookup landed; `https_rr` holds its answer.
+    #[cfg(http3)]
+    pub(crate) fn finish_h3_discovery(&self) {
+        *self.h3_discovery.lock().expect("pool state poisoned") = H3Discovery::Done;
+    }
+
+    /// The cached HTTPS record answer, when it is still fresh — tests read
+    /// it to see discovery ran.
+    #[cfg(all(http3, test))]
+    pub(crate) fn https_rr(&self) -> Option<HttpsRr> {
+        *self.https_rr.lock().expect("pool state poisoned")
+    }
+
+    /// A QUIC handshake to this origin failed; no h3 attempt until
+    /// `h3_broken_until` lapses.
+    #[cfg(http3)]
+    pub(crate) fn mark_h3_broken(&self, now: Instant) {
+        let backoff = *self.h3_backoff.lock().expect("pool state poisoned");
+        *self.h3_broken_until.lock().expect("pool state poisoned") = Some(now + backoff);
+    }
+
+    /// When QUIC backoff ends for this origin, if it is active — tests read
+    /// it to see a failed handshake put the origin into backoff.
+    #[cfg(all(http3, test))]
+    pub(crate) fn h3_broken_until(&self) -> Option<Instant> {
+        *self.h3_broken_until.lock().expect("pool state poisoned")
+    }
+
+    /// How long a racing QUIC dial is given to finish.
+    #[cfg(http3)]
+    pub(crate) fn h3_connect_timeout(&self) -> Duration {
+        *self.h3_connect_timeout.lock().expect("pool state poisoned")
+    }
+
+    /// Override the QUIC dial deadline and failure backoff — the race tests
+    /// shorten the deadline so a dead UDP port falls back fast.
+    #[cfg(all(http3, test))]
+    pub(crate) fn set_h3_timeouts(&self, connect_timeout: Duration, backoff: Duration) {
+        *self.h3_connect_timeout.lock().expect("pool state poisoned") = connect_timeout;
+        *self.h3_backoff.lock().expect("pool state poisoned") = backoff;
+    }
+
+    /// Store `connection` as the origin's shared h3 handle unless a live one
+    /// is already stored — a second racer's win replaces only a dead handle.
+    #[cfg(http3)]
+    pub(crate) fn insert_h3(&self, connection: H3Connection) {
+        let mut h3 = self.h3.lock().expect("pool state poisoned");
+        if h3.as_ref().is_none_or(H3Connection::is_closed) {
+            *h3 = Some(connection);
+        }
+    }
+
+    /// The stored h3 handle, if any — tests observe whether a dead one was
+    /// evicted at checkout.
+    #[cfg(all(http3, test))]
+    pub(crate) fn h3_connection(&self) -> Option<H3Connection> {
+        self.h3.lock().expect("pool state poisoned").clone()
     }
 }
 
@@ -145,24 +394,62 @@ pub enum Reuse {
     FreshDial,
 }
 
+/// Whether a checkout may serve or dial HTTP/3 for the origin. The pool
+/// never sees proxy rules — the caller computes this once per request.
+#[cfg(http3)]
+#[derive(Clone, Copy, Debug)]
+pub enum H3 {
+    /// The request reaches the origin directly: a known h3-capable origin
+    /// upgrades on this checkout.
+    Allowed,
+    /// The request goes through a proxy or is plaintext: QUIC is never
+    /// dialed and a pooled h3 handle is never handed out.
+    Blocked,
+}
+
 /// What [`Pool::checkout`] found for an origin.
 pub enum Checkout {
+    /// A clone of the origin's live h3 handle, ready to send.
+    #[cfg(http3)]
+    H3(H3Connection),
     /// A clone of the origin's live h2 handle, ready to send.
     #[cfg(feature = "http2")]
     H2(http2::SendRequest<http_kit::Body>),
     /// An idle h1 connection, exclusively leased until the response body ends.
     H1(H1Lease),
     /// Nothing reusable: dial a new connection holding this permit.
-    Dial(DialPermit),
+    /// `h3_port` is the UDP port the dial should race a QUIC handshake on —
+    /// `Some` when the origin has advertised h3.
+    Dial {
+        /// The permit the dial's outcome is recorded under.
+        permit: DialPermit,
+        /// The advertised h3 port, when the origin is known to speak h3.
+        #[cfg(http3)]
+        h3_port: Option<u16>,
+    },
+}
+
+#[cfg(http3)]
+impl Checkout {
+    /// The port a `Dial` should race a QUIC handshake on, if the origin has
+    /// advertised h3.
+    pub(crate) const fn h3_port(&self) -> Option<u16> {
+        match self {
+            Self::Dial { h3_port, .. } => *h3_port,
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Debug for Checkout {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(http3)]
+            Self::H3(_) => f.write_str("Checkout::H3"),
             #[cfg(feature = "http2")]
             Self::H2(_) => f.write_str("Checkout::H2"),
             Self::H1(_) => f.write_str("Checkout::H1"),
-            Self::Dial(_) => f.write_str("Checkout::Dial"),
+            Self::Dial { .. } => f.write_str("Checkout::Dial"),
         }
     }
 }
@@ -239,11 +526,21 @@ impl fmt::Debug for H1Lease {
 
 /// The right to dial one connection to an origin, handed out by
 /// [`Pool::checkout`] when nothing was reusable. Passed to
-/// [`Pool::insert_h1`] or [`Pool::insert_h2`] once the dial's handshake has
-/// learned the protocol, or dropped on failure so the next waiter dials.
+/// [`Pool::insert_h1`], [`Pool::insert_h2`] or [`Pool::insert_h3`] once the
+/// dial's handshake has learned the protocol, or dropped on failure so the
+/// next waiter dials.
 pub struct DialPermit {
     entry: Arc<OriginEntry>,
     hold: DialHold,
+}
+
+#[cfg(http3)]
+impl DialPermit {
+    /// The origin state this permit dials under — the backend hands it to the
+    /// detached QUIC loser so a finished handshake still lands in the pool.
+    pub(crate) fn entry(&self) -> Arc<OriginEntry> {
+        self.entry.clone()
+    }
 }
 
 /// What a [`DialPermit`] keeps held while the dial runs.
@@ -271,15 +568,48 @@ impl Pool {
         }
     }
 
-    /// Check out a connection for `origin`: a clone of a live h2 handle, a
-    /// lease on an idle h1 connection, or a [`DialPermit`] to dial a new one.
-    /// `reuse` says whether pooled connections may be reused; `FreshDial`
-    /// skips them so the retry after a refused request opens a new
-    /// connection.
-    pub async fn checkout(&self, origin: Origin, reuse: Reuse) -> Checkout {
+    /// Check out a connection for `origin`: a clone of a live h3 or h2
+    /// handle, a lease on an idle h1 connection, or a [`DialPermit`] to dial
+    /// a new one. `reuse` says whether pooled connections may be reused;
+    /// `FreshDial` skips them so the retry after a refused request opens a
+    /// new connection. `h3` — computed by the caller from the proxy rules —
+    /// gates every h3 path: an origin that has advertised h3 yields a dial
+    /// whose permit carries the QUIC port to race, even when idle TCP
+    /// connections could serve the request instead.
+    pub async fn checkout(&self, origin: Origin, reuse: Reuse, #[cfg(http3)] h3: H3) -> Checkout {
         let entry = self.entry(&origin);
         let pooled = matches!(reuse, Reuse::Pooled);
         loop {
+            #[cfg(http3)]
+            if matches!(h3, H3::Allowed) {
+                if pooled && let Some(connection) = live_h3(&entry) {
+                    return Checkout::H3(connection);
+                }
+                if entry.h3_candidate(Instant::now()).is_some() {
+                    // The origin advertised h3: this checkout dials even when
+                    // a TCP connection could answer — the dial races QUIC
+                    // against it. `dialing` coalesces concurrent upgrades; a
+                    // waiter re-checks and finds the stored handle.
+                    let dialing = entry.dialing.lock_arc().await;
+                    if pooled && let Some(connection) = live_h3(&entry) {
+                        return Checkout::H3(connection);
+                    }
+                    match entry.h3_candidate(Instant::now()) {
+                        Some(h3_port) => {
+                            return Checkout::Dial {
+                                permit: DialPermit {
+                                    entry,
+                                    hold: DialHold::Coalesced(dialing),
+                                },
+                                h3_port: Some(h3_port),
+                            };
+                        }
+                        // A dial we waited on marked QUIC broken or the
+                        // advertisement expired — fall through to TCP.
+                        None => drop(dialing),
+                    }
+                }
+            }
             #[cfg(feature = "http2")]
             if pooled && let Some(sender) = live_h2(&entry) {
                 return Checkout::H2(sender);
@@ -298,18 +628,26 @@ impl Pool {
                 // is reusable, or with the dial's permit otherwise.
                 let permit = entry.h1_slots.acquire_arc().await;
                 if !pooled {
-                    return Checkout::Dial(DialPermit {
-                        entry,
-                        hold: DialHold::H1(permit),
-                    });
+                    return Checkout::Dial {
+                        permit: DialPermit {
+                            entry,
+                            hold: DialHold::H1(permit),
+                        },
+                        #[cfg(http3)]
+                        h3_port: None,
+                    };
                 }
                 match self.lease_idle(&entry, permit).await {
                     Ok(lease) => return Checkout::H1(lease),
                     Err(permit) => {
-                        return Checkout::Dial(DialPermit {
-                            entry,
-                            hold: DialHold::H1(permit),
-                        });
+                        return Checkout::Dial {
+                            permit: DialPermit {
+                                entry,
+                                hold: DialHold::H1(permit),
+                            },
+                            #[cfg(http3)]
+                            h3_port: None,
+                        };
                     }
                 }
             }
@@ -330,10 +668,14 @@ impl Pool {
                 drop(dialing);
                 continue;
             }
-            return Checkout::Dial(DialPermit {
-                entry,
-                hold: DialHold::Coalesced(dialing),
-            });
+            return Checkout::Dial {
+                permit: DialPermit {
+                    entry,
+                    hold: DialHold::Coalesced(dialing),
+                },
+                #[cfg(http3)]
+                h3_port: None,
+            };
         }
     }
 
@@ -363,6 +705,15 @@ impl Pool {
         }
     }
 
+    /// Record that `permit`'s dial opened an h3 connection: the handle becomes
+    /// the origin's shared connection. `permit` still holds `dialing`, so the
+    /// waiters re-check and find the handle as soon as it is stored.
+    #[cfg(http3)]
+    pub fn insert_h3(permit: DialPermit, connection: H3Connection) {
+        permit.entry.insert_h3(connection);
+        drop(permit);
+    }
+
     /// Record that `permit`'s dial negotiated h2: the handle becomes the
     /// origin's shared connection. `permit` still holds `dialing`, so the
     /// waiters re-check and find the handle as soon as it is stored.
@@ -384,7 +735,7 @@ impl Pool {
     /// The entry for `origin`, created on first contact. Inserting a new
     /// origin sweeps the table: an entry referenced only by the map that
     /// holds no live connection is finished and removed.
-    fn entry(&self, origin: &Origin) -> Arc<OriginEntry> {
+    pub(crate) fn entry(&self, origin: &Origin) -> Arc<OriginEntry> {
         let mut origins = self.origins.lock().expect("pool state poisoned");
         if let Some(entry) = origins.get(origin) {
             return entry.clone();
@@ -450,6 +801,22 @@ fn live_h2(entry: &OriginEntry) -> Option<http2::SendRequest<http_kit::Body>> {
     }
 }
 
+/// A clone of `entry`'s live h3 handle, or `None` — a dead one is evicted so
+/// the next checkout re-dials. `is_closed` is the whole liveness check: the
+/// h3 dispatcher accepts new streams while the QUIC connection is open.
+#[cfg(http3)]
+fn live_h3(entry: &OriginEntry) -> Option<H3Connection> {
+    let mut h3 = entry.h3.lock().expect("pool state poisoned");
+    match h3.as_ref() {
+        Some(connection) if connection.is_closed() => {
+            *h3 = None;
+            None
+        }
+        Some(connection) => Some(connection.clone()),
+        None => None,
+    }
+}
+
 impl fmt::Debug for Pool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Pool").finish_non_exhaustive()
@@ -473,6 +840,8 @@ mod tests {
     use hyper::client::conn::http1;
 
     use super::{Checkout, IdleH1, Origin, Pool, Reuse};
+    #[cfg(http3)]
+    use super::{H3, HttpsRr};
     use crate::transport::{
         connect::{Protocol, Via},
         hyper_io::HyperIo,
@@ -538,7 +907,16 @@ mod tests {
             let origin = origin();
             park_idle(&pool, &origin, h1_sender().await);
             assert!(
-                matches!(pool.checkout(origin, Reuse::Pooled).await, Checkout::H1(_)),
+                matches!(
+                    pool.checkout(
+                        origin,
+                        Reuse::Pooled,
+                        #[cfg(http3)]
+                        H3::Blocked
+                    )
+                    .await,
+                    Checkout::H1(_)
+                ),
                 "a live idle connection must be leased, not dialed past"
             );
         });
@@ -552,8 +930,14 @@ mod tests {
             park_idle(&pool, &origin, h1_sender().await);
             assert!(
                 matches!(
-                    pool.checkout(origin, Reuse::FreshDial).await,
-                    Checkout::Dial(_)
+                    pool.checkout(
+                        origin,
+                        Reuse::FreshDial,
+                        #[cfg(http3)]
+                        H3::Blocked
+                    )
+                    .await,
+                    Checkout::Dial { .. }
                 ),
                 "a fresh-dial checkout must ignore idle connections"
             );
@@ -572,8 +956,14 @@ mod tests {
             let entry = pool.entry(&origin);
             assert!(
                 matches!(
-                    pool.checkout(origin, Reuse::Pooled).await,
-                    Checkout::Dial(_)
+                    pool.checkout(
+                        origin,
+                        Reuse::Pooled,
+                        #[cfg(http3)]
+                        H3::Blocked
+                    )
+                    .await,
+                    Checkout::Dial { .. }
                 ),
                 "an expired idle connection must be evicted, not leased"
             );
@@ -593,14 +983,31 @@ mod tests {
         block_on(async {
             let pool = Pool::new();
             let origin = origin();
-            let Checkout::Dial(permit) = pool.checkout(origin.clone(), Reuse::Pooled).await else {
+            let Checkout::Dial { permit, .. } = pool
+                .checkout(
+                    origin.clone(),
+                    Reuse::Pooled,
+                    #[cfg(http3)]
+                    H3::Blocked,
+                )
+                .await
+            else {
                 panic!("an empty pool must hand out a dial permit");
             };
             Pool::insert_h1(permit, h1_sender().await, Via::Direct)
                 .await
                 .release();
             assert!(
-                matches!(pool.checkout(origin, Reuse::Pooled).await, Checkout::H1(_)),
+                matches!(
+                    pool.checkout(
+                        origin,
+                        Reuse::Pooled,
+                        #[cfg(http3)]
+                        H3::Blocked
+                    )
+                    .await,
+                    Checkout::H1(_)
+                ),
                 "a released connection must come back out of idle"
             );
         });
@@ -623,7 +1030,15 @@ mod tests {
                 port: 12,
                 ..origin()
             };
-            let Checkout::Dial(permit) = pool.checkout(held.clone(), Reuse::Pooled).await else {
+            let Checkout::Dial { permit, .. } = pool
+                .checkout(
+                    held.clone(),
+                    Reuse::Pooled,
+                    #[cfg(http3)]
+                    H3::Blocked,
+                )
+                .await
+            else {
                 panic!("an empty origin must hand out a dial permit");
             };
 
@@ -658,6 +1073,122 @@ mod tests {
             assert_eq!(origins.len(), 2);
             drop(origins);
             drop(permit);
+        });
+    }
+
+    /// An https origin, for the h3 paths that only exist under TLS.
+    #[cfg(http3)]
+    fn https_origin() -> Origin {
+        Origin {
+            scheme: Scheme::HTTPS,
+            ..origin()
+        }
+    }
+
+    #[cfg(http3)]
+    #[test]
+    fn h3_candidate_prefers_alt_svc_over_https_rr() {
+        let pool = Pool::new();
+        let entry = pool.entry(&https_origin());
+        let now = Instant::now();
+        entry.insert_https_rr(HttpsRr {
+            h3: true,
+            port: Some(8443),
+            expires: now + Duration::from_secs(60),
+        });
+        assert_eq!(
+            entry.h3_candidate(now),
+            Some(8443),
+            "an h3 HTTPS record alone names its port"
+        );
+        entry.insert_alt_svc("127.0.0.1", r#"h3=":9443"; ma=60"#, now);
+        assert_eq!(
+            entry.h3_candidate(now),
+            Some(9443),
+            "a fresh Alt-Svc wins over the DNS answer"
+        );
+    }
+
+    #[cfg(http3)]
+    #[test]
+    fn expired_knowledge_is_evicted_on_read() {
+        let pool = Pool::new();
+        let entry = pool.entry(&https_origin());
+        let now = Instant::now();
+        let stale = now
+            .checked_sub(Duration::from_secs(60))
+            .expect("test instant is far from the epoch");
+        entry.insert_https_rr(HttpsRr {
+            h3: true,
+            port: Some(8443),
+            expires: stale,
+        });
+        assert_eq!(entry.h3_candidate(now), None);
+        assert!(
+            entry.https_rr().is_none(),
+            "a stale record must be dropped on read"
+        );
+    }
+
+    #[cfg(http3)]
+    #[test]
+    fn backoff_hides_the_candidate() {
+        let pool = Pool::new();
+        let entry = pool.entry(&https_origin());
+        let now = Instant::now();
+        entry.insert_alt_svc("127.0.0.1", r#"h3=":9443"; ma=60"#, now);
+        entry.mark_h3_broken(now);
+        assert_eq!(
+            entry.h3_candidate(now),
+            None,
+            "an origin under QUIC backoff must not be offered h3"
+        );
+        assert!(entry.h3_broken_until().is_some());
+    }
+
+    /// An h3-capable origin's concurrent checkouts coalesce: the first takes
+    /// the `dialing` lock and races, the second waits and then rides the
+    /// stored handle.
+    #[cfg(http3)]
+    #[test]
+    fn concurrent_h3_checkouts_coalesce() {
+        block_on(async {
+            use crate::backend::test_support;
+            let server = test_support::H3Server::start(&test_support::TestCa::new());
+            // The transport owns the QUIC endpoint; it must outlive the
+            // connection.
+            let (_transport, connection) = test_support::h3_connection(&server).await;
+
+            let pool = Pool::new();
+            let origin = https_origin();
+            pool.entry(&origin).insert_alt_svc(
+                &origin.host,
+                &format!(r#"h3=":{}"; ma=60"#, server.addr().port()),
+                Instant::now(),
+            );
+
+            let first = pool.checkout(origin.clone(), Reuse::Pooled, H3::Allowed);
+            let second = pool.checkout(origin.clone(), Reuse::Pooled, H3::Allowed);
+            futures_util::pin_mut!(first);
+            futures_util::pin_mut!(second);
+
+            let Checkout::Dial { h3_port, permit } = first.await else {
+                panic!("an h3-capable origin must dial with a QUIC port")
+            };
+            assert_eq!(h3_port, Some(server.addr().port()));
+            let pending = futures_util::future::poll_fn(|cx| {
+                std::task::Poll::Ready(second.as_mut().poll(cx).is_pending())
+            })
+            .await;
+            assert!(
+                pending,
+                "the second checkout must wait on `dialing`, not race its own"
+            );
+            Pool::insert_h3(permit, connection);
+            assert!(
+                matches!(second.await, Checkout::H3(_)),
+                "once the dial lands its h3 handle, the waiter must ride it"
+            );
         });
     }
 }

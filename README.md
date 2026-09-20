@@ -262,7 +262,10 @@ are both enabled, `rustls` takes precedence. The `default` feature enables
 
 The hyper backend negotiates HTTP/2 through ALPN by default on every TLS
 connection that allows it (`http2` feature); servers that only speak HTTP/1.1
-keep working unchanged. Disable with `default-features = false` for a smaller
+keep working unchanged. It also upgrades an origin to HTTP/3 (`http3`
+feature) when the origin advertises it — through an `Alt-Svc` response header
+or an HTTPS DNS record — racing QUIC against TCP and falling back to TCP when
+QUIC is unavailable. Disable with `default-features = false` for a smaller
 build.
 
 Common dependency lines:

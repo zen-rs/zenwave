@@ -16,8 +16,8 @@ fn main() {
         // rustls-platform-verifier needs a JVM handle on Android.
         android_verifier: { all(target_os = "android", tls_rustls) },
         // QUIC transport and the h3 connection type exist only where the
-        // shared connector and the rustls engine do.
-        http3: { all(connector, feature = "http3") },
+        // shared connector, the hyper backend and the rustls engine do.
+        http3: { all(connector, feature = "hyper-backend", feature = "http3") },
         // Which backend `DefaultBackend` resolves to: hyper wins, then URLSession, then libcurl.
         apple_backend: { all(target_vendor = "apple", feature = "apple-backend") },
         default_hyper: { all(not(target_arch = "wasm32"), feature = "hyper-backend") },

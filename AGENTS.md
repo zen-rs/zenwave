@@ -39,6 +39,8 @@ src/
       mod.rs      — Hyper + async-net backend; ALPN picks h1 or h2 per connection
       rt.rs       — hyper::rt::Executor/Timer over the backend spawner + async-io
       h3.rs       — HTTP/3 connection over QUIC (h3 + h3-quinn; http3 feature)
+      alt_svc.rs  — RFC 7838 Alt-Svc parsing and the per-origin h3 advertisement
+      test_support.rs — shared test fixtures: throwaway CA, TLS and h3 servers
     curl.rs       — libcurl backend
     apple.rs      — URLSession backend (Apple platforms)
     web.rs        — Fetch API backend (wasm32)

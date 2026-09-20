@@ -6,6 +6,7 @@ use async_io::block_on;
 use executor_core::{AnyExecutor, Executor as _};
 use hyper::rt::Executor;
 
+#[cfg(http3)]
 use crate::transport::Spawn;
 #[cfg(feature = "http2")]
 use {
@@ -38,7 +39,7 @@ impl Spawner {
     /// The spawner as the shared [`Spawn`] the transport hands to the QUIC
     /// endpoint and DNS resolver so they run wherever this backend's
     /// connection drivers run.
-    #[allow(dead_code)] // consumed by the pool's h3 dial and DNS lookup (#69)
+    #[cfg(http3)]
     pub fn as_spawn(&self) -> Spawn {
         let this = self.clone();
         Arc::new(move |future| this.spawn(future))

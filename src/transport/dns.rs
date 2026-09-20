@@ -8,7 +8,7 @@
 //! `happy_eyeballs`, and turning a record into an HTTP/3 decision is the
 //! connection pool's job (issue #69); this module only resolves it.
 
-use std::{future::Future, net::IpAddr};
+use std::{future::Future, net::IpAddr, time::Duration};
 
 #[cfg(not(target_os = "android"))]
 use std::str::FromStr;
@@ -35,6 +35,9 @@ use crate::Error;
 mod android;
 #[cfg(not(target_os = "android"))]
 pub mod runtime;
+/// DNS fixtures shared with the backend's discovery tests.
+#[cfg(all(test, not(target_os = "android")))]
+pub mod test_support;
 
 /// The resolver configuration a [`Transport`](crate::Transport) carries: the
 /// system's, read once at build so no blocking `fs::read` ever runs per
@@ -82,7 +85,7 @@ impl Config {
 
     /// An explicit configuration — the `TransportBuilder::dns_config`
     /// override for tests.
-    #[allow(dead_code)] // only the dns unit tests construct one
+    #[allow(dead_code)] // only the tests construct one
     pub fn new(config: ResolverConfig, options: ResolverOpts) -> Self {
         Self::System(Box::new(SystemConfig { config, options }))
     }
@@ -111,13 +114,15 @@ fn build_resolver(
 }
 
 /// What a usable HTTPS record offers for an origin.
-#[allow(dead_code)] // consumed by the connection pool's h3 discovery (issue #69)
 #[derive(Debug)]
 pub struct HttpsRecord {
     /// ALPN protocol identifiers from `SvcParam` key 1, e.g. `["h2", "h3"]`.
     pub alpn: Vec<String>,
     /// Alternative endpoint port from `SvcParam` key 3.
     pub port: Option<u16>,
+    /// How long the answer stays valid: the minimum TTL of the answer's
+    /// records.
+    pub ttl: Duration,
 }
 
 /// The HTTPS default port queries `host` directly; every other port queries
@@ -196,8 +201,11 @@ where
     let mut domain = query_domain(host, port);
     let mut hops = 0;
     let record = loop {
-        match classify(&query(domain.clone()).await?) {
-            Answers::Service(svcb) => break Some(https_record_of(&svcb)),
+        let records = query(domain.clone()).await?;
+        match classify(&records) {
+            Answers::Service(svcb) => {
+                break Some(https_record_of(&svcb, min_ttl(&records)));
+            }
             // A second alias or a "." target has no usable endpoint.
             Answers::Alias(target) if hops < MAX_ALIAS_HOPS => {
                 hops += 1;
@@ -251,8 +259,9 @@ fn classify(records: &[Record]) -> Answers {
     best.cloned().map_or(Answers::Empty, Answers::Service)
 }
 
-/// The [`HttpsRecord`] a `ServiceMode` SVCB/HTTPS record describes.
-fn https_record_of(svcb: &SVCB) -> HttpsRecord {
+/// The [`HttpsRecord`] a `ServiceMode` SVCB/HTTPS record describes; `ttl` is
+/// the minimum TTL of the answer's records.
+fn https_record_of(svcb: &SVCB, ttl: Duration) -> HttpsRecord {
     let mut alpn = Vec::new();
     let mut port = None;
     for (key, value) in &svcb.svc_params {
@@ -262,139 +271,44 @@ fn https_record_of(svcb: &SVCB) -> HttpsRecord {
             _ => {}
         }
     }
-    HttpsRecord { alpn, port }
+    HttpsRecord { alpn, port, ttl }
+}
+
+/// The shortest TTL in an answer set — the answer is no fresher than its
+/// least-fresh record.
+fn min_ttl(records: &[Record]) -> Duration {
+    records
+        .iter()
+        .map(|record| Duration::from_secs(u64::from(record.ttl)))
+        .min()
+        .unwrap_or(Duration::ZERO)
 }
 
 #[cfg(all(test, not(target_os = "android")))]
 mod tests {
-    use std::{
-        net::{SocketAddr, UdpSocket},
-        sync::{
-            Arc,
-            mpsc::{self, Receiver},
-        },
-        thread,
-        time::Duration,
-    };
+    use std::{net::SocketAddr, time::Duration};
 
     use hickory_proto::{
-        op::{Message, MessageType, Query, ResponseCode},
-        rr::rdata::{HTTPS, svcb::Alpn},
-    };
-    use hickory_resolver::config::{
-        ConnectionConfig, NameServerConfig, ResolverConfig, ResolverOpts,
+        op::{Query, ResponseCode},
+        rr::{
+            RecordType,
+            rdata::svcb::{Alpn, SvcParamKey, SvcParamValue},
+        },
     };
 
     use super::{
-        Config, HTTPS_DEFAULT_PORT, HttpsRecord, Name, RData, Record, RecordType, SVCB,
-        SvcParamKey, SvcParamValue,
+        Config, HTTPS_DEFAULT_PORT, HttpsRecord,
+        test_support::{TTL, answer, https, name, queried_name, resolver_config, serve, spawn},
     };
-    use crate::{
-        Error,
-        transport::{Spawn, Transport},
-    };
-
-    /// TTL of the synthetic records.
-    const TTL: u32 = 300;
-
-    /// How long a test waits for a query to arrive at the server.
-    const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
-
-    /// A DNS name for tests.
-    fn name(domain: &str) -> Name {
-        domain.parse().expect("test domain must parse")
-    }
-
-    /// A UDP DNS server on a dedicated thread: `respond` answers every query,
-    /// and each queried name and record type is observable on the returned
-    /// channel. The thread lives until the test process ends.
-    fn serve(
-        respond: impl Fn(&Message) -> Message + Send + 'static,
-    ) -> (SocketAddr, Receiver<(Name, RecordType)>) {
-        let socket = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let addr = socket.local_addr().unwrap();
-        let (names, queried) = mpsc::channel();
-        thread::spawn(move || {
-            let mut buffer = [0; 4096];
-            while let Ok((len, peer)) = socket.recv_from(&mut buffer) {
-                let Ok(query) = Message::from_vec(&buffer[..len]) else {
-                    continue;
-                };
-                if let Some(asked) = query.queries.first() {
-                    let _ = names.send((asked.name().clone(), asked.query_type()));
-                }
-                if let Ok(response) = respond(&query).to_vec() {
-                    let _ = socket.send_to(&response, peer);
-                }
-            }
-        });
-        (addr, queried)
-    }
-
-    /// A resolver config pointed at the in-process server.
-    fn config(server: SocketAddr) -> (ResolverConfig, ResolverOpts) {
-        let mut udp = ConnectionConfig::udp();
-        udp.port = server.port();
-        let config = ResolverConfig::from_name_servers(vec![NameServerConfig::new(
-            server.ip(),
-            true,
-            vec![udp],
-        )]);
-        let mut options = ResolverOpts::default();
-        options.attempts = 1;
-        (config, options)
-    }
-
-    /// A response echoing the query's metadata, with `rcode` and `answers`.
-    fn answer(query: &Message, rcode: ResponseCode, answers: Vec<Record>) -> Message {
-        let mut response = Message::new(
-            query.metadata.id,
-            MessageType::Response,
-            query.metadata.op_code,
-        );
-        response.metadata.recursion_desired = query.metadata.recursion_desired;
-        response.metadata.recursion_available = true;
-        response.metadata.response_code = rcode;
-        response.queries.clone_from(&query.queries);
-        response.answers = answers;
-        response
-    }
-
-    /// An HTTPS RR owned by `owner`.
-    fn https(
-        owner: &str,
-        priority: u16,
-        target: &str,
-        params: Vec<(SvcParamKey, SvcParamValue)>,
-    ) -> Record {
-        Record::from_rdata(
-            name(owner),
-            TTL,
-            RData::HTTPS(HTTPS(SVCB::new(priority, name(target), params))),
-        )
-    }
-
-    /// A spawner that runs every background task on a dedicated thread —
-    /// the same fallback `HyperBackend` uses when no executor is supplied.
-    fn spawn() -> Spawn {
-        Arc::new(|future| {
-            thread::spawn(move || {
-                async_io::block_on(future);
-            });
-        })
-    }
+    use crate::{Error, transport::Transport};
 
     fn lookup(server: SocketAddr, host: &str, port: u16) -> Result<Option<HttpsRecord>, Error> {
-        let (config, options) = config(server);
+        let (config, options) = resolver_config(server);
         let transport = Transport::builder()
             .dns_config(Config::new(config, options))
             .build()
             .expect("transport builds");
         async_io::block_on(transport.https_record(spawn(), host, port))
-    }
-
-    fn queried_name(queried: &Receiver<(Name, RecordType)>) -> (Name, RecordType) {
-        queried.recv_timeout(QUERY_TIMEOUT).unwrap()
     }
 
     #[test]
@@ -417,6 +331,7 @@ mod tests {
 
         assert_eq!(record.alpn, ["h2", "h3"]);
         assert_eq!(record.port, None);
+        assert_eq!(record.ttl, Duration::from_secs(u64::from(TTL)));
         assert_eq!(
             queried_name(&queried),
             (name("example.test."), RecordType::HTTPS)
