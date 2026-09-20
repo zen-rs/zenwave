@@ -27,6 +27,7 @@ pub enum Protocol {
     /// HTTP/1.1 — always the answer for plaintext connections.
     Http1,
     /// HTTP/2, negotiated through ALPN on the innermost TLS layer.
+    #[cfg(feature = "http2")]
     Http2,
 }
 
@@ -158,6 +159,7 @@ pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connec
 /// negotiated ALPN for TLS targets, always [`Protocol::Http1`] for plaintext.
 fn connection(stream: Stream, via: Via, target: Target<'_>) -> Connection {
     let protocol = match (target.tls, stream.negotiated_alpn().as_deref()) {
+        #[cfg(feature = "http2")]
         (true, Some(b"h2")) => Protocol::Http2,
         _ => Protocol::Http1,
     };

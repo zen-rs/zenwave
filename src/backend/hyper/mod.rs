@@ -186,10 +186,6 @@ impl Endpoint for HyperBackend {
             Protocol::Http1 => self.send_http1(connection, request).await?,
             #[cfg(feature = "http2")]
             Protocol::Http2 => self.send_http2(connection, request).await?,
-            #[cfg(not(feature = "http2"))]
-            Protocol::Http2 => {
-                unreachable!("ALPN never offers h2 without the `http2` feature")
-            }
         };
 
         let mut response = response.map(|body| {
