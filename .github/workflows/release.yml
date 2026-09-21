@@ -45,25 +45,28 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          # Outside the checkout: `cargo publish` refuses to package a dirty
+          # working tree, and this file would be the dirt.
+          checks="${RUNNER_TEMP}/checks.tsv"
           deadline=$(( $(date +%s) + 3300 ))
           while :; do
             gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs?per_page=100" \
               --jq '.check_runs[] | [.name, (.conclusion // "pending")] | @tsv' \
-              | grep -v '^Publish release	' > checks.tsv || true
+              | grep -v '^Publish release	' > "${checks}" || true
 
-            if grep -E '\t(failure|cancelled|timed_out|action_required|startup_failure|stale)$' checks.tsv; then
+            if grep -E '\t(failure|cancelled|timed_out|action_required|startup_failure|stale)$' "${checks}"; then
               echo "::error::a check on ${SHA} did not pass (see list above); not publishing"
               exit 1
             fi
-            pending=$(grep -c $'\tpending$' checks.tsv || true)
-            started=$(wc -l < checks.tsv)
+            pending=$(grep -c $'\tpending$' "${checks}" || true)
+            started=$(wc -l < "${checks}")
             if [ "${pending}" -eq 0 ] && [ "${started}" -gt 0 ]; then
               echo "every check on ${SHA} passed"
               exit 0
             fi
             if [ "$(date +%s)" -gt "${deadline}" ]; then
               echo "::error::timed out after 55 minutes waiting for checks on ${SHA}"
-              cat checks.tsv
+              cat "${checks}"
               exit 1
             fi
             sleep 30
