@@ -5,41 +5,69 @@ name: Release
 # `dev` because a pull request opened with the default `GITHUB_TOKEN` starts
 # no workflow runs, so one targeting `main` could never satisfy the required
 # check there and no release could ever be merged.
+#
+# Publishing runs on `push` rather than on CI's `workflow_run`: crates.io
+# trusted publishing refuses to mint a token for the `workflow_run` event,
+# so the job waits for this commit's checks itself before it publishes.
 on:
+  push:
+    branches: [main]
   workflow_run:
     workflows: [CI]
-    branches: [main, dev]
+    branches: [dev]
     types: [completed]
 
 jobs:
   release:
     name: Publish release
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'main'
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: read
+      checks: read
       id-token: write
+    concurrency:
+      group: release-publish-main
+      cancel-in-progress: false
     steps:
-      - name: Checkout tested main commit
+      - name: Checkout the pushed main commit
         uses: actions/checkout@v6
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - &verify-tested-commit
-        name: Verify tested commit
+      # Nothing publishes until this very commit is green. Every check run
+      # on it must conclude, and all of them must have passed.
+      - name: Wait for this commit's checks
         env:
-          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
-          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
         run: |
-          actual_sha="$(git rev-parse HEAD)"
-          if [[ "$actual_sha" != "$EXPECTED_SHA" ]]; then
-            echo "::error::$BRANCH moved after CI: expected $EXPECTED_SHA, checked out $actual_sha"
-            exit 1
-          fi
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 3300 ))
+          while :; do
+            gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs?per_page=100" \
+              --jq '.check_runs[] | [.name, (.conclusion // "pending")] | @tsv' \
+              | grep -v '^Publish release	' > checks.tsv || true
+
+            if grep -E '\t(failure|cancelled|timed_out|action_required|startup_failure|stale)$' checks.tsv; then
+              echo "::error::a check on ${SHA} did not pass (see list above); not publishing"
+              exit 1
+            fi
+            pending=$(grep -c $'\tpending$' checks.tsv || true)
+            started=$(wc -l < checks.tsv)
+            if [ "${pending}" -eq 0 ] && [ "${started}" -gt 0 ]; then
+              echo "every check on ${SHA} passed"
+              exit 0
+            fi
+            if [ "$(date +%s)" -gt "${deadline}" ]; then
+              echo "::error::timed out after 55 minutes waiting for checks on ${SHA}"
+              cat checks.tsv
+              exit 1
+            fi
+            sleep 30
+          done
       - &rust-toolchain
         name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -59,8 +87,8 @@ jobs:
   release-pr:
     name: Prepare next release
     if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'dev'
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -75,7 +103,15 @@ jobs:
           ref: dev
           fetch-depth: 0
           persist-credentials: false
-      - *verify-tested-commit
+      - name: Verify tested commit
+        env:
+          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "$actual_sha" != "$EXPECTED_SHA" ]]; then
+            echo "::error::dev moved after CI: expected $EXPECTED_SHA, checked out $actual_sha"
+            exit 1
+          fi
       - *rust-toolchain
       # The pull request lands the bump on `dev`; the release itself is the
       # `dev` -> `main` pull request that carries it, which runs the full
