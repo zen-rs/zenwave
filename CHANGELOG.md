@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/zen-rs/zenwave/compare/v0.6.1...v0.7.0) - 2026-09-21
+
+### Added
+
+- add HTTP/3 discovery and connection racing
+- pool hyper connections per origin in the transport
+- *(hyper)* negotiate ALPN and speak HTTP/2 over TLS
+
+### Fixed
+
+- tell cargo-machete the fixture binary's dependencies are used
+- address review findings on h3 discovery
+- refuse non-HTTP schemes when building a request
+- *(pool)* lossless lease release, fresh-dial retries, origin sweeping
+- *(rustls)* allow unnecessary_wraps on negotiated_alpn
+- *(native-tls)* propagate negotiated_alpn errors
+- *(transport)* gate Protocol::Http2 behind the http2 feature
+- *(transport)* allow Http2OrHttp1 unused without hyper-backend
+
+### Other
+
+- publish from the push event, waiting for the commit's checks
+- Merge pull request #81 from zen-rs/ci/release-pr-on-dev
+- open the release pull request against dev
+- let release-plz's pull request reach main
+- serve the wasm and workerd lanes from the local fixture
+- extract the httpbin fixture for reuse and answer CORS preflights
+- abandon a body the server never finishes
+- prove pooled h1 reuse with fixture accept counts
+- serve the local httpbin fixture with hyper's server
+- note the per-origin connection pool in AGENTS.md
+- Merge remote-tracking branch 'origin/dev' into feat/connection-pool
+- restore trailing newlines
+- Merge remote-tracking branch 'origin/dev' into feat/alpn-http2
+- run tests with cargo nextest ([#63](https://github.com/zen-rs/zenwave/pull/63))
+- publish to crates.io via OIDC trusted publishing ([#61](https://github.com/zen-rs/zenwave/pull/61))
+- gate pull requests into main so only dev may merge ([#62](https://github.com/zen-rs/zenwave/pull/62))
+- *(websocket)* drain the server socket through the close handshake
+- *(release)* turn the semver check back on ([#59](https://github.com/zen-rs/zenwave/pull/59))
+
 ## [0.6.1](https://github.com/zen-rs/zenwave/compare/v0.6.0...v0.6.1) - 2026-09-11
 
 ### Fixed
