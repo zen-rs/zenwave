@@ -191,7 +191,7 @@ clippy.pedantic = "warn"
 clippy.nursery = "warn"
 clippy.cargo = "allow"
 
-# `Body::try_clone` (zen-rs/http-kit#11) is not released yet; pinned to the
+# `Body::try_clone` (zen-rs/http-kit#11) is on http-kit's dev but not released; pinned to the
 # exact commit until it is.
 [patch.crates-io]
-http-kit = { git = "https://github.com/zen-rs/http-kit", rev = "1d89a29c4e4d81de2b49cd7f03d03b70bd309f5a" }
+http-kit = { git = "https://github.com/zen-rs/http-kit", rev = "d13bd9c2225230a508f014eb5b8dd88a2d562970" }

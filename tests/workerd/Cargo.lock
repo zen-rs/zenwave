@@ -1421,7 +1421,7 @@ dependencies = [
 [[package]]
 name = "http-kit"
 version = "0.4.2"
-source = "git+https://github.com/zen-rs/http-kit?rev=1d89a29c4e4d81de2b49cd7f03d03b70bd309f5a#1d89a29c4e4d81de2b49cd7f03d03b70bd309f5a"
+source = "git+https://github.com/zen-rs/http-kit?rev=d13bd9c2225230a508f014eb5b8dd88a2d562970#d13bd9c2225230a508f014eb5b8dd88a2d562970"
 dependencies = [
  "bytes",
  "bytestr",
