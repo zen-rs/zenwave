@@ -70,6 +70,10 @@ impl Middleware for Cache {
             return Ok(entry.to_response(now));
         }
 
+        // Read before sending: the backend takes the request out of `request`,
+        // so its headers are gone once `respond` returns.
+        let auth_present = request.headers().contains_key(header::AUTHORIZATION);
+
         let mut cached_entry = None;
         if let Some(entry) = self.entries.get(&key) {
             let entry_requires_revalidation = entry.must_revalidate || !entry.is_fresh(now);
@@ -100,7 +104,6 @@ impl Middleware for Cache {
         }
 
         let response_cc = CacheControl::from_header_map(response.headers());
-        let auth_present = request.headers().contains_key(header::AUTHORIZATION);
         let allow_shared = !auth_present || response_cc.public;
 
         if allow_shared && !response_cc.no_store {
@@ -341,6 +344,25 @@ mod tests {
     }
 
     #[test]
+    fn does_not_share_a_private_authenticated_response() {
+        async_io::block_on(async {
+            let backend = CountingEndpoint::new("private", &[("cache-control", "max-age=60")]);
+            let mut cache = Cache::new();
+
+            for _ in 0..2 {
+                let mut request = new_request();
+                request
+                    .headers_mut()
+                    .insert(header::AUTHORIZATION, "Bearer secret".parse().unwrap());
+                let mut endpoint = backend.clone();
+                let response = cache.handle(&mut request, &mut endpoint).await.unwrap();
+                assert_eq!(body_text(response).await, "private");
+            }
+            assert_eq!(backend.calls(), 2);
+        });
+    }
+
+    #[test]
     fn respects_no_store() {
         async_io::block_on(async {
             let backend = CountingEndpoint::new("world", &[("cache-control", "no-store")]);
@@ -375,6 +397,10 @@ mod tests {
             assert_eq!(backend.calls(), 2);
             assert_eq!(backend.conditional_requests(), 1);
         });
+    }
+
+    fn new_placeholder() -> Request {
+        HttpRequest::builder().uri("/").body(Body::empty()).unwrap()
     }
 
     fn new_request() -> Request {
@@ -419,8 +445,11 @@ mod tests {
         type Error = Infallible;
         fn respond(
             &mut self,
-            _request: &mut Request,
+            request: &mut Request,
         ) -> impl std::future::Future<Output = Result<Response, Self::Error>> {
+            // Like a real backend, take the request out and leave a
+            // placeholder behind.
+            drop(std::mem::replace(request, new_placeholder()));
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut builder = HttpResponse::builder().status(StatusCode::OK);
             for (name, value) in &self.headers {

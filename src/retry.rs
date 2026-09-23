@@ -17,12 +17,11 @@ use crate::client::Client;
 /// (e.g., connection timeout, DNS error). It does *not* retry requests that receive
 /// a valid HTTP response, even if the status code indicates an error (e.g., 500 or 503).
 ///
-/// # Warning
-///
-/// This middleware retries requests by calling the inner client's `respond` method multiple times.
-/// If the request body is a stream that is consumed by the inner client (e.g., during a partial upload),
-/// subsequent retries may send an empty or incomplete body. This is safe for requests with empty bodies
-/// (like GET) or buffered bodies that can be replayed.
+/// Every attempt sends the original request. A backend takes the request out
+/// of the `&mut Request` it is handed, so a copy is taken before each attempt
+/// and restored for the next one. A request whose body can be read only once
+/// (a reader or a stream) cannot be copied and is attempted once: its error is
+/// returned as is.
 #[derive(Debug, Clone)]
 pub struct Retry<C: Client> {
     client: C,
@@ -84,13 +83,17 @@ impl<C: Client> Endpoint for Retry<C> {
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         let mut attempts = 0;
         loop {
+            let replay = (attempts < self.max_retries)
+                .then(|| replayable(request))
+                .flatten();
             match self.client.respond(request).await {
                 Ok(response) => return Ok(response),
                 Err(err) => {
-                    attempts += 1;
-                    if attempts > self.max_retries {
+                    let Some(replay) = replay else {
                         return Err(err);
-                    }
+                    };
+                    attempts += 1;
+                    tracing::debug!(attempt = attempts, uri = %replay.uri(), "retrying request");
 
                     // Simple exponential backoff
                     let delay =
@@ -104,8 +107,22 @@ impl<C: Client> Endpoint for Retry<C> {
                         delay.as_millis() as u32
                     ))
                     .await;
+
+                    *request = replay;
                 }
             }
         }
     }
+}
+
+/// A copy of `request` for the next attempt, or `None` when its body can be
+/// read only once.
+fn replayable(request: &Request) -> Option<Request> {
+    let mut copy = Request::new(request.body().try_clone()?);
+    *copy.method_mut() = request.method().clone();
+    *copy.uri_mut() = request.uri().clone();
+    *copy.version_mut() = request.version();
+    *copy.headers_mut() = request.headers().clone();
+    *copy.extensions_mut() = request.extensions().clone();
+    Some(copy)
 }
