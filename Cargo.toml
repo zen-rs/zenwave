@@ -10,7 +10,7 @@ keywords = ["http", "client", "async", "networking", "middleware"]
 categories = ["network-programming", "web-programming::http-client"]
 
 [dependencies]
-http-kit = "0.4"
+http-kit = "0.4.3"
 serde = { version = "1.0", default-features = false, features = ["derive"]}
 serde_json = "1.0"
 base64 = "0.22"
@@ -190,8 +190,3 @@ clippy.perf = "warn"
 clippy.pedantic = "warn"
 clippy.nursery = "warn"
 clippy.cargo = "allow"
-
-# `Body::try_clone` (zen-rs/http-kit#11) is on http-kit's dev but not released; pinned to the
-# exact commit until it is.
-[patch.crates-io]
-http-kit = { git = "https://github.com/zen-rs/http-kit", rev = "d13bd9c2225230a508f014eb5b8dd88a2d562970" }

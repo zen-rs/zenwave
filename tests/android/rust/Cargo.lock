@@ -873,8 +873,9 @@ dependencies = [
 
 [[package]]
 name = "http-kit"
-version = "0.4.2"
-source = "git+https://github.com/zen-rs/http-kit?rev=1d89a29c4e4d81de2b49cd7f03d03b70bd309f5a#1d89a29c4e4d81de2b49cd7f03d03b70bd309f5a"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae6c75e9030cb6c33d85e0f15c54f832496ef4a6cfdc80ad45b6e93149dd73a7"
 dependencies = [
  "bytes",
  "bytestr",

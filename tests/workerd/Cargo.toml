@@ -28,6 +28,3 @@ zenwave = { path = "../.." }
 # skyzen's own transitive zenwave is the checkout under test too.
 [patch.crates-io]
 zenwave = { path = "../.." }
-# The checkout under test pins an unreleased http-kit; a path dependency
-# does not carry its [patch], so it is repeated here.
-http-kit = { git = "https://github.com/zen-rs/http-kit", rev = "d13bd9c2225230a508f014eb5b8dd88a2d562970" }
