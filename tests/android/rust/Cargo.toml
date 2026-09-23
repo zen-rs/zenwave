@@ -54,3 +54,8 @@ ignored = [
   "tiny_http",
   "url",
 ]
+
+# The checkout under test pins an unreleased http-kit; a path dependency
+# does not carry its [patch], so it is repeated here.
+[patch.crates-io]
+http-kit = { git = "https://github.com/zen-rs/http-kit", rev = "1d89a29c4e4d81de2b49cd7f03d03b70bd309f5a" }

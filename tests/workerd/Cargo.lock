@@ -1421,8 +1421,7 @@ dependencies = [
 [[package]]
 name = "http-kit"
 version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05f85bfff63ecb379edf2f138a3184a188b1e14e0f841d38e6225eb7f7073b39"
+source = "git+https://github.com/zen-rs/http-kit?rev=1d89a29c4e4d81de2b49cd7f03d03b70bd309f5a#1d89a29c4e4d81de2b49cd7f03d03b70bd309f5a"
 dependencies = [
  "bytes",
  "bytestr",
@@ -4187,7 +4186,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -4531,7 +4530,7 @@ dependencies = [
 
 [[package]]
 name = "zenwave"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-fs",
