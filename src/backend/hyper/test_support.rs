@@ -475,6 +475,14 @@ impl H3Server {
         self.endpoint.close(0u32.into(), b"gone");
     }
 
+    /// A transport trusting the CA this server's leaf is signed by.
+    pub(crate) fn transport(&self) -> Transport {
+        Transport::builder()
+            .extra_root_certificate_der(self.ca_der.to_vec())
+            .build()
+            .expect("transport builds")
+    }
+
     /// A `https://localhost:<port>` URI for `path`.
     pub(crate) fn uri(&self, path: &str) -> String {
         format!("https://localhost:{}{path}", self.addr.port())
@@ -486,10 +494,7 @@ impl H3Server {
 /// the connection.
 #[cfg(http3)]
 pub async fn h3_connection(server: &H3Server) -> (Transport, H3Connection) {
-    let transport = Transport::builder()
-        .extra_root_certificate_der(server.ca_der.to_vec())
-        .build()
-        .expect("transport builds");
+    let transport = server.transport();
     let spawn = thread_spawn();
     let endpoint = transport
         .quic_endpoint(spawn.clone())
@@ -534,6 +539,7 @@ async fn serve_h3_request(
         ("GET", "/slow") => {
             serve_slow(&mut stream, slow_release.expect("one /slow per test")).await
         }
+        ("GET", "/delayed") => serve_delayed(&mut stream).await,
         _ => serve_status(&mut stream, http::StatusCode::NOT_FOUND).await,
     };
     result.expect("request is served");
@@ -564,6 +570,15 @@ async fn serve_echo(stream: &mut ServerStream) -> Result<(), h3::error::StreamEr
         stream.send_data(data).await?;
     }
     stream.finish().await
+}
+
+/// The response starts only after a fixed sleep — past the idle timeout the
+/// keep-alive tests dial with, so a client without keep-alives dies waiting
+/// for it.
+#[cfg(http3)]
+async fn serve_delayed(stream: &mut ServerStream) -> Result<(), h3::error::StreamError> {
+    async_io::Timer::after(Duration::from_secs(2)).await;
+    serve_body(stream, Bytes::from_static(b"delayed hello over h3")).await
 }
 
 /// The second chunk waits for the test to release it: a client that buffers
