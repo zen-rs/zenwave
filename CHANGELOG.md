@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2](https://github.com/zen-rs/zenwave/compare/v0.7.1...v0.7.2) - 2026-09-29
+
+### Fixed
+
+- *(pool)* never reuse an h2 connection the server sent GOAWAY on ([#96](https://github.com/zen-rs/zenwave/pull/96))
+- *(transport)* keep QUIC connections alive through the idle timeout ([#94](https://github.com/zen-rs/zenwave/pull/94))
+
 ## [0.7.1](https://github.com/zen-rs/zenwave/compare/v0.7.0...v0.7.1) - 2026-09-23
 
 ### Fixed
