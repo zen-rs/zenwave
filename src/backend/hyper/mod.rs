@@ -612,8 +612,36 @@ impl Endpoint for HyperBackend {
                 #[cfg(feature = "http2")]
                 // The URI stays absolute: hyper derives `:scheme` and
                 // `:authority` from it.
-                Checkout::H2(mut sender) => {
-                    match send_or_retry(sender.try_send_request(request).await, retried)? {
+                Checkout::H2(mut handle) => {
+                    // A pooled connection that already received a remote
+                    // GOAWAY can still be checked out: neither hyper nor h2
+                    // exposes GOAWAY state on `SendRequest` —
+                    // `poll_ready`/`is_ready`/`is_closed` all reduce to
+                    // `dispatch.is_closed()`, the dispatch task's death
+                    // (hyper 1.11 `src/client/dispatch.rs`,
+                    // `want::SharedGiver::is_canceled`) — while h2 only
+                    // refuses sends, `Streams::send_request`'s
+                    // `ensure_no_conn_error` set by `recv_go_away`
+                    // (h2 0.4 `src/proto/streams/streams.rs`). The send
+                    // failure below is therefore also the going-away
+                    // detector: flag the handle so no later checkout reuses
+                    // the connection, and replay the request once on a fresh
+                    // dial — a stream refused by GOAWAY was never processed
+                    // (RFC 9113 §6.8). A streaming body is not replayable
+                    // and fails as before.
+                    let replay = replayable_request(&request);
+                    let mut sent = handle.sender().try_send_request(request).await;
+                    if let Err(error) = &mut sent
+                        && is_remote_go_away(error.error())
+                    {
+                        handle.flag_going_away();
+                        if !retried && let Some(unsent) = replay {
+                            retried = true;
+                            request = unsent;
+                            continue;
+                        }
+                    }
+                    match send_or_retry(sent, retried)? {
                         Sent::Done(response) => break (into_body(response), None),
                         Sent::Retry(unsent) => {
                             retried = true;
@@ -719,6 +747,34 @@ fn send_or_retry<T, E: Unsent>(
             _ => Err(error.into_error()),
         },
     }
+}
+
+/// Whether `error` is an h2 `GOAWAY` initiated by the remote. hyper wraps
+/// h2 errors under its `Http2` kind with the `h2::Error` as the source —
+/// `Error::new_h2` only unwraps `is_io` causes into plain io errors, so a
+/// `GoAway` always survives as the cause (hyper 1.11 `src/error.rs`).
+#[cfg(feature = "http2")]
+fn is_remote_go_away(error: &hyper::Error) -> bool {
+    std::error::Error::source(error)
+        .and_then(|cause| cause.downcast_ref::<h2::Error>())
+        .is_some_and(|error| error.is_go_away() && error.is_remote())
+}
+
+/// A copy of `request` for a replay on a fresh connection, or `None` when
+/// the body cannot be sent twice — `http_kit::Body::try_clone` yields a
+/// body only for buffered bytes (or an empty one); a reader, stream, or
+/// frozen body is not replayed.
+#[cfg(feature = "http2")]
+fn replayable_request(
+    request: &http::Request<http_kit::Body>,
+) -> Option<http::Request<http_kit::Body>> {
+    let mut replay = http::Request::new(request.body().try_clone()?);
+    *replay.method_mut() = request.method().clone();
+    *replay.uri_mut() = request.uri().clone();
+    *replay.version_mut() = request.version();
+    *replay.headers_mut() = request.headers().clone();
+    *replay.extensions_mut() = request.extensions().clone();
+    Some(replay)
 }
 
 /// Shape an h1 request for the path its connection took: origin-form and a
@@ -1261,12 +1317,15 @@ mod tests {
 
     #[cfg(feature = "http2")]
     mod http2 {
+        use std::time::Duration;
+
         use async_io::block_on;
+        use futures_channel::oneshot;
         use http::Version;
 
         use super::super::{
             HyperBackend,
-            test_support::{TestCa, TlsServer},
+            test_support::{GoAway, TestCa, TlsServer},
         };
         use crate::{Client as _, ResponseExt as _};
 
@@ -1358,6 +1417,85 @@ mod tests {
                 server.accept_count(),
                 1,
                 "concurrent h2 requests must share one connection"
+            );
+        }
+
+        #[test]
+        fn a_pooled_h2_connection_sent_goaway_is_not_reused() {
+            let ca = TestCa::new();
+            let server = TlsServer::serve_goaway(&ca, GoAway::Graceful);
+            let mut client = HyperBackend::new(ca.transport());
+
+            block_on(async {
+                client
+                    .get(server.uri("/first"))
+                    .expect("test request must build")
+                    .await
+                    .expect("first h2 request must succeed");
+                // The GOAWAY went out with the first response, so the second
+                // request either finds the going-away handle evicted or has
+                // its send refused and replayed — a fresh dial serves it.
+                let response = client
+                    .get(server.uri("/second"))
+                    .expect("test request must build")
+                    .await
+                    .expect("request after GOAWAY must succeed");
+                assert_eq!(
+                    &*response.into_string().await.expect("body must read"),
+                    "zenwave"
+                );
+            });
+
+            assert_eq!(server.next_request().version, Version::HTTP_2);
+            assert_eq!(server.next_request().version, Version::HTTP_2);
+            assert_eq!(
+                server.accept_count(),
+                2,
+                "a connection the server sent GOAWAY on must not be reused"
+            );
+        }
+
+        #[test]
+        fn a_request_refused_by_a_goaway_after_dispatch_is_replayed() {
+            let ca = TestCa::new();
+            let (trigger, fire) = oneshot::channel();
+            let server = TlsServer::serve_goaway(&ca, GoAway::Abrupt(fire));
+            let mut client = HyperBackend::new(ca.transport());
+
+            block_on(async {
+                client
+                    .get(server.uri("/first"))
+                    .expect("test request must build")
+                    .await
+                    .expect("first h2 request must succeed");
+                // The second request is dispatched on the pooled conn before
+                // the server's GOAWAY goes out; the GOAWAY is stamped with a
+                // last-stream-id below the new stream, so the client sees it
+                // refused — and replays it on a fresh dial.
+                let second = async {
+                    client
+                        .get(server.uri("/second"))
+                        .expect("test request must build")
+                        .await
+                };
+                let go_away = async {
+                    async_io::Timer::after(Duration::from_millis(100)).await;
+                    trigger.send(()).expect("server must await the trigger");
+                };
+                let (second, ()) = futures_util::future::join(second, go_away).await;
+                let response = second.expect("a refused request must be replayed");
+                assert_eq!(
+                    &*response.into_string().await.expect("body must read"),
+                    "zenwave"
+                );
+            });
+
+            assert_eq!(server.next_request().version, Version::HTTP_2);
+            assert_eq!(server.next_request().version, Version::HTTP_2);
+            assert_eq!(
+                server.accept_count(),
+                2,
+                "a refused request must be replayed on a fresh connection"
             );
         }
     }
