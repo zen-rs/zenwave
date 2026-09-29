@@ -10,6 +10,8 @@
 //! HTTPS-RR knowledge and the h3 handle join the entry in #69 as plain
 //! additional fields.
 
+#[cfg(feature = "http2")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::HashMap,
     fmt,
@@ -94,7 +96,7 @@ pub struct OriginEntry {
     h1_slots: Arc<Semaphore>,
     /// The origin's shared h2 handle; clones multiplex over one connection.
     #[cfg(feature = "http2")]
-    h2: Mutex<Option<http2::SendRequest<http_kit::Body>>>,
+    h2: Mutex<Option<H2Handle>>,
     /// The protocol the origin speaks: `Some` once a dial negotiated it, or
     /// immediately for plaintext — `http` has no ALPN, so it can only be h1.
     /// A known-h1 origin dials in parallel under `h1_slots` while anything
@@ -251,7 +253,7 @@ impl OriginEntry {
         #[cfg(feature = "http2")]
         {
             let mut h2 = self.h2.lock().expect("pool state poisoned");
-            if h2.as_ref().is_some_and(http2::SendRequest::is_closed) {
+            if h2.as_ref().is_some_and(|handle| !handle.usable()) {
                 *h2 = None;
             }
             if h2.is_some() {
@@ -502,7 +504,7 @@ pub enum Checkout {
     H3(H3Connection),
     /// A clone of the origin's live h2 handle, ready to send.
     #[cfg(feature = "http2")]
-    H2(http2::SendRequest<http_kit::Body>),
+    H2(H2Handle),
     /// An idle h1 connection, exclusively leased until the response body ends.
     H1(H1Lease),
     /// Nothing reusable: dial a new connection holding this permit.
@@ -699,8 +701,8 @@ impl Pool {
                 }
             }
             #[cfg(feature = "http2")]
-            if pooled && let Some(sender) = live_h2(&entry) {
-                return Checkout::H2(sender);
+            if pooled && let Some(handle) = live_h2(&entry) {
+                return Checkout::H2(handle);
             }
             // An idle h1 connection exists only after `insert_h1` recorded
             // the protocol, so `h1_idle` only has to be consulted on the
@@ -744,8 +746,8 @@ impl Pool {
             // dials so one handshake serves every waiter.
             let dialing = entry.dialing.lock_arc().await;
             #[cfg(feature = "http2")]
-            if pooled && let Some(sender) = live_h2(&entry) {
-                return Checkout::H2(sender);
+            if pooled && let Some(handle) = live_h2(&entry) {
+                return Checkout::H2(handle);
             }
             if matches!(
                 *entry.protocol.lock().expect("pool state poisoned"),
@@ -808,7 +810,10 @@ impl Pool {
     #[cfg(feature = "http2")]
     pub fn insert_h2(permit: DialPermit, sender: http2::SendRequest<http_kit::Body>) {
         *permit.entry.protocol.lock().expect("pool state poisoned") = Some(Protocol::Http2);
-        *permit.entry.h2.lock().expect("pool state poisoned") = Some(sender);
+        *permit.entry.h2.lock().expect("pool state poisoned") = Some(H2Handle {
+            sender,
+            going_away: Arc::new(AtomicBool::new(false)),
+        });
         // Idle h1 connections the dial replaces can never be checked out
         // again; drop them rather than leaving their drivers parked.
         permit
@@ -877,18 +882,51 @@ impl Pool {
     }
 }
 
-/// A clone of `entry`'s live h2 handle, or `None` — a dead one is evicted so
-/// the next checkout re-dials. `is_closed` is the whole liveness check: the
-/// h2 dispatcher is always ready to accept a stream while it is open.
+/// A cloneable h2 connection handle: `sender` multiplexes requests over the
+/// shared connection, and `going_away` lets any handout flag the connection
+/// as ending. A remote GOAWAY makes a send fail but leaves the connection
+/// alive — and `is_closed` false — until the connection task finishes, so
+/// the flag is what keeps a refused handle out of the pool meanwhile.
 #[cfg(feature = "http2")]
-fn live_h2(entry: &OriginEntry) -> Option<http2::SendRequest<http_kit::Body>> {
+#[derive(Clone)]
+pub struct H2Handle {
+    sender: http2::SendRequest<http_kit::Body>,
+    going_away: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "http2")]
+impl H2Handle {
+    /// The h2 send handle.
+    pub const fn sender(&mut self) -> &mut http2::SendRequest<http_kit::Body> {
+        &mut self.sender
+    }
+
+    /// Mark the connection as going away: liveness checks evict it instead
+    /// of handing it out again.
+    pub fn flag_going_away(&self) {
+        self.going_away.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the handle may still be handed out: not flagged going-away
+    /// and not closed.
+    fn usable(&self) -> bool {
+        !self.going_away.load(Ordering::Relaxed) && !self.sender.is_closed()
+    }
+}
+
+/// A clone of `entry`'s live h2 handle, or `None` — a dead or going-away one
+/// is evicted so the next checkout re-dials. `is_closed` catches a connection
+/// whose task ended; `going_away` catches one the server is closing that a
+/// refused send already observed.
+#[cfg(feature = "http2")]
+fn live_h2(entry: &OriginEntry) -> Option<H2Handle> {
     let mut h2 = entry.h2.lock().expect("pool state poisoned");
     match h2.as_ref() {
-        Some(sender) if sender.is_closed() => {
+        Some(handle) if !handle.usable() => {
             *h2 = None;
             None
         }
-        Some(sender) => Some(sender.clone()),
+        Some(handle) => Some(handle.clone()),
         None => None,
     }
 }
