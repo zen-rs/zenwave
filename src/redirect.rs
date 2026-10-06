@@ -96,7 +96,14 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
                 .await
                 .map_err(FollowRedirectError::RemoteError)?;
 
-            if !response.status().is_redirection() {
+            if !matches!(
+                response.status(),
+                StatusCode::MOVED_PERMANENTLY
+                    | StatusCode::FOUND
+                    | StatusCode::SEE_OTHER
+                    | StatusCode::TEMPORARY_REDIRECT
+                    | StatusCode::PERMANENT_REDIRECT
+            ) {
                 return Ok(response);
             }
 
