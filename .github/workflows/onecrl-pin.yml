@@ -1,0 +1,103 @@
+name: OneCRL pin
+
+# Moves onecrl.pin.json to the newest zen-rs/onecrl-snapshots release. The
+# pull request it opens gets CI through `workflow_dispatch` (a GITHUB_TOKEN
+# pull request triggers no runs) and is merged once every check passes; a
+# failing one is left open.
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+  checks: read
+
+concurrency:
+  group: onecrl-pin
+  cancel-in-progress: false
+
+jobs:
+  pin:
+    name: Move the OneCRL pin
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          persist-credentials: false
+
+      - name: Find the newest snapshot
+        id: snapshot
+        run: |
+          set -euo pipefail
+          tag=$(gh release view -R zen-rs/onecrl-snapshots --json tagName -q .tagName)
+          url="https://github.com/zen-rs/onecrl-snapshots/releases/download/${tag}/onecrl.json"
+          if [ "$(jq -er .url onecrl.pin.json)" = "$url" ]; then
+            echo "the pin is already at ${tag}"
+            exit 0
+          fi
+          curl -fsSL --retry 5 --retry-all-errors -o "${RUNNER_TEMP}/onecrl.json" "$url"
+          sha256=$(sha256sum "${RUNNER_TEMP}/onecrl.json" | cut -d' ' -f1)
+          published=$(curl -fsSL --retry 5 --retry-all-errors "${url}.sha256" | cut -d' ' -f1)
+          if [ "$sha256" != "$published" ]; then
+            echo "::error::snapshot ${tag} hashes to ${sha256}, but its release publishes ${published}"
+            exit 1
+          fi
+          {
+            echo "tag=${tag}"
+            echo "url=${url}"
+            echo "sha256=${sha256}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open the pin pull request
+        id: pr
+        if: steps.snapshot.outputs.tag != ''
+        env:
+          TAG: ${{ steps.snapshot.outputs.tag }}
+          URL: ${{ steps.snapshot.outputs.url }}
+          SHA256: ${{ steps.snapshot.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          branch="onecrl/pin-${TAG}"
+          if gh pr list -R "$GITHUB_REPOSITORY" --head "$branch" --state all --json number -q '.[].number' | grep -q .; then
+            echo "::error::a pull request for ${branch} already exists"
+            exit 1
+          fi
+          jq -n --arg url "$URL" --arg sha256 "$SHA256" '{url: $url, sha256: $sha256}' > onecrl.pin.json
+          gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/heads/${branch}" -f sha="$(git rev-parse HEAD)" > /dev/null
+          # A commit made through the API is signed by GitHub.
+          gh api -X PUT "repos/${GITHUB_REPOSITORY}/contents/onecrl.pin.json" \
+            -f branch="$branch" \
+            -f message="chore(onecrl): move the snapshot pin to ${TAG}" \
+            -f content="$(base64 -w0 onecrl.pin.json)" \
+            -f sha="$(git rev-parse HEAD:onecrl.pin.json)" > /dev/null
+          pr=$(gh pr create -R "$GITHUB_REPOSITORY" --base dev --head "$branch" \
+            --title "chore(onecrl): move the snapshot pin to ${TAG}" \
+            --body "Moves \`onecrl.pin.json\` to the zen-rs/onecrl-snapshots release ${TAG} (SHA-256 \`${SHA256}\`).")
+          gh workflow run ci.yml -R "$GITHUB_REPOSITORY" --ref "$branch"
+          echo "number=${pr##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Merge once every check passes
+        if: steps.pr.outputs.number != ''
+        env:
+          PR: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          # The dispatched run takes a moment to register its checks.
+          deadline=$(( $(date +%s) + 300 ))
+          until [ "$(gh pr checks "$PR" -R "$GITHUB_REPOSITORY" 2>/dev/null | wc -l)" -gt 0 ]; do
+            if [ "$(date +%s)" -gt "$deadline" ]; then
+              echo "::error::no checks appeared on #${PR}"
+              exit 1
+            fi
+            sleep 15
+          done
+          timeout 3900 gh pr checks "$PR" -R "$GITHUB_REPOSITORY" --watch --interval 60
+          gh pr merge "$PR" -R "$GITHUB_REPOSITORY" --merge

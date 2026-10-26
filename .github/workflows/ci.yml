@@ -10,6 +10,9 @@ on:
     branches: ["**"]
   pull_request:
     branches: ["**"]
+  # The OneCRL pin workflow dispatches CI on its own pull requests, which
+  # the GITHUB_TOKEN that opens them cannot trigger otherwise.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
