@@ -77,6 +77,15 @@ jobs:
       # Mint a short-lived crates.io token from the GitHub OIDC identity
       # instead of a stored CARGO_REGISTRY_TOKEN (trusted publishing is
       # configured per crate on crates.io).
+      # The crate carries the pinned OneCRL snapshot so that building it from
+      # crates.io needs no network; `build.rs` checks it against the pin again.
+      - name: Fetch the pinned OneCRL snapshot
+        run: |
+          set -euo pipefail
+          url=$(jq -er .url onecrl.pin.json)
+          sha256=$(jq -er .sha256 onecrl.pin.json)
+          curl -fsSL --retry 5 --retry-all-errors -o onecrl.json "$url"
+          echo "$sha256  onecrl.json" | sha256sum -c -
       - uses: rust-lang/crates-io-auth-action@v1
         id: crates-io-auth
       - name: Publish unpublished crate version

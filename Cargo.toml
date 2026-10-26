@@ -8,6 +8,28 @@ description = "Ergonomic HTTP client framework."
 license = "MIT"
 keywords = ["http", "client", "async", "networking", "middleware"]
 categories = ["network-programming", "web-programming::http-client"]
+# The tracked files plus the pinned OneCRL snapshot, which stays out of git
+# (`.gitignore`) and is fetched by the release workflow before publishing.
+include = [
+    "/.github/**",
+    "/examples/**",
+    "/scripts/**",
+    "/src/**",
+    "/tests/**",
+    "/.gitignore",
+    "/AGENTS.md",
+    "/CHANGELOG.md",
+    "/CLAUDE.md",
+    "/Cargo.toml",
+    "/LICENSE",
+    "/README.md",
+    "/_typos.toml",
+    "/build.rs",
+    "/clippy.toml",
+    "/onecrl.json",
+    "/onecrl.pin.json",
+    "/release-plz.toml",
+]
 
 [dependencies]
 http-kit = "0.4.3"

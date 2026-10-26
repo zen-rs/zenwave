@@ -5,6 +5,9 @@ git_release_name = "v{{ version }}"
 publish = true
 git_tag_enable = true
 changelog_update = true
+# The release workflow adds the pinned OneCRL snapshot, untracked by design,
+# to the checkout before publishing.
+publish_allow_dirty = true
 
 [[package]]
 name = "zenwave"
