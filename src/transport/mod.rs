@@ -188,8 +188,10 @@ impl Transport {
     /// The unix domain socket every connection dials, when the transport was
     /// built with one — always `None` on platforms without unix sockets.
     #[cfg(native)]
+    // Off unix only curl and the HTTP/3 decision ask, so it can go unused.
     #[cfg_attr(
         not(unix_socket),
+        allow(dead_code),
         expect(clippy::unused_self, clippy::missing_const_for_fn)
     )]
     pub(crate) fn unix_socket(&self) -> Option<&Path> {
