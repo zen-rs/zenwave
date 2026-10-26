@@ -204,6 +204,12 @@ impl Default for AppleBackend {
 impl Endpoint for AppleBackend {
     type Error = crate::Error;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+        if self.transport.unix_socket().is_some() {
+            return Err(AppleError::BadRequest(anyhow!(
+                "URLSession cannot connect over unix domain sockets"
+            ))
+            .into());
+        }
         let route = self.route_for(request.uri())?;
         if let Some(authorization) = route.proxy_authorization {
             request

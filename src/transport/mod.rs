@@ -31,6 +31,10 @@
 
 use std::fmt;
 #[cfg(native)]
+use std::path::Path;
+#[cfg(unix_socket)]
+use std::path::PathBuf;
+#[cfg(native)]
 use std::sync::Arc;
 #[cfg(http3)]
 use std::{future::Future, pin::Pin};
@@ -100,6 +104,10 @@ pub struct Transport {
 struct Inner {
     proxy: Proxy,
     extra_roots: Vec<CertificateDer<'static>>,
+    /// The unix domain socket every connection dials instead of a host:port,
+    /// when the transport was built with one.
+    #[cfg(unix_socket)]
+    unix_socket: Option<PathBuf>,
     /// Platform roots plus extras as PEM, for libcurl. `None` without extras.
     #[cfg(feature = "curl-backend")]
     ca_bundle: Option<Vec<u8>>,
@@ -175,6 +183,17 @@ impl Transport {
         &self.inner.extra_roots
     }
 
+    /// The unix domain socket every connection dials, when the transport was
+    /// built with one — always `None` on platforms without unix sockets.
+    #[cfg(native)]
+    pub(crate) fn unix_socket(&self) -> Option<&Path> {
+        #[cfg(unix_socket)]
+        let socket = self.inner.unix_socket.as_deref();
+        #[cfg(not(unix_socket))]
+        let socket = None;
+        socket
+    }
+
     #[cfg(tls_engine)]
     pub(crate) fn tls(&self) -> &tls::TlsConnector {
         &self.inner.tls
@@ -221,6 +240,8 @@ impl fmt::Debug for Transport {
         debug
             .field("proxy", &self.inner.proxy)
             .field("extra_roots", &self.inner.extra_roots.len());
+        #[cfg(unix_socket)]
+        debug.field("unix_socket", &self.inner.unix_socket);
         debug.finish_non_exhaustive()
     }
 }
@@ -236,6 +257,8 @@ pub struct TransportBuilder {
     proxy: Option<Proxy>,
     #[cfg(native)]
     extra_roots: Vec<CertificateDer<'static>>,
+    #[cfg(unix_socket)]
+    unix_socket: Option<PathBuf>,
     /// Resolver configuration override — tests point it at an in-process
     /// DNS server instead of the system's.
     #[cfg(all(http3, not(target_os = "android")))]
@@ -249,6 +272,8 @@ impl fmt::Debug for TransportBuilder {
         debug
             .field("proxy", &self.proxy)
             .field("extra_roots", &self.extra_roots.len());
+        #[cfg(unix_socket)]
+        debug.field("unix_socket", &self.unix_socket);
         debug.finish_non_exhaustive()
     }
 }
@@ -284,6 +309,22 @@ impl TransportBuilder {
     #[must_use]
     pub fn extra_root_certificate_der(mut self, der: impl Into<Vec<u8>>) -> Self {
         self.extra_roots.push(CertificateDer::from(der.into()));
+        self
+    }
+
+    /// Route every connection through the unix domain socket at `path` — the
+    /// `curl --unix-socket` model: request URIs stay ordinary
+    /// `http(s)://host/path`, so `Host` headers and TLS server names keep
+    /// their usual meaning, and an `https` request wraps the socket's byte
+    /// stream in TLS.
+    ///
+    /// Proxy rules do not apply: no proxy can reach a local socket. The
+    /// hyper and curl backends serve such a transport; `URLSession` cannot
+    /// and reports an error per request.
+    #[cfg(unix_socket)]
+    #[must_use]
+    pub fn unix_socket(mut self, path: impl Into<PathBuf>) -> Self {
+        self.unix_socket = Some(path.into());
         self
     }
 
@@ -333,6 +374,8 @@ impl TransportBuilder {
                 inner: Arc::new(Inner {
                     proxy: self.proxy.unwrap_or_else(Proxy::system),
                     extra_roots: self.extra_roots,
+                    #[cfg(unix_socket)]
+                    unix_socket: self.unix_socket,
                     #[cfg(feature = "curl-backend")]
                     ca_bundle,
                     #[cfg(tls_engine)]

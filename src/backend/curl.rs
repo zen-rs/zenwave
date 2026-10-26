@@ -1,4 +1,8 @@
-use std::{mem::replace, str};
+use std::{
+    mem::replace,
+    path::{Path, PathBuf},
+    str,
+};
 
 use anyhow::{Context, anyhow};
 use blocking::unblock;
@@ -132,11 +136,18 @@ async fn execute(request: Request, transport: &Transport) -> Result<Response, Cu
         .map_err(CurlError::bad_request)?
         .to_vec();
 
-    let proxy = transport
-        .proxy()
-        .intercept(&parts.uri)
-        .map(|intercept| resolve_proxy(&intercept).map_err(CurlError::bad_request))
-        .transpose()?;
+    // No proxy can reach a local socket: a transport carrying one skips the
+    // matcher entirely, matching `curl --unix-socket`.
+    let unix_socket = transport.unix_socket().map(Path::to_path_buf);
+    let proxy = if unix_socket.is_some() {
+        None
+    } else {
+        transport
+            .proxy()
+            .intercept(&parts.uri)
+            .map(|intercept| resolve_proxy(&intercept).map_err(CurlError::bad_request))
+            .transpose()?
+    };
 
     let prepared = PreparedRequest {
         method: parts.method.as_str().to_owned(),
@@ -144,6 +155,7 @@ async fn execute(request: Request, transport: &Transport) -> Result<Response, Cu
         headers,
         body: body_bytes,
         proxy,
+        unix_socket,
         ca_bundle: transport.ca_bundle().map(<[u8]>::to_vec),
     };
 
@@ -160,6 +172,9 @@ fn perform(request: PreparedRequest) -> Result<Response, CurlError> {
     easy.url(&request.url).map_err(map_curl_error)?;
     easy.custom_request(&request.method)
         .map_err(map_curl_error)?;
+    if let Some(path) = &request.unix_socket {
+        easy.unix_socket_path(Some(path)).map_err(map_curl_error)?;
+    }
 
     if upload_len > 0 {
         easy.upload(true).map_err(map_curl_error)?;
@@ -259,6 +274,7 @@ struct PreparedRequest {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     proxy: Option<ResolvedProxy>,
+    unix_socket: Option<PathBuf>,
     ca_bundle: Option<Vec<u8>>,
 }
 #[derive(Debug)]

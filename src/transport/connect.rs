@@ -2,7 +2,12 @@
 //! an HTTP proxy (absolute-form requests or a `CONNECT` tunnel), or through a
 //! SOCKS5 proxy.
 
+#[cfg(unix_socket)]
+use std::path::Path;
+
 use async_net::TcpStream;
+#[cfg(unix_socket)]
+use async_net::unix::UnixStream;
 use http::{HeaderValue, Uri};
 
 use super::{Transport, happy_eyeballs, socks5, stream::Stream, tunnel};
@@ -82,8 +87,16 @@ pub fn proxied(transport: &Transport, target: Target<'_>) -> Result<bool, Error>
         .is_some())
 }
 
-/// Connect to `target` following the transport's proxy rules.
+/// Connect to `target` following the transport's proxy rules — or through
+/// its unix domain socket when the transport was built with one: the socket
+/// replaces host, port, and proxies alike, while `target` still decides
+/// whether TLS wraps the stream and which server name the handshake sends.
 pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connection, Error> {
+    #[cfg(unix_socket)]
+    if let Some(path) = transport.unix_socket() {
+        return unix_connect(transport, path, target).await;
+    }
+
     let Some(intercept) = transport.proxy().intercept(&destination_uri(target)?) else {
         let tcp = tcp(target.host, target.port).await?;
         let stream = finish(transport, target, tcp).await?;
@@ -179,6 +192,29 @@ fn connection(stream: Stream, via: Via, target: Target<'_>) -> Result<Connection
         via,
         protocol,
     })
+}
+
+/// Open `target`'s connection on the transport's unix domain socket.
+#[cfg(unix_socket)]
+async fn unix_connect(
+    transport: &Transport,
+    path: &Path,
+    target: Target<'_>,
+) -> Result<Connection, Error> {
+    let unix = UnixStream::connect(path)
+        .await
+        .map_err(|error| Error::Transport(Box::new(error)))?;
+    let stream = if target.tls {
+        Stream::TlsOverUnix(Box::new(
+            transport
+                .tls()
+                .connect(target.host, unix, target.protocols)
+                .await?,
+        ))
+    } else {
+        Stream::Unix(unix)
+    };
+    connection(stream, Via::Direct, target)
 }
 
 /// Wrap a TCP stream that already reaches the target in TLS when asked.
