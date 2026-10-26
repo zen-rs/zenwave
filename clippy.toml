@@ -1,0 +1,2 @@
+# Proper names clippy would otherwise want in backticks.
+doc-valid-idents = ["OneCRL", ".."]

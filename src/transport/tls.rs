@@ -36,7 +36,10 @@ mod engine {
             Verifier::new_with_extra_roots(extra_roots.iter().cloned(), provider)
         }
         .map_err(Error::tls)?;
-        Ok(Arc::new(verifier))
+        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = Arc::new(verifier);
+        #[cfg(onecrl)]
+        let verifier = onecrl_wrap(verifier);
+        Ok(verifier)
     }
 
     /// The system anchors read from disk plus `extra_roots`, verified by webpki;
@@ -54,7 +57,17 @@ mod engine {
             rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(store), provider)
                 .build()
                 .map_err(Error::tls)?;
+        #[cfg(onecrl)]
+        let verifier = onecrl_wrap(verifier);
         Ok(verifier)
+    }
+
+    /// Wrap `verifier` in the OneCRL baseline where the target carries it.
+    #[cfg(onecrl)]
+    fn onecrl_wrap(
+        verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    ) -> Arc<dyn rustls::client::danger::ServerCertVerifier> {
+        Arc::new(super::super::onecrl::OneCrlVerifier::new(verifier))
     }
 
     /// The ALPN list for `protocols`: h2 only exists with the `http2` feature.

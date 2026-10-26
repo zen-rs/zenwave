@@ -60,6 +60,9 @@ pub(crate) mod happy_eyeballs;
 pub(crate) mod hyper_io;
 #[cfg(tls_native)]
 pub(crate) mod native_tls_stream;
+// The OneCRL baseline, wrapped around the webpki verifiers (`tls` engine).
+#[cfg(onecrl)]
+mod onecrl;
 // The hyper backend's per-origin connection pool; other backends pool through
 // their platform.
 #[cfg(all(connector, feature = "hyper-backend"))]
