@@ -37,13 +37,20 @@ tokio = { version = "1", features = ["io-util"] }
 
 [build-dependencies]
 cfg_aliases = "0.2"
+# Compile the pinned OneCRL snapshot into `OUT_DIR` (`onecrl` feature): parse
+# and validate it, hash-check it against the pin, and fetch it when the crate
+# does not package onecrl.json.
+serde_json = { version = "1.0", optional = true }
+base64 = { version = "0.22", optional = true }
+ring = { version = "0.17", optional = true, default-features = false }
+minreq = { version = "3", optional = true, default-features = false, features = ["https-rustls"] }
 
 [features]
 # Default: hyper transport, rustls verified by the operating system's trust
 # store (`rustls-platform-verifier`), websockets, HTTP/2 and HTTP/3. On wasm32
 # the built-in Fetch backend is always used and none of the native features
 # apply.
-default = ["hyper-backend", "rustls", "ws", "http2", "http3"]
+default = ["hyper-backend", "rustls", "ws", "http2", "http3", "onecrl"]
 
 # HTTP backends (native platforms only). At least one must be enabled.
 #
@@ -81,6 +88,12 @@ ws = ["dep:async-tungstenite"]
 # HTTP/3 over QUIC for the hyper backend. QUIC needs a QUIC-capable TLS
 # library, so it requires the `rustls` engine.
 http3 = ["rustls", "dep:bytes", "dep:h3", "dep:h3-quinn", "dep:quinn"]
+
+# Refuse certificates listed by Mozilla's OneCRL on the paths that verify
+# chains with webpki (`src/transport/onecrl.rs`). A pinned snapshot of the
+# list is compiled into the binary by `build.rs`; Apple and Windows builds
+# carry no table, since their OS trust service ships its own distrust.
+onecrl = ["rustls", "dep:webpki", "dep:ring", "dep:minreq", "dep:serde_json", "dep:base64"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-sys = { version = "0.3", features = [
@@ -144,6 +157,13 @@ dirs = "6.0"
 once_cell = "1.19"
 time = "0.3.47"
 tower-service = "0.3"
+
+# The OneCRL baseline applies where `rustls` chains are checked by webpki:
+# every target but Apple and Windows (whose trust services distrust on their
+# own) and wasm32 (no native TLS at all).
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple"), not(windows)))'.dependencies]
+webpki = { package = "rustls-webpki", version = "0.103", optional = true, default-features = false, features = ["alloc"] }
+ring = { version = "0.17", optional = true, default-features = false }
 
 # Android resolves HTTPS records through `android.net.DnsResolver` over JNI
 # (src/transport/dns/android.rs); `jni-min-helper` supplies the Java proxy that
