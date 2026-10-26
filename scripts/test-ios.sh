@@ -49,7 +49,9 @@ for features in "${feature_sets[@]}"; do
   [[ -n "$executables" ]] || { echo "no test executables were built" >&2; exit 1; }
   while IFS= read -r executable; do
     echo "--- $(basename "$executable")"
-    xcrun simctl spawn "$simulator" "$executable"
+    # The simulator's own TMPDIR is too long for a unix socket path
+    # (sun_path holds 104 bytes); the spawned binary gets the host's /tmp.
+    SIMCTL_CHILD_TMPDIR=/tmp/ xcrun simctl spawn "$simulator" "$executable"
   done <<<"$executables"
   echo "::endgroup::"
 done
