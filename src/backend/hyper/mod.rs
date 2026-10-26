@@ -102,13 +102,14 @@ impl HyperBackend {
                 .race_dial_and_send(origin, permit, h3_port, request)
                 .await;
         }
-        let dialed = self.dial_tcp(origin).await?;
+        let dialed = self.dial(origin).await?;
         self.send_on_dialed(permit, dialed, request).await
     }
 
-    /// Connect to `origin` over TCP — through a proxy when the rules say so —
-    /// and run the negotiated hyper handshake.
-    async fn dial_tcp(&self, origin: &Origin) -> Result<DialedTcp, crate::Error> {
+    /// Connect to `origin` — the transport's unix socket when it has one,
+    /// else TCP through whatever proxy the rules say — and run the
+    /// negotiated hyper handshake.
+    async fn dial(&self, origin: &Origin) -> Result<Dialed, crate::Error> {
         let connection = connect(
             &self.transport,
             Target {
@@ -129,7 +130,7 @@ impl HyperBackend {
                 // The driver runs once for the connection's life, not per
                 // request.
                 self.spawner.spawn(drive(driver));
-                Ok(DialedTcp::H1 {
+                Ok(Dialed::H1 {
                     sender,
                     via: connection.via,
                 })
@@ -149,7 +150,7 @@ impl HyperBackend {
                 // Ready before pooling: the handle is shared as soon as it
                 // is stored.
                 sender.ready().await.map_err(HyperError::Connection)?;
-                Ok(DialedTcp::H2 { sender })
+                Ok(Dialed::H2 { sender })
             }
         }
     }
@@ -158,11 +159,11 @@ impl HyperBackend {
     async fn send_on_dialed(
         &self,
         permit: DialPermit,
-        dialed: DialedTcp,
+        dialed: Dialed,
         mut request: http::Request<http_kit::Body>,
     ) -> Result<(http::Response<http_kit::Body>, Option<H1Lease>), crate::Error> {
         match dialed {
-            DialedTcp::H1 { sender, via } => {
+            Dialed::H1 { sender, via } => {
                 shape_h1_request(&mut request, &via)?;
                 let (response, lease) = Pool::insert_h1(permit, sender, via)
                     .await
@@ -172,7 +173,7 @@ impl HyperBackend {
                 Ok((into_body(response), Some(lease)))
             }
             #[cfg(feature = "http2")]
-            DialedTcp::H2 { mut sender } => {
+            Dialed::H2 { mut sender } => {
                 Pool::insert_h2(permit, sender.clone());
                 let response = sender
                     .try_send_request(request)
@@ -205,7 +206,7 @@ impl HyperBackend {
             let timeout = entry.h3_connect_timeout();
             async move { quic_dial(&transport, spawn, &host, h3_port, timeout).await }
         });
-        let tcp = self.dial_tcp(origin);
+        let tcp = self.dial(origin);
         pin_mut!(tcp);
         match select(quic, tcp).await {
             Either::Left((result, tcp)) => match result {
@@ -316,8 +317,8 @@ impl HyperError {
     }
 }
 
-/// A freshly connected TCP connection after its hyper handshake.
-enum DialedTcp {
+/// A freshly connected connection after its hyper handshake.
+enum Dialed {
     /// HTTP/1.1 — exclusive; pooled by leasing.
     H1 {
         sender: hyper::client::conn::http1::SendRequest<http_kit::Body>,
@@ -478,11 +479,14 @@ impl HyperBackend {
                 protocols: Protocols::Http2OrHttp1,
             },
         )?;
-        Ok(if origin.scheme == Scheme::HTTPS && !proxied {
-            H3::Allowed
-        } else {
-            H3::Blocked
-        })
+        Ok(
+            if origin.scheme == Scheme::HTTPS && !proxied && self.transport.unix_socket().is_none()
+            {
+                H3::Allowed
+            } else {
+                H3::Blocked
+            },
+        )
     }
 
     /// Feed the response's `Alt-Svc` headers into the origin's entry — an
