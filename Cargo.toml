@@ -66,6 +66,7 @@ rustls = [
     "dep:futures-rustls",
     "dep:rustls",
     "dep:rustls-platform-verifier",
+    "dep:webpki",
 ]
 # The platform's native TLS library (OpenSSL, SChannel, or Security.framework),
 # driven on futures-io streams by an in-tree adapter.
@@ -129,6 +130,7 @@ http-body-util = "0.1.3"
 futures-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = { version = "1.12", features = ["std"] }
+webpki = { package = "rustls-webpki", version = "0.103", optional = true, default-features = false }
 rustls-native-certs = { version = "0.8", optional = true }
 pem = { version = "4", optional = true }
 native-tls = { version = "0.2", optional = true, features = ["alpn"] }

@@ -36,7 +36,9 @@ mod engine {
             Verifier::new_with_extra_roots(extra_roots.iter().cloned(), provider)
         }
         .map_err(Error::tls)?;
-        Ok(Arc::new(verifier))
+        Ok(Arc::new(
+            super::super::blocked_certificates::BlockedKeyVerifier::new(Arc::new(verifier)),
+        ))
     }
 
     /// The system anchors read from disk plus `extra_roots`, verified by webpki;
@@ -54,7 +56,9 @@ mod engine {
             rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(store), provider)
                 .build()
                 .map_err(Error::tls)?;
-        Ok(verifier)
+        Ok(Arc::new(
+            super::super::blocked_certificates::BlockedKeyVerifier::new(verifier),
+        ))
     }
 
     /// The ALPN list for `protocols`: h2 only exists with the `http2` feature.
