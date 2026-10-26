@@ -43,8 +43,9 @@ jobs:
         with:
           shared-key: test-${{ matrix.os }}
       - uses: taiki-e/install-action@nextest
+      # `onecrl` only compiles where webpki verifies (Linux here); elsewhere it is a no-op.
       - name: Run hyper backend tests (rustls)
-        run: cargo nextest run --no-default-features --features hyper-backend,rustls,ws --workspace
+        run: cargo nextest run --no-default-features --features hyper-backend,rustls,ws,onecrl --workspace
       - name: Run hyper backend tests (native-tls)
         run: cargo nextest run --no-default-features --features hyper-backend,native-tls,ws --workspace
       - name: Run hyper backend doctests
