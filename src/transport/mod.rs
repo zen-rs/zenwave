@@ -188,6 +188,10 @@ impl Transport {
     /// The unix domain socket every connection dials, when the transport was
     /// built with one — always `None` on platforms without unix sockets.
     #[cfg(native)]
+    #[cfg_attr(
+        not(unix_socket),
+        expect(clippy::unused_self, clippy::missing_const_for_fn)
+    )]
     pub(crate) fn unix_socket(&self) -> Option<&Path> {
         #[cfg(unix_socket)]
         let socket = self.inner.unix_socket.as_deref();

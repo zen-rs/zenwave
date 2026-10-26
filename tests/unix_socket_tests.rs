@@ -2,60 +2,66 @@
 //! connection to the socket while request URIs stay ordinary `http` URIs.
 #![cfg(all(unix, not(target_arch = "wasm32")))]
 
-use std::{
-    io::{self, Read as _, Write as _},
-    os::unix::net::{UnixListener, UnixStream},
-    path::PathBuf,
-    thread,
-};
+use std::path::PathBuf;
 
-use zenwave::{Client as _, ResponseExt as _, StatusCode, Transport};
+use zenwave::{Client as _, Transport};
 
-const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong";
+/// The unix socket server side, for the backends that can dial one.
+#[cfg(any(feature = "hyper-backend", feature = "curl-backend"))]
+mod server {
+    use std::{
+        io::{self, Read as _, Write as _},
+        os::unix::net::{UnixListener, UnixStream},
+        path::PathBuf,
+        thread,
+    };
 
-/// Read one HTTP/1.1 request head, up to the blank line ending it.
-fn read_request(socket: &mut UnixStream) -> io::Result<Vec<u8>> {
-    let mut request = [0_u8; 4_096];
-    let mut filled = 0_usize;
-    loop {
-        let read = socket.read(&mut request[filled..])?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "test request ended before its HTTP header",
-            ));
+    pub const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong";
+
+    /// Read one HTTP/1.1 request head, up to the blank line ending it.
+    pub fn read_request(socket: &mut UnixStream) -> io::Result<Vec<u8>> {
+        let mut request = [0_u8; 4_096];
+        let mut filled = 0_usize;
+        loop {
+            let read = socket.read(&mut request[filled..])?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "test request ended before its HTTP header",
+                ));
+            }
+            filled += read;
+            if request[..filled]
+                .windows(4)
+                .any(|window| window == b"\r\n\r\n")
+            {
+                return Ok(request[..filled].to_vec());
+            }
+            assert!(
+                filled < request.len(),
+                "test request exceeded its explicit header bound"
+            );
         }
-        filled += read;
-        if request[..filled]
-            .windows(4)
-            .any(|window| window == b"\r\n\r\n")
-        {
-            return Ok(request[..filled].to_vec());
-        }
-        assert!(
-            filled < request.len(),
-            "test request exceeded its explicit header bound"
-        );
     }
-}
 
-/// Accept one connection, assert it carries an origin-form request with the
-/// URI's `Host` header, and answer it once.
-fn serve_once(socket_path: PathBuf) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let listener = UnixListener::bind(&socket_path).expect("test unix socket must bind");
-        let (mut socket, _) = listener.accept().expect("test connection must arrive");
-        let request = read_request(&mut socket).expect("test request must read");
-        let head = String::from_utf8(request).expect("request head is ASCII");
-        let request_line = head.lines().next().expect("request has a first line");
-        assert_eq!(request_line, "GET /over-unix HTTP/1.1");
-        assert!(
-            head.lines()
-                .any(|line| line.eq_ignore_ascii_case("host: daemon.local")),
-            "the request must carry the URI's host header, got:\n{head}"
-        );
-        socket.write_all(RESPONSE).expect("response must write");
-    })
+    /// Accept one connection, assert it carries an origin-form request with the
+    /// URI's `Host` header, and answer it once.
+    pub fn serve_once(socket_path: PathBuf) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let listener = UnixListener::bind(&socket_path).expect("test unix socket must bind");
+            let (mut socket, _) = listener.accept().expect("test connection must arrive");
+            let request = read_request(&mut socket).expect("test request must read");
+            let head = String::from_utf8(request).expect("request head is ASCII");
+            let request_line = head.lines().next().expect("request has a first line");
+            assert_eq!(request_line, "GET /over-unix HTTP/1.1");
+            assert!(
+                head.lines()
+                    .any(|line| line.eq_ignore_ascii_case("host: daemon.local")),
+                "the request must carry the URI's host header, got:\n{head}"
+            );
+            socket.write_all(RESPONSE).expect("response must write");
+        })
+    }
 }
 
 fn unix_transport(socket_path: PathBuf) -> Transport {
@@ -68,16 +74,22 @@ fn unix_transport(socket_path: PathBuf) -> Transport {
 #[cfg(feature = "hyper-backend")]
 mod hyper_backend {
     use std::{
+        io::Write as _,
+        os::unix::net::UnixListener,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
+        thread,
         time::Duration,
     };
 
-    use zenwave::backend::HyperBackend;
+    use zenwave::{ResponseExt as _, StatusCode, backend::HyperBackend};
 
-    use super::*;
+    use super::{
+        server::{RESPONSE, read_request, serve_once},
+        *,
+    };
 
     #[test_executors::async_test]
     async fn requests_are_served_over_the_unix_socket() {
@@ -153,9 +165,9 @@ mod hyper_backend {
 
 #[cfg(feature = "curl-backend")]
 mod curl_backend {
-    use zenwave::backend::CurlBackend;
+    use zenwave::{ResponseExt as _, StatusCode, backend::CurlBackend};
 
-    use super::*;
+    use super::{server::serve_once, *};
 
     #[test_executors::async_test]
     async fn requests_are_served_over_the_unix_socket() {
