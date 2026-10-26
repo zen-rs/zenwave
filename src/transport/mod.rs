@@ -46,8 +46,6 @@ use crate::Error;
 
 #[cfg(android_verifier)]
 mod android;
-#[cfg(tls_rustls)]
-pub(crate) mod blocked_certificates;
 #[cfg(feature = "curl-backend")]
 mod ca_bundle;
 #[cfg(connector)]
