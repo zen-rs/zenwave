@@ -469,6 +469,10 @@ impl HyperBackend {
     /// proxied or plaintext request never sees the pool's h3 paths.
     #[cfg(http3)]
     fn h3_gate(&self, origin: &Origin) -> Result<H3, crate::Error> {
+        #[cfg(unix_socket)]
+        if self.transport.unix_socket().is_some() {
+            return Ok(H3::Blocked);
+        }
         let proxied = proxied(
             &self.transport,
             Target {
@@ -479,14 +483,11 @@ impl HyperBackend {
                 protocols: Protocols::Http2OrHttp1,
             },
         )?;
-        Ok(
-            if origin.scheme == Scheme::HTTPS && !proxied && self.transport.unix_socket().is_none()
-            {
-                H3::Allowed
-            } else {
-                H3::Blocked
-            },
-        )
+        Ok(if origin.scheme == Scheme::HTTPS && !proxied {
+            H3::Allowed
+        } else {
+            H3::Blocked
+        })
     }
 
     /// Feed the response's `Alt-Svc` headers into the origin's entry — an
