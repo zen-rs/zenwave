@@ -30,10 +30,8 @@
 //! ```
 
 use std::fmt;
-#[cfg(native)]
-use std::path::Path;
 #[cfg(unix_socket)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(native)]
 use std::sync::Arc;
 #[cfg(http3)]
@@ -184,20 +182,10 @@ impl Transport {
     }
 
     /// The unix domain socket every connection dials, when the transport was
-    /// built with one — always `None` on platforms without unix sockets.
-    #[cfg(native)]
-    // Off unix only curl and the HTTP/3 decision ask, so it can go unused.
-    #[cfg_attr(
-        not(unix_socket),
-        allow(dead_code),
-        expect(clippy::unused_self, clippy::missing_const_for_fn)
-    )]
+    /// built with one.
+    #[cfg(unix_socket)]
     pub(crate) fn unix_socket(&self) -> Option<&Path> {
-        #[cfg(unix_socket)]
-        let socket = self.inner.unix_socket.as_deref();
-        #[cfg(not(unix_socket))]
-        let socket = None;
-        socket
+        self.inner.unix_socket.as_deref()
     }
 
     #[cfg(tls_engine)]
