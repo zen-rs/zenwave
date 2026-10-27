@@ -115,7 +115,7 @@ http3 = ["rustls", "dep:bytes", "dep:h3", "dep:h3-quinn", "dep:quinn"]
 # chains with webpki (`src/transport/onecrl.rs`). A pinned snapshot of the
 # list is compiled into the binary by `build.rs`; Apple and Windows builds
 # carry no table, since their OS trust service ships its own distrust.
-onecrl = ["rustls", "dep:webpki", "dep:ring", "dep:minreq", "dep:serde_json", "dep:base64"]
+onecrl = ["rustls", "dep:webpki", "dep:ring", "dep:minreq", "dep:serde_json", "dep:base64", "dep:arc-swap"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-sys = { version = "0.3", features = [
@@ -186,6 +186,8 @@ tower-service = "0.3"
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple"), not(windows)))'.dependencies]
 webpki = { package = "rustls-webpki", version = "0.103", optional = true, default-features = false, features = ["alloc"] }
 ring = { version = "0.17", optional = true, default-features = false }
+# The refresher swaps in a merged additions table per round.
+arc-swap = { version = "1.9.3", optional = true, default-features = false }
 
 # Android resolves HTTPS records through `android.net.DnsResolver` over JNI
 # (src/transport/dns/android.rs); `jni-min-helper` supplies the Java proxy that
