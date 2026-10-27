@@ -39,7 +39,7 @@ use crate::{
 
 /// The Remote Settings changeset endpoint: the OneCRL collection's
 /// incremental view.
-pub(crate) const DEFAULT_ENDPOINT: &str = "https://firefox.settings.services.mozilla.com/v1/buckets/security-state/collections/onecrl/changeset";
+pub const DEFAULT_ENDPOINT: &str = "https://firefox.settings.services.mozilla.com/v1/buckets/security-state/collections/onecrl/changeset";
 
 /// The additions file inside the resolved cache directory.
 const FILE_NAME: &str = "changes.json";
@@ -47,14 +47,14 @@ const FILE_NAME: &str = "changes.json";
 /// What `TransportBuilder` keeps for `onecrl_refresh`; `interval` doubles as
 /// the enable flag — refresh is opt-in.
 #[derive(Debug)]
-pub(crate) struct Refresh {
+pub struct Refresh {
     /// The round interval; `None` until `onecrl_refresh` is called.
-    pub(crate) interval: Option<Duration>,
+    pub interval: Option<Duration>,
     /// The changeset endpoint; [`DEFAULT_ENDPOINT`] unless a test overrode it.
-    pub(crate) endpoint: String,
+    pub endpoint: String,
     /// The directory `zenwave/onecrl/` persists additions under; `None`
     /// resolves the platform cache directory at `build()`.
-    pub(crate) cache_dir: Option<PathBuf>,
+    pub cache_dir: Option<PathBuf>,
 }
 
 impl Refresh {
@@ -64,7 +64,7 @@ impl Refresh {
     ///
     /// Returns [`Error::Io`] when refresh is enabled but no cache directory
     /// exists for the additions file.
-    pub(crate) fn resolve(&self) -> Result<Option<Plan>, Error> {
+    pub fn resolve(&self) -> Result<Option<Plan>, Error> {
         let Some(interval) = self.interval else {
             return Ok(None);
         };
@@ -92,7 +92,7 @@ impl Default for Refresh {
 
 /// Refresh fully resolved: how often, where to fetch, and the directory
 /// `changes.json` lives in.
-pub(crate) struct Plan {
+pub struct Plan {
     interval: Duration,
     endpoint: String,
     dir: PathBuf,
@@ -109,7 +109,7 @@ struct Changeset {
 /// # Errors
 ///
 /// Returns [`Error::Io`] when the thread cannot be spawned.
-pub(crate) fn spawn(
+pub fn spawn(
     inner: &Arc<Inner>,
     additions: Arc<ArcSwap<Additions>>,
     plan: Plan,
@@ -515,6 +515,11 @@ mod tests {
             .with_single_cert(chain, key)
             .expect("server certificate");
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        // Every handshake must verify the chain afresh: a resumed session
+        // presents no certificate, so the OneCRL verifier never runs and a
+        // refreshed listing would look accepted.
+        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        config.send_tls13_tickets = 0;
         let acceptor = futures_rustls::TlsAcceptor::from(Arc::new(config));
         let (listener, port) = async_io::block_on(async {
             let listener = async_net::TcpListener::bind("127.0.0.1:0")
@@ -626,7 +631,7 @@ mod tests {
         })
     }
 
-    fn changeset_body(changes: Vec<serde_json::Value>) -> String {
+    fn changeset_body(changes: &[serde_json::Value]) -> String {
         json!({"timestamp": TIMESTAMP, "changes": changes}).to_string()
     }
 
@@ -729,7 +734,7 @@ mod tests {
         let fixture = Fixture::new();
         let (release, gate) = mpsc::channel();
         let changeset = serve_changeset(
-            changeset_body(vec![issuer_serial_record(&fixture.intermediate)]),
+            changeset_body(&[issuer_serial_record(&fixture.intermediate)]),
             Some(gate),
         );
         let dir = tempfile::tempdir().expect("cache dir");
@@ -753,7 +758,7 @@ mod tests {
         let fixture = Fixture::new();
         let dir = tempfile::tempdir().expect("cache dir");
         let populated = serve_changeset(
-            changeset_body(vec![issuer_serial_record(&fixture.intermediate)]),
+            changeset_body(&[issuer_serial_record(&fixture.intermediate)]),
             None,
         );
         let first = transport(&fixture.root, &populated, dir.path());
@@ -761,7 +766,7 @@ mod tests {
         wait_for_file(&persisted_file(dir.path()));
         drop(first);
 
-        let empty = serve_changeset(changeset_body(Vec::new()), None);
+        let empty = serve_changeset(changeset_body(&[]), None);
         let second = transport(&fixture.root, &empty, dir.path());
         wait_for_revoked(&second, fixture.port);
     }
@@ -772,7 +777,7 @@ mod tests {
     fn without_refresh_the_endpoint_is_never_contacted() {
         let fixture = Fixture::new();
         let changeset = serve_changeset(
-            changeset_body(vec![issuer_serial_record(&fixture.intermediate)]),
+            changeset_body(&[issuer_serial_record(&fixture.intermediate)]),
             None,
         );
         let dir = tempfile::tempdir().expect("cache dir");
@@ -799,7 +804,7 @@ mod tests {
     fn a_refreshed_subject_key_listing_refuses_the_chain() {
         let fixture = Fixture::new();
         let changeset = serve_changeset(
-            changeset_body(vec![subject_key_record(&fixture.intermediate)]),
+            changeset_body(&[subject_key_record(&fixture.intermediate)]),
             None,
         );
         let dir = tempfile::tempdir().expect("cache dir");

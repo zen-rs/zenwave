@@ -341,7 +341,7 @@ impl TransportBuilder {
     /// cache directory is the app's `Context.getCacheDir()`.
     #[cfg(onecrl)]
     #[must_use]
-    pub fn onecrl_refresh(mut self, interval: Duration) -> Self {
+    pub const fn onecrl_refresh(mut self, interval: Duration) -> Self {
         self.onecrl.interval = Some(interval);
         self
     }
@@ -356,7 +356,7 @@ impl TransportBuilder {
         endpoint: &str,
         cache_dir: std::path::PathBuf,
     ) -> Self {
-        self.onecrl.endpoint = endpoint.to_owned();
+        endpoint.clone_into(&mut self.onecrl.endpoint);
         self.onecrl.cache_dir = Some(cache_dir);
         self
     }

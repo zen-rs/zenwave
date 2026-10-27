@@ -39,15 +39,15 @@ use rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
 
-pub(crate) mod record;
-pub(crate) mod refresh;
+pub mod record;
+pub mod refresh;
 
 /// The pinned snapshot table, compiled by `build.rs`.
 const TABLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/onecrl.bin"));
 
 /// The changeset timestamp the compiled table covers — the refresher asks
 /// Remote Settings for everything after it.
-pub(crate) fn baseline_timestamp() -> u64 {
+pub fn baseline_timestamp() -> u64 {
     u64::from_le_bytes(TABLE[..8].try_into().expect("the table has a header"))
 }
 
@@ -55,7 +55,7 @@ pub(crate) fn baseline_timestamp() -> u64 {
 /// and persisted under the cache directory. The maps are replaced wholesale
 /// under `ArcSwap`, so a verification never observes a half-merged round.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Additions {
+pub struct Additions {
     /// The newest changeset timestamp the maps cover; 0 while only the
     /// baseline applies.
     timestamp: u64,
@@ -67,18 +67,18 @@ pub(crate) struct Additions {
 
 impl Additions {
     /// The newest changeset timestamp the maps cover.
-    pub(crate) const fn timestamp(&self) -> u64 {
+    pub const fn timestamp(&self) -> u64 {
         self.timestamp
     }
 
     /// Advance the covered timestamp to `timestamp` when it is newer. A
     /// changeset with no usable records still counts as seen.
-    pub(crate) fn advance(&mut self, timestamp: u64) {
+    pub fn advance(&mut self, timestamp: u64) {
         self.timestamp = self.timestamp.max(timestamp);
     }
 
     /// Fold `entry` in.
-    pub(crate) fn insert(&mut self, entry: record::Entry) {
+    pub fn insert(&mut self, entry: record::Entry) {
         match entry {
             record::Entry::IssuerSerial { issuer, serial } => {
                 self.issuers.entry(issuer).or_default().insert(serial);
