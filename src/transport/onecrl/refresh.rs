@@ -586,7 +586,9 @@ mod tests {
             }
         });
         Changeset {
-            url: format!("http://127.0.0.1:{port}"),
+            // Shaped like the Remote Settings endpoint: a path the query
+            // follows.
+            url: format!("http://127.0.0.1:{port}/changeset"),
             hits,
         }
     }
