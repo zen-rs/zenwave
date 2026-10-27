@@ -34,6 +34,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 #[cfg(native)]
 use std::sync::Arc;
+#[cfg(onecrl)]
+use std::time::Duration;
 #[cfg(http3)]
 use std::{future::Future, pin::Pin};
 
@@ -256,6 +258,9 @@ pub struct TransportBuilder {
     extra_roots: Vec<CertificateDer<'static>>,
     #[cfg(unix_socket)]
     unix_socket: Option<PathBuf>,
+    /// OneCRL additions refresh — enabled by [`Self::onecrl_refresh`].
+    #[cfg(onecrl)]
+    onecrl: onecrl::refresh::Refresh,
     /// Resolver configuration override — tests point it at an in-process
     /// DNS server instead of the system's.
     #[cfg(all(http3, not(target_os = "android")))]
@@ -271,6 +276,8 @@ impl fmt::Debug for TransportBuilder {
             .field("extra_roots", &self.extra_roots.len());
         #[cfg(unix_socket)]
         debug.field("unix_socket", &self.unix_socket);
+        #[cfg(onecrl)]
+        debug.field("onecrl_refresh", &self.onecrl.interval);
         debug.finish_non_exhaustive()
     }
 }
@@ -325,6 +332,35 @@ impl TransportBuilder {
         self
     }
 
+    /// Keep the OneCRL blocklist current past the
+    /// compiled baseline: every `interval`, fetch the
+    /// Remote Settings changes since the newest record
+    /// seen, add them to the lookup, and persist them
+    /// under `dirs::cache_dir()/zenwave/onecrl/` so the
+    /// next process starts from them. On Android the
+    /// cache directory is the app's `Context.getCacheDir()`.
+    #[cfg(onecrl)]
+    #[must_use]
+    pub const fn onecrl_refresh(mut self, interval: Duration) -> Self {
+        self.onecrl.interval = Some(interval);
+        self
+    }
+
+    /// Point OneCRL refresh at `endpoint`, persisting under `cache_dir`
+    /// instead of the platform cache directory — a constructor for tests,
+    /// not a runtime hook.
+    #[cfg(all(onecrl, test))]
+    #[must_use]
+    pub(crate) fn onecrl_refresh_endpoint(
+        mut self,
+        endpoint: &str,
+        cache_dir: std::path::PathBuf,
+    ) -> Self {
+        endpoint.clone_into(&mut self.onecrl.endpoint);
+        self.onecrl.cache_dir = Some(cache_dir);
+        self
+    }
+
     /// Resolve through `config` instead of the system resolver
     /// configuration — a constructor for tests, not a runtime hook.
     #[cfg(all(http3, not(target_os = "android")))]
@@ -340,12 +376,27 @@ impl TransportBuilder {
     /// # Errors
     ///
     /// Returns [`Error::Tls`] when a certificate cannot be parsed or the
-    /// platform trust store cannot be initialised.
+    /// platform trust store cannot be initialised. With OneCRL refresh
+    /// enabled it also fails with [`Error::Io`] when the platform has no
+    /// cache directory for the persisted additions.
     pub fn build(self) -> Result<Transport, Error> {
         #[cfg(native)]
         {
+            // Resolving the refresh plan here — not on the refresher thread —
+            // lets `build` report a missing cache directory.
+            #[cfg(onecrl)]
+            let refresh = self.onecrl.resolve()?.map(|plan| {
+                (
+                    plan,
+                    Arc::new(arc_swap::ArcSwap::from_pointee(onecrl::Additions::default())),
+                )
+            });
             #[cfg(tls_engine)]
-            let tls = tls::TlsConnector::new(&self.extra_roots)?;
+            let tls = tls::TlsConnector::new(
+                &self.extra_roots,
+                #[cfg(onecrl)]
+                refresh.as_ref().map(|(_, additions)| Arc::clone(additions)),
+            )?;
             #[cfg(feature = "curl-backend")]
             let ca_bundle = if self.extra_roots.is_empty() {
                 None
@@ -367,7 +418,7 @@ impl TransportBuilder {
             });
             #[cfg(all(http3, target_os = "android"))]
             let dns = dns::Config;
-            Ok(Transport {
+            let transport = Transport {
                 inner: Arc::new(Inner {
                     proxy: self.proxy.unwrap_or_else(Proxy::system),
                     extra_roots: self.extra_roots,
@@ -386,7 +437,14 @@ impl TransportBuilder {
                     #[cfg(all(http3, not(target_os = "android")))]
                     resolver: once_cell::sync::OnceCell::new(),
                 }),
-            })
+            };
+            // The refresher holds a `Weak`; spawning after `inner` exists also
+            // covers the thread failing to start as a build error.
+            #[cfg(onecrl)]
+            if let Some((plan, additions)) = refresh {
+                onecrl::refresh::spawn(&transport.inner, additions, plan)?;
+            }
+            Ok(transport)
         }
         #[cfg(not(native))]
         {

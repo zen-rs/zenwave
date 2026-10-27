@@ -13,12 +13,16 @@ use super::connect::Protocols;
 mod engine {
     use std::sync::Arc;
 
+    #[cfg(onecrl)]
+    use arc_swap::ArcSwap;
     use futures_io::{AsyncRead, AsyncWrite};
     use rustls::{ClientConfig, crypto::ring, pki_types::ServerName};
     use rustls_pki_types::CertificateDer;
     #[cfg(not(android_verifier))]
     use rustls_platform_verifier::Verifier;
 
+    #[cfg(onecrl)]
+    use super::super::onecrl::Additions;
     use super::Protocols;
     use crate::Error;
 
@@ -29,6 +33,7 @@ mod engine {
     fn verifier(
         extra_roots: &[CertificateDer<'static>],
         provider: Arc<rustls::crypto::CryptoProvider>,
+        #[cfg(onecrl)] additions: Option<Arc<ArcSwap<Additions>>>,
     ) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, Error> {
         let verifier = if extra_roots.is_empty() {
             Verifier::new(provider)
@@ -38,7 +43,7 @@ mod engine {
         .map_err(Error::tls)?;
         let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = Arc::new(verifier);
         #[cfg(onecrl)]
-        let verifier = onecrl_wrap(verifier);
+        let verifier = onecrl_wrap(verifier, additions);
         Ok(verifier)
     }
 
@@ -48,6 +53,7 @@ mod engine {
     fn verifier(
         extra_roots: &[CertificateDer<'static>],
         provider: Arc<rustls::crypto::CryptoProvider>,
+        #[cfg(onecrl)] additions: Option<Arc<ArcSwap<Additions>>>,
     ) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, Error> {
         let mut store = super::super::android::system_roots()?;
         for root in extra_roots {
@@ -58,16 +64,21 @@ mod engine {
                 .build()
                 .map_err(Error::tls)?;
         #[cfg(onecrl)]
-        let verifier = onecrl_wrap(verifier);
+        let verifier = onecrl_wrap(verifier, additions);
         Ok(verifier)
     }
 
-    /// Wrap `verifier` in the OneCRL baseline where the target carries it.
+    /// Wrap `verifier` in the OneCRL baseline where the target carries it;
+    /// `additions` is the refresher's shared table when the transport opted
+    /// in.
     #[cfg(onecrl)]
     fn onecrl_wrap(
         verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+        additions: Option<Arc<ArcSwap<Additions>>>,
     ) -> Arc<dyn rustls::client::danger::ServerCertVerifier> {
-        Arc::new(super::super::onecrl::OneCrlVerifier::new(verifier))
+        Arc::new(super::super::onecrl::OneCrlVerifier::new(
+            verifier, additions,
+        ))
     }
 
     /// The ALPN list for `protocols`: h2 only exists with the `http2` feature.
@@ -92,9 +103,17 @@ mod engine {
     }
 
     impl TlsConnector {
-        pub fn new(extra_roots: &[CertificateDer<'static>]) -> Result<Self, Error> {
+        pub fn new(
+            extra_roots: &[CertificateDer<'static>],
+            #[cfg(onecrl)] additions: Option<Arc<ArcSwap<Additions>>>,
+        ) -> Result<Self, Error> {
             let provider = Arc::new(ring::default_provider());
-            let verifier = verifier(extra_roots, Arc::clone(&provider))?;
+            let verifier = verifier(
+                extra_roots,
+                Arc::clone(&provider),
+                #[cfg(onecrl)]
+                additions,
+            )?;
             let base = ClientConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions()
                 .map_err(Error::tls)?

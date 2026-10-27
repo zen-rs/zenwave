@@ -245,7 +245,7 @@ async fn tcp(host: &str, port: u16) -> Result<TcpStream, Error> {
 }
 
 /// `host:port`, bracketing IPv6 literals.
-fn authority(host: &str, port: u16) -> String {
+pub fn authority(host: &str, port: u16) -> String {
     if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]:{port}")
     } else {

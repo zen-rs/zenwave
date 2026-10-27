@@ -1,6 +1,13 @@
 //! Emits `cfg` aliases so platform and feature conditions read the same everywhere.
 use cfg_aliases::cfg_aliases;
 
+/// The changeset record parser — the same file `src/transport/onecrl.rs`
+/// compiles, so the snapshot and the refresher's fetched records decode
+/// identically.
+#[cfg(feature = "onecrl")]
+#[path = "src/transport/onecrl/record.rs"]
+mod record;
+
 fn main() {
     cfg_aliases! {
         // Anything that is not the browser/Workers Fetch backend.
@@ -128,23 +135,10 @@ mod onecrl {
             .collect()
     }
 
-    /// Compile the changeset into the binary table `src/transport/onecrl.rs`
-    /// searches in place:
-    ///
-    /// ```text
-    /// u32 issuer_count | u32 subject_count
-    /// issuer index:  issuer_count × { name_off, name_len, serials_off, serials_len }
-    /// subject index: subject_count × { name_off, name_len, hashes_off, hashes_len }
-    /// areas:         per issuer, serials_len × { off, len } serial sub-index
-    ///                entries, then per subject hashes_len × 32-byte hashes
-    /// byte area:     every name and serial value, concatenated
-    /// ```
-    ///
-    /// All offsets are little-endian `u32` measured from byte 0; each index is
-    /// sorted by the bytes it keys on so lookups binary-search.
     /// The changeset grouped into the two indexable forms: issuer name to its
     /// serial values, subject name to its SPKI SHA-256s.
     struct Indexes {
+        timestamp: u64,
         issuers: BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
         subjects: BTreeMap<Vec<u8>, Vec<[u8; 32]>>,
     }
@@ -153,57 +147,61 @@ mod onecrl {
     fn records(snapshot: &[u8]) -> Indexes {
         let changeset: serde_json::Value =
             serde_json::from_slice(snapshot).expect("parse the OneCRL snapshot");
+        let timestamp = changeset["timestamp"]
+            .as_u64()
+            .expect("the OneCRL snapshot needs a timestamp");
         let changes = changeset["changes"]
             .as_array()
             .expect("the OneCRL snapshot's changes must be an array");
-        let field = |record: &serde_json::Value, name: &str| {
-            record[name].as_str().map(|value| {
-                use base64::Engine as _;
-                base64::engine::general_purpose::STANDARD
-                    .decode(value)
-                    .unwrap_or_else(|e| panic!("a OneCRL record's {name}: {e}"))
-            })
-        };
         let mut issuers = BTreeMap::new();
         let mut subjects = BTreeMap::new();
         for record in changes {
-            match (
-                field(record, "issuerName"),
-                field(record, "serialNumber"),
-                field(record, "subject"),
-                field(record, "pubKeyHash"),
-            ) {
-                (Some(issuer), Some(serial), None, None) => {
-                    issuers
-                        .entry(name(&issuer))
-                        .or_insert_with(Vec::new)
-                        .push(serial);
+            match crate::record::entry(record).expect("a OneCRL record must decode") {
+                Some(crate::record::Entry::IssuerSerial { issuer, serial }) => {
+                    issuers.entry(issuer).or_insert_with(Vec::new).push(serial);
                 }
-                (None, None, Some(subject), Some(hash)) => {
-                    let hash: [u8; 32] = hash
-                        .try_into()
-                        .expect("a OneCRL pubKeyHash must be a 32-byte SHA-256");
-                    subjects
-                        .entry(name(&subject))
-                        .or_insert_with(Vec::new)
-                        .push(hash);
+                Some(crate::record::Entry::SubjectKey { subject, hash }) => {
+                    subjects.entry(subject).or_insert_with(Vec::new).push(hash);
                 }
-                _ => {
-                    panic!("a OneCRL record must be issuerName+serialNumber or subject+pubKeyHash")
-                }
+                None => {}
             }
         }
-        Indexes { issuers, subjects }
+        Indexes {
+            timestamp,
+            issuers,
+            subjects,
+        }
     }
 
+    /// Compile the changeset into the binary table `src/transport/onecrl.rs`
+    /// searches in place:
+    ///
+    /// ```text
+    /// u64 timestamp | u32 issuer_count | u32 subject_count
+    /// issuer index:  issuer_count × { name_off, name_len, serials_off, serials_len }
+    /// subject index: subject_count × { name_off, name_len, hashes_off, hashes_len }
+    /// areas:         per issuer, serials_len × { off, len } serial sub-index
+    ///                entries, then per subject hashes_len × 32-byte hashes
+    /// byte area:     every name and serial value, concatenated
+    /// ```
+    ///
+    /// `timestamp` is the changeset's top-level timestamp, little-endian
+    /// `u64`; the refresher asks Remote Settings for everything after it. All
+    /// other offsets are little-endian `u32` measured from byte 0; each index
+    /// is sorted by the bytes it keys on so lookups binary-search.
     fn compile(snapshot: &[u8]) -> Vec<u8> {
-        let Indexes { issuers, subjects } = records(snapshot);
+        let Indexes {
+            timestamp,
+            issuers,
+            subjects,
+        } = records(snapshot);
         let mut table = Vec::new();
-        write_u32(&mut table, 0, issuers.len());
-        write_u32(&mut table, 4, subjects.len());
-        table.resize(8 + (issuers.len() + subjects.len()) * 16, 0);
-        let issuer_index = 8;
-        let subject_index = 8 + issuers.len() * 16;
+        table.extend_from_slice(&timestamp.to_le_bytes());
+        write_u32(&mut table, 8, issuers.len());
+        write_u32(&mut table, 12, subjects.len());
+        table.resize(16 + (issuers.len() + subjects.len()) * 16, 0);
+        let issuer_index = 16;
+        let subject_index = 16 + issuers.len() * 16;
         let areas_base = subject_index + subjects.len() * 16;
 
         let mut areas = Vec::new();
@@ -280,36 +278,5 @@ mod onecrl {
             table.resize(offset + 4, 0);
         }
         table[offset..offset + 4].copy_from_slice(&u32::try_from(value).unwrap().to_le_bytes());
-    }
-
-    /// The content of a DER `SEQUENCE` TLV — `webpki::Cert::issuer()` and
-    /// `subject()` report names without the outer tag and length, so records
-    /// are stored the same way. Anything that is not exactly one SEQUENCE is
-    /// not a Name and fails the build.
-    fn name(der: &[u8]) -> Vec<u8> {
-        assert!(
-            der.first() == Some(&0x30),
-            "a OneCRL name must be a SEQUENCE"
-        );
-        let (content, total) = match der[1] {
-            short if short < 0x80 => (2, 2 + short as usize),
-            first => {
-                let n = (first & 0x7f) as usize;
-                assert!(
-                    (1..=4).contains(&n) && der.len() >= 2 + n,
-                    "a OneCRL name's length must be DER"
-                );
-                let mut len = 0usize;
-                for byte in &der[2..2 + n] {
-                    len = len << 8 | usize::from(*byte);
-                }
-                (2 + n, 2 + n + len)
-            }
-        };
-        assert!(
-            total == der.len(),
-            "a OneCRL name must be exactly one SEQUENCE TLV"
-        );
-        der[content..].to_vec()
     }
 }
