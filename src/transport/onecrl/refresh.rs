@@ -659,17 +659,30 @@ mod tests {
 
     /// Retry the handshake until the chain is refused, at most `TEST_TIMEOUT`
     /// — a refresh round lands asynchronously.
-    fn wait_for_revoked(transport: &Transport, port: u16) {
+    fn wait_for_revoked(transport: &Transport, port: u16, changeset: &Changeset, dir: &Path) {
         let deadline = Instant::now() + TEST_TIMEOUT;
         loop {
             let result = async_io::block_on(handshake(transport, port));
             if revoked(&result) {
                 return;
             }
-            assert!(
-                Instant::now() < deadline,
-                "the chain was still accepted after {TEST_TIMEOUT:?}: {result:?}"
-            );
+            if Instant::now() >= deadline {
+                // Name the stage that broke: whether the refresher reached the
+                // server, whether it persisted, and what a direct fetch yields.
+                let plan = super::Plan {
+                    interval: Duration::from_secs(3600),
+                    endpoint: changeset.url.clone(),
+                    dir: dir.to_path_buf(),
+                };
+                let fetched = async_io::block_on(super::fetch(transport, &plan, 0))
+                    .map(|fetched| (fetched.timestamp, fetched.changes.len()));
+                panic!(
+                    "the chain was still accepted after {TEST_TIMEOUT:?}: {result:?}; \
+                     changeset requests: {}, changes.json persisted: {}, direct fetch: {fetched:?}",
+                    changeset.hits.load(Ordering::SeqCst),
+                    persisted_file(dir).exists(),
+                );
+            }
             thread::sleep(Duration::from_millis(25));
         }
     }
@@ -746,7 +759,7 @@ mod tests {
             .expect("the chain verifies before the refresh round lands");
 
         drop(release);
-        wait_for_revoked(&transport, fixture.port);
+        wait_for_revoked(&transport, fixture.port, &changeset, dir.path());
         wait_for_file(&persisted_file(dir.path()));
     }
 
@@ -762,13 +775,13 @@ mod tests {
             None,
         );
         let first = transport(&fixture.root, &populated, dir.path());
-        wait_for_revoked(&first, fixture.port);
+        wait_for_revoked(&first, fixture.port, &populated, dir.path());
         wait_for_file(&persisted_file(dir.path()));
         drop(first);
 
         let empty = serve_changeset(changeset_body(&[]), None);
         let second = transport(&fixture.root, &empty, dir.path());
-        wait_for_revoked(&second, fixture.port);
+        wait_for_revoked(&second, fixture.port, &empty, dir.path());
     }
 
     /// (c) Without `onecrl_refresh` nothing contacts Remote Settings: the
@@ -810,6 +823,6 @@ mod tests {
         let dir = tempfile::tempdir().expect("cache dir");
         let transport = transport(&fixture.root, &changeset, dir.path());
 
-        wait_for_revoked(&transport, fixture.port);
+        wait_for_revoked(&transport, fixture.port, &changeset, dir.path());
     }
 }
