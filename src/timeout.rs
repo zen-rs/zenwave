@@ -6,12 +6,6 @@
 //! in a dedicated async runtime.
 
 use core::time::Duration;
-#[cfg(target_arch = "wasm32")]
-use core::{
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-};
 
 #[cfg(not(target_arch = "wasm32"))]
 use async_io::Timer;
@@ -22,6 +16,9 @@ use http_kit::{
     Endpoint, HttpError, Middleware, Request, Response, StatusCode, middleware::MiddlewareError,
 };
 use thiserror::Error;
+
+#[cfg(target_arch = "wasm32")]
+use crate::single_threaded::SingleThreaded;
 
 /// Middleware that fails requests exceeding the configured duration.
 #[derive(Debug, Clone, Copy)]
@@ -70,7 +67,7 @@ impl Middleware for Timeout {
 
         match futures_util::future::select(response_future, timeout_future).await {
             Either::Left((result, _)) => Ok(result.map_err(MiddlewareError::Endpoint)?),
-            Either::Right((_, _)) => Err(MiddlewareError::Middleware(TimeoutError)),
+            Either::Right(((), _)) => Err(MiddlewareError::Middleware(TimeoutError)),
         }
     }
 }
@@ -82,28 +79,12 @@ fn timeout_future(duration: Duration) -> SingleThreaded<TimeoutFuture> {
     SingleThreaded(TimeoutFuture::new(millis))
 }
 
+// The timer's output is discarded either way (`select` reports which side
+// finished first), so both flavours produce `()` and the match arm can be
+// target-independent.
 #[cfg(not(target_arch = "wasm32"))]
-fn timeout_future(duration: Duration) -> Timer {
-    Timer::after(duration)
-}
-
-#[cfg(target_arch = "wasm32")]
-struct SingleThreaded<T>(T);
-
-#[cfg(target_arch = "wasm32")]
-unsafe impl<T> Send for SingleThreaded<T> {}
-#[cfg(target_arch = "wasm32")]
-unsafe impl<T> Sync for SingleThreaded<T> {}
-
-#[cfg(target_arch = "wasm32")]
-impl<T: Future> Future for SingleThreaded<T> {
-    type Output = T::Output;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: SingleThreaded is a newtype wrapper; we never move the inner future.
-        let inner = unsafe { self.map_unchecked_mut(|this| &mut this.0) };
-        inner.poll(cx)
-    }
+async fn timeout_future(duration: Duration) {
+    Timer::after(duration).await;
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

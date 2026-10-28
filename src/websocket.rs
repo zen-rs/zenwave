@@ -449,13 +449,12 @@ mod native {
 
 #[cfg(target_arch = "wasm32")]
 mod wasm {
-    use std::{cell::RefCell, fmt, rc::Rc, sync::Arc};
+    use std::{cell::RefCell, fmt, future::Future, io, rc::Rc, sync::Arc};
 
     use async_lock::Mutex;
     use futures_channel::{mpsc, oneshot};
     use futures_util::StreamExt;
     use http_kit::utils::{ByteStr, Bytes};
-    use std::io;
     use wasm_bindgen::{JsCast, JsValue, closure::Closure};
     use web_sys::{
         BinaryType, CloseEvent, ErrorEvent, MessageEvent, WebSocket as BrowserWebSocket,
@@ -463,6 +462,7 @@ mod wasm {
 
     use super::{WebSocketConfig, WebSocketError, WebSocketMessage, serialize_payload};
     use crate::Transport;
+    use crate::single_threaded::SingleThreaded;
 
     type Result<T> = core::result::Result<T, WebSocketError>;
 
@@ -495,7 +495,7 @@ mod wasm {
 
     /// Sending half of a websocket connection.
     pub struct WebSocketSender {
-        inner: Arc<SharedSocket>,
+        inner: Arc<SingleThreaded<SharedSocket>>,
     }
 
     impl fmt::Debug for WebSocketSender {
@@ -514,7 +514,7 @@ mod wasm {
 
     /// Receiving half of a websocket connection.
     pub struct WebSocketReceiver {
-        inner: Arc<SharedSocket>,
+        inner: Arc<SingleThreaded<SharedSocket>>,
     }
 
     impl fmt::Debug for WebSocketReceiver {
@@ -528,8 +528,10 @@ mod wasm {
     /// # Errors
     ///
     /// Returns an error if the browser reports an error or the connection fails.
-    pub async fn connect(uri: impl AsRef<str>) -> Result<WebSocket> {
-        connect_with(uri, &Transport::system(), WebSocketConfig::default()).await
+    pub fn connect(uri: impl AsRef<str>) -> impl Future<Output = Result<WebSocket>> + Send {
+        SingleThreaded(async move {
+            connect_with(uri, &Transport::system(), WebSocketConfig::default()).await
+        })
     }
 
     /// Establish a websocket connection from the browser environment.
@@ -540,132 +542,98 @@ mod wasm {
     /// # Errors
     ///
     /// Returns an error if the browser reports an error or the connection fails.
-    pub async fn connect_with(
-        uri: impl AsRef<str>,
+    // `use<U>` is the true capture set: `_transport` is a signature shim for
+    // the native API and the future never borrows it.
+    pub fn connect_with<U>(
+        uri: U,
         _transport: &Transport,
         config: WebSocketConfig,
-    ) -> Result<WebSocket> {
-        let socket = BrowserWebSocket::new(uri.as_ref())
-            .map_err(|e| connection_failed(format_js_value(&e)))?;
-        socket.set_binary_type(BinaryType::Arraybuffer);
+    ) -> impl Future<Output = Result<WebSocket>> + Send + use<U>
+    where
+        U: AsRef<str>,
+    {
+        SingleThreaded(async move {
+            let socket = BrowserWebSocket::new(uri.as_ref())
+                .map_err(|e| connection_failed(format_js_value(&e)))?;
+            socket.set_binary_type(BinaryType::Arraybuffer);
 
-        // The browser reports whole messages, never frames, so the two
-        // configured caps collapse into one: the smaller of them.
-        let message_limit = message_size_limit(&config);
+            // The browser reports whole messages, never frames, so the two
+            // configured caps collapse into one: the smaller of them.
+            let message_limit = message_size_limit(&config);
 
-        let (event_tx, event_rx) = mpsc::unbounded::<WsEvent>();
-        let (ready_tx, ready_rx) = oneshot::channel::<core::result::Result<(), String>>();
-        let pending = Rc::new(RefCell::new(Some(ready_tx)));
+            let (event_tx, event_rx) = mpsc::unbounded::<WsEvent>();
+            let (ready_tx, ready_rx) = oneshot::channel::<core::result::Result<(), String>>();
+            let pending = Rc::new(RefCell::new(Some(ready_tx)));
 
-        let onopen_pending = Rc::clone(&pending);
-        let on_open = Closure::wrap(Box::new(move || {
-            if let Some(sender) = onopen_pending.borrow_mut().take() {
-                let _ = sender.send(Ok(()));
+            let onopen_pending = Rc::clone(&pending);
+            let on_open = Closure::wrap(Box::new(move || {
+                if let Some(sender) = onopen_pending.borrow_mut().take() {
+                    let _ = sender.send(Ok(()));
+                }
+            }) as Box<dyn FnMut()>);
+            socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+
+            let on_message_socket = socket.clone();
+            let on_message_tx = event_tx.clone();
+            let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
+                deliver_message(&event, &on_message_socket, &on_message_tx, message_limit);
+            }) as Box<dyn FnMut(MessageEvent)>);
+            socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+
+            let on_error_pending = Rc::clone(&pending);
+            let on_error_tx = event_tx.clone();
+            let on_error = Closure::wrap(Box::new(move |event: ErrorEvent| {
+                let message = event.message();
+                if let Some(sender) = on_error_pending.borrow_mut().take() {
+                    let _ = sender.send(Err(message.clone()));
+                }
+                let _ = on_error_tx.unbounded_send(WsEvent::Error(message));
+            }) as Box<dyn FnMut(ErrorEvent)>);
+            socket.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+
+            let on_close_pending = Rc::clone(&pending);
+            let on_close_tx = event_tx.clone();
+            let on_close = Closure::wrap(Box::new(move |event: CloseEvent| {
+                if let Some(sender) = on_close_pending.borrow_mut().take() {
+                    let reason = event.reason();
+                    let message = if reason.is_empty() {
+                        format!("Connection closed (code {})", event.code())
+                    } else {
+                        reason
+                    };
+                    let _ = sender.send(Err(message));
+                }
+                let _ = on_close_tx.unbounded_send(WsEvent::Closed);
+            }) as Box<dyn FnMut(CloseEvent)>);
+            socket.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+
+            match ready_rx.await {
+                Ok(Ok(())) => {
+                    socket.set_onopen(None);
+                    drop(on_open);
+                }
+                Ok(Err(message)) => {
+                    return Err(connection_failed(message));
+                }
+                Err(_) => {
+                    return Err(connection_failed("WebSocket connection cancelled"));
+                }
             }
-        }) as Box<dyn FnMut()>);
-        socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
 
-        let on_message_socket = socket.clone();
-        let on_message_tx = event_tx.clone();
-        let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
-            let data = event.data();
-            // Each payload kind converts at most once: a text payload is
-            // checked by its UTF-8 byte length after a single conversion, a
-            // binary one by the buffer's length before it is copied into
-            // Rust memory.
-            let text = data.as_string();
-            let size = text
-                .as_ref()
-                .map_or_else(|| binary_size(&data), |text| Some(text.len()));
-            if let Some(size) = size
-                && let Some(limit) = message_limit.filter(|limit| size > *limit)
-            {
-                reject_oversized(&on_message_socket, &on_message_tx, size, limit);
-                return;
-            }
+            let shared = Arc::new(SingleThreaded(SharedSocket {
+                socket,
+                receiver: Mutex::new(event_rx),
+                _on_message: on_message,
+                _on_error: on_error,
+                _on_close: on_close,
+            }));
 
-            if let Some(text) = text {
-                let _ =
-                    on_message_tx.unbounded_send(WsEvent::Message(WebSocketMessage::from(text)));
-                return;
-            }
-
-            if let Ok(array) = data.clone().dyn_into::<js_sys::ArrayBuffer>() {
-                let view = js_sys::Uint8Array::new(&array);
-                let mut bytes = vec![0; view.length() as usize];
-                view.copy_to(&mut bytes[..]);
-                let _ =
-                    on_message_tx.unbounded_send(WsEvent::Message(WebSocketMessage::from(bytes)));
-                return;
-            }
-
-            if let Ok(view) = data.dyn_into::<js_sys::Uint8Array>() {
-                let mut bytes = vec![0; view.length() as usize];
-                view.copy_to(&mut bytes[..]);
-                let _ =
-                    on_message_tx.unbounded_send(WsEvent::Message(WebSocketMessage::from(bytes)));
-                return;
-            }
-
-            let _ = on_message_tx.unbounded_send(WsEvent::Error(
-                "Unsupported websocket message type".to_string(),
-            ));
-        }) as Box<dyn FnMut(MessageEvent)>);
-        socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-
-        let on_error_pending = Rc::clone(&pending);
-        let on_error_tx = event_tx.clone();
-        let on_error = Closure::wrap(Box::new(move |event: ErrorEvent| {
-            let message = event.message();
-            if let Some(sender) = on_error_pending.borrow_mut().take() {
-                let _ = sender.send(Err(message.clone()));
-            }
-            let _ = on_error_tx.unbounded_send(WsEvent::Error(message));
-        }) as Box<dyn FnMut(ErrorEvent)>);
-        socket.set_onerror(Some(on_error.as_ref().unchecked_ref()));
-
-        let on_close_pending = Rc::clone(&pending);
-        let on_close_tx = event_tx.clone();
-        let on_close = Closure::wrap(Box::new(move |event: CloseEvent| {
-            if let Some(sender) = on_close_pending.borrow_mut().take() {
-                let reason = event.reason();
-                let message = if reason.is_empty() {
-                    format!("Connection closed (code {})", event.code())
-                } else {
-                    reason
-                };
-                let _ = sender.send(Err(message));
-            }
-            let _ = on_close_tx.unbounded_send(WsEvent::Closed);
-        }) as Box<dyn FnMut(CloseEvent)>);
-        socket.set_onclose(Some(on_close.as_ref().unchecked_ref()));
-
-        match ready_rx.await {
-            Ok(Ok(())) => {
-                socket.set_onopen(None);
-                drop(on_open);
-            }
-            Ok(Err(message)) => {
-                return Err(connection_failed(message));
-            }
-            Err(_) => {
-                return Err(connection_failed("WebSocket connection cancelled"));
-            }
-        }
-
-        let shared = Arc::new(SharedSocket {
-            socket,
-            receiver: Mutex::new(event_rx),
-            _on_message: on_message,
-            _on_error: on_error,
-            _on_close: on_close,
-        });
-
-        Ok(WebSocket {
-            sender: WebSocketSender {
-                inner: Arc::clone(&shared),
-            },
-            receiver: WebSocketReceiver { inner: shared },
+            Ok(WebSocket {
+                sender: WebSocketSender {
+                    inner: Arc::clone(&shared),
+                },
+                receiver: WebSocketReceiver { inner: shared },
+            })
         })
     }
 
@@ -679,8 +647,7 @@ mod wasm {
         where
             T: serde::Serialize,
         {
-            let payload = serialize_payload(&value)?;
-            self.send_text(payload).await
+            self.sender.send(value).await
         }
 
         /// Send a text websocket message.
@@ -745,8 +712,14 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if the browser fails to queue the frame.
+        // The lib and lib-test passes report this as different lints.
+        #[allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "the native sender's signature; the browser acts synchronously"
+        )]
         pub async fn send_text(&self, text: impl Into<ByteStr>) -> Result<()> {
-            self.send_message(WebSocketMessage::text(text)).await
+            self.send_message(WebSocketMessage::text(text))
         }
 
         /// Send a binary websocket message.
@@ -754,11 +727,17 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if the browser fails to queue the frame.
+        // The lib and lib-test passes report this as different lints.
+        #[allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "the native sender's signature; the browser acts synchronously"
+        )]
         pub async fn send_binary(&self, bytes: impl Into<Bytes>) -> Result<()> {
-            self.send_message(WebSocketMessage::binary(bytes)).await
+            self.send_message(WebSocketMessage::binary(bytes))
         }
 
-        async fn send_message(&self, message: WebSocketMessage) -> Result<()> {
+        fn send_message(&self, message: WebSocketMessage) -> Result<()> {
             match message {
                 WebSocketMessage::Text(text) => self
                     .inner
@@ -789,6 +768,12 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if the browser refuses to close the socket.
+        // The lib and lib-test passes report this as different lints.
+        #[allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "the native sender's signature; the browser acts synchronously"
+        )]
         pub async fn close(&self) -> Result<()> {
             self.inner
                 .socket
@@ -811,6 +796,55 @@ mod wasm {
                 Some(WsEvent::Error(message)) => Err(connection_failed(message)),
             }
         }
+    }
+
+    /// Forward one browser `message` event to the receiver, rejecting a
+    /// payload over `message_limit` before it reaches Rust memory.
+    fn deliver_message(
+        event: &MessageEvent,
+        socket: &BrowserWebSocket,
+        events: &mpsc::UnboundedSender<WsEvent>,
+        message_limit: Option<usize>,
+    ) {
+        let data = event.data();
+        // Each payload kind converts at most once: a text payload is
+        // checked by its UTF-8 byte length after a single conversion, a
+        // binary one by the buffer's length before it is copied into
+        // Rust memory.
+        let text = data.as_string();
+        let size = text
+            .as_ref()
+            .map_or_else(|| binary_size(&data), |text| Some(text.len()));
+        if let Some(size) = size
+            && let Some(limit) = message_limit.filter(|limit| size > *limit)
+        {
+            reject_oversized(socket, events, size, limit);
+            return;
+        }
+
+        if let Some(text) = text {
+            let _ = events.unbounded_send(WsEvent::Message(WebSocketMessage::from(text)));
+            return;
+        }
+
+        if let Ok(array) = data.clone().dyn_into::<js_sys::ArrayBuffer>() {
+            let view = js_sys::Uint8Array::new(&array);
+            let mut bytes = vec![0; view.length() as usize];
+            view.copy_to(&mut bytes[..]);
+            let _ = events.unbounded_send(WsEvent::Message(WebSocketMessage::from(bytes)));
+            return;
+        }
+
+        if let Ok(view) = data.dyn_into::<js_sys::Uint8Array>() {
+            let mut bytes = vec![0; view.length() as usize];
+            view.copy_to(&mut bytes[..]);
+            let _ = events.unbounded_send(WsEvent::Message(WebSocketMessage::from(bytes)));
+            return;
+        }
+
+        let _ = events.unbounded_send(WsEvent::Error(
+            "Unsupported websocket message type".to_string(),
+        ));
     }
 
     /// The largest payload a [`WebSocketConfig`] lets through. The browser
@@ -858,10 +892,7 @@ mod wasm {
     }
 
     fn connection_failed(message: impl Into<ByteStr>) -> WebSocketError {
-        WebSocketError::ConnectionFailed(Box::new(io::Error::new(
-            io::ErrorKind::Other,
-            message.into().to_string(),
-        )))
+        WebSocketError::ConnectionFailed(Box::new(io::Error::other(message.into().to_string())))
     }
 
     fn format_js_value(value: &JsValue) -> String {

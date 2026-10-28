@@ -88,6 +88,8 @@ pub mod timeout;
 mod client;
 pub mod redirect;
 pub mod retry;
+#[cfg(target_arch = "wasm32")]
+mod single_threaded;
 
 // Re-export the unified error type
 pub use error::Error;

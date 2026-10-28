@@ -90,10 +90,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-ubuntu
       - run: cargo build --target wasm32-unknown-unknown
+      # The desktop clippy lanes never compile the wasm32-only code. The
+      # examples block on async-io and are native-only, so they stay out.
+      - run: cargo clippy --target wasm32-unknown-unknown --lib --tests -- -D warnings
 
   mobile:
     # Cross-compilation for the mobile targets, tests included. The suites run

@@ -135,35 +135,30 @@ impl CookieStore {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn prepare(&mut self) -> Result<(), CookieError> {
-        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(path) = self
+            .persistence
+            .as_ref()
+            .filter(|p| !p.initialized)
+            .map(|p| p.path.clone())
         {
-            if let Some(path) = self
+            self.load_from_disk(&path).await?;
+            if let Some(persistence) = self
                 .persistence
-                .as_ref()
-                .filter(|p| !p.initialized)
-                .map(|p| p.path.clone())
+                .as_mut()
+                .filter(|persist| persist.path == path)
             {
-                self.load_from_disk(&path).await?;
-                if let Some(persistence) = self
-                    .persistence
-                    .as_mut()
-                    .filter(|persist| persist.path == path)
-                {
-                    persistence.initialized = true;
-                }
+                persistence.initialized = true;
             }
         }
         Ok(())
     }
 
-    #[allow(unused_variables)]
+    #[cfg(not(target_arch = "wasm32"))]
     async fn finalize(&self, updated: bool) -> Result<(), CookieError> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if updated && let Some(persistence) = &self.persistence {
-                self.persist_to_path(&persistence.path).await?;
-            }
+        if updated && let Some(persistence) = &self.persistence {
+            self.persist_to_path(&persistence.path).await?;
         }
         Ok(())
     }
@@ -225,6 +220,9 @@ impl Middleware for CookieStore {
         request: &mut Request,
         mut next: E,
     ) -> Result<Response, http_kit::middleware::MiddlewareError<E::Error, Self::Error>> {
+        // Persistence exists only on native targets; on wasm32 there is
+        // nothing to prepare or finalize.
+        #[cfg(not(target_arch = "wasm32"))]
         self.prepare().await.map_err(MiddlewareError::Middleware)?;
 
         let request_url = Url::parse(&request.uri().to_string()).ok();
@@ -257,12 +255,14 @@ impl Middleware for CookieStore {
                     jar.changed |=
                         store_response_cookies(&mut self.store, response.headers(), &url);
                 }
+                #[cfg(not(target_arch = "wasm32"))]
                 self.finalize(jar.changed)
                     .await
                     .map_err(MiddlewareError::Middleware)?;
                 Ok(response)
             }
             Err(err) => {
+                #[cfg(not(target_arch = "wasm32"))]
                 if let Err(persist) = self.finalize(jar.changed).await {
                     tracing::warn!(error = %persist, "failed to persist cookies after endpoint error");
                 }

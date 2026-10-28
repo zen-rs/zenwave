@@ -1,19 +1,20 @@
 //! Tests for middleware components in Zenwave
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Duration;
 use std::{
     convert::Infallible,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
 };
 use zenwave::cookie::CookieStore;
 
+#[cfg(not(target_arch = "wasm32"))]
+use zenwave::HttpError;
 use zenwave::redirect::FollowRedirect;
-use zenwave::{
-    Body, Client, Endpoint, HttpError, Middleware, Request, Response, StatusCode, client,
-};
+use zenwave::{Body, Client, Endpoint, Middleware, Request, Response, StatusCode, client};
 
 mod common;
 use common::{httpbin_base, httpbin_uri};
