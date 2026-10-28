@@ -13,9 +13,11 @@ use crate::client::Client;
 
 /// Middleware that retries failed requests.
 ///
-/// This middleware automatically retries requests that fail with a transport error
-/// (e.g., connection timeout, DNS error). It does *not* retry requests that receive
-/// a valid HTTP response, even if the status code indicates an error (e.g., 500 or 503).
+/// This middleware automatically retries requests that fail with a transient
+/// error — a transport failure, a timeout or an I/O error, classified by
+/// [`crate::Error::is_transient`]. Any other error (a malformed request, a
+/// refused credential, an HTTP error status) cannot succeed on a second
+/// attempt and is returned after the first one.
 ///
 /// Every attempt sends the original request. A backend takes the request out
 /// of the `&mut Request` it is handed, so a copy is taken before each attempt
@@ -23,7 +25,11 @@ use crate::client::Client;
 /// (a reader or a stream) cannot be copied and is attempted once: its error is
 /// returned as is.
 #[derive(Debug, Clone)]
-pub struct Retry<C: Client> {
+pub struct Retry<C>
+where
+    C: Client,
+    C::Error: Into<crate::Error>,
+{
     client: C,
     max_retries: usize,
     min_delay: Duration,
@@ -48,7 +54,10 @@ impl<T: Future> Future for SingleThreaded<T> {
     }
 }
 
-impl<C: Client> Retry<C> {
+impl<C: Client> Retry<C>
+where
+    C::Error: Into<crate::Error>,
+{
     /// Create a new `Retry` middleware.
     pub const fn new(client: C, max_retries: usize) -> Self {
         Self {
@@ -74,10 +83,13 @@ impl<C: Client> Retry<C> {
     }
 }
 
-impl<C: Client> Client for Retry<C> {}
+impl<C: Client> Client for Retry<C> where C::Error: Into<crate::Error> {}
 
-impl<C: Client> Endpoint for Retry<C> {
-    type Error = C::Error;
+impl<C: Client> Endpoint for Retry<C>
+where
+    C::Error: Into<crate::Error>,
+{
+    type Error = crate::Error;
 
     #[allow(clippy::cast_possible_truncation)]
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
@@ -89,6 +101,10 @@ impl<C: Client> Endpoint for Retry<C> {
             match self.client.respond(request).await {
                 Ok(response) => return Ok(response),
                 Err(err) => {
+                    let err = err.into();
+                    if !err.is_transient() {
+                        return Err(err);
+                    }
                     let Some(replay) = replay else {
                         return Err(err);
                     };
