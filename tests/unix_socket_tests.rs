@@ -12,7 +12,7 @@ mod server {
     use std::{
         io::{self, Read as _, Write as _},
         os::unix::net::{UnixListener, UnixStream},
-        path::PathBuf,
+        path::Path,
         thread,
     };
 
@@ -46,9 +46,11 @@ mod server {
 
     /// Accept one connection, assert it carries an origin-form request with the
     /// URI's `Host` header, and answer it once.
-    pub fn serve_once(socket_path: PathBuf) -> thread::JoinHandle<()> {
+    pub fn serve_once(socket_path: &Path) -> thread::JoinHandle<()> {
+        // Bound before the worker starts, so the socket exists by the time
+        // the caller dials it.
+        let listener = UnixListener::bind(socket_path).expect("test unix socket must bind");
         thread::spawn(move || {
-            let listener = UnixListener::bind(&socket_path).expect("test unix socket must bind");
             let (mut socket, _) = listener.accept().expect("test connection must arrive");
             let request = read_request(&mut socket).expect("test request must read");
             let head = String::from_utf8(request).expect("request head is ASCII");
@@ -95,7 +97,7 @@ mod hyper_backend {
     async fn requests_are_served_over_the_unix_socket() {
         let dir = tempfile::tempdir().expect("socket dir must be temporary");
         let socket_path = dir.path().join("zenwave.sock");
-        let worker = serve_once(socket_path.clone());
+        let worker = serve_once(&socket_path);
 
         let mut client = HyperBackend::new(unix_transport(socket_path));
         let response = client
@@ -114,9 +116,8 @@ mod hyper_backend {
         let socket_path = dir.path().join("zenwave-pool.sock");
         let accepts = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&accepts);
-        let path = socket_path.clone();
+        let listener = UnixListener::bind(&socket_path).expect("test unix socket must bind");
         let worker = thread::spawn(move || {
-            let listener = UnixListener::bind(&path).expect("test unix socket must bind");
             let (mut first, _) = listener.accept().expect("first connection must arrive");
             counter.fetch_add(1, Ordering::SeqCst);
             first
@@ -173,7 +174,7 @@ mod curl_backend {
     async fn requests_are_served_over_the_unix_socket() {
         let dir = tempfile::tempdir().expect("socket dir must be temporary");
         let socket_path = dir.path().join("zenwave-curl.sock");
-        let worker = serve_once(socket_path.clone());
+        let worker = serve_once(&socket_path);
 
         let mut client = CurlBackend::new(unix_transport(socket_path));
         let response = client
