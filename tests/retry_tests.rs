@@ -229,9 +229,30 @@ async fn retry_attempts_a_read_once_body_once() {
     assert_eq!(state.lock().unwrap().attempts, 1);
 }
 
+/// Counts the attempts `Retry` hands to the client beneath it.
+#[cfg(not(target_arch = "wasm32"))]
+struct CountAttempts<C> {
+    client: C,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<C: Client> Endpoint for CountAttempts<C> {
+    type Error = C::Error;
+
+    async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.client.respond(request).await
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<C: Client> Client for CountAttempts<C> {}
+
 /// A server that accepts a connection and drops it on the floor stands in
-/// for a transient transport failure: each attempt costs one accepted
-/// connection.
+/// for a transient transport failure. A backend may itself redial a dropped
+/// connection (`URLSession` does), so attempts are counted above the backend.
 #[cfg(not(target_arch = "wasm32"))]
 #[test_executors::async_test]
 async fn retry_retries_a_dropped_connection_up_to_max_retries() {
@@ -254,10 +275,14 @@ async fn retry_retries_a_dropped_connection_up_to_max_retries() {
         }
     });
 
-    let mut client = zenwave::client()
-        .retry(2)
-        .min_delay(Duration::from_millis(1))
-        .max_delay(Duration::from_millis(5));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut client = CountAttempts {
+        client: zenwave::client(),
+        attempts: Arc::clone(&attempts),
+    }
+    .retry(2)
+    .min_delay(Duration::from_millis(1))
+    .max_delay(Duration::from_millis(5));
 
     let error = client
         .get(&base)
@@ -268,8 +293,9 @@ async fn retry_retries_a_dropped_connection_up_to_max_retries() {
         error.is_transient(),
         "a dropped connection must be transient, got: {error}"
     );
-    // The first dial plus max_retries more, each on a fresh connection.
-    assert_eq!(accepted.load(Ordering::Relaxed), 3);
+    // The first attempt plus max_retries more, each reaching the server.
+    assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    assert!(accepted.load(Ordering::Relaxed) >= 3);
 }
 
 #[test_executors::async_test]
