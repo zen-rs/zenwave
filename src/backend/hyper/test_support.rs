@@ -415,14 +415,29 @@ async fn serve_goaway_conn(
             return;
         };
         let (parts, mut body) = request.into_parts();
-        let mut received = Vec::new();
-        while let Some(chunk) = body.data().await {
-            let Ok(chunk) = chunk else {
-                return;
-            };
-            let _ = body.flow_control().release_capacity(chunk.len());
-            received.extend_from_slice(&chunk);
-        }
+        // A raw h2 server reads frames only while `conn` is polled, and a
+        // request's END_STREAM may come in a frame after its HEADERS (hyper's
+        // client sends it that way for a body that does not report
+        // `is_end_stream`). Keep the connection polled while the body is
+        // collected, or a late END_STREAM is never read (issue #122).
+        let received = {
+            let collect = std::pin::pin!(async {
+                let mut received = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk.ok()?;
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                    received.extend_from_slice(&chunk);
+                }
+                Some(received)
+            });
+            let drive = std::pin::pin!(futures_util::future::poll_fn(|cx| conn.poll_closed(cx)));
+            match futures_util::future::select(collect, drive).await {
+                futures_util::future::Either::Left((Some(received), _)) => received,
+                // The stream was reset, or the connection ended mid-body.
+                futures_util::future::Either::Left((None, _))
+                | futures_util::future::Either::Right(_) => return,
+            }
+        };
         observed
             .send(Observed {
                 version: parts.version,
@@ -806,4 +821,89 @@ async fn serve_status(
         .expect("response builds");
     stream.send_response(response).await?;
     stream.finish().await
+}
+
+#[cfg(feature = "http2")]
+mod tests {
+    use std::{pin::pin, sync::Arc};
+
+    use futures_rustls::TlsConnector;
+    use futures_util::future::{Either, join, select};
+    use hyper::body::Bytes;
+    use rustls::{ClientConfig, RootCertStore, crypto::ring, pki_types::ServerName};
+
+    use super::{GoAway, TEST_TIMEOUT, TestCa, TlsServer, TokioCompat};
+
+    /// A raw h2 client — none of the backend's code — opens a stream with
+    /// `HEADERS` alone, waits for the server to acknowledge a `PING` sent after
+    /// them, and only then ends the stream with an empty `DATA` frame: the
+    /// frame order hyper's client produces for a body that does not report
+    /// `is_end_stream`. The fixture must keep reading the connection while
+    /// it collects a request body, or the late `END_STREAM` is never read and
+    /// the request hangs until the client's keep-alive gives up.
+    #[test]
+    fn the_goaway_fixture_reads_a_request_body_that_ends_in_a_later_frame() {
+        let ca = TestCa::new();
+        let server = TlsServer::serve_goaway(&ca, GoAway::Graceful);
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(ca.ca_der.clone())
+            .expect("test CA must be a valid root");
+        let mut config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+
+        let received = async_io::block_on(async {
+            let tcp = async_net::TcpStream::connect(server.addr())
+                .await
+                .expect("fixture must accept");
+            let tls = TlsConnector::from(Arc::new(config))
+                .connect(ServerName::try_from("localhost").expect("valid name"), tcp)
+                .await
+                .expect("TLS handshake must succeed");
+            let (mut sender, mut connection) = h2::client::handshake(TokioCompat(tls))
+                .await
+                .expect("h2 handshake must succeed");
+            let mut ping_pong = connection.ping_pong().expect("ping_pong is taken once");
+            let exchange = async {
+                let request = http::Request::get(server.uri("/late-end-stream"))
+                    .body(())
+                    .expect("request builds");
+                let (response, mut stream) = sender
+                    .send_request(request, false)
+                    .expect("stream must open");
+                ping_pong
+                    .ping(h2::Ping::opaque())
+                    .await
+                    .expect("server must answer the PING");
+                stream
+                    .send_data(Bytes::new(), true)
+                    .expect("END_STREAM must queue");
+                let mut body = response.await.expect("response must arrive").into_body();
+                let mut received = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    received.extend_from_slice(&chunk.expect("response body must read"));
+                }
+                received
+            };
+            let exchange = pin!(exchange);
+            let timeout = pin!(async_io::Timer::after(TEST_TIMEOUT));
+            // The plan shuts the connection down gracefully after this
+            // stream, so the client connection ends once the exchange does.
+            match select(join(exchange, connection), timeout).await {
+                Either::Left(((received, ended), _)) => {
+                    ended.expect("the client connection must end cleanly");
+                    received
+                }
+                Either::Right(_) => {
+                    panic!("the fixture never read the END_STREAM sent after the HEADERS")
+                }
+            }
+        });
+        assert_eq!(received, b"zenwave");
+        assert_eq!(server.next_request().body, b"");
+    }
 }
