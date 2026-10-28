@@ -27,11 +27,23 @@ struct MockClient {
 enum MockError {
     #[error("mock network error")]
     NetworkError,
+    #[error("request cannot succeed on another attempt")]
+    Permanent,
     #[error("no more mock responses")]
     Exhausted,
 }
 
 impl HttpError for MockError {}
+
+impl From<MockError> for zenwave::Error {
+    fn from(err: MockError) -> Self {
+        match err {
+            MockError::NetworkError => Self::Transport(Box::new(err)),
+            MockError::Permanent => Self::InvalidUri("permanent mock failure".to_owned()),
+            MockError::Exhausted => Self::Other(Box::new(err)),
+        }
+    }
+}
 
 impl MockClient {
     fn with_results(results: Vec<Result<Response, MockError>>) -> Self {
@@ -141,9 +153,27 @@ async fn retry_middleware_gives_up_after_max_retries() {
         .unwrap();
 
     let result = client.respond(&mut request).await;
-    assert!(matches!(result, Err(MockError::NetworkError)));
+    assert!(matches!(result, Err(zenwave::Error::Transport(_))));
 
     assert_eq!(state.lock().unwrap().attempts, 3); // Initial + 2 retries
+}
+
+#[test_executors::async_test]
+async fn retry_middleware_does_not_retry_permanent_errors() {
+    let mock = MockClient::with_results(vec![Err(MockError::Permanent), Ok(ok_response())]);
+    let state = mock.state();
+
+    let mut client = mock.retry(3).min_delay(Duration::from_millis(1));
+
+    let mut request = http::Request::builder()
+        .uri("https://example.com/")
+        .body(Body::empty())
+        .unwrap();
+
+    let result = client.respond(&mut request).await;
+    assert!(matches!(result, Err(zenwave::Error::InvalidUri(_))));
+
+    assert_eq!(state.lock().unwrap().attempts, 1);
 }
 
 #[test_executors::async_test]
@@ -195,8 +225,51 @@ async fn retry_attempts_a_read_once_body_once() {
         ))
         .unwrap();
     let result = client.respond(&mut request).await;
-    assert!(matches!(result, Err(MockError::NetworkError)));
+    assert!(matches!(result, Err(zenwave::Error::Transport(_))));
     assert_eq!(state.lock().unwrap().attempts, 1);
+}
+
+/// A server that accepts a connection and drops it on the floor stands in
+/// for a transient transport failure: each attempt costs one accepted
+/// connection.
+#[cfg(not(target_arch = "wasm32"))]
+#[test_executors::async_test]
+async fn retry_retries_a_dropped_connection_up_to_max_retries() {
+    use std::{
+        net::TcpListener,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind the dropping listener");
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            if stream.is_err() {
+                break;
+            }
+            counter.fetch_add(1, Ordering::Relaxed);
+            // The stream drops here, before any response.
+        }
+    });
+
+    let mut client = zenwave::client()
+        .retry(2)
+        .min_delay(Duration::from_millis(1))
+        .max_delay(Duration::from_millis(5));
+
+    let error = client
+        .get(&base)
+        .expect("request must build")
+        .await
+        .expect_err("a dropped connection must fail");
+    assert!(
+        error.is_transient(),
+        "a dropped connection must be transient, got: {error}"
+    );
+    // The first dial plus max_retries more, each on a fresh connection.
+    assert_eq!(accepted.load(Ordering::Relaxed), 3);
 }
 
 #[test_executors::async_test]

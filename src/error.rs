@@ -241,6 +241,16 @@ impl Error {
         matches!(self, Self::Timeout)
     }
 
+    /// Check if this failure could succeed on another attempt.
+    ///
+    /// A broken connection, a timeout or an I/O error may be transient;
+    /// anything else — a malformed request, a refused credential, an HTTP
+    /// error status — fails the same way every time.
+    #[must_use]
+    pub const fn is_transient(&self) -> bool {
+        matches!(self, Self::Transport(_) | Self::Timeout | Self::Io(_))
+    }
+
     /// Check if this is a client error (4xx HTTP status).
     #[must_use]
     pub fn is_client_error(&self) -> bool {
