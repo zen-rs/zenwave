@@ -7,7 +7,11 @@ mod common;
 #[cfg(target_arch = "wasm32")]
 mod wasm_tests {
     use super::common::httpbin_uri;
+    #[cfg(feature = "ws")]
+    use super::common::websocket_uri;
     use serde_json::Value;
+    #[cfg(feature = "ws")]
+    use zenwave::websocket::{WebSocketConfig, WebSocketError, connect_with};
     use zenwave::{Client, Method, client, get};
 
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -106,5 +110,71 @@ mod wasm_tests {
                     .or_else(|| value.as_array().and_then(|arr| arr.first()?.as_str()))
             });
         assert_eq!(x_test, Some("wasm"));
+    }
+
+    /// A text message over the configured limit is never delivered: the
+    /// receiver gets the same `ConnectionFailed` error shape the native
+    /// tungstenite path reports, and the socket is closed.
+    #[wasm_bindgen_test]
+    #[cfg(feature = "ws")]
+    async fn wasm_websocket_rejects_text_over_limit() {
+        let socket = connect_with(
+            websocket_uri("/ws/echo"),
+            &zenwave::Transport::system(),
+            WebSocketConfig::default().with_max_message_size(Some(64)),
+        )
+        .await
+        .unwrap();
+
+        socket.send_text("x".repeat(128)).await.unwrap();
+        match socket.recv().await {
+            Err(WebSocketError::ConnectionFailed(_)) => {}
+            other => panic!("expected size-limit error, got {other:?}"),
+        }
+        assert!(socket.recv().await.unwrap().is_none());
+    }
+
+    /// A binary message over the configured limit is rejected and the
+    /// socket closes, just like the text case.
+    #[wasm_bindgen_test]
+    #[cfg(feature = "ws")]
+    async fn wasm_websocket_rejects_binary_over_limit() {
+        let socket = connect_with(
+            websocket_uri("/ws/echo"),
+            &zenwave::Transport::system(),
+            WebSocketConfig::default().with_max_frame_size(Some(64)),
+        )
+        .await
+        .unwrap();
+
+        socket.send_binary(vec![0x42_u8; 128]).await.unwrap();
+        match socket.recv().await {
+            Err(WebSocketError::ConnectionFailed(_)) => {}
+            other => panic!("expected size-limit error, got {other:?}"),
+        }
+        assert!(socket.recv().await.unwrap().is_none());
+    }
+
+    /// Text and binary messages within the limit echo back unchanged.
+    #[wasm_bindgen_test]
+    #[cfg(feature = "ws")]
+    async fn wasm_websocket_echoes_within_limit() {
+        let socket = connect_with(
+            websocket_uri("/ws/echo"),
+            &zenwave::Transport::system(),
+            WebSocketConfig::default().with_max_message_size(Some(1024)),
+        )
+        .await
+        .unwrap();
+
+        socket.send_text("hello fixture").await.unwrap();
+        let message = socket.recv().await.unwrap().expect("echo message");
+        assert_eq!(message.as_text(), Some("hello fixture"));
+
+        socket.send_binary(vec![1_u8, 2, 3, 4]).await.unwrap();
+        let message = socket.recv().await.unwrap().expect("echo message");
+        assert_eq!(message.as_bytes(), Some(&[1_u8, 2, 3, 4][..]));
+
+        socket.close().await.unwrap();
     }
 }
