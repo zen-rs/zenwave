@@ -449,7 +449,7 @@ mod native {
 
 #[cfg(target_arch = "wasm32")]
 mod wasm {
-    use std::{cell::RefCell, fmt, future::Future, io, rc::Rc};
+    use std::{cell::RefCell, fmt, future::Future, io, rc::Rc, sync::Arc};
 
     use async_lock::Mutex;
     use futures_channel::{mpsc, oneshot};
@@ -495,7 +495,7 @@ mod wasm {
 
     /// Sending half of a websocket connection.
     pub struct WebSocketSender {
-        inner: Rc<SharedSocket>,
+        inner: Arc<SingleThreaded<SharedSocket>>,
     }
 
     impl fmt::Debug for WebSocketSender {
@@ -507,14 +507,14 @@ mod wasm {
     impl Clone for WebSocketSender {
         fn clone(&self) -> Self {
             Self {
-                inner: Rc::clone(&self.inner),
+                inner: Arc::clone(&self.inner),
             }
         }
     }
 
     /// Receiving half of a websocket connection.
     pub struct WebSocketReceiver {
-        inner: Rc<SharedSocket>,
+        inner: Arc<SingleThreaded<SharedSocket>>,
     }
 
     impl fmt::Debug for WebSocketReceiver {
@@ -547,7 +547,7 @@ mod wasm {
     pub fn connect_with<U>(
         uri: U,
         _transport: &Transport,
-        _config: WebSocketConfig,
+        config: WebSocketConfig,
     ) -> impl Future<Output = Result<WebSocket>> + Send + use<U>
     where
         U: AsRef<str>,
@@ -556,6 +556,10 @@ mod wasm {
             let socket = BrowserWebSocket::new(uri.as_ref())
                 .map_err(|e| connection_failed(format_js_value(&e)))?;
             socket.set_binary_type(BinaryType::Arraybuffer);
+
+            // The browser reports whole messages, never frames, so the two
+            // configured caps collapse into one: the smaller of them.
+            let message_limit = message_size_limit(&config);
 
             let (event_tx, event_rx) = mpsc::unbounded::<WsEvent>();
             let (ready_tx, ready_rx) = oneshot::channel::<core::result::Result<(), String>>();
@@ -569,35 +573,10 @@ mod wasm {
             }) as Box<dyn FnMut()>);
             socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
 
+            let on_message_socket = socket.clone();
             let on_message_tx = event_tx.clone();
             let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
-                let data = event.data();
-                if let Some(text) = data.as_string() {
-                    let _ = on_message_tx
-                        .unbounded_send(WsEvent::Message(WebSocketMessage::from(text)));
-                    return;
-                }
-
-                if let Ok(array) = data.clone().dyn_into::<js_sys::ArrayBuffer>() {
-                    let view = js_sys::Uint8Array::new(&array);
-                    let mut bytes = vec![0; view.length() as usize];
-                    view.copy_to(&mut bytes[..]);
-                    let _ = on_message_tx
-                        .unbounded_send(WsEvent::Message(WebSocketMessage::from(bytes)));
-                    return;
-                }
-
-                if let Ok(view) = data.dyn_into::<js_sys::Uint8Array>() {
-                    let mut bytes = vec![0; view.length() as usize];
-                    view.copy_to(&mut bytes[..]);
-                    let _ = on_message_tx
-                        .unbounded_send(WsEvent::Message(WebSocketMessage::from(bytes)));
-                    return;
-                }
-
-                let _ = on_message_tx.unbounded_send(WsEvent::Error(
-                    "Unsupported websocket message type".to_string(),
-                ));
+                deliver_message(&event, &on_message_socket, &on_message_tx, message_limit);
             }) as Box<dyn FnMut(MessageEvent)>);
             socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
 
@@ -641,17 +620,17 @@ mod wasm {
                 }
             }
 
-            let shared = Rc::new(SharedSocket {
+            let shared = Arc::new(SingleThreaded(SharedSocket {
                 socket,
                 receiver: Mutex::new(event_rx),
                 _on_message: on_message,
                 _on_error: on_error,
                 _on_close: on_close,
-            });
+            }));
 
             Ok(WebSocket {
                 sender: WebSocketSender {
-                    inner: Rc::clone(&shared),
+                    inner: Arc::clone(&shared),
                 },
                 receiver: WebSocketReceiver { inner: shared },
             })
@@ -664,11 +643,11 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if serialization fails or the browser cannot queue the frame.
-        pub fn send<'a, T>(&'a self, value: T) -> impl Future<Output = Result<()>> + Send + 'a
+        pub async fn send<T>(&self, value: T) -> Result<()>
         where
-            T: serde::Serialize + 'a,
+            T: serde::Serialize,
         {
-            self.sender.send(value)
+            self.sender.send(value).await
         }
 
         /// Send a text websocket message.
@@ -676,11 +655,8 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if the browser fails to queue the frame.
-        pub fn send_text<'a>(
-            &'a self,
-            text: impl Into<ByteStr> + 'a,
-        ) -> impl Future<Output = Result<()>> + Send + 'a {
-            self.sender.send_text(text)
+        pub async fn send_text(&self, text: impl Into<ByteStr>) -> Result<()> {
+            self.sender.send_text(text).await
         }
 
         /// Send a binary websocket message.
@@ -688,11 +664,8 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if the browser fails to queue the frame.
-        pub fn send_binary<'a>(
-            &'a self,
-            bytes: impl Into<Bytes> + 'a,
-        ) -> impl Future<Output = Result<()>> + Send + 'a {
-            self.sender.send_binary(bytes)
+        pub async fn send_binary(&self, bytes: impl Into<Bytes>) -> Result<()> {
+            self.sender.send_binary(bytes).await
         }
 
         /// Receive the next websocket message.
@@ -700,8 +673,8 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if the websocket reports an error event.
-        pub fn recv(&self) -> impl Future<Output = Result<Option<WebSocketMessage>>> + Send + '_ {
-            self.receiver.recv()
+        pub async fn recv(&self) -> Result<Option<WebSocketMessage>> {
+            self.receiver.recv().await
         }
 
         /// Close the websocket connection gracefully.
@@ -709,9 +682,8 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if the browser refuses to close the socket.
-        pub fn close(self) -> impl Future<Output = Result<()>> + Send {
-            let sender = self.sender;
-            SingleThreaded(async move { sender.close().await })
+        pub async fn close(self) -> Result<()> {
+            self.sender.close().await
         }
 
         /// Split the websocket into sending and receiving halves.
@@ -727,14 +699,12 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if serialization fails or the browser cannot queue the frame.
-        pub fn send<'a, T>(&'a self, value: T) -> impl Future<Output = Result<()>> + Send + 'a
+        pub async fn send<T>(&self, value: T) -> Result<()>
         where
-            T: serde::Serialize + 'a,
+            T: serde::Serialize,
         {
-            SingleThreaded(async move {
-                let payload = serialize_payload(&value)?;
-                self.send_text(payload).await
-            })
+            let payload = serialize_payload(&value)?;
+            self.send_text(payload).await
         }
 
         /// Send a text websocket message.
@@ -742,11 +712,14 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if the browser fails to queue the frame.
-        pub fn send_text<'a>(
-            &'a self,
-            text: impl Into<ByteStr> + 'a,
-        ) -> impl Future<Output = Result<()>> + Send + 'a {
-            SingleThreaded(async move { self.send_message(WebSocketMessage::text(text)) })
+        // The lib and lib-test passes report this as different lints.
+        #[allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "the native sender's signature; the browser acts synchronously"
+        )]
+        pub async fn send_text(&self, text: impl Into<ByteStr>) -> Result<()> {
+            self.send_message(WebSocketMessage::text(text))
         }
 
         /// Send a binary websocket message.
@@ -754,11 +727,14 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if the browser fails to queue the frame.
-        pub fn send_binary<'a>(
-            &'a self,
-            bytes: impl Into<Bytes> + 'a,
-        ) -> impl Future<Output = Result<()>> + Send + 'a {
-            SingleThreaded(async move { self.send_message(WebSocketMessage::binary(bytes)) })
+        // The lib and lib-test passes report this as different lints.
+        #[allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "the native sender's signature; the browser acts synchronously"
+        )]
+        pub async fn send_binary(&self, bytes: impl Into<Bytes>) -> Result<()> {
+            self.send_message(WebSocketMessage::binary(bytes))
         }
 
         fn send_message(&self, message: WebSocketMessage) -> Result<()> {
@@ -792,13 +768,17 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if the browser refuses to close the socket.
-        pub fn close(&self) -> impl Future<Output = Result<()>> + Send + '_ {
-            SingleThreaded(async move {
-                self.inner
-                    .socket
-                    .close()
-                    .map_err(|e| connection_failed(format_js_value(&e)))
-            })
+        // The lib and lib-test passes report this as different lints.
+        #[allow(
+            clippy::unused_async,
+            clippy::unused_async_trait_impl,
+            reason = "the native sender's signature; the browser acts synchronously"
+        )]
+        pub async fn close(&self) -> Result<()> {
+            self.inner
+                .socket
+                .close()
+                .map_err(|e| connection_failed(format_js_value(&e)))
         }
     }
 
@@ -808,16 +788,107 @@ mod wasm {
         /// # Errors
         ///
         /// Returns an error if the websocket reports an error event.
-        pub fn recv(&self) -> impl Future<Output = Result<Option<WebSocketMessage>>> + Send + '_ {
-            SingleThreaded(async move {
-                let mut receiver = self.inner.receiver.lock().await;
-                match receiver.next().await {
-                    Some(WsEvent::Message(message)) => Ok(Some(message)),
-                    Some(WsEvent::Closed) | None => Ok(None),
-                    Some(WsEvent::Error(message)) => Err(connection_failed(message)),
-                }
-            })
+        pub async fn recv(&self) -> Result<Option<WebSocketMessage>> {
+            let mut receiver = self.inner.receiver.lock().await;
+            match receiver.next().await {
+                Some(WsEvent::Message(message)) => Ok(Some(message)),
+                Some(WsEvent::Closed) | None => Ok(None),
+                Some(WsEvent::Error(message)) => Err(connection_failed(message)),
+            }
         }
+    }
+
+    /// Forward one browser `message` event to the receiver, rejecting a
+    /// payload over `message_limit` before it reaches Rust memory.
+    fn deliver_message(
+        event: &MessageEvent,
+        socket: &BrowserWebSocket,
+        events: &mpsc::UnboundedSender<WsEvent>,
+        message_limit: Option<usize>,
+    ) {
+        let data = event.data();
+        // Each payload kind converts at most once: a text payload is
+        // checked by its UTF-8 byte length after a single conversion, a
+        // binary one by the buffer's length before it is copied into
+        // Rust memory.
+        let text = data.as_string();
+        let size = text
+            .as_ref()
+            .map_or_else(|| binary_size(&data), |text| Some(text.len()));
+        if let Some(size) = size
+            && let Some(limit) = message_limit.filter(|limit| size > *limit)
+        {
+            reject_oversized(socket, events, size, limit);
+            return;
+        }
+
+        if let Some(text) = text {
+            let _ = events.unbounded_send(WsEvent::Message(WebSocketMessage::from(text)));
+            return;
+        }
+
+        if let Ok(array) = data.clone().dyn_into::<js_sys::ArrayBuffer>() {
+            let view = js_sys::Uint8Array::new(&array);
+            let mut bytes = vec![0; view.length() as usize];
+            view.copy_to(&mut bytes[..]);
+            let _ = events.unbounded_send(WsEvent::Message(WebSocketMessage::from(bytes)));
+            return;
+        }
+
+        if let Ok(view) = data.dyn_into::<js_sys::Uint8Array>() {
+            let mut bytes = vec![0; view.length() as usize];
+            view.copy_to(&mut bytes[..]);
+            let _ = events.unbounded_send(WsEvent::Message(WebSocketMessage::from(bytes)));
+            return;
+        }
+
+        let _ = events.unbounded_send(WsEvent::Error(
+            "Unsupported websocket message type".to_string(),
+        ));
+    }
+
+    /// The largest payload a [`WebSocketConfig`] lets through. The browser
+    /// exposes whole messages only, so the effective cap is the smaller of
+    /// the two configured limits; both `None` means no limit.
+    fn message_size_limit(config: &WebSocketConfig) -> Option<usize> {
+        config
+            .max_message_size
+            .into_iter()
+            .chain(config.max_frame_size)
+            .min()
+    }
+
+    /// Report a message over `limit` to the receiver and close the socket.
+    /// Called before the payload is copied into Rust memory, so an oversized
+    /// message is never delivered. Native closes with 1009 (Message Too Big,
+    /// RFC 6455 §7.4.1), but a script may only send 1000 or 3000–4999, so the
+    /// reason carries the cause here.
+    fn reject_oversized(
+        socket: &BrowserWebSocket,
+        events: &mpsc::UnboundedSender<WsEvent>,
+        size: usize,
+        limit: usize,
+    ) {
+        let _ = events.unbounded_send(WsEvent::Error(format!(
+            "websocket message of {size} bytes exceeds the {limit}-byte limit"
+        )));
+        socket
+            .close_with_code_and_reason(1000, "message too large")
+            .expect("1000 with a short reason is a close every browser accepts");
+    }
+
+    /// The byte length of a binary `MessageEvent` payload, read without
+    /// copying it into Rust memory. `None` for any other payload type.
+    fn binary_size(data: &JsValue) -> Option<usize> {
+        if data.is_instance_of::<js_sys::ArrayBuffer>() {
+            let array: &js_sys::ArrayBuffer = data.unchecked_ref();
+            return Some(array.byte_length() as usize);
+        }
+        if data.is_instance_of::<js_sys::Uint8Array>() {
+            let view: &js_sys::Uint8Array = data.unchecked_ref();
+            return Some(view.length() as usize);
+        }
+        None
     }
 
     fn connection_failed(message: impl Into<ByteStr>) -> WebSocketError {

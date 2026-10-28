@@ -34,4 +34,4 @@ export ZENWAVE_TEST_BASE_URL="${base%/}"
 curl -sf "$ZENWAVE_TEST_BASE_URL/get" >/dev/null
 
 echo "Running wasm-pack tests for browser=${BROWSER} against $ZENWAVE_TEST_BASE_URL..."
-wasm-pack test --"${BROWSER}" --headless -- --no-default-features
+wasm-pack test --"${BROWSER}" --headless -- --no-default-features --features ws
