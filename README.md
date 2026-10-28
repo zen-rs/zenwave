@@ -87,7 +87,7 @@ Built-in middleware:
 | `.enable_persistent_cookie()` | Cookie jar backed by a file on disk (native only) |
 | `.bearer_auth(token)` | Adds `Authorization: Bearer <token>` to every request |
 | `.basic_auth(user, pass)` | Adds `Authorization: Basic <base64>` to every request |
-| `.retry(n)` | Retries failed requests up to `n` times |
+| `.retry(n)` | Retries transiently failed requests up to `n` times |
 | `.with(OAuth2ClientCredentials::new(...))` | Client-credentials OAuth2 flow with automatic refresh |
 
 Redirects are on by default. Call `zenwave::client().disable_redirect()` to get the

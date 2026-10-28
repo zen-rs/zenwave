@@ -523,8 +523,15 @@ pub trait Client: Endpoint + Sized {
         FollowRedirect::new(self)
     }
 
-    /// Enable automatic retry of failed requests.
-    fn retry(self, max_retries: usize) -> Retry<Self> {
+    /// Enable automatic retry of transiently failed requests.
+    ///
+    /// Only errors [`crate::Error::is_transient`] classifies as transient —
+    /// transport failures, timeouts and I/O errors — are retried; any other
+    /// error returns after the first attempt.
+    fn retry(self, max_retries: usize) -> Retry<Self>
+    where
+        Self::Error: Into<crate::Error>,
+    {
         Retry::new(self, max_retries)
     }
 
