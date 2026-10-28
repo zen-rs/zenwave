@@ -9,7 +9,8 @@ mod common;
 use common::httpbin_uri;
 use zenwave::{Client, Proxy, Transport, backend::CurlBackend};
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn libcurl_does_not_read_the_environment_on_its_own() {
     // A proxy nothing listens on: if libcurl consulted the variable, the
     // request would fail with a connection error instead of succeeding.

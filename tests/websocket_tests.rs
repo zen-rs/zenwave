@@ -35,7 +35,8 @@ fn public_echo_servers() -> Vec<String> {
     ]
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn websocket_echo_roundtrip() {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,
@@ -66,7 +67,8 @@ async fn websocket_echo_roundtrip() {
     server.await;
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn websocket_split_roundtrip() {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,
@@ -105,7 +107,8 @@ async fn websocket_split_roundtrip() {
     server.await;
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn websocket_respects_max_message_size_config() {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,
@@ -142,7 +145,8 @@ async fn websocket_respects_max_message_size_config() {
     server.await;
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn websocket_binary_roundtrip() {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,
@@ -180,7 +184,8 @@ async fn websocket_binary_roundtrip() {
     server.await;
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn websocket_handles_server_ping() {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,
@@ -222,7 +227,8 @@ async fn websocket_handles_server_ping() {
     server.await;
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn websocket_public_echo_service_roundtrip() {
     let payload = format!(
         "zenwave-public-echo-{}",
@@ -277,7 +283,8 @@ where
 
 const MB: usize = 1024 * 1024;
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn websocket_accepts_64mb_message_by_default() {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,
@@ -313,7 +320,8 @@ async fn websocket_accepts_64mb_message_by_default() {
     server.await;
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn websocket_rejects_128mb_message_by_default() {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => listener,

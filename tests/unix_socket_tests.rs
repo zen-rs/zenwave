@@ -91,7 +91,8 @@ mod hyper_backend {
         *,
     };
 
-    #[test_executors::async_test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
     async fn requests_are_served_over_the_unix_socket() {
         let dir = tempfile::tempdir().expect("socket dir must be temporary");
         let socket_path = dir.path().join("zenwave.sock");
@@ -108,7 +109,8 @@ mod hyper_backend {
         worker.join().expect("test server must finish");
     }
 
-    #[test_executors::async_test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
     async fn pooled_connections_reuse_the_socket() {
         let dir = tempfile::tempdir().expect("socket dir must be temporary");
         let socket_path = dir.path().join("zenwave-pool.sock");
@@ -169,7 +171,8 @@ mod curl_backend {
 
     use super::{server::serve_once, *};
 
-    #[test_executors::async_test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
     async fn requests_are_served_over_the_unix_socket() {
         let dir = tempfile::tempdir().expect("socket dir must be temporary");
         let socket_path = dir.path().join("zenwave-curl.sock");
@@ -194,7 +197,8 @@ mod apple_backend {
 
     use super::*;
 
-    #[test_executors::async_test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
     async fn unix_sockets_are_rejected() {
         let dir = tempfile::tempdir().expect("socket dir must be temporary");
         let mut client = AppleBackend::new(unix_transport(dir.path().join("zenwave.sock")));

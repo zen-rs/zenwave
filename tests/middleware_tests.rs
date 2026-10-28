@@ -18,7 +18,8 @@ use zenwave::{
 mod common;
 use common::httpbin_uri;
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn test_cookie_store_middleware() {
     let mut client = client().enable_cookie();
 
@@ -46,7 +47,8 @@ fn test_cookie_store_creation() {
     assert_ne!(format!("{cookie_store:?}"), "");
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn test_follow_redirect_middleware() {
     let mut client = client();
 
@@ -65,7 +67,8 @@ fn test_follow_redirect_creation() {
     // Just ensure it can be created
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn test_follow_redirect_multiple_redirects() {
     let mut client = client();
 
@@ -76,7 +79,8 @@ async fn test_follow_redirect_multiple_redirects() {
     assert!(response.status().is_success());
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn test_client_with_multiple_middleware() {
     let mut client = client().enable_cookie();
 
@@ -92,7 +96,8 @@ async fn test_client_with_multiple_middleware() {
     assert!(response2.is_ok());
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn test_without_redirect_middleware() {
     let mut client = client().disable_redirect();
     let response = client.get(httpbin_uri("/redirect/1")).unwrap().await;
@@ -102,7 +107,8 @@ async fn test_without_redirect_middleware() {
     assert!(response.status().is_redirection());
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn test_middleware_with_custom_middleware() {
     struct TestMiddleware;
 
@@ -185,7 +191,8 @@ impl Endpoint for CountingBackend {
 impl Client for CountingBackend {}
 
 #[cfg(not(target_arch = "wasm32"))]
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn test_timeout_middleware_success() {
     let mut client = SlowClient {
         delay: Duration::from_millis(20),
@@ -202,7 +209,8 @@ async fn test_timeout_middleware_success() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn test_timeout_middleware_triggers_gateway_timeout() {
     // Both sides are timers; the backend's must stay far behind the timeout
     // even when the reactor's first wake-up is late (a simulator under a
@@ -226,7 +234,8 @@ async fn test_timeout_middleware_triggers_gateway_timeout() {
     );
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn test_enable_cache_serves_cached_response() {
     let hits = Arc::new(AtomicUsize::new(0));
     let backend = CountingBackend::new(hits.clone());

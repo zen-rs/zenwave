@@ -10,7 +10,8 @@ fn header<'a>(response: &'a zenwave::Response, name: &str) -> Option<&'a str> {
     response.headers().get(name).and_then(|v| v.to_str().ok())
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn fixture_answers_cors_preflight() {
     let response = client()
         .method(Method::OPTIONS, httpbin_uri("/post"))
@@ -30,7 +31,8 @@ async fn fixture_answers_cors_preflight() {
     assert!(header(&response, "access-control-allow-credentials").is_none());
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn fixture_responses_carry_cors_origin() {
     let response = get(httpbin_uri("/get")).await.unwrap();
     assert_eq!(header(&response, "access-control-allow-origin"), Some("*"));

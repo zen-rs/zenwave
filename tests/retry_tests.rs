@@ -94,7 +94,8 @@ fn ok_response() -> Response {
         .unwrap()
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn retry_middleware_retries_on_error() {
     let mock = MockClient::with_results(vec![
         Err(MockError::NetworkError),
@@ -121,7 +122,8 @@ async fn retry_middleware_retries_on_error() {
     assert_eq!(attempts, 3);
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn retry_middleware_gives_up_after_max_retries() {
     let mock = MockClient::with_results(vec![
         Err(MockError::NetworkError),
@@ -146,7 +148,8 @@ async fn retry_middleware_gives_up_after_max_retries() {
     assert_eq!(state.lock().unwrap().attempts, 3); // Initial + 2 retries
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn retry_resends_the_original_request() {
     let mock = MockClient::with_results(vec![
         Err(MockError::NetworkError),
@@ -180,7 +183,8 @@ async fn retry_resends_the_original_request() {
     }
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn retry_attempts_a_read_once_body_once() {
     let mock = MockClient::with_results(vec![Err(MockError::NetworkError), Ok(ok_response())]);
     let state = mock.state();
@@ -199,7 +203,8 @@ async fn retry_attempts_a_read_once_body_once() {
     assert_eq!(state.lock().unwrap().attempts, 1);
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn retry_over_redirects_retries_instead_of_failing_on_the_placeholder() {
     let mock = MockClient::with_results(vec![Err(MockError::NetworkError), Ok(ok_response())]);
     let state = mock.state();

@@ -36,7 +36,8 @@ fn test_hyper_backend_default() {
     assert_ne!(format!("{backend:?}"), "");
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 #[cfg(default_hyper)]
 async fn test_hyper_backend_get_request() {
     let mut backend = HyperBackend::default();
@@ -51,7 +52,8 @@ async fn test_hyper_backend_get_request() {
     assert!(response.status().is_success());
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 #[cfg(default_hyper)]
 async fn test_hyper_backend_post_request() {
     let mut backend = HyperBackend::default();
@@ -66,7 +68,8 @@ async fn test_hyper_backend_post_request() {
     assert!(response.status().is_success());
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 #[cfg(default_hyper)]
 async fn test_hyper_backend_https_request() {
     let mut backend = HyperBackend::default();
@@ -81,7 +84,8 @@ async fn test_hyper_backend_https_request() {
     assert!(response.status().is_success());
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 #[cfg(default_hyper)]
 async fn test_hyper_backend_invalid_uri() {
     let mut backend = HyperBackend::default();
@@ -94,7 +98,8 @@ async fn test_hyper_backend_invalid_uri() {
     assert!(response.is_err());
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 #[cfg(default_hyper)]
 async fn test_hyper_backend_http_error_returns_err() {
     let mut backend = HyperBackend::default();
@@ -111,7 +116,8 @@ async fn test_hyper_backend_http_error_returns_err() {
     );
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 #[cfg(all(not(target_arch = "wasm32"), feature = "curl-backend"))]
 async fn test_curl_backend_http_error_returns_err() {
     use zenwave::backend::CurlBackend;
@@ -141,13 +147,15 @@ fn test_hyper_backend_request_cancellation() {}
 mod web_backend_tests {
     use zenwave::backend::WebBackend;
 
-    #[test_executors::async_test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
     async fn test_web_backend_creation() {
         let backend = WebBackend::new(zenwave::Transport::system());
         assert!(format!("{backend:?}").starts_with("WebBackend"));
     }
 
-    #[test_executors::async_test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
     async fn test_web_backend_default() {
         let backend = WebBackend::default();
         assert!(format!("{backend:?}").starts_with("WebBackend"));

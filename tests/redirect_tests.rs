@@ -105,7 +105,8 @@ fn ok_response() -> Response {
         .unwrap()
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn follow_redirect_resolves_relative_paths_and_keeps_headers() {
     let mock = MockClient::with_responses(vec![
         redirect_response(StatusCode::FOUND, "/landing"),
@@ -134,7 +135,8 @@ async fn follow_redirect_resolves_relative_paths_and_keeps_headers() {
     drop(state);
 }
 
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn follow_redirect_strips_sensitive_headers_on_host_change() {
     let mock = MockClient::with_responses(vec![
         redirect_response(StatusCode::MOVED_PERMANENTLY, "https://example.net/next"),
@@ -184,7 +186,8 @@ fn get_request(uri: &str) -> Request {
 
 /// A 304 is a cache verdict, not a redirect: it must reach the caller
 /// untouched, validator headers and all, after exactly one request.
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn not_modified_without_location_is_returned() {
     let response = http::Response::builder()
         .status(StatusCode::NOT_MODIFIED)
@@ -213,7 +216,8 @@ async fn not_modified_without_location_is_returned() {
 }
 
 /// Even carrying a Location header, a 304 is never followed.
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn not_modified_with_location_is_not_followed() {
     let mock = MockClient::with_responses(vec![status_response(
         StatusCode::NOT_MODIFIED,
@@ -230,7 +234,8 @@ async fn not_modified_with_location_is_not_followed() {
 
 /// 300, 305 and 306 are not redirect statuses a client may follow —
 /// they pass through whether or not a Location header is present.
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn other_3xx_statuses_pass_through_unfollowed() {
     for (status, location) in [
         (StatusCode::MULTIPLE_CHOICES, None),
@@ -266,7 +271,8 @@ async fn other_3xx_statuses_pass_through_unfollowed() {
 }
 
 /// A plain success answers once and returns.
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn ok_passes_through() {
     let mock = MockClient::with_responses(vec![ok_response()]);
     let state = mock.state();
@@ -281,7 +287,8 @@ async fn ok_passes_through() {
 /// The five redirect statuses still follow their Location: 303 always
 /// rewrites to GET, 301/302 rewrite non-GET/HEAD to GET, 307/308 keep
 /// the original method.
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn redirect_statuses_with_location_are_followed() {
     for (status, expected_method) in [
         (StatusCode::MOVED_PERMANENTLY, Method::GET),
@@ -324,7 +331,8 @@ async fn redirect_statuses_with_location_are_followed() {
 }
 
 /// A redirect status with no Location is still an error.
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn redirect_status_without_location_errors() {
     for status in [
         StatusCode::MOVED_PERMANENTLY,
@@ -348,7 +356,8 @@ async fn redirect_status_without_location_errors() {
 /// End to end through the real client: the fixture's /status/304 has no
 /// Location, and the 304 must still come back delivered rather than error
 /// as a malformed redirect.
-#[test_executors::async_test]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
 async fn real_client_delivers_a_304_without_location() {
     let response = zenwave::client()
         .get(httpbin_uri("/status/304"))
