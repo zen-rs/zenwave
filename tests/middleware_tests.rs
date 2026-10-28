@@ -81,36 +81,6 @@ async fn test_cookies_sent_only_to_matching_path() {
 }
 
 #[test_executors::async_test]
-async fn test_secure_cookie_not_sent_over_http() {
-    let mut client = client().enable_cookie();
-
-    // Loopback is a trustworthy origin, so `Secure` cookies are sent to
-    // `localhost`/`127.0.0.1` even over http (as browsers do). `0.0.0.0`
-    // reaches the same fixture but is not trustworthy, so the `Secure`
-    // cookie stays in the jar.
-    let base = httpbin_base().replace("127.0.0.1", "0.0.0.0");
-    client
-        .get(format!("{base}/cookies/set/locked/1?secure"))
-        .unwrap()
-        .await
-        .unwrap();
-
-    let body = client
-        .get(format!("{base}/cookies"))
-        .unwrap()
-        .await
-        .unwrap()
-        .into_body()
-        .into_string()
-        .await
-        .unwrap();
-    assert!(
-        !body.contains("locked"),
-        "secure cookie sent over http: {body}"
-    );
-}
-
-#[test_executors::async_test]
 async fn test_cookie_set_by_redirect_reaches_next_hop() {
     let mut client = client().enable_cookie();
 

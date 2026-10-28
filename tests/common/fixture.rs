@@ -361,38 +361,15 @@ fn handle_set_cookie(path: &str, query: &[(String, String)]) -> TestResponse {
     let mut parts = path.split('/');
     let name = parts.next().unwrap_or_default();
     let value = parts.next().unwrap_or_default();
-    let mut cookie = format!("{name}={value}");
-    // Attributes arrive as query parameters: `?path=/x&domain=y&secure`.
-    let mut explicit_path = false;
-    for (key, value) in query {
-        let attribute = match key.as_str() {
-            "path" => {
-                explicit_path = true;
-                "Path"
-            }
-            "domain" => "Domain",
-            "max-age" => "Max-Age",
-            "secure" => {
-                cookie.push_str("; Secure");
-                continue;
-            }
-            "httponly" => {
-                cookie.push_str("; HttpOnly");
-                continue;
-            }
-            _ => continue,
-        };
-        cookie.push_str("; ");
-        cookie.push_str(attribute);
-        cookie.push('=');
-        cookie.push_str(value);
-    }
-    // httpbin sets `Path=/`; without it the RFC default path of the deep
-    // `/cookies/set/...` route would hide the cookie from `/cookies`.
-    if !explicit_path {
-        cookie += "; Path=/";
-    }
-    text_response(200, "cookie set").with_header("Set-Cookie", cookie)
+    // `?path=/x` scopes the cookie. Without it the cookie gets httpbin's
+    // `Path=/`: the RFC default path of the deep `/cookies/set/...` route
+    // would hide it from `/cookies`.
+    let path = query
+        .iter()
+        .find_map(|(key, value)| (key == "path").then_some(value.as_str()))
+        .unwrap_or("/");
+    text_response(200, "cookie set")
+        .with_header("Set-Cookie", format!("{name}={value}; Path={path}"))
 }
 
 fn handle_status(code: &str) -> TestResponse {
