@@ -22,11 +22,39 @@ use {
 };
 
 /// Middleware for managing cookies in HTTP requests and responses.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CookieStore {
     store: Store,
     #[cfg(not(target_arch = "wasm32"))]
     persistence: Option<Persistence>,
+}
+
+impl Default for CookieStore {
+    fn default() -> Self {
+        Self {
+            store: new_store(),
+            #[cfg(not(target_arch = "wasm32"))]
+            persistence: None,
+        }
+    }
+}
+
+/// The pinned Public Suffix List `build.rs` compiled in, checked by
+/// `cookie_store` against every `Domain` attribute per RFC 6265 §5.3.
+#[cfg(feature = "public-suffix")]
+fn public_suffix_list() -> publicsuffix::List {
+    include_str!(concat!(env!("OUT_DIR"), "/public_suffix_list.dat"))
+        .parse()
+        .expect("the compiled-in Public Suffix List must parse")
+}
+
+/// A `cookie_store` jar — carrying the Public Suffix List when the
+/// `public-suffix` feature is on.
+fn new_store() -> Store {
+    let store = Store::default();
+    #[cfg(feature = "public-suffix")]
+    let store = store.with_suffix_list(public_suffix_list());
+    store
 }
 
 /// The jar [`CookieStore`] lends to the chain through `request.extensions`
@@ -40,7 +68,7 @@ pub struct CookieStore {
 /// `http::Extensions` requires it; the jar is moved, never copied, and a
 /// `Clone` made by `Extensions::clone` (e.g. `Retry`'s replay snapshot)
 /// only ever replaces the request it came from.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct RequestCookieJar {
     /// The jar, owned by the request until `CookieStore` takes it back.
     pub(crate) store: Store,
@@ -130,7 +158,7 @@ impl CookieStore {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn persistent_with_path(path: impl Into<PathBuf>) -> Self {
         Self {
-            store: Store::default(),
+            store: new_store(),
             persistence: Some(Persistence::new(path.into())),
         }
     }
@@ -177,8 +205,13 @@ impl CookieStore {
         };
 
         if !data.is_empty() {
-            self.store = cookie_store::serde::json::load_all(&data[..])
+            // `load_all` builds a fresh jar without the suffix list; attach it
+            // again so cookies set after the load are still checked.
+            let loaded = cookie_store::serde::json::load_all(&data[..])
                 .map_err(CookieError::FailToParseCookiesFromDisk)?;
+            #[cfg(feature = "public-suffix")]
+            let loaded = loaded.with_suffix_list(public_suffix_list());
+            self.store = loaded;
         }
 
         Ok(())

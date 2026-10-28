@@ -125,6 +125,91 @@ async fn test_origin_scoped_cookie_not_sent_after_cross_origin_redirect() {
     );
 }
 
+/// A client whose plaintext requests all go through the fixture as a forward
+/// proxy: the proxy never resolves the request host, so the fixture answers
+/// URLs for hostnames no DNS record could give it — the only way to drive
+/// the cookie store with a real public suffix (`co.uk`) against it.
+#[cfg(all(not(target_arch = "wasm32"), feature = "public-suffix"))]
+fn proxied_client() -> impl Client {
+    let transport = zenwave::Transport::builder()
+        .proxy(zenwave::Proxy::builder().http(httpbin_base()).build())
+        .build()
+        .unwrap();
+    zenwave::client_with(transport).enable_cookie()
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "public-suffix"))]
+#[test_executors::async_test]
+async fn test_public_suffix_domain_cookie_is_rejected() {
+    let mut client = proxied_client();
+
+    // `co.uk` is a listed public suffix: a subdomain may not set it as a
+    // cookie Domain, so this Set-Cookie is dropped entirely.
+    client
+        .get("http://shop.example.co.uk/cookies/set/suffix/1?domain=co.uk")
+        .unwrap()
+        .await
+        .unwrap();
+
+    // A sibling host under the suffix must never see it — without the
+    // suffix check the `co.uk`-scoped cookie would be sent here.
+    let body = client
+        .get("http://other.example.co.uk/cookies")
+        .unwrap()
+        .await
+        .unwrap()
+        .into_body()
+        .into_string()
+        .await
+        .unwrap();
+    assert!(
+        !body.contains("suffix"),
+        "public-suffix cookie leaked to a sibling host: {body}"
+    );
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "public-suffix"))]
+#[test_executors::async_test]
+async fn test_public_suffix_domain_cookie_from_suffix_host_is_host_only() {
+    let mut client = proxied_client();
+
+    // RFC 6265 §5.3 step 5: the request host is the suffix itself, so the
+    // Domain attribute collapses to host-only instead of being rejected.
+    client
+        .get("http://co.uk/cookies/set/apex/1?domain=co.uk")
+        .unwrap()
+        .await
+        .unwrap();
+
+    let body = client
+        .get("http://co.uk/cookies")
+        .unwrap()
+        .await
+        .unwrap()
+        .into_body()
+        .into_string()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("apex=1"),
+        "host-only suffix cookie missing on its own host: {body}"
+    );
+
+    let body = client
+        .get("http://www.example.co.uk/cookies")
+        .unwrap()
+        .await
+        .unwrap()
+        .into_body()
+        .into_string()
+        .await
+        .unwrap();
+    assert!(
+        !body.contains("apex"),
+        "host-only suffix cookie leaked to a subdomain: {body}"
+    );
+}
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn test_cookie_store_creation() {

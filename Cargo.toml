@@ -8,8 +8,9 @@ description = "Ergonomic HTTP client framework."
 license = "MIT"
 keywords = ["http", "client", "async", "networking", "middleware"]
 categories = ["network-programming", "web-programming::http-client"]
-# The tracked files plus the pinned OneCRL snapshot, which stays out of git
-# (`.gitignore`) and is fetched by the release workflow before publishing.
+# The tracked files plus the pinned OneCRL snapshot and Public Suffix List,
+# which stay out of git (`.gitignore`) and are fetched by the release
+# workflow before publishing.
 include = [
     "/.github/**",
     "/examples/**",
@@ -28,6 +29,8 @@ include = [
     "/clippy.toml",
     "/onecrl.json",
     "/onecrl.pin.json",
+    "/public_suffix.pin.json",
+    "/public_suffix_list.dat",
     "/release-plz.toml",
 ]
 
@@ -55,6 +58,9 @@ tracing = "0.1.44"
 cookie_store = { version = "0.22.1", default-features = false, features = [
     "serde_json",
 ] }
+# The list itself is compiled in by `build.rs` from the pinned, hash-verified
+# `public_suffix_list.dat`.
+publicsuffix = { version = "2.3.0", default-features = false, optional = true }
 
 [dev-dependencies]
 serde_json = "1.0.154"
@@ -85,7 +91,7 @@ webpki-roots = { version = "1.0.11", optional = true }
 # store (`rustls-platform-verifier`), websockets, HTTP/2 and HTTP/3. On wasm32
 # the built-in Fetch backend is always used and none of the native features
 # apply.
-default = ["hyper-backend", "rustls", "ws", "http2", "http3", "onecrl"]
+default = ["hyper-backend", "rustls", "ws", "http2", "http3", "onecrl", "public-suffix"]
 
 # HTTP backends (native platforms only). At least one must be enabled.
 #
@@ -130,6 +136,18 @@ http3 = ["rustls", "dep:bytes", "dep:h3", "dep:h3-quinn", "dep:quinn"]
 # list is compiled into the binary by `build.rs`; Apple and Windows builds
 # carry no table, since their OS trust service ships its own distrust.
 onecrl = ["rustls", "dep:webpki", "dep:ring", "dep:minreq", "dep:serde_json", "dep:base64", "dep:arc-swap", "dep:webpki-roots"]
+
+# Reject cookie `Domain` attributes naming a public suffix (RFC 6265 §5.3) in
+# the cookie middleware: `build.rs` compiles the pinned, hash-verified Public
+# Suffix List in and `cookie_store` checks each Domain against it.
+public-suffix = [
+    "cookie_store/public_suffix",
+    "dep:publicsuffix",
+    "dep:minreq",
+    "dep:ring",
+    "dep:serde_json",
+    "dep:webpki-roots",
+]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-sys = { version = "0.3.97", features = [
