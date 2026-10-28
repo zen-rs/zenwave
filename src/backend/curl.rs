@@ -110,11 +110,15 @@ impl Client for CurlBackend {}
 impl Endpoint for CurlBackend {
     type Error = crate::Error;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-        let dummy_request = http::Request::builder()
+        let mut dummy_request = http::Request::builder()
             .method(Method::GET)
             .uri("/")
             .body(Body::empty())
             .expect("building dummy request failed");
+        // Extensions are caller context, not wire data: they stay on the
+        // request slot handed to the endpoint so middleware (e.g. the
+        // cookie jar) finds them again once `respond` returns.
+        std::mem::swap(dummy_request.extensions_mut(), request.extensions_mut());
         let request = replace(request, dummy_request);
         execute(request, &self.transport).await.map_err(Into::into)
     }

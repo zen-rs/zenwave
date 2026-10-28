@@ -442,7 +442,7 @@ fn handle_request(request: &TestRequest) -> TestResponse {
                 return handle_basic_auth(request, stripped);
             }
             if let Some(stripped) = path.strip_prefix("/cookies/set/") {
-                return handle_set_cookie(stripped);
+                return handle_set_cookie(stripped, &query);
             }
             if let Some(stripped) = path.strip_prefix("/status/") {
                 return handle_status(stripped);
@@ -475,11 +475,19 @@ fn handle_basic_auth(request: &TestRequest, path: &str) -> TestResponse {
     text_response(401, "unauthorized")
 }
 
-fn handle_set_cookie(path: &str) -> TestResponse {
+fn handle_set_cookie(path: &str, query: &[(String, String)]) -> TestResponse {
     let mut parts = path.split('/');
     let name = parts.next().unwrap_or_default();
     let value = parts.next().unwrap_or_default();
-    text_response(200, "cookie set").with_header("Set-Cookie", format!("{name}={value}"))
+    // `?path=/x` scopes the cookie. Without it the cookie gets httpbin's
+    // `Path=/`: the RFC default path of the deep `/cookies/set/...` route
+    // would hide it from `/cookies`.
+    let path = query
+        .iter()
+        .find_map(|(key, value)| (key == "path").then_some(value.as_str()))
+        .unwrap_or("/");
+    text_response(200, "cookie set")
+        .with_header("Set-Cookie", format!("{name}={value}; Path={path}"))
 }
 
 fn handle_status(code: &str) -> TestResponse {
@@ -519,7 +527,13 @@ fn handle_redirect_to(query: &[(String, String)]) -> TestResponse {
         .iter()
         .find(|(key, _)| key == "url")
         .map_or("/", |(_, value)| value.as_str());
-    redirect_response(target)
+    let mut response = redirect_response(target);
+    // `?set-cookie=name=value` attaches a Set-Cookie to the redirect
+    // itself, the login-flow shape per-hop cookie handling exists for.
+    for (_, cookie) in query.iter().filter(|(key, _)| key == "set-cookie") {
+        response = response.with_header("Set-Cookie", cookie.clone());
+    }
+    response
 }
 
 fn redirect_response(location: &str) -> TestResponse {
