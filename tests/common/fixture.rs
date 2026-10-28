@@ -486,8 +486,14 @@ fn handle_set_cookie(path: &str, query: &[(String, String)]) -> TestResponse {
         .iter()
         .find_map(|(key, value)| (key == "path").then_some(value.as_str()))
         .unwrap_or("/");
+    // `?domain=example.co.uk` adds a `Domain` attribute so tests can exercise
+    // RFC 6265 domain matching (and public-suffix rejection).
+    let domain = query
+        .iter()
+        .find_map(|(key, value)| (key == "domain").then_some(format!("; Domain={value}")))
+        .unwrap_or_default();
     text_response(200, "cookie set")
-        .with_header("Set-Cookie", format!("{name}={value}; Path={path}"))
+        .with_header("Set-Cookie", format!("{name}={value}; Path={path}{domain}"))
 }
 
 fn handle_status(code: &str) -> TestResponse {

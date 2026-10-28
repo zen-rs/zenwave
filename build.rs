@@ -8,6 +8,80 @@ use cfg_aliases::cfg_aliases;
 #[path = "src/transport/onecrl/record.rs"]
 mod record;
 
+/// Fetch-and-verify shared by the pinned assets (OneCRL snapshot, Public
+/// Suffix List): a packaged crate ships the file at its root, a git build
+/// downloads it from the pinned URL. Either way the SHA-256 is checked
+/// against the pin before the bytes are used.
+#[cfg(any(feature = "onecrl", feature = "public-suffix"))]
+mod pinned {
+    use std::{fs, path::Path};
+
+    /// The verified bytes of the pinned asset `pin_file` names: `asset` is
+    /// the file's name both at the manifest root (the copy a packaged crate
+    /// ships) and under `OUT_DIR` (where a git build's download is kept);
+    /// `label` is how error messages call it.
+    pub fn fetch(
+        manifest: &Path,
+        out_dir: &Path,
+        pin_file: &str,
+        asset: &str,
+        label: &str,
+    ) -> Vec<u8> {
+        let pin: serde_json::Value = serde_json::from_slice(
+            &fs::read(manifest.join(pin_file))
+                .unwrap_or_else(|error| panic!("read {pin_file}: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("parse {pin_file}: {error}"));
+        let url = pin["url"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{pin_file} needs url"));
+        let expected = pin["sha256"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{pin_file} needs sha256"));
+        let bytes = if manifest.join(asset).exists() {
+            fs::read(manifest.join(asset))
+                .unwrap_or_else(|error| panic!("read packaged {asset}: {error}"))
+        } else {
+            let response = minreq::get(url)
+                .send()
+                .unwrap_or_else(|e| panic!("downloading {label} from {url}: {e}"));
+            assert!(
+                response.status_code == 200,
+                "downloading {label} from {url}: HTTP {}",
+                response.status_code
+            );
+            let bytes = response.into_bytes();
+            fs::write(out_dir.join(asset), &bytes)
+                .unwrap_or_else(|error| panic!("write downloaded {asset}: {error}"));
+            bytes
+        };
+        let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+        assert!(
+            digest.as_ref() == hex(expected).as_slice(),
+            "{label}'s SHA-256 does not match {pin_file}'s {expected}"
+        );
+        bytes
+    }
+
+    /// Decode a lowercase hex string such as a pin's `sha256`.
+    fn hex(value: &str) -> Vec<u8> {
+        assert!(
+            value.len().is_multiple_of(2),
+            "the pinned sha256 must be hex"
+        );
+        value
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                u8::from_str_radix(str::from_utf8(pair).unwrap(), 16)
+                    .expect("the pinned sha256 must be hex")
+            })
+            .collect()
+    }
+}
+
 fn main() {
     cfg_aliases! {
         // Anything that is not the browser/Workers Fetch backend.
@@ -46,18 +120,45 @@ fn main() {
         ) },
     }
 
-    // Both are inputs to the compiled table; a missing onecrl.json (a git
-    // build) still gets a rerun edge so its later appearance regenerates.
+    // The pins and their packaged assets are inputs to the compiled tables; a
+    // missing asset (a git build) still gets a rerun edge so its later
+    // appearance regenerates.
     println!("cargo:rerun-if-changed=onecrl.pin.json");
     println!("cargo:rerun-if-changed=onecrl.json");
+    println!("cargo:rerun-if-changed=public_suffix.pin.json");
+    println!("cargo:rerun-if-changed=public_suffix_list.dat");
 
     #[cfg(feature = "onecrl")]
     onecrl::generate();
+    #[cfg(feature = "public-suffix")]
+    public_suffix::generate();
+}
+
+#[cfg(feature = "public-suffix")]
+mod public_suffix {
+    use std::{env, fs, path::PathBuf};
+
+    /// The pinned Public Suffix List, verbatim under `OUT_DIR` for
+    /// `src/cookie.rs` to `include_str!`.
+    pub fn generate() {
+        let manifest =
+            PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+        let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+        let list = crate::pinned::fetch(
+            &manifest,
+            &out_dir,
+            "public_suffix.pin.json",
+            "public_suffix_list.dat",
+            "the Public Suffix List",
+        );
+        fs::write(out_dir.join("public_suffix_list.dat"), list)
+            .expect("write public_suffix_list.dat");
+    }
 }
 
 #[cfg(feature = "onecrl")]
 mod onecrl {
-    use std::{collections::BTreeMap, env, fs, path::Path, path::PathBuf};
+    use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
     /// Generate the table, but only when the *target* — not the host running
     /// this build script — compiles the `onecrl` cfg. Feature cfgs apply to a
@@ -78,61 +179,14 @@ mod onecrl {
         let manifest =
             PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
         let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
-        let snapshot = snapshot(&manifest, &out_dir);
+        let snapshot = crate::pinned::fetch(
+            &manifest,
+            &out_dir,
+            "onecrl.pin.json",
+            "onecrl.json",
+            "the OneCRL snapshot",
+        );
         fs::write(out_dir.join("onecrl.bin"), compile(&snapshot)).expect("write onecrl.bin");
-    }
-
-    /// The snapshot bytes, verified against the pin either way: the copy a
-    /// packaged crate ships at its root, or the pinned asset downloaded for a
-    /// git build.
-    fn snapshot(manifest: &Path, out_dir: &Path) -> Vec<u8> {
-        let pin: serde_json::Value = serde_json::from_slice(
-            &fs::read(manifest.join("onecrl.pin.json")).expect("read onecrl.pin.json"),
-        )
-        .expect("parse onecrl.pin.json");
-        let url = pin["url"].as_str().expect("onecrl.pin.json needs url");
-        let expected = pin["sha256"]
-            .as_str()
-            .expect("onecrl.pin.json needs sha256");
-        let bytes = if manifest.join("onecrl.json").exists() {
-            fs::read(manifest.join("onecrl.json")).expect("read packaged onecrl.json")
-        } else {
-            let response = minreq::get(url)
-                .send()
-                .unwrap_or_else(|e| panic!("downloading the OneCRL snapshot from {url}: {e}"));
-            assert!(
-                response.status_code == 200,
-                "downloading the OneCRL snapshot from {url}: HTTP {}",
-                response.status_code
-            );
-            let bytes = response.into_bytes();
-            fs::write(out_dir.join("onecrl.json"), &bytes).expect("write downloaded snapshot");
-            bytes
-        };
-        let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
-        assert!(
-            digest.as_ref() == hex(expected).as_slice(),
-            "the OneCRL snapshot's SHA-256 does not match onecrl.pin.json's {expected}"
-        );
-        bytes
-    }
-
-    /// Decode a lowercase hex string such as the pin's `sha256`.
-    fn hex(value: &str) -> Vec<u8> {
-        assert!(
-            value.len().is_multiple_of(2),
-            "the pinned sha256 must be hex"
-        );
-        value
-            .as_bytes()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| {
-                u8::from_str_radix(str::from_utf8(pair).unwrap(), 16)
-                    .expect("the pinned sha256 must be hex")
-            })
-            .collect()
     }
 
     /// The changeset grouped into the two indexable forms: issuer name to its
