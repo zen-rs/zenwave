@@ -159,6 +159,8 @@ rcgen = "0.14.10"
 futures-rustls = { version = "0.26.0", default-features = false, features = ["ring", "tls12"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 hyper = { version = "1.12.0", features = ["server", "http1", "http2"] }
+# The websocket echo endpoint in `tests/common/fixture.rs`.
+async-tungstenite = { version = "0.35.0", default-features = false, features = ["smol-runtime"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 async-io = "2.6.0"

@@ -23,6 +23,7 @@ ignored = [
     "base64",
     "serde_json",
     "url",
+    "async-tungstenite",
 ]
 
 # The dependencies of `tests/common/fixture.rs`, pinned as in the root
@@ -36,3 +37,4 @@ futures-io = "0.3.34"
 base64 = "0.23.1"
 serde_json = "1.0.154"
 url = "2.5.8"
+async-tungstenite = { version = "0.35.0", default-features = false, features = ["smol-runtime"] }
