@@ -16,7 +16,7 @@ use zenwave::{
 };
 
 mod common;
-use common::httpbin_uri;
+use common::{httpbin_base, httpbin_uri};
 
 #[test_executors::async_test]
 async fn test_cookie_store_middleware() {
@@ -37,6 +37,121 @@ async fn test_cookie_store_middleware() {
     let body = response.into_body().into_string().await.unwrap();
     assert!(body.contains("test"));
     assert!(body.contains("value"));
+}
+
+#[test_executors::async_test]
+async fn test_cookies_sent_only_to_matching_path() {
+    let mut client = client().enable_cookie();
+
+    client
+        .get(httpbin_uri("/cookies/set/pathed/1?path=/headers"))
+        .unwrap()
+        .await
+        .unwrap();
+
+    // Reaching the cookie's own Path sends it.
+    let body = client
+        .get(httpbin_uri("/headers"))
+        .unwrap()
+        .await
+        .unwrap()
+        .into_body()
+        .into_string()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("pathed=1"),
+        "cookie missing on its own path: {body}"
+    );
+
+    // Anywhere else it stays in the jar.
+    let body = client
+        .get(httpbin_uri("/cookies"))
+        .unwrap()
+        .await
+        .unwrap()
+        .into_body()
+        .into_string()
+        .await
+        .unwrap();
+    assert!(
+        !body.contains("pathed"),
+        "path-scoped cookie leaked: {body}"
+    );
+}
+
+#[test_executors::async_test]
+async fn test_secure_cookie_not_sent_over_http() {
+    let mut client = client().enable_cookie();
+
+    // Loopback is a trustworthy origin, so `Secure` cookies are sent to
+    // `localhost`/`127.0.0.1` even over http (as browsers do). `0.0.0.0`
+    // reaches the same fixture but is not trustworthy, so the `Secure`
+    // cookie stays in the jar.
+    let base = httpbin_base().replace("127.0.0.1", "0.0.0.0");
+    client
+        .get(format!("{base}/cookies/set/locked/1?secure"))
+        .unwrap()
+        .await
+        .unwrap();
+
+    let body = client
+        .get(format!("{base}/cookies"))
+        .unwrap()
+        .await
+        .unwrap()
+        .into_body()
+        .into_string()
+        .await
+        .unwrap();
+    assert!(
+        !body.contains("locked"),
+        "secure cookie sent over http: {body}"
+    );
+}
+
+#[test_executors::async_test]
+async fn test_cookie_set_by_redirect_reaches_next_hop() {
+    let mut client = client().enable_cookie();
+
+    // The 302 sets the session cookie; the hop it lands on must send it.
+    let response = client
+        .get(httpbin_uri("/redirect-to?url=/cookies&set-cookie=sess=abc"))
+        .unwrap()
+        .await
+        .unwrap();
+    let body = response.into_body().into_string().await.unwrap();
+    assert!(
+        body.contains("sess=abc"),
+        "redirect hop did not carry the cookie it set: {body}"
+    );
+}
+
+#[test_executors::async_test]
+async fn test_origin_scoped_cookie_not_sent_after_cross_origin_redirect() {
+    let mut client = client().enable_cookie();
+
+    // `localhost` and `127.0.0.1` are the same fixture but different
+    // origins: a host-only cookie for one must never reach the other.
+    let localhost = httpbin_base().replace("127.0.0.1", "localhost");
+    let target = httpbin_uri("/cookies")
+        .replace(':', "%3A")
+        .replace('/', "%2F");
+    let body = client
+        .get(format!(
+            "{localhost}/redirect-to?url={target}&set-cookie=onlyhost=1"
+        ))
+        .unwrap()
+        .await
+        .unwrap()
+        .into_body()
+        .into_string()
+        .await
+        .unwrap();
+    assert!(
+        !body.contains("onlyhost"),
+        "host-scoped cookie crossed origins: {body}"
+    );
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]

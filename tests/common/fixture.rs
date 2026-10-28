@@ -324,7 +324,7 @@ fn handle_request(request: &TestRequest) -> TestResponse {
                 return handle_basic_auth(request, stripped);
             }
             if let Some(stripped) = path.strip_prefix("/cookies/set/") {
-                return handle_set_cookie(stripped);
+                return handle_set_cookie(stripped, &query);
             }
             if let Some(stripped) = path.strip_prefix("/status/") {
                 return handle_status(stripped);
@@ -357,11 +357,42 @@ fn handle_basic_auth(request: &TestRequest, path: &str) -> TestResponse {
     text_response(401, "unauthorized")
 }
 
-fn handle_set_cookie(path: &str) -> TestResponse {
+fn handle_set_cookie(path: &str, query: &[(String, String)]) -> TestResponse {
     let mut parts = path.split('/');
     let name = parts.next().unwrap_or_default();
     let value = parts.next().unwrap_or_default();
-    text_response(200, "cookie set").with_header("Set-Cookie", format!("{name}={value}"))
+    let mut cookie = format!("{name}={value}");
+    // Attributes arrive as query parameters: `?path=/x&domain=y&secure`.
+    let mut explicit_path = false;
+    for (key, value) in query {
+        let attribute = match key.as_str() {
+            "path" => {
+                explicit_path = true;
+                "Path"
+            }
+            "domain" => "Domain",
+            "max-age" => "Max-Age",
+            "secure" => {
+                cookie.push_str("; Secure");
+                continue;
+            }
+            "httponly" => {
+                cookie.push_str("; HttpOnly");
+                continue;
+            }
+            _ => continue,
+        };
+        cookie.push_str("; ");
+        cookie.push_str(attribute);
+        cookie.push('=');
+        cookie.push_str(value);
+    }
+    // httpbin sets `Path=/`; without it the RFC default path of the deep
+    // `/cookies/set/...` route would hide the cookie from `/cookies`.
+    if !explicit_path {
+        cookie += "; Path=/";
+    }
+    text_response(200, "cookie set").with_header("Set-Cookie", cookie)
 }
 
 fn handle_status(code: &str) -> TestResponse {
@@ -401,7 +432,13 @@ fn handle_redirect_to(query: &[(String, String)]) -> TestResponse {
         .iter()
         .find(|(key, _)| key == "url")
         .map_or("/", |(_, value)| value.as_str());
-    redirect_response(target)
+    let mut response = redirect_response(target);
+    // `?set-cookie=name=value` attaches a Set-Cookie to the redirect
+    // itself, the login-flow shape per-hop cookie handling exists for.
+    for (_, cookie) in query.iter().filter(|(key, _)| key == "set-cookie") {
+        response = response.with_header("Set-Cookie", cookie.clone());
+    }
+    response
 }
 
 fn redirect_response(location: &str) -> TestResponse {
