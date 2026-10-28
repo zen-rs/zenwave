@@ -750,6 +750,9 @@ async fn serve_h3_request(
     let result = match (request.method().as_str(), request.uri().path()) {
         ("GET", "/hello") => serve_body(&mut stream, Bytes::from_static(b"hello over h3")).await,
         ("POST", "/echo") => serve_echo(&mut stream).await,
+        // A complete response without reading the request body: dropping
+        // the stream then stops the request side (STOP_SENDING).
+        ("POST", "/early") => serve_body(&mut stream, Bytes::from_static(b"answered early")).await,
         ("GET", "/slow") => {
             serve_slow(&mut stream, slow_release.expect("one /slow per test")).await
         }
