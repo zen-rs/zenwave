@@ -158,11 +158,11 @@ pub enum CookieErrorKind {
 
     /// Failed to parse cookie data.
     #[error("failed to parse cookies: {0}")]
-    ParseFailed(#[source] serde_json::Error),
+    ParseFailed(#[source] cookie_store::Error),
 
     /// Failed to persist cookies to disk.
     #[error("failed to persist cookies: {0}")]
-    PersistFailed(#[source] std::io::Error),
+    PersistFailed(#[source] cookie_store::Error),
 
     /// Invalid cookie header.
     #[error("invalid cookie header")]
