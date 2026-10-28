@@ -7,6 +7,7 @@ use http_kit::{
 };
 use url::Url;
 
+use crate::cookie::{RequestCookieJar, cookie_header, store_response_cookies};
 use crate::{Body, Request, Response, StatusCode, client::Client};
 
 /// Middleware that follows HTTP redirects.
@@ -96,6 +97,12 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
                 .await
                 .map_err(FollowRedirectError::RemoteError)?;
 
+            // `request` holds whatever the endpoint left behind — the jar,
+            // when the chain carries one, rides along in its extensions.
+            if let Some(jar) = request.extensions_mut().get_mut::<RequestCookieJar>() {
+                jar.response_url = Some(current_url.clone());
+            }
+
             if !matches!(
                 response.status(),
                 StatusCode::MOVED_PERMANENTLY
@@ -148,9 +155,33 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
                 redirect_headers.remove(COOKIE);
             }
 
+            // A response that redirects is a hop: its `Set-Cookie` headers
+            // belong to this hop's URL.
+            if let Some(jar) = request.extensions_mut().get_mut::<RequestCookieJar>() {
+                jar.changed |=
+                    store_response_cookies(&mut jar.store, response.headers(), &current_url);
+            }
+
             let mut headers = redirect_headers.clone();
             headers.remove(HOST);
             headers.remove(CONTENT_LENGTH);
+
+            // The jar moves onto the next hop's request, and the next
+            // `Cookie` header comes from it for the new URL — replacing the
+            // carried-over one, including the value just stripped on a
+            // cross-origin hop.
+            if let Some(jar) = request.extensions_mut().remove::<RequestCookieJar>() {
+                match cookie_header(&jar.store, &redirect_url) {
+                    Some(cookie) => {
+                        headers.insert(COOKIE, cookie);
+                    }
+                    None => {
+                        headers.remove(COOKIE);
+                    }
+                }
+                new_request.extensions_mut().insert(jar);
+            }
+
             *new_request.headers_mut() = headers;
 
             *request = new_request;
