@@ -120,13 +120,19 @@ fn main() {
         ) },
     }
 
-    // The pins and their packaged assets are inputs to the compiled tables; a
-    // missing asset (a git build) still gets a rerun edge so its later
-    // appearance regenerates.
-    println!("cargo:rerun-if-changed=onecrl.pin.json");
-    println!("cargo:rerun-if-changed=onecrl.json");
-    println!("cargo:rerun-if-changed=public_suffix.pin.json");
-    println!("cargo:rerun-if-changed=public_suffix_list.dat");
+    // The pins and their packaged assets are inputs to the compiled tables.
+    // An asset exists only in a packaged crate; Cargo treats a missing path
+    // as always changed, so a git build watches the pin alone, which changes
+    // whenever the pinned asset does.
+    for (pin, asset) in [
+        ("onecrl.pin.json", "onecrl.json"),
+        ("public_suffix.pin.json", "public_suffix_list.dat"),
+    ] {
+        println!("cargo:rerun-if-changed={pin}");
+        if std::path::Path::new(asset).exists() {
+            println!("cargo:rerun-if-changed={asset}");
+        }
+    }
 
     #[cfg(feature = "onecrl")]
     onecrl::generate();
