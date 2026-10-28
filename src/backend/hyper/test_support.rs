@@ -894,13 +894,12 @@ mod tests {
             };
             let exchange = pin!(exchange);
             let timeout = pin!(async_io::Timer::after(TEST_TIMEOUT));
-            // The plan shuts the connection down gracefully after this
-            // stream, so the client connection ends once the exchange does.
+            // The connection is driven alongside the exchange. The plan shuts
+            // it down after this stream and the fixture then closes the
+            // socket, which the client's last write can race (BrokenPipe), so
+            // how the connection ends is not what this test checks (#139).
             match select(join(exchange, connection), timeout).await {
-                Either::Left(((received, ended), _)) => {
-                    ended.expect("the client connection must end cleanly");
-                    received
-                }
+                Either::Left(((received, _), _)) => received,
                 Either::Right(_) => {
                     panic!("the fixture never read the END_STREAM sent after the HEADERS")
                 }
