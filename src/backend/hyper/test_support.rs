@@ -750,6 +750,9 @@ async fn serve_h3_request(
     let result = match (request.method().as_str(), request.uri().path()) {
         ("GET", "/hello") => serve_body(&mut stream, Bytes::from_static(b"hello over h3")).await,
         ("POST", "/echo") => serve_echo(&mut stream).await,
+        // A complete response without reading the request body: dropping
+        // the stream then stops the request side (STOP_SENDING).
+        ("POST", "/early") => serve_body(&mut stream, Bytes::from_static(b"answered early")).await,
         ("GET", "/slow") => {
             serve_slow(&mut stream, slow_release.expect("one /slow per test")).await
         }
@@ -891,13 +894,12 @@ mod tests {
             };
             let exchange = pin!(exchange);
             let timeout = pin!(async_io::Timer::after(TEST_TIMEOUT));
-            // The plan shuts the connection down gracefully after this
-            // stream, so the client connection ends once the exchange does.
+            // The connection is driven alongside the exchange. The plan shuts
+            // it down after this stream and the fixture then closes the
+            // socket, which the client's last write can race (BrokenPipe), so
+            // how the connection ends is not what this test checks (#139).
             match select(join(exchange, connection), timeout).await {
-                Either::Left(((received, ended), _)) => {
-                    ended.expect("the client connection must end cleanly");
-                    received
-                }
+                Either::Left(((received, _), _)) => received,
                 Either::Right(_) => {
                     panic!("the fixture never read the END_STREAM sent after the HEADERS")
                 }

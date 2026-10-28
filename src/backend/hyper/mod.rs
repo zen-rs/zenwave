@@ -1514,11 +1514,9 @@ mod tests {
     #[cfg(http3)]
     mod h3_discovery {
         use std::{
+            collections::HashSet,
             net::UdpSocket,
-            sync::{
-                Arc,
-                atomic::{AtomicUsize, Ordering},
-            },
+            sync::mpsc,
             thread,
             time::{Duration, Instant},
         };
@@ -1720,25 +1718,43 @@ mod tests {
             });
         }
 
+        /// The Source Connection ID of a QUIC long-header packet: it sits in
+        /// the cleartext invariant header (RFC 8999 §5.1) and every dial
+        /// draws a fresh one, so distinct values count dials.
+        fn long_header_scid(datagram: &[u8]) -> Vec<u8> {
+            assert!(
+                datagram[0] & 0x80 != 0,
+                "a handshake that never got an answer only sends long headers"
+            );
+            let dcid_len = usize::from(datagram[5]);
+            let scid_len = usize::from(datagram[6 + dcid_len]);
+            datagram[7 + dcid_len..7 + dcid_len + scid_len].to_vec()
+        }
+
         /// c. QUIC to a dead UDP port loses to TCP; the detached loser's
-        /// failure puts the origin into backoff and the next request sends
-        /// no datagram at all. The origin is an IPv4 literal so the racer's
+        /// failure puts the origin into backoff and the next request starts
+        /// no QUIC dial. The origin is an IPv4 literal so the racer's
         /// datagrams always land on the counting socket.
+        ///
+        /// Dials are counted by connection ID, not datagrams: dropping the
+        /// abandoned handshake at its deadline makes quinn send a
+        /// `CONNECTION_CLOSE` on that same connection, and its endpoint
+        /// driver flushes it concurrently with the backoff being recorded.
         #[test]
         fn a_dead_udp_port_falls_back_and_backs_off() {
             let ca = TestCa::new();
             let udp = UdpSocket::bind(("127.0.0.1", 0)).expect("counting socket binds");
             let udp_port = udp.local_addr().expect("counting address").port();
-            let datagrams = Arc::new(AtomicUsize::new(0));
-            thread::spawn({
-                let datagrams = datagrams.clone();
-                move || {
-                    let mut buffer = [0_u8; 2048];
-                    while udp.recv(&mut buffer).is_ok() {
-                        datagrams.fetch_add(1, Ordering::SeqCst);
+            let (datagram_tx, datagrams) = mpsc::channel();
+            thread::spawn(move || {
+                let mut buffer = [0_u8; 2048];
+                while let Ok(len) = udp.recv(&mut buffer) {
+                    if datagram_tx.send(long_header_scid(&buffer[..len])).is_err() {
+                        break;
                     }
                 }
             });
+            let mut dials = HashSet::new();
 
             let tcp = TlsServer::serve(
                 &ca,
@@ -1768,8 +1784,12 @@ mod tests {
                     .await
                     .expect("the race must fall back to TCP");
                 wait_until(|| entry.h3_broken_until().is_some()).await;
-                let sent = datagrams.load(Ordering::SeqCst);
-                assert!(sent > 0, "the QUIC racer must have sent Initial datagrams");
+                dials.extend(datagrams.try_iter());
+                assert_eq!(
+                    dials.len(),
+                    1,
+                    "the race must have started exactly one QUIC dial"
+                );
 
                 client
                     .get(uri)
@@ -1777,13 +1797,10 @@ mod tests {
                     .await
                     .expect("the backoff request must succeed over TCP");
                 // Give a stray dial a moment to show up, then check nothing
-                // left the endpoint.
+                // left the endpoint but the abandoned dial's own packets.
                 async_io::Timer::after(Duration::from_millis(100)).await;
-                assert_eq!(
-                    datagrams.load(Ordering::SeqCst),
-                    sent,
-                    "QUIC backoff must keep the origin on TCP"
-                );
+                dials.extend(datagrams.try_iter());
+                assert_eq!(dials.len(), 1, "QUIC backoff must keep the origin on TCP");
             });
         }
 
