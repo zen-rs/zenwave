@@ -146,24 +146,28 @@ impl Transport {
     /// on Android before the JVM has been registered through `ndk-context`. Use
     /// [`Transport::builder`] and [`TransportBuilder::build`] to handle that
     /// as an error instead.
+    #[cfg(native)]
     #[must_use]
     pub fn system() -> Self {
-        #[cfg(native)]
-        {
-            // Immutable, computed once: the one process-wide value zenwave keeps.
-            static SYSTEM: std::sync::OnceLock<Transport> = std::sync::OnceLock::new();
-            SYSTEM
-                .get_or_init(|| {
-                    Self::builder().build().unwrap_or_else(|error| {
-                        panic!("zenwave: the system transport cannot be initialised: {error}")
-                    })
+        // Immutable, computed once: the one process-wide value zenwave keeps.
+        static SYSTEM: std::sync::OnceLock<Transport> = std::sync::OnceLock::new();
+        SYSTEM
+            .get_or_init(|| {
+                Self::builder().build().unwrap_or_else(|error| {
+                    panic!("zenwave: the system transport cannot be initialised: {error}")
                 })
-                .clone()
-        }
-        #[cfg(not(native))]
-        {
-            Self {}
-        }
+            })
+            .clone()
+    }
+
+    /// The platform default: system proxy settings and the system trust store.
+    ///
+    /// On wasm32 the browser owns proxying and trust, so the transport
+    /// carries no configuration at all.
+    #[cfg(not(native))]
+    #[must_use]
+    pub const fn system() -> Self {
+        Self {}
     }
 
     /// Start describing a custom transport.
@@ -379,8 +383,8 @@ impl TransportBuilder {
     /// platform trust store cannot be initialised. With OneCRL refresh
     /// enabled it also fails with [`Error::Io`] when the platform has no
     /// cache directory for the persisted additions.
+    #[cfg(native)]
     pub fn build(self) -> Result<Transport, Error> {
-        #[cfg(native)]
         {
             // Resolving the refresh plan here — not on the refresher thread —
             // lets `build` report a missing cache directory.
@@ -446,9 +450,16 @@ impl TransportBuilder {
             }
             Ok(transport)
         }
-        #[cfg(not(native))]
-        {
-            Ok(Transport {})
-        }
+    }
+
+    /// Build the transport. The browser owns proxying and trust, so there
+    /// is nothing to load.
+    ///
+    /// # Errors
+    ///
+    /// Never fails on wasm32; the `Result` keeps the native signature.
+    #[cfg(not(native))]
+    pub const fn build(self) -> Result<Transport, Error> {
+        Ok(Transport {})
     }
 }

@@ -43,16 +43,20 @@ pub mod tls;
 mod local {
     /// The fixture URL is baked in at compile time: a browser has no runtime
     /// environment to consult, and falling back to a public service would make
-    /// the lanes depend on it silently.
+    /// the lanes depend on it silently. The empty fallback keeps `cargo
+    /// clippy --all-targets` compiling without the fixture; the first test to
+    /// read it panics instead.
     const HTTPBIN_BASE: &str = match option_env!("ZENWAVE_TEST_BASE_URL") {
         Some(base) => base,
-        None => panic!(
-            "ZENWAVE_TEST_BASE_URL must be set when compiling the wasm tests; \
-             scripts/test-wasm.sh starts the fixture and exports it"
-        ),
+        None => "",
     };
 
     pub fn httpbin_base() -> String {
+        assert!(
+            !HTTPBIN_BASE.is_empty(),
+            "ZENWAVE_TEST_BASE_URL must be set when running the wasm tests; \
+             scripts/test-wasm.sh starts the fixture and exports it"
+        );
         HTTPBIN_BASE.trim_end_matches('/').to_string()
     }
 
