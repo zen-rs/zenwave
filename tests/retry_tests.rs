@@ -106,8 +106,7 @@ fn ok_response() -> Response {
         .unwrap()
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn retry_middleware_retries_on_error() {
     let mock = MockClient::with_results(vec![
         Err(MockError::NetworkError),
@@ -134,8 +133,7 @@ async fn retry_middleware_retries_on_error() {
     assert_eq!(attempts, 3);
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn retry_middleware_gives_up_after_max_retries() {
     let mock = MockClient::with_results(vec![
         Err(MockError::NetworkError),
@@ -160,8 +158,7 @@ async fn retry_middleware_gives_up_after_max_retries() {
     assert_eq!(state.lock().unwrap().attempts, 3); // Initial + 2 retries
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn retry_middleware_does_not_retry_permanent_errors() {
     let mock = MockClient::with_results(vec![Err(MockError::Permanent), Ok(ok_response())]);
     let state = mock.state();
@@ -179,8 +176,7 @@ async fn retry_middleware_does_not_retry_permanent_errors() {
     assert_eq!(state.lock().unwrap().attempts, 1);
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn retry_resends_the_original_request() {
     let mock = MockClient::with_results(vec![
         Err(MockError::NetworkError),
@@ -214,8 +210,7 @@ async fn retry_resends_the_original_request() {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn retry_attempts_a_read_once_body_once() {
     let mock = MockClient::with_results(vec![Err(MockError::NetworkError), Ok(ok_response())]);
     let state = mock.state();
@@ -259,8 +254,7 @@ impl<C: Client> Client for CountAttempts<C> {}
 /// for a transient transport failure. A backend may itself redial a dropped
 /// connection (`URLSession` does), so attempts are counted above the backend.
 #[cfg(not(target_arch = "wasm32"))]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn retry_retries_a_dropped_connection_up_to_max_retries() {
     use std::{
         net::TcpListener,
@@ -304,8 +298,7 @@ async fn retry_retries_a_dropped_connection_up_to_max_retries() {
     assert!(accepted.load(Ordering::Relaxed) >= 3);
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn retry_over_redirects_retries_instead_of_failing_on_the_placeholder() {
     let mock = MockClient::with_results(vec![Err(MockError::NetworkError), Ok(ok_response())]);
     let state = mock.state();

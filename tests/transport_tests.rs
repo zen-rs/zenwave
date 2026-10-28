@@ -36,8 +36,7 @@ mod http {
 
     use crate::common::tls::tls_fixture;
 
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-    #[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+    #[test_executors::async_test]
     async fn system_roots_reject_a_locally_issued_certificate() {
         let fixture = tls_fixture();
         let mut client = DefaultBackend::default();
@@ -49,8 +48,7 @@ mod http {
         assert!(matches!(error, Error::Tls(_)), "{error:?}");
     }
 
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-    #[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+    #[test_executors::async_test]
     async fn extra_roots_trust_a_locally_issued_certificate() {
         let fixture = tls_fixture();
         let transport = Transport::builder()
@@ -79,8 +77,7 @@ mod websocket {
 
     use crate::common::tls::tls_fixture;
 
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-    #[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+    #[test_executors::async_test]
     async fn system_roots_reject_a_locally_issued_certificate() {
         let fixture = tls_fixture();
         let error = websocket::connect(fixture.wss_uri())
@@ -92,8 +89,7 @@ mod websocket {
         );
     }
 
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-    #[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+    #[test_executors::async_test]
     async fn extra_roots_trust_a_locally_issued_certificate() {
         let fixture = tls_fixture();
         let transport = Transport::builder()
@@ -111,8 +107,7 @@ mod websocket {
         socket.close().await.expect("close");
     }
 
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-    #[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+    #[test_executors::async_test]
     async fn websockets_offer_only_http1_through_alpn() {
         let fixture = tls_fixture();
         let transport = Transport::builder()

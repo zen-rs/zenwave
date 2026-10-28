@@ -36,8 +36,7 @@ fn basic(user: &str, password: &str) -> String {
     )
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn http_target_is_forwarded_in_absolute_form_with_credentials() {
     let proxy = HttpProxy::start_requiring(&basic("alice", "s3cret"));
     let rules = Proxy::builder()
@@ -68,8 +67,7 @@ async fn http_target_is_forwarded_in_absolute_form_with_credentials() {
     assert!(requests.len() <= 2, "{requests:?}");
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn no_proxy_bypasses_the_proxy() {
     let proxy = HttpProxy::start();
     let rules = Proxy::builder()
@@ -86,8 +84,7 @@ async fn no_proxy_bypasses_the_proxy() {
     assert!(proxy.requests().is_empty(), "{:?}", proxy.requests());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn proxy_none_ignores_everything() {
     let proxy = HttpProxy::start();
     let mut client = DefaultBackend::new(transport(Proxy::none()));
@@ -101,8 +98,7 @@ async fn proxy_none_ignores_everything() {
 
 // The plain Android test binary has no JVM for the platform verifier; TLS on
 // Android is exercised by the instrumented app under `tests/android`.
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn https_target_is_tunnelled_with_connect() {
     let proxy = HttpProxy::start_requiring(&basic("bob", "hunter2"));
     let fixture = tls_fixture();
@@ -132,8 +128,7 @@ async fn https_target_is_tunnelled_with_connect() {
     assert_eq!(tunnel.proxy_authorization, Some(basic("bob", "hunter2")));
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn rejected_tunnel_is_an_error() {
     let proxy = HttpProxy::start_requiring(&basic("bob", "hunter2"));
     let fixture = tls_fixture();
@@ -160,8 +155,7 @@ async fn rejected_tunnel_is_an_error() {
 /// `socks5://` resolves on the client. `CFNetwork` always hands the hostname to
 /// the proxy, so the Apple backend has no client-side flavour to test.
 #[cfg(not(default_apple))]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn socks5_resolves_locally_and_authenticates() {
     let proxy = Socks5Proxy::start_requiring("carol", "pw");
     let rules = Proxy::builder()
@@ -185,8 +179,7 @@ async fn socks5_resolves_locally_and_authenticates() {
     );
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn socks5h_sends_the_hostname_to_the_proxy() {
     let proxy = Socks5Proxy::start_requiring("erin", "pw");
     let fixture = tls_fixture();
@@ -212,8 +205,7 @@ async fn socks5h_sends_the_hostname_to_the_proxy() {
 }
 
 #[cfg(not(default_curl))]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn socks4_is_refused() {
     let rules = Proxy::builder().all("socks4://127.0.0.1:1").build();
     let mut client = DefaultBackend::new(transport(rules));
@@ -236,8 +228,7 @@ async fn socks4_is_refused() {
 /// socket is dual-stack so a stray racer shows up whichever address family
 /// `localhost` resolves to first.
 #[cfg(http3)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn proxied_origins_never_dial_quic() {
     use std::{
         net::UdpSocket,
@@ -326,8 +317,7 @@ mod websocket {
         transport_with_test_ca,
     };
 
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-    #[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+    #[test_executors::async_test]
     async fn wss_is_tunnelled_with_connect() {
         let proxy = HttpProxy::start();
         let fixture = tls_fixture();

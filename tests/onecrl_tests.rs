@@ -149,8 +149,7 @@ async fn get(transport: Transport, address: SocketAddr) -> Result<StatusCode, ze
         .map(|response| response.status())
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn a_chain_listed_by_subject_and_key_is_refused() {
     let key = KeyPair::from_pem(COMPROMISED_KEY).expect("compromised key must load");
     let mut params = CertificateParams::new(Vec::<String>::new()).expect("issuer params");
@@ -175,8 +174,7 @@ async fn a_chain_listed_by_subject_and_key_is_refused() {
     );
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn a_chain_listed_by_issuer_and_serial_is_refused() {
     // An otherwise valid chain that also presents the listed intermediate:
     // webpki ignores the extra certificate, OneCRL must not.
@@ -193,8 +191,7 @@ async fn a_chain_listed_by_issuer_and_serial_is_refused() {
     );
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn an_ordinary_chain_verifies() {
     let (ca, issuer) = throwaway_ca();
     let (leaf, leaf_key) = localhost_leaf(&issuer);

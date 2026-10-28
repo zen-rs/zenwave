@@ -56,6 +56,9 @@ tracing = "0.1.44"
 [dev-dependencies]
 serde_json = "1.0.154"
 tempfile = "3.27.0"
+# Held at 0.4: 0.6 drops `#[async_test]` for `wasm_lite_test`, which does not
+# link on native Windows yet (zen-rs/zenwave#128).
+test_executors = "0.4.1"
 futures-executor = "0.3.34"
 httparse = "1.10.1"
 # `tokio::io` traits for the raw `h2` server in the hyper test fixtures.
@@ -139,7 +142,10 @@ web-sys = { version = "0.3.97", features = [
     "ErrorEvent",
     "BinaryType",
 ] }
-wasm-streams = "0.7.0"
+# Held at 0.5: each wasm-streams release exports the same `#[wasm_bindgen]`
+# glue symbols, so two versions in one module fail to link, and skyzen (the
+# `tests/workerd` worker) still depends on 0.5 (zen-rs/skyzen#39).
+wasm-streams = "0.5.0"
 wasm-bindgen = "0.2.120"
 wasm-bindgen-futures = "0.4.70"
 gloo-timers = { version = "0.4.0", features = ["futures"] }
@@ -148,11 +154,6 @@ gloo-timers = { version = "0.4.0", features = ["futures"] }
 wasm-bindgen-test = "0.3.79"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-# `#[wasm_lite::wasm_lite_test]` on an `async fn` expands to a `#[test]` that
-# drives the body with `wasm_lite_std::block_on`; the wasm32 half of each test
-# is a `#[wasm_bindgen_test]` (test_executors 0.6 retired `#[async_test]`).
-wasm_lite = "0.1.4"
-wasm_lite_std = "0.1.4"
 smol = "2.0.2"
 rcgen = "0.14.10"
 futures-rustls = { version = "0.26.0", default-features = false, features = ["ring", "tls12"] }

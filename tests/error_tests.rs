@@ -5,15 +5,13 @@ mod common;
 use common::httpbin_uri;
 use zenwave::{Client, client, get};
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn test_invalid_url_error() {
     let result = get("not-a-valid-url").await;
     assert!(result.is_err());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn test_invalid_scheme_error() {
     // Refused while building the request: no backend may reach the network
     // for a protocol it does not speak (libcurl would happily talk FTP).
@@ -34,15 +32,13 @@ fn test_client_invalid_url_error() {
     assert!(result.is_err());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn test_unreachable_host_error() {
     let result = get("https://this-host-definitely-does-not-exist-12345.com").await;
     assert!(result.is_err());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn test_timeout_behavior() {
     // Test with a very slow endpoint
     let result = get(httpbin_uri("/delay/1")).await;
@@ -50,8 +46,7 @@ async fn test_timeout_behavior() {
     assert!(result.is_ok());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn test_json_parsing_error() {
     use serde_json::Value;
 
@@ -61,8 +56,7 @@ async fn test_json_parsing_error() {
     assert!(result.is_err());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn test_404_not_found() {
     let result = get(httpbin_uri("/status/404")).await;
     assert!(result.is_err(), "expected 404 to surface as error");
@@ -74,8 +68,7 @@ async fn test_404_not_found() {
     );
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn test_500_server_error() {
     let result = get(httpbin_uri("/status/500")).await;
     assert!(result.is_err(), "expected 500 to surface as error");
@@ -95,8 +88,7 @@ fn test_method_construction_with_invalid_uri() {
     assert!(result.is_err());
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn test_empty_response_handling() {
     let result = get(httpbin_uri("/status/204")).await;
     assert!(result.is_ok());
@@ -120,8 +112,7 @@ async fn test_empty_response_handling() {
 /// the h1 connection unusable. The pool is the hyper backend's; the curl
 /// and Apple backends reuse connections on their own terms.
 #[cfg(all(feature = "hyper-backend", not(target_arch = "wasm32")))]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), wasm_lite::wasm_lite_test)]
+#[test_executors::async_test]
 async fn test_pooled_connection_released_on_every_path() {
     use futures_util::StreamExt as _;
 
