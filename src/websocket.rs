@@ -543,11 +543,15 @@ mod wasm {
     pub async fn connect_with(
         uri: impl AsRef<str>,
         _transport: &Transport,
-        _config: WebSocketConfig,
+        config: WebSocketConfig,
     ) -> Result<WebSocket> {
         let socket = BrowserWebSocket::new(uri.as_ref())
             .map_err(|e| connection_failed(format_js_value(&e)))?;
         socket.set_binary_type(BinaryType::Arraybuffer);
+
+        // The browser reports whole messages, never frames, so the two
+        // configured caps collapse into one: the smaller of them.
+        let message_limit = message_size_limit(&config);
 
         let (event_tx, event_rx) = mpsc::unbounded::<WsEvent>();
         let (ready_tx, ready_rx) = oneshot::channel::<core::result::Result<(), String>>();
@@ -561,10 +565,26 @@ mod wasm {
         }) as Box<dyn FnMut()>);
         socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
 
+        let on_message_socket = socket.clone();
         let on_message_tx = event_tx.clone();
         let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
             let data = event.data();
-            if let Some(text) = data.as_string() {
+            // Each payload kind converts at most once: a text payload is
+            // checked by its UTF-8 byte length after a single conversion, a
+            // binary one by the buffer's length before it is copied into
+            // Rust memory.
+            let text = data.as_string();
+            let size = text
+                .as_ref()
+                .map_or_else(|| binary_size(&data), |text| Some(text.len()));
+            if let Some(size) = size
+                && let Some(limit) = message_limit.filter(|limit| size > *limit)
+            {
+                reject_oversized(&on_message_socket, &on_message_tx, size, limit);
+                return;
+            }
+
+            if let Some(text) = text {
                 let _ =
                     on_message_tx.unbounded_send(WsEvent::Message(WebSocketMessage::from(text)));
                 return;
@@ -791,6 +811,47 @@ mod wasm {
                 Some(WsEvent::Error(message)) => Err(connection_failed(message)),
             }
         }
+    }
+
+    /// The largest payload a [`WebSocketConfig`] lets through. The browser
+    /// exposes whole messages only, so the effective cap is the smaller of
+    /// the two configured limits; both `None` means no limit.
+    fn message_size_limit(config: &WebSocketConfig) -> Option<usize> {
+        config
+            .max_message_size
+            .into_iter()
+            .chain(config.max_frame_size)
+            .min()
+    }
+
+    /// Report a message over `limit` to the receiver and close the socket
+    /// with 1009 (Message Too Big, RFC 6455 §7.4.1), the code tungstenite
+    /// closes with on the native path. Called before the payload is copied
+    /// into Rust memory, so an oversized message is never delivered.
+    fn reject_oversized(
+        socket: &BrowserWebSocket,
+        events: &mpsc::UnboundedSender<WsEvent>,
+        size: usize,
+        limit: usize,
+    ) {
+        let _ = events.unbounded_send(WsEvent::Error(format!(
+            "websocket message of {size} bytes exceeds the {limit}-byte limit"
+        )));
+        let _ = socket.close_with_code_and_reason(1009, "message too large");
+    }
+
+    /// The byte length of a binary `MessageEvent` payload, read without
+    /// copying it into Rust memory. `None` for any other payload type.
+    fn binary_size(data: &JsValue) -> Option<usize> {
+        if data.is_instance_of::<js_sys::ArrayBuffer>() {
+            let array: &js_sys::ArrayBuffer = data.unchecked_ref();
+            return Some(array.byte_length() as usize);
+        }
+        if data.is_instance_of::<js_sys::Uint8Array>() {
+            let view: &js_sys::Uint8Array = data.unchecked_ref();
+            return Some(view.length() as usize);
+        }
+        None
     }
 
     fn connection_failed(message: impl Into<ByteStr>) -> WebSocketError {

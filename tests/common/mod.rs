@@ -59,6 +59,11 @@ mod local {
     pub fn httpbin_uri(path: &str) -> String {
         format!("{}/{}", httpbin_base(), path.trim_start_matches('/'))
     }
+
+    /// The fixture URL with the `ws://` scheme, for websocket tests.
+    pub fn websocket_uri(path: &str) -> String {
+        httpbin_uri(path).replacen("http://", "ws://", 1)
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
