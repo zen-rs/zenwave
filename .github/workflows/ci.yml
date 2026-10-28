@@ -6,8 +6,6 @@ permissions:
   checks: write
 
 on:
-  push:
-    branches: ["**"]
   pull_request:
     branches: ["**"]
   # The OneCRL pin workflow dispatches CI on its own pull requests, which
@@ -22,8 +20,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  tier:
+    # A pull request into `main` runs the full set; every other run
+    # (dev PRs, manual dispatches) runs the Linux set. release-plz bump
+    # pull requests (`release-plz-*` heads) run nothing at all, so this
+    # job skips itself and every other job skips through `needs: tier`.
+    name: Tier
+    if: ${{ !startsWith(github.head_ref, 'release-plz-') }}
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.tier.outputs.name }}
+      os: ${{ steps.tier.outputs.os }}
+    steps:
+      - id: tier
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.base_ref }}" = "main" ]; then
+            {
+              echo 'name=full'
+              echo 'os=["ubuntu-latest","windows-latest","macos-latest"]'
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo 'name=linux'
+              echo 'os=["ubuntu-latest"]'
+            } >> "$GITHUB_OUTPUT"
+          fi
+
   fmt:
     name: Format
+    needs: tier
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,13 +59,15 @@ jobs:
 
   features:
     # Every valid feature combination, on every desktop OS, through clippy.
-    # One slice per TLS engine so the powerset runs in parallel.
+    # One slice per TLS engine so the powerset runs in parallel. The Linux
+    # set carries the ubuntu legs only.
     name: Features (${{ matrix.os }}, ${{ matrix.engine }})
+    needs: tier
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(needs.tier.outputs.os) }}
         engine: [rustls, native-tls, none]
     steps:
       - uses: actions/checkout@v4
@@ -56,6 +83,7 @@ jobs:
 
   wasm:
     name: WASM
+    needs: tier
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -70,8 +98,10 @@ jobs:
   mobile:
     # Cross-compilation for the mobile targets, tests included. The suites run
     # on an iOS simulator in test.yml and on a physical Android device through
-    # scripts/test-android.sh (emulators are not used).
+    # scripts/test-android.sh (emulators are not used). Full set only.
     name: Mobile (${{ matrix.name }})
+    needs: tier
+    if: ${{ needs.tier.outputs.name == 'full' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -148,6 +178,7 @@ jobs:
 
   coverage:
     name: Coverage
+    needs: tier
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -167,6 +198,7 @@ jobs:
 
   typos:
     name: Typos
+    needs: tier
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -177,6 +209,7 @@ jobs:
 
   audit:
     name: Security Audit
+    needs: tier
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -191,6 +224,7 @@ jobs:
 
   unused-deps:
     name: Unused Dependencies
+    needs: tier
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -203,4 +237,27 @@ jobs:
 
   test:
     name: Test
+    needs: tier
     uses: ./.github/workflows/test.yml
+    with:
+      tier: ${{ needs.tier.outputs.name }}
+
+  ci-result:
+    # The required check on `main`: green when every job it needs
+    # succeeded or was skipped (the tier skips what a run does not
+    # cover), and the only job present on release-plz pull requests.
+    name: CI result
+    if: always()
+    needs: [tier, fmt, features, wasm, mobile, coverage, typos, audit, unused-deps, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check job results
+        env:
+          RESULTS: ${{ join(needs.*.result, ', ') }}
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo "job results: $RESULTS"
+          if [ "$FAILED" = "true" ]; then
+            echo "::error::one or more jobs failed or were cancelled"
+            exit 1
+          fi
