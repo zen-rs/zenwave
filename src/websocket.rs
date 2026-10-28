@@ -824,10 +824,11 @@ mod wasm {
             .min()
     }
 
-    /// Report a message over `limit` to the receiver and close the socket
-    /// with 1009 (Message Too Big, RFC 6455 §7.4.1), the code tungstenite
-    /// closes with on the native path. Called before the payload is copied
-    /// into Rust memory, so an oversized message is never delivered.
+    /// Report a message over `limit` to the receiver and close the socket.
+    /// Called before the payload is copied into Rust memory, so an oversized
+    /// message is never delivered. Native closes with 1009 (Message Too Big,
+    /// RFC 6455 §7.4.1), but a script may only send 1000 or 3000–4999, so the
+    /// reason carries the cause here.
     fn reject_oversized(
         socket: &BrowserWebSocket,
         events: &mpsc::UnboundedSender<WsEvent>,
@@ -837,7 +838,9 @@ mod wasm {
         let _ = events.unbounded_send(WsEvent::Error(format!(
             "websocket message of {size} bytes exceeds the {limit}-byte limit"
         )));
-        let _ = socket.close_with_code_and_reason(1009, "message too large");
+        socket
+            .close_with_code_and_reason(1000, "message too large")
+            .expect("1000 with a short reason is a close every browser accepts");
     }
 
     /// The byte length of a binary `MessageEvent` payload, read without
