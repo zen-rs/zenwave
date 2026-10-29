@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/zen-rs/zenwave/compare/v0.7.1...v0.8.0) - 2026-10-29
+
+### Added
+
+- *(cookie)* reject Domain attributes naming a public suffix
+- *(onecrl)* opt-in refresh past the compiled baseline
+- *(tls)* refuse OneCRL-listed certificates on the webpki verifiers
+- *(tls)* distrust compromised CA keys ahead of platform verification ([#102](https://github.com/zen-rs/zenwave/pull/102))
+- *(transport)* connect over unix domain sockets ([#100](https://github.com/zen-rs/zenwave/pull/100))
+
+### Fixed
+
+- *(deps)* require http-kit 0.4.4
+- *(build)* watch packaged assets only where they exist
+- *(h3)* return a response the server sent before reading the whole request
+- *(deps)* hold test_executors at 0.4 and wasm-streams at 0.5
+- *(wasm)* lint the wasm32 build in CI and clear its warnings
+- *(websocket)* close oversized wasm messages with a script-legal code
+- *(websocket)* enforce message size limits on wasm32
+- *(deps)* distrust the compromised eMudhra intermediates and update dependencies
+- *(cookie)* [**breaking**] scope cookies per RFC 6265 and handle them on every redirect hop
+- *(retry)* [**breaking**] retry only transient failures
+- *(onecrl)* verify every refresh-test handshake and satisfy Linux clippy
+- *(transport)* compile unix socket support only where unix sockets exist
+- *(transport)* allow unix_socket to go unused off unix
+- *(transport)* unix socket support builds clean off unix and on the iOS simulator
+- *(redirect)* follow only redirect statuses, return 304 and other 3xx unchanged ([#98](https://github.com/zen-rs/zenwave/pull/98))
+- *(pool)* never reuse an h2 connection the server sent GOAWAY on ([#96](https://github.com/zen-rs/zenwave/pull/96))
+- *(transport)* keep QUIC connections alive through the idle timeout ([#94](https://github.com/zen-rs/zenwave/pull/94))
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into fix/138-build-rerun
+- Merge remote-tracking branch 'origin/dev' into fix/136-h3-flakes
+- *(hyper)* stop asserting how the GOAWAY test's connection ends
+- *(hyper)* count QUIC dials by connection ID in the backoff test
+- Merge pull request #135 from zen-rs/fix/122-goaway-hang
+- *(hyper)* keep the GOAWAY fixture's h2 connection polled while reading a body
+- Merge pull request #126 from zen-rs/fix/120-deps-emudhra
+- Merge pull request #131 from zen-rs/fix/125-wasm-clippy
+- run CI on pull requests only, tiered by base branch
+- Merge remote-tracking branch 'origin/dev' into fix/120-deps-emudhra
+- Merge remote-tracking branch 'origin/dev' into fix/125-wasm-clippy
+- Merge pull request #124 from zen-rs/fix/119-cookie-scoping
+- Merge remote-tracking branch 'origin/dev' into fix/120-deps-emudhra
+- Merge origin/dev into fix/125-wasm-clippy
+- Merge pull request #127 from zen-rs/fix/118-wasm-ws-limits
+- Merge remote-tracking branch 'origin/dev' into fix/119-cookie-scoping
+- *(unix)* bind the test listeners before spawning their servers
+- *(cookie)* drop the 0.0.0.0 Secure-over-http fixture test
+- Merge remote-tracking branch 'origin/dev' into fix/120-deps-emudhra
+- *(retry)* count attempts above the backend
+- Merge pull request #116 from zen-rs/feat/111-onecrl-refresh
+- *(onecrl)* give the test changeset endpoint a path
+- *(onecrl)* name the refresh stage that failed when a chain stays accepted
+- move the OneCRL snapshot pin on a schedule
+- *(test)* run the OneCRL tests on the hyper rustls lane
+- Merge pull request #112 from zen-rs/feat/109-onecrl-baseline
+- *(tls)* refuse OneCRL-listed chains over real handshakes
+- *(release)* package the pinned OneCRL snapshot
+- Merge remote-tracking branch 'origin/revert/102-compromised-ca-blocklist' into fix/unix-socket-ci
+- Revert "feat(tls): distrust compromised CA keys ahead of platform verification ([#102](https://github.com/zen-rs/zenwave/pull/102))"
+
 ## [0.7.1](https://github.com/zen-rs/zenwave/compare/v0.7.0...v0.7.1) - 2026-09-23
 
 ### Fixed
