@@ -102,13 +102,14 @@ impl HyperBackend {
                 .race_dial_and_send(origin, permit, h3_port, request)
                 .await;
         }
-        let dialed = self.dial_tcp(origin).await?;
+        let dialed = self.dial(origin).await?;
         self.send_on_dialed(permit, dialed, request).await
     }
 
-    /// Connect to `origin` over TCP — through a proxy when the rules say so —
-    /// and run the negotiated hyper handshake.
-    async fn dial_tcp(&self, origin: &Origin) -> Result<DialedTcp, crate::Error> {
+    /// Connect to `origin` — the transport's unix socket when it has one,
+    /// else TCP through whatever proxy the rules say — and run the
+    /// negotiated hyper handshake.
+    async fn dial(&self, origin: &Origin) -> Result<Dialed, crate::Error> {
         let connection = connect(
             &self.transport,
             Target {
@@ -129,7 +130,7 @@ impl HyperBackend {
                 // The driver runs once for the connection's life, not per
                 // request.
                 self.spawner.spawn(drive(driver));
-                Ok(DialedTcp::H1 {
+                Ok(Dialed::H1 {
                     sender,
                     via: connection.via,
                 })
@@ -149,7 +150,7 @@ impl HyperBackend {
                 // Ready before pooling: the handle is shared as soon as it
                 // is stored.
                 sender.ready().await.map_err(HyperError::Connection)?;
-                Ok(DialedTcp::H2 { sender })
+                Ok(Dialed::H2 { sender })
             }
         }
     }
@@ -158,11 +159,11 @@ impl HyperBackend {
     async fn send_on_dialed(
         &self,
         permit: DialPermit,
-        dialed: DialedTcp,
+        dialed: Dialed,
         mut request: http::Request<http_kit::Body>,
     ) -> Result<(http::Response<http_kit::Body>, Option<H1Lease>), crate::Error> {
         match dialed {
-            DialedTcp::H1 { sender, via } => {
+            Dialed::H1 { sender, via } => {
                 shape_h1_request(&mut request, &via)?;
                 let (response, lease) = Pool::insert_h1(permit, sender, via)
                     .await
@@ -172,7 +173,7 @@ impl HyperBackend {
                 Ok((into_body(response), Some(lease)))
             }
             #[cfg(feature = "http2")]
-            DialedTcp::H2 { mut sender } => {
+            Dialed::H2 { mut sender } => {
                 Pool::insert_h2(permit, sender.clone());
                 let response = sender
                     .try_send_request(request)
@@ -205,7 +206,7 @@ impl HyperBackend {
             let timeout = entry.h3_connect_timeout();
             async move { quic_dial(&transport, spawn, &host, h3_port, timeout).await }
         });
-        let tcp = self.dial_tcp(origin);
+        let tcp = self.dial(origin);
         pin_mut!(tcp);
         match select(quic, tcp).await {
             Either::Left((result, tcp)) => match result {
@@ -316,8 +317,8 @@ impl HyperError {
     }
 }
 
-/// A freshly connected TCP connection after its hyper handshake.
-enum DialedTcp {
+/// A freshly connected connection after its hyper handshake.
+enum Dialed {
     /// HTTP/1.1 — exclusive; pooled by leasing.
     H1 {
         sender: hyper::client::conn::http1::SendRequest<http_kit::Body>,
@@ -468,6 +469,10 @@ impl HyperBackend {
     /// proxied or plaintext request never sees the pool's h3 paths.
     #[cfg(http3)]
     fn h3_gate(&self, origin: &Origin) -> Result<H3, crate::Error> {
+        #[cfg(unix_socket)]
+        if self.transport.unix_socket().is_some() {
+            return Ok(H3::Blocked);
+        }
         let proxied = proxied(
             &self.transport,
             Target {
@@ -564,11 +569,15 @@ impl HyperBackend {
 impl Endpoint for HyperBackend {
     type Error = crate::Error;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-        let dummy_request = http::Request::builder()
+        let mut dummy_request = http::Request::builder()
             .method(Method::GET)
             .uri("/")
             .body(http_kit::Body::empty())
             .unwrap();
+        // Extensions are caller context, not wire data: they stay on the
+        // request slot handed to the endpoint so middleware (e.g. the
+        // cookie jar) finds them again once `respond` returns.
+        std::mem::swap(dummy_request.extensions_mut(), request.extensions_mut());
         let mut request: http::Request<http_kit::Body> = replace(request, dummy_request);
         // The absolute URI, kept so a request taken back from a dead
         // connection can be reshaped for whichever checkout serves the retry.
@@ -612,8 +621,36 @@ impl Endpoint for HyperBackend {
                 #[cfg(feature = "http2")]
                 // The URI stays absolute: hyper derives `:scheme` and
                 // `:authority` from it.
-                Checkout::H2(mut sender) => {
-                    match send_or_retry(sender.try_send_request(request).await, retried)? {
+                Checkout::H2(mut handle) => {
+                    // A pooled connection that already received a remote
+                    // GOAWAY can still be checked out: neither hyper nor h2
+                    // exposes GOAWAY state on `SendRequest` —
+                    // `poll_ready`/`is_ready`/`is_closed` all reduce to
+                    // `dispatch.is_closed()`, the dispatch task's death
+                    // (hyper 1.11 `src/client/dispatch.rs`,
+                    // `want::SharedGiver::is_canceled`) — while h2 only
+                    // refuses sends, `Streams::send_request`'s
+                    // `ensure_no_conn_error` set by `recv_go_away`
+                    // (h2 0.4 `src/proto/streams/streams.rs`). The send
+                    // failure below is therefore also the going-away
+                    // detector: flag the handle so no later checkout reuses
+                    // the connection, and replay the request once on a fresh
+                    // dial — a stream refused by GOAWAY was never processed
+                    // (RFC 9113 §6.8). A streaming body is not replayable
+                    // and fails as before.
+                    let replay = replayable_request(&request);
+                    let mut sent = handle.sender().try_send_request(request).await;
+                    if let Err(error) = &mut sent
+                        && is_remote_go_away(error.error())
+                    {
+                        handle.flag_going_away();
+                        if !retried && let Some(unsent) = replay {
+                            retried = true;
+                            request = unsent;
+                            continue;
+                        }
+                    }
+                    match send_or_retry(sent, retried)? {
                         Sent::Done(response) => break (into_body(response), None),
                         Sent::Retry(unsent) => {
                             retried = true;
@@ -719,6 +756,34 @@ fn send_or_retry<T, E: Unsent>(
             _ => Err(error.into_error()),
         },
     }
+}
+
+/// Whether `error` is an h2 `GOAWAY` initiated by the remote. hyper wraps
+/// h2 errors under its `Http2` kind with the `h2::Error` as the source —
+/// `Error::new_h2` only unwraps `is_io` causes into plain io errors, so a
+/// `GoAway` always survives as the cause (hyper 1.11 `src/error.rs`).
+#[cfg(feature = "http2")]
+fn is_remote_go_away(error: &hyper::Error) -> bool {
+    std::error::Error::source(error)
+        .and_then(|cause| cause.downcast_ref::<h2::Error>())
+        .is_some_and(|error| error.is_go_away() && error.is_remote())
+}
+
+/// A copy of `request` for a replay on a fresh connection, or `None` when
+/// the body cannot be sent twice — `http_kit::Body::try_clone` yields a
+/// body only for buffered bytes (or an empty one); a reader, stream, or
+/// frozen body is not replayed.
+#[cfg(feature = "http2")]
+fn replayable_request(
+    request: &http::Request<http_kit::Body>,
+) -> Option<http::Request<http_kit::Body>> {
+    let mut replay = http::Request::new(request.body().try_clone()?);
+    *replay.method_mut() = request.method().clone();
+    *replay.uri_mut() = request.uri().clone();
+    *replay.version_mut() = request.version();
+    *replay.headers_mut() = request.headers().clone();
+    *replay.extensions_mut() = request.extensions().clone();
+    Some(replay)
 }
 
 /// Shape an h1 request for the path its connection took: origin-form and a
@@ -1261,12 +1326,15 @@ mod tests {
 
     #[cfg(feature = "http2")]
     mod http2 {
+        use std::time::Duration;
+
         use async_io::block_on;
+        use futures_channel::oneshot;
         use http::Version;
 
         use super::super::{
             HyperBackend,
-            test_support::{TestCa, TlsServer},
+            test_support::{GoAway, TestCa, TlsServer},
         };
         use crate::{Client as _, ResponseExt as _};
 
@@ -1360,6 +1428,85 @@ mod tests {
                 "concurrent h2 requests must share one connection"
             );
         }
+
+        #[test]
+        fn a_pooled_h2_connection_sent_goaway_is_not_reused() {
+            let ca = TestCa::new();
+            let server = TlsServer::serve_goaway(&ca, GoAway::Graceful);
+            let mut client = HyperBackend::new(ca.transport());
+
+            block_on(async {
+                client
+                    .get(server.uri("/first"))
+                    .expect("test request must build")
+                    .await
+                    .expect("first h2 request must succeed");
+                // The GOAWAY went out with the first response, so the second
+                // request either finds the going-away handle evicted or has
+                // its send refused and replayed — a fresh dial serves it.
+                let response = client
+                    .get(server.uri("/second"))
+                    .expect("test request must build")
+                    .await
+                    .expect("request after GOAWAY must succeed");
+                assert_eq!(
+                    &*response.into_string().await.expect("body must read"),
+                    "zenwave"
+                );
+            });
+
+            assert_eq!(server.next_request().version, Version::HTTP_2);
+            assert_eq!(server.next_request().version, Version::HTTP_2);
+            assert_eq!(
+                server.accept_count(),
+                2,
+                "a connection the server sent GOAWAY on must not be reused"
+            );
+        }
+
+        #[test]
+        fn a_request_refused_by_a_goaway_after_dispatch_is_replayed() {
+            let ca = TestCa::new();
+            let (trigger, fire) = oneshot::channel();
+            let server = TlsServer::serve_goaway(&ca, GoAway::Abrupt(fire));
+            let mut client = HyperBackend::new(ca.transport());
+
+            block_on(async {
+                client
+                    .get(server.uri("/first"))
+                    .expect("test request must build")
+                    .await
+                    .expect("first h2 request must succeed");
+                // The second request is dispatched on the pooled conn before
+                // the server's GOAWAY goes out; the GOAWAY is stamped with a
+                // last-stream-id below the new stream, so the client sees it
+                // refused — and replays it on a fresh dial.
+                let second = async {
+                    client
+                        .get(server.uri("/second"))
+                        .expect("test request must build")
+                        .await
+                };
+                let go_away = async {
+                    async_io::Timer::after(Duration::from_millis(100)).await;
+                    trigger.send(()).expect("server must await the trigger");
+                };
+                let (second, ()) = futures_util::future::join(second, go_away).await;
+                let response = second.expect("a refused request must be replayed");
+                assert_eq!(
+                    &*response.into_string().await.expect("body must read"),
+                    "zenwave"
+                );
+            });
+
+            assert_eq!(server.next_request().version, Version::HTTP_2);
+            assert_eq!(server.next_request().version, Version::HTTP_2);
+            assert_eq!(
+                server.accept_count(),
+                2,
+                "a refused request must be replayed on a fresh connection"
+            );
+        }
     }
 
     /// The QUIC/TCP race tests of issue #69: Alt-Svc and HTTPS-RR discovery,
@@ -1367,11 +1514,9 @@ mod tests {
     #[cfg(http3)]
     mod h3_discovery {
         use std::{
+            collections::HashSet,
             net::UdpSocket,
-            sync::{
-                Arc,
-                atomic::{AtomicUsize, Ordering},
-            },
+            sync::mpsc,
             thread,
             time::{Duration, Instant},
         };
@@ -1573,25 +1718,43 @@ mod tests {
             });
         }
 
+        /// The Source Connection ID of a QUIC long-header packet: it sits in
+        /// the cleartext invariant header (RFC 8999 §5.1) and every dial
+        /// draws a fresh one, so distinct values count dials.
+        fn long_header_scid(datagram: &[u8]) -> Vec<u8> {
+            assert!(
+                datagram[0] & 0x80 != 0,
+                "a handshake that never got an answer only sends long headers"
+            );
+            let dcid_len = usize::from(datagram[5]);
+            let scid_len = usize::from(datagram[6 + dcid_len]);
+            datagram[7 + dcid_len..7 + dcid_len + scid_len].to_vec()
+        }
+
         /// c. QUIC to a dead UDP port loses to TCP; the detached loser's
-        /// failure puts the origin into backoff and the next request sends
-        /// no datagram at all. The origin is an IPv4 literal so the racer's
+        /// failure puts the origin into backoff and the next request starts
+        /// no QUIC dial. The origin is an IPv4 literal so the racer's
         /// datagrams always land on the counting socket.
+        ///
+        /// Dials are counted by connection ID, not datagrams: dropping the
+        /// abandoned handshake at its deadline makes quinn send a
+        /// `CONNECTION_CLOSE` on that same connection, and its endpoint
+        /// driver flushes it concurrently with the backoff being recorded.
         #[test]
         fn a_dead_udp_port_falls_back_and_backs_off() {
             let ca = TestCa::new();
             let udp = UdpSocket::bind(("127.0.0.1", 0)).expect("counting socket binds");
             let udp_port = udp.local_addr().expect("counting address").port();
-            let datagrams = Arc::new(AtomicUsize::new(0));
-            thread::spawn({
-                let datagrams = datagrams.clone();
-                move || {
-                    let mut buffer = [0_u8; 2048];
-                    while udp.recv(&mut buffer).is_ok() {
-                        datagrams.fetch_add(1, Ordering::SeqCst);
+            let (datagram_tx, datagrams) = mpsc::channel();
+            thread::spawn(move || {
+                let mut buffer = [0_u8; 2048];
+                while let Ok(len) = udp.recv(&mut buffer) {
+                    if datagram_tx.send(long_header_scid(&buffer[..len])).is_err() {
+                        break;
                     }
                 }
             });
+            let mut dials = HashSet::new();
 
             let tcp = TlsServer::serve(
                 &ca,
@@ -1621,8 +1784,12 @@ mod tests {
                     .await
                     .expect("the race must fall back to TCP");
                 wait_until(|| entry.h3_broken_until().is_some()).await;
-                let sent = datagrams.load(Ordering::SeqCst);
-                assert!(sent > 0, "the QUIC racer must have sent Initial datagrams");
+                dials.extend(datagrams.try_iter());
+                assert_eq!(
+                    dials.len(),
+                    1,
+                    "the race must have started exactly one QUIC dial"
+                );
 
                 client
                     .get(uri)
@@ -1630,13 +1797,10 @@ mod tests {
                     .await
                     .expect("the backoff request must succeed over TCP");
                 // Give a stray dial a moment to show up, then check nothing
-                // left the endpoint.
+                // left the endpoint but the abandoned dial's own packets.
                 async_io::Timer::after(Duration::from_millis(100)).await;
-                assert_eq!(
-                    datagrams.load(Ordering::SeqCst),
-                    sent,
-                    "QUIC backoff must keep the origin on TCP"
-                );
+                dials.extend(datagrams.try_iter());
+                assert_eq!(dials.len(), 1, "QUIC backoff must keep the origin on TCP");
             });
         }
 

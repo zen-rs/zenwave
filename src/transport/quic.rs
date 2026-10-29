@@ -16,6 +16,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, ready},
+    time::Duration,
 };
 
 use async_io::Async;
@@ -205,12 +206,154 @@ pub fn endpoint(spawn: Spawn) -> Result<quinn::Endpoint, Error> {
     .map_err(|error| Error::Transport(Box::new(error)))
 }
 
+/// How long a QUIC connection may sit without packets before the endpoint
+/// closes it — the dead-peer detector. This is quinn's default, restated
+/// explicitly so [`QUIC_KEEP_ALIVE_INTERVAL`] can be justified against it.
+const QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often an otherwise-quiet QUIC connection sends a keep-alive packet.
+/// RFC 9000 §10.1.2 lets an endpoint defer the idle timeout by sending
+/// ack-eliciting packets, and since a lost one is not retransmitted the
+/// interval must leave room for more than one within the timeout: a third
+/// of [`QUIC_MAX_IDLE_TIMEOUT`] survives two lost keep-alives. Without it a
+/// request whose response takes longer than the idle timeout to start dies
+/// mid-wait even though nothing is wrong with the connection (#93).
+const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
 /// QUIC client TLS derived from the transport's shared rustls configuration:
 /// the same verifier and extra roots, with ALPN fixed to `h3`.
 pub fn client_config(base: &rustls::ClientConfig) -> Result<quinn::ClientConfig, Error> {
+    client_config_with_timeouts(base, QUIC_MAX_IDLE_TIMEOUT, Some(QUIC_KEEP_ALIVE_INTERVAL))
+}
+
+/// `client_config` with the idle and keep-alive durations passed in — the
+/// tests shrink them so the wait stays short, and `None` keep-alive is the
+/// negative control.
+fn client_config_with_timeouts(
+    base: &rustls::ClientConfig,
+    max_idle_timeout: Duration,
+    keep_alive_interval: Option<Duration>,
+) -> Result<quinn::ClientConfig, Error> {
+    let mut transport = quinn::TransportConfig::default();
+    transport
+        .max_idle_timeout(Some(
+            max_idle_timeout
+                .try_into()
+                .map_err(|error| Error::Transport(Box::new(error)))?,
+        ))
+        .keep_alive_interval(keep_alive_interval);
     let mut config = base.clone();
     config.alpn_protocols = vec![b"h3".to_vec()];
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(config)
         .map_err(|error| Error::Transport(Box::new(error)))?;
-    Ok(quinn::ClientConfig::new(Arc::new(quic)))
+    let mut config = quinn::ClientConfig::new(Arc::new(quic));
+    config.transport_config(Arc::new(transport));
+    Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use futures_util::TryStreamExt;
+
+    use super::{QUIC_KEEP_ALIVE_INTERVAL, QUIC_MAX_IDLE_TIMEOUT, client_config_with_timeouts};
+    use crate::{
+        Transport,
+        backend::{
+            h3::H3Connection,
+            test_support::{H3Server, TestCa, block_on_test, thread_spawn},
+        },
+    };
+
+    /// The idle timeout the tests run against — short enough that `/delayed`'s
+    /// 2 s response crosses it, keeping the suite fast.
+    const IDLE: Duration = Duration::from_secs(1);
+    /// Well inside `IDLE`: three keep-alives land before it fires.
+    const KEEP_ALIVE: Duration = Duration::from_millis(300);
+
+    fn request(uri: String) -> http::Request<http_kit::Body> {
+        http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(http_kit::Body::empty())
+            .expect("request builds")
+    }
+
+    async fn body_bytes(body: http_kit::Body) -> Vec<u8> {
+        body.try_collect::<Vec<Bytes>>()
+            .await
+            .expect("body is valid")
+            .concat()
+    }
+
+    /// A client h3 connection to `server` with the test idle timeout and the
+    /// given keep-alive. The returned `Transport` owns the shared QUIC
+    /// endpoint and must outlive the connection.
+    async fn connect(server: &H3Server, keep_alive: Option<Duration>) -> (Transport, H3Connection) {
+        let transport = server.transport();
+        let spawn = thread_spawn();
+        let endpoint = transport
+            .quic_endpoint(spawn.clone())
+            .expect("client endpoint binds");
+        let config = client_config_with_timeouts(transport.tls().client_config(), IDLE, keep_alive)
+            .expect("QUIC client config");
+        let connection =
+            H3Connection::connect(endpoint, config, server.addr(), "localhost", &spawn)
+                .await
+                .expect("h3 connection is established");
+        (transport, connection)
+    }
+
+    /// The production constants must keep the keep-alive interval well inside
+    /// the idle timeout (RFC 9000 §10.1.2) — the property the fix rests on.
+    #[test]
+    fn keep_alive_interval_sits_well_inside_the_idle_timeout() {
+        assert!(QUIC_KEEP_ALIVE_INTERVAL * 2 < QUIC_MAX_IDLE_TIMEOUT);
+    }
+
+    /// `/delayed` answers 2 s after the request — beyond the client's 1 s
+    /// idle timeout — so the response only arrives because keep-alive
+    /// packets defer the timeout (RFC 9000 §10.1.2). This is the #93
+    /// reproducer: before the fix every such request died at the timeout.
+    #[test]
+    fn keep_alive_holds_the_connection_past_the_idle_timeout() {
+        let server = H3Server::start(&TestCa::new());
+        block_on_test(async {
+            let (_transport, mut connection) = connect(&server, Some(KEEP_ALIVE)).await;
+            let response = connection
+                .request(request(server.uri("/delayed")))
+                .await
+                .expect("the request survives the server's delay");
+            assert_eq!(response.status(), http::StatusCode::OK);
+            assert_eq!(
+                body_bytes(response.into_body()).await,
+                b"delayed hello over h3"
+            );
+        });
+    }
+
+    /// Negative control of the same setup: with keep-alive disabled the idle
+    /// timeout fires mid-request and the request dies — the failure #93
+    /// reports.
+    #[test]
+    fn without_keep_alive_the_idle_timeout_kills_the_request() {
+        let server = H3Server::start(&TestCa::new());
+        block_on_test(async {
+            let (_transport, mut connection) = connect(&server, None).await;
+            let error = connection
+                .request(request(server.uri("/delayed")))
+                .await
+                .expect_err("the request must die with the idle timeout");
+            assert!(
+                error
+                    .to_string()
+                    .to_lowercase()
+                    .replace(' ', "")
+                    .contains("timeout"),
+                "the failure must be the QUIC idle timeout, got: {error}"
+            );
+        });
+    }
 }

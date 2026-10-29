@@ -110,14 +110,20 @@ release-plz computes the bump and opens a PR to main.
 
 ## CI
 
-Runs on every push and PR (`.github/workflows/ci.yml` + `test.yml`):
+Runs on every PR and manual dispatch (`.github/workflows/ci.yml` +
+`test.yml`), never on push. A PR into `main` runs the full set below;
+every other run (dev PRs, dispatches) runs only the Linux legs.
+release-plz bump PRs run nothing. `CI result` aggregates all jobs and
+is the required check on `main`.
 - `cargo fmt --check`
 - Features: clippy over every valid feature combination (`scripts/check-features.sh`,
-  cargo-hack powerset) on Linux, Windows and macOS, one slice per TLS engine
-- WASM build check; mobile cross-compilation (iOS device/simulator, Android
-  arm64/x86_64/armv7) with tests
-- Tests: hyper (rustls and native-tls) and curl on Linux/Windows/macOS,
-  apple-backend on macOS, the suite on an iOS simulator (`scripts/test-ios.sh`,
+  cargo-hack powerset) on Linux, Windows and macOS (Linux only outside
+  `main` PRs), one slice per TLS engine
+- WASM build + clippy; mobile cross-compilation (iOS device/simulator,
+  Android arm64/x86_64/armv7; `main` PRs only) with tests
+- Tests: hyper (rustls and native-tls) and curl on Linux/Windows/macOS
+  (Linux only outside `main` PRs); `main` PRs also run apple-backend on
+  macOS, the suite on an iOS simulator (`scripts/test-ios.sh`,
   `simctl spawn`), wasm-pack in Chrome/Firefox/Safari, workerd
 - Android runs on a physical device, not in CI: `scripts/test-android.sh`
   over adb (never an emulator); TLS on Android needs the JVM and is covered by

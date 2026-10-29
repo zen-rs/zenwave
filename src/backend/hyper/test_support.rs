@@ -15,7 +15,7 @@ use std::{
 use async_net::TcpListener;
 #[cfg(http3)]
 use bytes::Buf;
-#[cfg(http3)]
+#[cfg(any(feature = "http2", http3))]
 use futures_channel::oneshot;
 #[cfg(any(feature = "http2", http3))]
 use futures_rustls::TlsAcceptor;
@@ -38,7 +38,7 @@ use rustls::{
 #[cfg(http3)]
 use std::net::UdpSocket;
 #[cfg(feature = "http2")]
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use time::{Duration as TimeDelta, OffsetDateTime};
 
 #[cfg(http3)]
@@ -278,6 +278,220 @@ impl TlsServer {
             .recv_timeout(TEST_TIMEOUT)
             .expect("server must see the request")
     }
+
+    /// Start a server that only negotiates h2 and applies `plan` to the
+    /// first connection it accepts; every connection after it is served
+    /// normally. Each request is answered with `zenwave` and reported like
+    /// [`serve`](Self::serve) does.
+    #[cfg(feature = "http2")]
+    pub(crate) fn serve_goaway(ca: &TestCa, plan: GoAway) -> Self {
+        let (leaf, key) = ca.leaf();
+        let mut config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![leaf], key)
+            .expect("server certificate");
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let (listener, address) = async_io::block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("test listener must bind");
+            let address = listener.local_addr().expect("test address must exist");
+            (listener, address)
+        });
+        let (observed_tx, observed) = mpsc::channel();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accept_count = accepts.clone();
+        // The first connection to take the lock consumes the plan; later
+        // connections find `None` and serve every stream.
+        let plan = Arc::new(Mutex::new(Some(plan)));
+        thread::spawn(move || {
+            async_io::block_on(async move {
+                while let Ok((tcp, _)) = listener.accept().await {
+                    accept_count.fetch_add(1, Ordering::SeqCst);
+                    let acceptor = acceptor.clone();
+                    let observed_tx = observed_tx.clone();
+                    let plan = plan.clone();
+                    thread::spawn(move || {
+                        async_io::block_on(serve_goaway_conn(acceptor, tcp, observed_tx, plan));
+                    });
+                }
+            });
+        });
+        Self {
+            address,
+            accepts,
+            observed,
+        }
+    }
+}
+
+/// What the first h2 connection does after answering its first stream, to
+/// exercise the client against a `GOAWAY` arriving mid-pool.
+#[cfg(feature = "http2")]
+pub enum GoAway {
+    /// `graceful_shutdown` as the first answer flushes: a `GOAWAY` goes out
+    /// while the socket stays open — a going-away connection that is still
+    /// alive enough to be handed out again.
+    Graceful,
+    /// `abrupt_shutdown(NO_ERROR)` once `trigger` fires. While the trigger
+    /// is pending the connection is not polled, so the `GOAWAY` is stamped
+    /// with the streams the server already processed — a request that was
+    /// already dispatched is refused as above the last stream id.
+    Abrupt(oneshot::Receiver<()>),
+}
+
+/// `futures::io` → `tokio::io` adapter so the raw `h2` server — which
+/// requires `tokio::io` traits — can run over the fixture's futures-io TLS
+/// stream.
+#[cfg(feature = "http2")]
+struct TokioCompat<S>(S);
+
+#[cfg(feature = "http2")]
+impl<S: futures_io::AsyncRead + Unpin> tokio::io::AsyncRead for TokioCompat<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match std::pin::Pin::new(&mut self.0).poll_read(cx, buf.initialize_unfilled()) {
+            std::task::Poll::Ready(Ok(read)) => {
+                buf.advance(read);
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(error)),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+#[cfg(feature = "http2")]
+impl<S: futures_io::AsyncWrite + Unpin> tokio::io::AsyncWrite for TokioCompat<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_close(cx)
+    }
+}
+
+/// Serve one TLS connection over a raw `h2` server: report and answer every
+/// request, then run `plan` after the first stream when the connection
+/// holds it.
+#[cfg(feature = "http2")]
+async fn serve_goaway_conn(
+    acceptor: TlsAcceptor,
+    tcp: async_net::TcpStream,
+    observed: mpsc::Sender<Observed>,
+    plan: Arc<Mutex<Option<GoAway>>>,
+) {
+    let Ok(tls) = acceptor.accept(tcp).await else {
+        return;
+    };
+    let Ok(mut conn) = h2::server::handshake(TokioCompat(tls)).await else {
+        return;
+    };
+    let mut plan = plan.lock().expect("plan poisoned").take();
+    let mut first = true;
+    while let Some(incoming) = conn.accept().await {
+        let Ok((request, mut respond)) = incoming else {
+            return;
+        };
+        let (parts, mut body) = request.into_parts();
+        // A raw h2 server reads frames only while `conn` is polled, and a
+        // request's END_STREAM may come in a frame after its HEADERS (hyper's
+        // client sends it that way for a body that does not report
+        // `is_end_stream`). Keep the connection polled while the body is
+        // collected, or a late END_STREAM is never read (issue #122).
+        let received = {
+            let collect = std::pin::pin!(async {
+                let mut received = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk.ok()?;
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                    received.extend_from_slice(&chunk);
+                }
+                Some(received)
+            });
+            let drive = std::pin::pin!(futures_util::future::poll_fn(|cx| conn.poll_closed(cx)));
+            match futures_util::future::select(collect, drive).await {
+                futures_util::future::Either::Left((Some(received), _)) => received,
+                // The stream was reset, or the connection ended mid-body.
+                futures_util::future::Either::Left((None, _))
+                | futures_util::future::Either::Right(_) => return,
+            }
+        };
+        observed
+            .send(Observed {
+                version: parts.version,
+                authority: parts
+                    .uri
+                    .authority()
+                    .map(|authority| authority.as_str().to_owned()),
+                host: parts
+                    .headers
+                    .get(HOST)
+                    .map(|value| value.to_str().expect("Host is ASCII").to_owned()),
+                body: received,
+            })
+            .expect("observed channel must be open");
+        let Ok(mut send) = respond.send_response(hyper::Response::new(()), false) else {
+            return;
+        };
+        if send
+            .send_data(Bytes::from_static(b"zenwave"), true)
+            .is_err()
+        {
+            return;
+        }
+        if first {
+            first = false;
+            match plan.take() {
+                Some(GoAway::Graceful) => conn.graceful_shutdown(),
+                Some(GoAway::Abrupt(trigger)) => {
+                    // Flush the response before parking: h2 has no one-shot
+                    // flush, so drive the close future twice on a noop waker
+                    // (the second completes any partial write). The
+                    // connection then stays unparked until the trigger
+                    // fires — streams the client sends meanwhile are never
+                    // read, so the `abrupt_shutdown` below stamps a
+                    // last-stream-id before them.
+                    {
+                        let waker = futures_util::task::noop_waker();
+                        let mut cx = std::task::Context::from_waker(&waker);
+                        let _ = conn.poll_closed(&mut cx);
+                        let _ = conn.poll_closed(&mut cx);
+                    }
+                    if trigger.await.is_err() {
+                        return;
+                    }
+                    conn.abrupt_shutdown(h2::Reason::NO_ERROR);
+                    // Drive the connection until it ends so the `GOAWAY`
+                    // frame is flushed to the client.
+                    let _ = futures_util::future::poll_fn(|cx| conn.poll_closed(cx)).await;
+                    return;
+                }
+                None => {}
+            }
+        }
+    }
 }
 
 /// Accept TLS on `tcp` — after `handshake_delay`, so a racing QUIC dial can
@@ -475,6 +689,14 @@ impl H3Server {
         self.endpoint.close(0u32.into(), b"gone");
     }
 
+    /// A transport trusting the CA this server's leaf is signed by.
+    pub(crate) fn transport(&self) -> Transport {
+        Transport::builder()
+            .extra_root_certificate_der(self.ca_der.to_vec())
+            .build()
+            .expect("transport builds")
+    }
+
     /// A `https://localhost:<port>` URI for `path`.
     pub(crate) fn uri(&self, path: &str) -> String {
         format!("https://localhost:{}{path}", self.addr.port())
@@ -486,10 +708,7 @@ impl H3Server {
 /// the connection.
 #[cfg(http3)]
 pub async fn h3_connection(server: &H3Server) -> (Transport, H3Connection) {
-    let transport = Transport::builder()
-        .extra_root_certificate_der(server.ca_der.to_vec())
-        .build()
-        .expect("transport builds");
+    let transport = server.transport();
     let spawn = thread_spawn();
     let endpoint = transport
         .quic_endpoint(spawn.clone())
@@ -531,9 +750,13 @@ async fn serve_h3_request(
     let result = match (request.method().as_str(), request.uri().path()) {
         ("GET", "/hello") => serve_body(&mut stream, Bytes::from_static(b"hello over h3")).await,
         ("POST", "/echo") => serve_echo(&mut stream).await,
+        // A complete response without reading the request body: dropping
+        // the stream then stops the request side (STOP_SENDING).
+        ("POST", "/early") => serve_body(&mut stream, Bytes::from_static(b"answered early")).await,
         ("GET", "/slow") => {
             serve_slow(&mut stream, slow_release.expect("one /slow per test")).await
         }
+        ("GET", "/delayed") => serve_delayed(&mut stream).await,
         _ => serve_status(&mut stream, http::StatusCode::NOT_FOUND).await,
     };
     result.expect("request is served");
@@ -566,6 +789,15 @@ async fn serve_echo(stream: &mut ServerStream) -> Result<(), h3::error::StreamEr
     stream.finish().await
 }
 
+/// The response starts only after a fixed sleep — past the idle timeout the
+/// keep-alive tests dial with, so a client without keep-alives dies waiting
+/// for it.
+#[cfg(http3)]
+async fn serve_delayed(stream: &mut ServerStream) -> Result<(), h3::error::StreamError> {
+    async_io::Timer::after(Duration::from_secs(2)).await;
+    serve_body(stream, Bytes::from_static(b"delayed hello over h3")).await
+}
+
 /// The second chunk waits for the test to release it: a client that buffers
 /// the whole body before answering hangs here forever.
 #[cfg(http3)]
@@ -592,4 +824,88 @@ async fn serve_status(
         .expect("response builds");
     stream.send_response(response).await?;
     stream.finish().await
+}
+
+#[cfg(feature = "http2")]
+mod tests {
+    use std::{pin::pin, sync::Arc};
+
+    use futures_rustls::TlsConnector;
+    use futures_util::future::{Either, join, select};
+    use hyper::body::Bytes;
+    use rustls::{ClientConfig, RootCertStore, crypto::ring, pki_types::ServerName};
+
+    use super::{GoAway, TEST_TIMEOUT, TestCa, TlsServer, TokioCompat};
+
+    /// A raw h2 client — none of the backend's code — opens a stream with
+    /// `HEADERS` alone, waits for the server to acknowledge a `PING` sent after
+    /// them, and only then ends the stream with an empty `DATA` frame: the
+    /// frame order hyper's client produces for a body that does not report
+    /// `is_end_stream`. The fixture must keep reading the connection while
+    /// it collects a request body, or the late `END_STREAM` is never read and
+    /// the request hangs until the client's keep-alive gives up.
+    #[test]
+    fn the_goaway_fixture_reads_a_request_body_that_ends_in_a_later_frame() {
+        let ca = TestCa::new();
+        let server = TlsServer::serve_goaway(&ca, GoAway::Graceful);
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(ca.ca_der.clone())
+            .expect("test CA must be a valid root");
+        let mut config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+
+        let received = async_io::block_on(async {
+            let tcp = async_net::TcpStream::connect(server.addr())
+                .await
+                .expect("fixture must accept");
+            let tls = TlsConnector::from(Arc::new(config))
+                .connect(ServerName::try_from("localhost").expect("valid name"), tcp)
+                .await
+                .expect("TLS handshake must succeed");
+            let (mut sender, mut connection) = h2::client::handshake(TokioCompat(tls))
+                .await
+                .expect("h2 handshake must succeed");
+            let mut ping_pong = connection.ping_pong().expect("ping_pong is taken once");
+            let exchange = async {
+                let request = http::Request::get(server.uri("/late-end-stream"))
+                    .body(())
+                    .expect("request builds");
+                let (response, mut stream) = sender
+                    .send_request(request, false)
+                    .expect("stream must open");
+                ping_pong
+                    .ping(h2::Ping::opaque())
+                    .await
+                    .expect("server must answer the PING");
+                stream
+                    .send_data(Bytes::new(), true)
+                    .expect("END_STREAM must queue");
+                let mut body = response.await.expect("response must arrive").into_body();
+                let mut received = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    received.extend_from_slice(&chunk.expect("response body must read"));
+                }
+                received
+            };
+            let exchange = pin!(exchange);
+            let timeout = pin!(async_io::Timer::after(TEST_TIMEOUT));
+            // The connection is driven alongside the exchange. The plan shuts
+            // it down after this stream and the fixture then closes the
+            // socket, which the client's last write can race (BrokenPipe), so
+            // how the connection ends is not what this test checks (#139).
+            match select(join(exchange, connection), timeout).await {
+                Either::Left(((received, _), _)) => received,
+                Either::Right(_) => {
+                    panic!("the fixture never read the END_STREAM sent after the HEADERS")
+                }
+            }
+        });
+        assert_eq!(received, b"zenwave");
+        assert_eq!(server.next_request().body, b"");
+    }
 }

@@ -11,7 +11,10 @@ use http_kit::{
     header::{HeaderValue, LOCATION},
 };
 use zenwave::Client;
-use zenwave::redirect::FollowRedirect;
+use zenwave::redirect::{FollowRedirect, FollowRedirectError};
+
+mod common;
+use common::httpbin_uri;
 
 #[derive(Clone, Debug)]
 struct SeenRequest {
@@ -161,4 +164,197 @@ async fn follow_redirect_strips_sensitive_headers_on_host_change() {
     );
     assert_eq!(state.seen[1].uri, "https://example.net/next");
     drop(state);
+}
+
+fn status_response(status: StatusCode, location: Option<&str>) -> Response {
+    let mut builder = http::Response::builder().status(status);
+    if let Some(location) = location {
+        builder = builder.header(LOCATION, HeaderValue::from_str(location).unwrap());
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+fn get_request(uri: &str) -> Request {
+    http::Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// A 304 is a cache verdict, not a redirect: it must reach the caller
+/// untouched, validator headers and all, after exactly one request.
+#[test_executors::async_test]
+async fn not_modified_without_location_is_returned() {
+    let response = http::Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .header(http_kit::header::ETAG, "\"v1\"")
+        .body(Body::empty())
+        .unwrap();
+    let mock = MockClient::with_responses(vec![response]);
+    let state = mock.state();
+    let mut client = FollowRedirect::new(mock);
+    let mut request = get_request("https://example.com/conditional");
+
+    let response = client.respond(&mut request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        response
+            .headers()
+            .get(http_kit::header::ETAG)
+            .and_then(|value| value.to_str().ok()),
+        Some("\"v1\"")
+    );
+    assert_eq!(response.into_body().into_bytes().await.unwrap().len(), 0);
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.seen.len(), 1);
+    assert_eq!(state.seen[0].uri, "https://example.com/conditional");
+}
+
+/// Even carrying a Location header, a 304 is never followed.
+#[test_executors::async_test]
+async fn not_modified_with_location_is_not_followed() {
+    let mock = MockClient::with_responses(vec![status_response(
+        StatusCode::NOT_MODIFIED,
+        Some("https://example.com/elsewhere"),
+    )]);
+    let state = mock.state();
+    let mut client = FollowRedirect::new(mock);
+    let mut request = get_request("https://example.com/conditional");
+
+    let response = client.respond(&mut request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(state.lock().unwrap().seen.len(), 1);
+}
+
+/// 300, 305 and 306 are not redirect statuses a client may follow —
+/// they pass through whether or not a Location header is present.
+#[test_executors::async_test]
+async fn other_3xx_statuses_pass_through_unfollowed() {
+    for (status, location) in [
+        (StatusCode::MULTIPLE_CHOICES, None),
+        (
+            StatusCode::MULTIPLE_CHOICES,
+            Some("https://example.com/next"),
+        ),
+        (StatusCode::USE_PROXY, None),
+        (StatusCode::USE_PROXY, Some("https://example.com/next")),
+        (StatusCode::from_u16(306).unwrap(), None),
+        (
+            StatusCode::from_u16(306).unwrap(),
+            Some("https://example.com/next"),
+        ),
+    ] {
+        let mock = MockClient::with_responses(vec![status_response(status, location)]);
+        let state = mock.state();
+        let mut client = FollowRedirect::new(mock);
+        let mut request = get_request("https://example.com/resource");
+
+        let response = client.respond(&mut request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            status,
+            "status {status} must pass through"
+        );
+        assert_eq!(
+            state.lock().unwrap().seen.len(),
+            1,
+            "status {status} must not trigger a follow-up request"
+        );
+    }
+}
+
+/// A plain success answers once and returns.
+#[test_executors::async_test]
+async fn ok_passes_through() {
+    let mock = MockClient::with_responses(vec![ok_response()]);
+    let state = mock.state();
+    let mut client = FollowRedirect::new(mock);
+    let mut request = get_request("https://example.com/data");
+
+    let response = client.respond(&mut request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(state.lock().unwrap().seen.len(), 1);
+}
+
+/// The five redirect statuses still follow their Location: 303 always
+/// rewrites to GET, 301/302 rewrite non-GET/HEAD to GET, 307/308 keep
+/// the original method.
+#[test_executors::async_test]
+async fn redirect_statuses_with_location_are_followed() {
+    for (status, expected_method) in [
+        (StatusCode::MOVED_PERMANENTLY, Method::GET),
+        (StatusCode::FOUND, Method::GET),
+        (StatusCode::SEE_OTHER, Method::GET),
+        (StatusCode::TEMPORARY_REDIRECT, Method::POST),
+        (StatusCode::PERMANENT_REDIRECT, Method::POST),
+    ] {
+        let mock = MockClient::with_responses(vec![
+            redirect_response(status, "https://example.com/next"),
+            ok_response(),
+        ]);
+        let state = mock.state();
+        let mut client = FollowRedirect::new(mock);
+        let mut request = http::Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/start")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = client.respond(&mut request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "status {status} must be followed"
+        );
+
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.seen.len(),
+            2,
+            "status {status} must issue a second request"
+        );
+        assert_eq!(state.seen[1].uri, "https://example.com/next");
+        assert_eq!(
+            state.seen[1].method, expected_method,
+            "status {status} method rewriting"
+        );
+    }
+}
+
+/// A redirect status with no Location is still an error.
+#[test_executors::async_test]
+async fn redirect_status_without_location_errors() {
+    for status in [
+        StatusCode::MOVED_PERMANENTLY,
+        StatusCode::FOUND,
+        StatusCode::SEE_OTHER,
+        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::PERMANENT_REDIRECT,
+    ] {
+        let mock = MockClient::with_responses(vec![status_response(status, None)]);
+        let mut client = FollowRedirect::new(mock);
+        let mut request = get_request("https://example.com/start");
+
+        let result = client.respond(&mut request).await;
+        assert!(
+            matches!(result, Err(FollowRedirectError::MissingLocationHeader)),
+            "status {status} without Location must error"
+        );
+    }
+}
+
+/// End to end through the real client: the fixture's /status/304 has no
+/// Location, and the 304 must still come back delivered rather than error
+/// as a malformed redirect.
+#[test_executors::async_test]
+async fn real_client_delivers_a_304_without_location() {
+    let response = zenwave::client()
+        .get(httpbin_uri("/status/304"))
+        .unwrap()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 304);
+    assert_eq!(response.into_body().into_bytes().await.unwrap().len(), 0);
 }

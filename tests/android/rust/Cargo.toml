@@ -20,23 +20,23 @@ ws = ["zenwave/ws", "dep:async-tungstenite"]
 
 [dependencies]
 zenwave = { path = "../../..", default-features = false, features = ["hyper-backend", "rustls"] }
-jni = "0.22"
+jni = "0.22.4"
 
 # What `tests/common` needs.
-async-net = "2.0"
-async-tungstenite = { version = "0.34.0", default-features = false, features = ["smol-runtime"], optional = true }
-base64 = "0.22"
-futures-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-futures-util = { version = "0.3", features = ["io", "sink"] }
-httparse = "1.10"
-once_cell = "1.19"
-rcgen = "0.14"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-serde_json = "1.0"
-smol = "2.0"
-time = "0.3"
-tiny_http = "0.12"
-url = "2.5"
+async-net = "2.0.0"
+async-tungstenite = { version = "0.35.0", default-features = false, features = ["smol-runtime"], optional = true }
+base64 = "0.23.1"
+futures-rustls = { version = "0.26.0", default-features = false, features = ["ring", "tls12"] }
+futures-util = { version = "0.3.34", features = ["io", "sink"] }
+httparse = "1.10.1"
+once_cell = "1.21.4"
+rcgen = "0.14.10"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+serde_json = "1.0.154"
+smol = "2.0.2"
+time = "0.3.55"
+tiny_http = "0.12.0"
+url = "2.5.8"
 
 # The fixtures live in `tests/common`, pulled in through `#[path]`; cargo-machete
 # only scans this directory and so cannot see these being used.

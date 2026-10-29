@@ -110,13 +110,30 @@ impl H3Connection {
             .await
             .map_err(HyperError::http3)?;
 
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk?;
-            if !chunk.is_empty() {
-                stream.send_data(chunk).await.map_err(HyperError::http3)?;
+        let sent = 'send: {
+            while let Some(chunk) = body.next().await {
+                let chunk = chunk?;
+                if !chunk.is_empty()
+                    && let Err(error) = stream.send_data(chunk).await
+                {
+                    break 'send Err(error);
+                }
             }
+            // `finish` writes too: h3 puts a GREASE frame on the first
+            // request of every connection.
+            stream.finish().await
+        };
+        match sent {
+            Ok(()) => {}
+            // RFC 9114 §4.1: a server may send a complete response without
+            // reading the rest of the request and stop the request stream
+            // (STOP_SENDING); the client must not discard that response.
+            // Any send failure past this point surfaces on the response.
+            Err(h3::error::StreamError::RemoteTerminate { code, .. }) => {
+                debug!(%code, "server stopped reading the request; reading its response");
+            }
+            Err(error) => return Err(HyperError::http3(error).into()),
         }
-        stream.finish().await.map_err(HyperError::http3)?;
 
         let response = stream.recv_response().await.map_err(HyperError::http3)?;
         let (parts, ()) = response.into_parts();
@@ -208,6 +225,27 @@ mod tests {
                 .expect("request succeeds");
             assert_eq!(response.status(), http::StatusCode::OK);
             assert_eq!(body_bytes(response.into_body()).await, expected);
+        });
+    }
+
+    /// RFC 9114 §4.1: a server that answers before reading the whole
+    /// request stops the request stream, and the client must still return
+    /// the complete response. The body never ends, so the client is
+    /// certain to be writing when the stop arrives.
+    #[test]
+    fn a_response_sent_before_the_request_ends_is_returned() {
+        let server = H3Server::start(&TestCa::new());
+        block_on_test(async {
+            let (_transport, mut connection) = h3_connection(&server).await;
+            let body = http_kit::Body::from_stream(stream::repeat_with(|| {
+                Ok::<_, http_kit::BodyError>(Bytes::from_static(&[0xEE; 16 * 1024]))
+            }));
+            let response = connection
+                .request(request("POST", server.uri("/early"), body))
+                .await
+                .expect("the early response must be returned");
+            assert_eq!(response.status(), http::StatusCode::OK);
+            assert_eq!(body_bytes(response.into_body()).await, b"answered early");
         });
     }
 

@@ -1,3 +1,5 @@
+#[cfg(unix_socket)]
+use std::path::{Path, PathBuf};
 use std::{mem::replace, str};
 
 use anyhow::{Context, anyhow};
@@ -108,11 +110,15 @@ impl Client for CurlBackend {}
 impl Endpoint for CurlBackend {
     type Error = crate::Error;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-        let dummy_request = http::Request::builder()
+        let mut dummy_request = http::Request::builder()
             .method(Method::GET)
             .uri("/")
             .body(Body::empty())
             .expect("building dummy request failed");
+        // Extensions are caller context, not wire data: they stay on the
+        // request slot handed to the endpoint so middleware (e.g. the
+        // cookie jar) finds them again once `respond` returns.
+        std::mem::swap(dummy_request.extensions_mut(), request.extensions_mut());
         let request = replace(request, dummy_request);
         execute(request, &self.transport).await.map_err(Into::into)
     }
@@ -132,11 +138,25 @@ async fn execute(request: Request, transport: &Transport) -> Result<Response, Cu
         .map_err(CurlError::bad_request)?
         .to_vec();
 
-    let proxy = transport
-        .proxy()
-        .intercept(&parts.uri)
-        .map(|intercept| resolve_proxy(&intercept).map_err(CurlError::bad_request))
-        .transpose()?;
+    let matched_proxy = || {
+        transport
+            .proxy()
+            .intercept(&parts.uri)
+            .map(|intercept| resolve_proxy(&intercept).map_err(CurlError::bad_request))
+            .transpose()
+    };
+    // No proxy can reach a local socket: a transport carrying one skips the
+    // matcher entirely, matching `curl --unix-socket`.
+    #[cfg(unix_socket)]
+    let unix_socket = transport.unix_socket().map(Path::to_path_buf);
+    #[cfg(unix_socket)]
+    let proxy = if unix_socket.is_some() {
+        None
+    } else {
+        matched_proxy()?
+    };
+    #[cfg(not(unix_socket))]
+    let proxy = matched_proxy()?;
 
     let prepared = PreparedRequest {
         method: parts.method.as_str().to_owned(),
@@ -144,6 +164,8 @@ async fn execute(request: Request, transport: &Transport) -> Result<Response, Cu
         headers,
         body: body_bytes,
         proxy,
+        #[cfg(unix_socket)]
+        unix_socket,
         ca_bundle: transport.ca_bundle().map(<[u8]>::to_vec),
     };
 
@@ -160,6 +182,10 @@ fn perform(request: PreparedRequest) -> Result<Response, CurlError> {
     easy.url(&request.url).map_err(map_curl_error)?;
     easy.custom_request(&request.method)
         .map_err(map_curl_error)?;
+    #[cfg(unix_socket)]
+    if let Some(path) = &request.unix_socket {
+        easy.unix_socket_path(Some(path)).map_err(map_curl_error)?;
+    }
 
     if upload_len > 0 {
         easy.upload(true).map_err(map_curl_error)?;
@@ -259,6 +285,8 @@ struct PreparedRequest {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     proxy: Option<ResolvedProxy>,
+    #[cfg(unix_socket)]
+    unix_socket: Option<PathBuf>,
     ca_bundle: Option<Vec<u8>>,
 }
 #[derive(Debug)]

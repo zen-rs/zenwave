@@ -30,8 +30,12 @@
 //! ```
 
 use std::fmt;
+#[cfg(unix_socket)]
+use std::path::{Path, PathBuf};
 #[cfg(native)]
 use std::sync::Arc;
+#[cfg(onecrl)]
+use std::time::Duration;
 #[cfg(http3)]
 use std::{future::Future, pin::Pin};
 
@@ -58,6 +62,9 @@ pub(crate) mod happy_eyeballs;
 pub(crate) mod hyper_io;
 #[cfg(tls_native)]
 pub(crate) mod native_tls_stream;
+// The OneCRL baseline, wrapped around the webpki verifiers (`tls` engine).
+#[cfg(onecrl)]
+mod onecrl;
 // The hyper backend's per-origin connection pool; other backends pool through
 // their platform.
 #[cfg(all(connector, feature = "hyper-backend"))]
@@ -100,6 +107,10 @@ pub struct Transport {
 struct Inner {
     proxy: Proxy,
     extra_roots: Vec<CertificateDer<'static>>,
+    /// The unix domain socket every connection dials instead of a host:port,
+    /// when the transport was built with one.
+    #[cfg(unix_socket)]
+    unix_socket: Option<PathBuf>,
     /// Platform roots plus extras as PEM, for libcurl. `None` without extras.
     #[cfg(feature = "curl-backend")]
     ca_bundle: Option<Vec<u8>>,
@@ -135,24 +146,28 @@ impl Transport {
     /// on Android before the JVM has been registered through `ndk-context`. Use
     /// [`Transport::builder`] and [`TransportBuilder::build`] to handle that
     /// as an error instead.
+    #[cfg(native)]
     #[must_use]
     pub fn system() -> Self {
-        #[cfg(native)]
-        {
-            // Immutable, computed once: the one process-wide value zenwave keeps.
-            static SYSTEM: std::sync::OnceLock<Transport> = std::sync::OnceLock::new();
-            SYSTEM
-                .get_or_init(|| {
-                    Self::builder().build().unwrap_or_else(|error| {
-                        panic!("zenwave: the system transport cannot be initialised: {error}")
-                    })
+        // Immutable, computed once: the one process-wide value zenwave keeps.
+        static SYSTEM: std::sync::OnceLock<Transport> = std::sync::OnceLock::new();
+        SYSTEM
+            .get_or_init(|| {
+                Self::builder().build().unwrap_or_else(|error| {
+                    panic!("zenwave: the system transport cannot be initialised: {error}")
                 })
-                .clone()
-        }
-        #[cfg(not(native))]
-        {
-            Self {}
-        }
+            })
+            .clone()
+    }
+
+    /// The platform default: system proxy settings and the system trust store.
+    ///
+    /// On wasm32 the browser owns proxying and trust, so the transport
+    /// carries no configuration at all.
+    #[cfg(not(native))]
+    #[must_use]
+    pub const fn system() -> Self {
+        Self {}
     }
 
     /// Start describing a custom transport.
@@ -173,6 +188,13 @@ impl Transport {
     #[allow(dead_code)] // consumed by the curl and Apple backends
     pub(crate) fn extra_roots(&self) -> &[CertificateDer<'static>] {
         &self.inner.extra_roots
+    }
+
+    /// The unix domain socket every connection dials, when the transport was
+    /// built with one.
+    #[cfg(unix_socket)]
+    pub(crate) fn unix_socket(&self) -> Option<&Path> {
+        self.inner.unix_socket.as_deref()
     }
 
     #[cfg(tls_engine)]
@@ -221,6 +243,8 @@ impl fmt::Debug for Transport {
         debug
             .field("proxy", &self.inner.proxy)
             .field("extra_roots", &self.inner.extra_roots.len());
+        #[cfg(unix_socket)]
+        debug.field("unix_socket", &self.inner.unix_socket);
         debug.finish_non_exhaustive()
     }
 }
@@ -236,6 +260,11 @@ pub struct TransportBuilder {
     proxy: Option<Proxy>,
     #[cfg(native)]
     extra_roots: Vec<CertificateDer<'static>>,
+    #[cfg(unix_socket)]
+    unix_socket: Option<PathBuf>,
+    /// OneCRL additions refresh — enabled by [`Self::onecrl_refresh`].
+    #[cfg(onecrl)]
+    onecrl: onecrl::refresh::Refresh,
     /// Resolver configuration override — tests point it at an in-process
     /// DNS server instead of the system's.
     #[cfg(all(http3, not(target_os = "android")))]
@@ -249,6 +278,10 @@ impl fmt::Debug for TransportBuilder {
         debug
             .field("proxy", &self.proxy)
             .field("extra_roots", &self.extra_roots.len());
+        #[cfg(unix_socket)]
+        debug.field("unix_socket", &self.unix_socket);
+        #[cfg(onecrl)]
+        debug.field("onecrl_refresh", &self.onecrl.interval);
         debug.finish_non_exhaustive()
     }
 }
@@ -287,6 +320,51 @@ impl TransportBuilder {
         self
     }
 
+    /// Route every connection through the unix domain socket at `path` — the
+    /// `curl --unix-socket` model: request URIs stay ordinary
+    /// `http(s)://host/path`, so `Host` headers and TLS server names keep
+    /// their usual meaning, and an `https` request wraps the socket's byte
+    /// stream in TLS.
+    ///
+    /// Proxy rules do not apply: no proxy can reach a local socket. The
+    /// hyper and curl backends serve such a transport; `URLSession` cannot
+    /// and reports an error per request.
+    #[cfg(unix_socket)]
+    #[must_use]
+    pub fn unix_socket(mut self, path: impl Into<PathBuf>) -> Self {
+        self.unix_socket = Some(path.into());
+        self
+    }
+
+    /// Keep the OneCRL blocklist current past the
+    /// compiled baseline: every `interval`, fetch the
+    /// Remote Settings changes since the newest record
+    /// seen, add them to the lookup, and persist them
+    /// under `dirs::cache_dir()/zenwave/onecrl/` so the
+    /// next process starts from them. On Android the
+    /// cache directory is the app's `Context.getCacheDir()`.
+    #[cfg(onecrl)]
+    #[must_use]
+    pub const fn onecrl_refresh(mut self, interval: Duration) -> Self {
+        self.onecrl.interval = Some(interval);
+        self
+    }
+
+    /// Point OneCRL refresh at `endpoint`, persisting under `cache_dir`
+    /// instead of the platform cache directory — a constructor for tests,
+    /// not a runtime hook.
+    #[cfg(all(onecrl, test))]
+    #[must_use]
+    pub(crate) fn onecrl_refresh_endpoint(
+        mut self,
+        endpoint: &str,
+        cache_dir: std::path::PathBuf,
+    ) -> Self {
+        endpoint.clone_into(&mut self.onecrl.endpoint);
+        self.onecrl.cache_dir = Some(cache_dir);
+        self
+    }
+
     /// Resolve through `config` instead of the system resolver
     /// configuration — a constructor for tests, not a runtime hook.
     #[cfg(all(http3, not(target_os = "android")))]
@@ -302,12 +380,27 @@ impl TransportBuilder {
     /// # Errors
     ///
     /// Returns [`Error::Tls`] when a certificate cannot be parsed or the
-    /// platform trust store cannot be initialised.
+    /// platform trust store cannot be initialised. With OneCRL refresh
+    /// enabled it also fails with [`Error::Io`] when the platform has no
+    /// cache directory for the persisted additions.
+    #[cfg(native)]
     pub fn build(self) -> Result<Transport, Error> {
-        #[cfg(native)]
         {
+            // Resolving the refresh plan here — not on the refresher thread —
+            // lets `build` report a missing cache directory.
+            #[cfg(onecrl)]
+            let refresh = self.onecrl.resolve()?.map(|plan| {
+                (
+                    plan,
+                    Arc::new(arc_swap::ArcSwap::from_pointee(onecrl::Additions::default())),
+                )
+            });
             #[cfg(tls_engine)]
-            let tls = tls::TlsConnector::new(&self.extra_roots)?;
+            let tls = tls::TlsConnector::new(
+                &self.extra_roots,
+                #[cfg(onecrl)]
+                refresh.as_ref().map(|(_, additions)| Arc::clone(additions)),
+            )?;
             #[cfg(feature = "curl-backend")]
             let ca_bundle = if self.extra_roots.is_empty() {
                 None
@@ -329,10 +422,12 @@ impl TransportBuilder {
             });
             #[cfg(all(http3, target_os = "android"))]
             let dns = dns::Config;
-            Ok(Transport {
+            let transport = Transport {
                 inner: Arc::new(Inner {
                     proxy: self.proxy.unwrap_or_else(Proxy::system),
                     extra_roots: self.extra_roots,
+                    #[cfg(unix_socket)]
+                    unix_socket: self.unix_socket,
                     #[cfg(feature = "curl-backend")]
                     ca_bundle,
                     #[cfg(tls_engine)]
@@ -346,11 +441,25 @@ impl TransportBuilder {
                     #[cfg(all(http3, not(target_os = "android")))]
                     resolver: once_cell::sync::OnceCell::new(),
                 }),
-            })
+            };
+            // The refresher holds a `Weak`; spawning after `inner` exists also
+            // covers the thread failing to start as a build error.
+            #[cfg(onecrl)]
+            if let Some((plan, additions)) = refresh {
+                onecrl::refresh::spawn(&transport.inner, additions, plan)?;
+            }
+            Ok(transport)
         }
-        #[cfg(not(native))]
-        {
-            Ok(Transport {})
-        }
+    }
+
+    /// Build the transport. The browser owns proxying and trust, so there
+    /// is nothing to load.
+    ///
+    /// # Errors
+    ///
+    /// Never fails on wasm32; the `Result` keeps the native signature.
+    #[cfg(not(native))]
+    pub const fn build(self) -> Result<Transport, Error> {
+        Ok(Transport {})
     }
 }

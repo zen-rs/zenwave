@@ -10,6 +10,8 @@
 //! HTTPS-RR knowledge and the h3 handle join the entry in #69 as plain
 //! additional fields.
 
+#[cfg(feature = "http2")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::HashMap,
     fmt,
@@ -41,6 +43,8 @@ use crate::backend::{
 pub const MAX_H1_PER_ORIGIN: usize = 6;
 
 /// An idle h1 connection is dropped once it has gone unused for this long.
+/// The same window bounds a pooled h3 connection: QUIC keep-alives stop the
+/// protocol's own idle timeout from closing it, so the pool applies its own.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// How long a racing QUIC dial is given to finish before it loses; a detached
@@ -92,7 +96,7 @@ pub struct OriginEntry {
     h1_slots: Arc<Semaphore>,
     /// The origin's shared h2 handle; clones multiplex over one connection.
     #[cfg(feature = "http2")]
-    h2: Mutex<Option<http2::SendRequest<http_kit::Body>>>,
+    h2: Mutex<Option<H2Handle>>,
     /// The protocol the origin speaks: `Some` once a dial negotiated it, or
     /// immediately for plaintext — `http` has no ALPN, so it can only be h1.
     /// A known-h1 origin dials in parallel under `h1_slots` while anything
@@ -100,8 +104,15 @@ pub struct OriginEntry {
     protocol: Mutex<Option<Protocol>>,
     /// The origin's shared h3 handle; clones multiplex over one QUIC
     /// connection. Like h2, concurrent dials coalesce through `dialing`.
+    /// Unlike h2 the handle also expires: keep-alive packets stop the QUIC
+    /// idle timeout closing a quiet connection, so `idle_timeout` below
+    /// bounds how long it may sit unused.
     #[cfg(http3)]
-    h3: Mutex<Option<H3Connection>>,
+    h3: Mutex<Option<PooledH3>>,
+    /// The pool's idle window, cached here so `insert_h3` — reached without
+    /// a `Pool` handle — applies the same bound the checkouts do.
+    #[cfg(http3)]
+    idle_timeout: Duration,
     /// The h3 alternative the origin last advertised through `Alt-Svc`.
     #[cfg(http3)]
     alt_svc: Mutex<Option<AltSvc>>,
@@ -195,7 +206,7 @@ impl Drop for DiscoveryGuard {
 }
 
 impl OriginEntry {
-    fn new(origin: &Origin) -> Self {
+    fn new(origin: &Origin, #[cfg(http3)] idle_timeout: Duration) -> Self {
         Self {
             h1_idle: Mutex::new(Vec::new()),
             h1_slots: Arc::new(Semaphore::new(MAX_H1_PER_ORIGIN)),
@@ -204,6 +215,8 @@ impl OriginEntry {
             protocol: Mutex::new((origin.scheme == Scheme::HTTP).then_some(Protocol::Http1)),
             #[cfg(http3)]
             h3: Mutex::new(None),
+            #[cfg(http3)]
+            idle_timeout,
             #[cfg(http3)]
             alt_svc: Mutex::new(None),
             #[cfg(http3)]
@@ -240,7 +253,7 @@ impl OriginEntry {
         #[cfg(feature = "http2")]
         {
             let mut h2 = self.h2.lock().expect("pool state poisoned");
-            if h2.as_ref().is_some_and(http2::SendRequest::is_closed) {
+            if h2.as_ref().is_some_and(|handle| !handle.usable()) {
                 *h2 = None;
             }
             if h2.is_some() {
@@ -263,7 +276,10 @@ impl OriginEntry {
     fn has_live_h3(&self) -> bool {
         let live = {
             let mut h3 = self.h3.lock().expect("pool state poisoned");
-            if h3.as_ref().is_some_and(H3Connection::is_closed) {
+            if h3
+                .as_ref()
+                .is_some_and(|pooled| pooled.evictable(&self.idle_timeout))
+            {
                 *h3 = None;
             }
             h3.is_some()
@@ -412,13 +428,20 @@ impl OriginEntry {
         *self.h3_backoff.lock().expect("pool state poisoned") = backoff;
     }
 
-    /// Store `connection` as the origin's shared h3 handle unless a live one
-    /// is already stored — a second racer's win replaces only a dead handle.
+    /// Store `connection` as the origin's shared h3 handle unless a live,
+    /// unexpired one is already stored — a second racer's win replaces only
+    /// a dead or idle-bound handle.
     #[cfg(http3)]
     pub(crate) fn insert_h3(&self, connection: H3Connection) {
         let mut h3 = self.h3.lock().expect("pool state poisoned");
-        if h3.as_ref().is_none_or(H3Connection::is_closed) {
-            *h3 = Some(connection);
+        if h3
+            .as_ref()
+            .is_none_or(|pooled| pooled.evictable(&self.idle_timeout))
+        {
+            *h3 = Some(PooledH3 {
+                connection,
+                idle_since: Instant::now(),
+            });
         }
     }
 
@@ -426,7 +449,11 @@ impl OriginEntry {
     /// evicted at checkout.
     #[cfg(all(http3, test))]
     pub(crate) fn h3_connection(&self) -> Option<H3Connection> {
-        self.h3.lock().expect("pool state poisoned").clone()
+        self.h3
+            .lock()
+            .expect("pool state poisoned")
+            .as_ref()
+            .map(|pooled| pooled.connection.clone())
     }
 }
 
@@ -477,7 +504,7 @@ pub enum Checkout {
     H3(H3Connection),
     /// A clone of the origin's live h2 handle, ready to send.
     #[cfg(feature = "http2")]
-    H2(http2::SendRequest<http_kit::Body>),
+    H2(H2Handle),
     /// An idle h1 connection, exclusively leased until the response body ends.
     H1(H1Lease),
     /// Nothing reusable: dial a new connection holding this permit.
@@ -674,8 +701,8 @@ impl Pool {
                 }
             }
             #[cfg(feature = "http2")]
-            if pooled && let Some(sender) = live_h2(&entry) {
-                return Checkout::H2(sender);
+            if pooled && let Some(handle) = live_h2(&entry) {
+                return Checkout::H2(handle);
             }
             // An idle h1 connection exists only after `insert_h1` recorded
             // the protocol, so `h1_idle` only has to be consulted on the
@@ -719,8 +746,8 @@ impl Pool {
             // dials so one handshake serves every waiter.
             let dialing = entry.dialing.lock_arc().await;
             #[cfg(feature = "http2")]
-            if pooled && let Some(sender) = live_h2(&entry) {
-                return Checkout::H2(sender);
+            if pooled && let Some(handle) = live_h2(&entry) {
+                return Checkout::H2(handle);
             }
             if matches!(
                 *entry.protocol.lock().expect("pool state poisoned"),
@@ -783,7 +810,10 @@ impl Pool {
     #[cfg(feature = "http2")]
     pub fn insert_h2(permit: DialPermit, sender: http2::SendRequest<http_kit::Body>) {
         *permit.entry.protocol.lock().expect("pool state poisoned") = Some(Protocol::Http2);
-        *permit.entry.h2.lock().expect("pool state poisoned") = Some(sender);
+        *permit.entry.h2.lock().expect("pool state poisoned") = Some(H2Handle {
+            sender,
+            going_away: Arc::new(AtomicBool::new(false)),
+        });
         // Idle h1 connections the dial replaces can never be checked out
         // again; drop them rather than leaving their drivers parked.
         permit
@@ -803,7 +833,11 @@ impl Pool {
         if let Some(entry) = origins.get(origin) {
             return entry.clone();
         }
-        let entry = Arc::new(OriginEntry::new(origin));
+        let entry = Arc::new(OriginEntry::new(
+            origin,
+            #[cfg(http3)]
+            self.idle_timeout,
+        ));
         origins.insert(origin.clone(), entry.clone());
         origins.retain(|_, entry| {
             Arc::strong_count(entry) > 1 || entry.has_live_connections(self.idle_timeout)
@@ -848,36 +882,91 @@ impl Pool {
     }
 }
 
-/// A clone of `entry`'s live h2 handle, or `None` — a dead one is evicted so
-/// the next checkout re-dials. `is_closed` is the whole liveness check: the
-/// h2 dispatcher is always ready to accept a stream while it is open.
+/// A cloneable h2 connection handle: `sender` multiplexes requests over the
+/// shared connection, and `going_away` lets any handout flag the connection
+/// as ending. A remote GOAWAY makes a send fail but leaves the connection
+/// alive — and `is_closed` false — until the connection task finishes, so
+/// the flag is what keeps a refused handle out of the pool meanwhile.
 #[cfg(feature = "http2")]
-fn live_h2(entry: &OriginEntry) -> Option<http2::SendRequest<http_kit::Body>> {
+#[derive(Clone)]
+pub struct H2Handle {
+    sender: http2::SendRequest<http_kit::Body>,
+    going_away: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "http2")]
+impl H2Handle {
+    /// The h2 send handle.
+    pub const fn sender(&mut self) -> &mut http2::SendRequest<http_kit::Body> {
+        &mut self.sender
+    }
+
+    /// Mark the connection as going away: liveness checks evict it instead
+    /// of handing it out again.
+    pub fn flag_going_away(&self) {
+        self.going_away.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the handle may still be handed out: not flagged going-away
+    /// and not closed.
+    fn usable(&self) -> bool {
+        !self.going_away.load(Ordering::Relaxed) && !self.sender.is_closed()
+    }
+}
+
+/// A clone of `entry`'s live h2 handle, or `None` — a dead or going-away one
+/// is evicted so the next checkout re-dials. `is_closed` catches a connection
+/// whose task ended; `going_away` catches one the server is closing that a
+/// refused send already observed.
+#[cfg(feature = "http2")]
+fn live_h2(entry: &OriginEntry) -> Option<H2Handle> {
     let mut h2 = entry.h2.lock().expect("pool state poisoned");
     match h2.as_ref() {
-        Some(sender) if sender.is_closed() => {
+        Some(handle) if !handle.usable() => {
             *h2 = None;
             None
         }
-        Some(sender) => Some(sender.clone()),
+        Some(handle) => Some(handle.clone()),
         None => None,
     }
 }
 
-/// A clone of `entry`'s live h3 handle, or `None` — a dead one is evicted so
-/// the next checkout re-dials. `is_closed` is the whole liveness check: the
-/// h3 dispatcher accepts new streams while the QUIC connection is open.
+/// A pooled h3 connection and when the pool last handed it out. QUIC
+/// keep-alives mean an idle connection no longer closes itself, so the pool
+/// bounds it instead: `idle_since` refreshes on every hand-out and a handle
+/// unused for the pool's idle window is evicted — dropping the last clone
+/// ends the h3 driver, which closes the QUIC connection.
+#[cfg(http3)]
+struct PooledH3 {
+    connection: H3Connection,
+    idle_since: Instant,
+}
+
+#[cfg(http3)]
+impl PooledH3 {
+    /// Whether the handle should leave the pool: the connection is dead or
+    /// has gone unhanded-out for longer than `idle_timeout`.
+    fn evictable(&self, idle_timeout: &Duration) -> bool {
+        self.connection.is_closed() || self.idle_since.elapsed() >= *idle_timeout
+    }
+}
+
+/// A clone of `entry`'s live h3 handle, or `None` — a dead or idle-expired
+/// one is evicted so the next checkout re-dials. A surviving hand-out
+/// refreshes `idle_since`: a connection serving requests is not idle.
 #[cfg(http3)]
 fn live_h3(entry: &OriginEntry) -> Option<H3Connection> {
     let mut h3 = entry.h3.lock().expect("pool state poisoned");
-    match h3.as_ref() {
-        Some(connection) if connection.is_closed() => {
-            *h3 = None;
-            None
-        }
-        Some(connection) => Some(connection.clone()),
-        None => None,
+    if h3
+        .as_ref()
+        .is_some_and(|pooled| pooled.evictable(&entry.idle_timeout))
+    {
+        *h3 = None;
     }
+    h3.as_mut().map(|pooled| {
+        pooled.idle_since = Instant::now();
+        pooled.connection.clone()
+    })
 }
 
 impl fmt::Debug for Pool {
@@ -1251,6 +1340,38 @@ mod tests {
             assert!(
                 matches!(second.await, Checkout::H3(_)),
                 "once the dial lands its h3 handle, the waiter must ride it"
+            );
+        });
+    }
+
+    /// A pooled h3 connection is bounded by the pool's idle window: QUIC
+    /// keep-alives would otherwise hold it open indefinitely. Here the
+    /// window is zero, so a live-but-unused handle must be evicted on read.
+    #[cfg(http3)]
+    #[test]
+    fn idle_h3_connections_are_evicted() {
+        block_on(async {
+            use crate::backend::test_support;
+            let server = test_support::H3Server::start(&test_support::TestCa::new());
+            let (_transport, connection) = test_support::h3_connection(&server).await;
+
+            let pool = Pool {
+                origins: Mutex::new(HashMap::new()),
+                idle_timeout: Duration::ZERO,
+            };
+            let origin = https_origin();
+            let entry = pool.entry(&origin);
+            entry.insert_h3(connection);
+            assert!(
+                matches!(
+                    pool.checkout(origin, Reuse::Pooled, H3::Allowed).await,
+                    Checkout::Dial { h3_port: None, .. }
+                ),
+                "an idle-expired h3 connection must be evicted, not reused"
+            );
+            assert!(
+                entry.h3_connection().is_none(),
+                "the expired handle must be gone"
             );
         });
     }

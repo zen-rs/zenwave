@@ -2,6 +2,12 @@ name: Test
 
 on:
   workflow_call:
+    inputs:
+      # `full` for pull requests into `main`, `linux` otherwise; computed
+      # by the `tier` job in ci.yml.
+      tier:
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(inputs.tier == 'full' && '["ubuntu-latest","windows-latest","macos-latest"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -35,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(inputs.tier == 'full' && '["ubuntu-latest","windows-latest","macos-latest"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -43,8 +49,9 @@ jobs:
         with:
           shared-key: test-${{ matrix.os }}
       - uses: taiki-e/install-action@nextest
+      # `onecrl` only compiles where webpki verifies (Linux here); elsewhere it is a no-op.
       - name: Run hyper backend tests (rustls)
-        run: cargo nextest run --no-default-features --features hyper-backend,rustls,ws --workspace
+        run: cargo nextest run --no-default-features --features hyper-backend,rustls,ws,onecrl --workspace
       - name: Run hyper backend tests (native-tls)
         run: cargo nextest run --no-default-features --features hyper-backend,native-tls,ws --workspace
       - name: Run hyper backend doctests
@@ -52,6 +59,7 @@ jobs:
 
   wasm-linux:
     name: wasm-pack (Linux - ${{ matrix.browser }})
+    if: ${{ inputs.tier == 'full' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -72,6 +80,7 @@ jobs:
 
   wasm-macos:
     name: wasm-pack (macOS Safari)
+    if: ${{ inputs.tier == 'full' }}
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
@@ -95,6 +104,7 @@ jobs:
 
   apple-backend:
     name: Apple backend (macOS)
+    if: ${{ inputs.tier == 'full' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -109,6 +119,7 @@ jobs:
 
   ios-simulator:
     name: iOS simulator
+    if: ${{ inputs.tier == 'full' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -123,6 +134,7 @@ jobs:
 
   workerd:
     name: Cloudflare Worker (workerd via wrangler)
+    if: ${{ inputs.tier == 'full' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

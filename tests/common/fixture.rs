@@ -13,22 +13,28 @@ mod hyper_io;
 
 use std::{
     convert::Infallible,
+    io,
     net::TcpListener,
+    pin::Pin,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
+    task::{Context, Poll},
     thread,
     time::Duration,
 };
 
 use async_io::Async;
+use async_tungstenite::{WebSocketStream, tungstenite};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use futures_io::{AsyncRead, AsyncWrite};
 use futures_util::{StreamExt as _, stream};
 use http_body_util::{BodyExt as _, Full, StreamBody, combinators::BoxBody};
 use hyper::{
     body::{Bytes, Frame, Incoming},
+    rt::{Read as _, Write as _},
     service::service_fn,
 };
 use url::Url;
@@ -139,6 +145,11 @@ pub fn httpbin_uri(path: &str) -> String {
     format!("{}/{}", httpbin_base(), path.trim_start_matches('/'))
 }
 
+/// Build a `ws://` URL against the local test server.
+pub fn websocket_uri(path: &str) -> String {
+    httpbin_uri(path).replacen("http://", "ws://", 1)
+}
+
 pub fn test_server() -> &'static TestServer {
     static INSTANCE: OnceLock<TestServer> = OnceLock::new();
     INSTANCE.get_or_init(TestServer::start)
@@ -195,9 +206,110 @@ fn run_server(listener: &TcpListener, accepted: &AtomicUsize) {
             let io = HyperIo(Async::new(stream).expect("async socket wrapper"));
             let conn = hyper::server::conn::http1::Builder::new()
                 .keep_alive(true)
-                .serve_connection(io, service_fn(route));
+                .serve_connection(io, service_fn(route))
+                .with_upgrades();
             let _ = async_io::block_on(conn);
         });
+    }
+}
+
+/// The path the websocket echo endpoint answers.
+const WEBSOCKET_ECHO_PATH: &str = "/ws/echo";
+
+/// Whether the request is a websocket upgrade aimed at the echo endpoint.
+fn is_echo_upgrade(request: &hyper::Request<Incoming>) -> bool {
+    request.method() == hyper::Method::GET
+        && request.uri().path() == WEBSOCKET_ECHO_PATH
+        && request
+            .headers()
+            .get(hyper::header::UPGRADE)
+            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
+        && request
+            .headers()
+            .contains_key(hyper::header::SEC_WEBSOCKET_KEY)
+}
+
+/// Answer an echo upgrade with 101 and hand the socket to tungstenite on a
+/// dedicated thread. `hyper::upgrade::on` resolves only after hyper writes
+/// the response, which is why the connection is served `with_upgrades`.
+fn accept_echo_upgrade(
+    request: hyper::Request<Incoming>,
+) -> hyper::Response<BoxBody<Bytes, Infallible>> {
+    let accept = tungstenite::handshake::derive_accept_key(
+        request
+            .headers()
+            .get(hyper::header::SEC_WEBSOCKET_KEY)
+            .expect("a checked echo upgrade carries a key")
+            .as_bytes(),
+    );
+    thread::spawn(move || {
+        async_io::block_on(async move {
+            let Ok(upgraded) = hyper::upgrade::on(request).await else {
+                return;
+            };
+            let _ = websocket_echo(upgraded).await;
+        });
+    });
+    hyper::Response::builder()
+        .status(hyper::StatusCode::SWITCHING_PROTOCOLS)
+        .header(hyper::header::CONNECTION, "upgrade")
+        .header(hyper::header::UPGRADE, "websocket")
+        .header(hyper::header::SEC_WEBSOCKET_ACCEPT, accept)
+        .body(TestBody::Full(Vec::new()).into())
+        .expect("a 101 response builds")
+}
+
+/// Echo each text or binary message back until the peer closes; pings and
+/// the close handshake are answered by tungstenite itself.
+async fn websocket_echo(upgraded: hyper::upgrade::Upgraded) -> Result<(), tungstenite::Error> {
+    let mut socket = WebSocketStream::from_raw_socket(
+        UpgradedIo(upgraded),
+        tungstenite::protocol::Role::Server,
+        None,
+    )
+    .await;
+    while let Some(Ok(message)) = socket.next().await {
+        if message.is_text() || message.is_binary() {
+            socket.send(message).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The upgraded connection speaks hyper's I/O traits; tungstenite drives
+/// `futures-io` streams, so adapt it back the way `HyperIo` adapts forward.
+struct UpgradedIo(hyper::upgrade::Upgraded);
+
+impl AsyncRead for UpgradedIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut read_buf = hyper::rt::ReadBuf::new(buf);
+        match Pin::new(&mut self.0).poll_read(cx, read_buf.unfilled()) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for UpgradedIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
     }
 }
 
@@ -206,6 +318,12 @@ fn run_server(listener: &TcpListener, accepted: &AtomicUsize) {
 async fn route(
     request: hyper::Request<Incoming>,
 ) -> Result<hyper::Response<BoxBody<Bytes, Infallible>>, Infallible> {
+    // A websocket echo upgrade leaves hyper after the 101 response; the
+    // connection is served `with_upgrades` so the socket is handed to the
+    // waiting echo task instead of dropped.
+    if is_echo_upgrade(&request) {
+        return Ok(accept_echo_upgrade(request));
+    }
     let (parts, body) = request.into_parts();
     let body = body
         .collect()
@@ -324,7 +442,7 @@ fn handle_request(request: &TestRequest) -> TestResponse {
                 return handle_basic_auth(request, stripped);
             }
             if let Some(stripped) = path.strip_prefix("/cookies/set/") {
-                return handle_set_cookie(stripped);
+                return handle_set_cookie(stripped, &query);
             }
             if let Some(stripped) = path.strip_prefix("/status/") {
                 return handle_status(stripped);
@@ -357,11 +475,25 @@ fn handle_basic_auth(request: &TestRequest, path: &str) -> TestResponse {
     text_response(401, "unauthorized")
 }
 
-fn handle_set_cookie(path: &str) -> TestResponse {
+fn handle_set_cookie(path: &str, query: &[(String, String)]) -> TestResponse {
     let mut parts = path.split('/');
     let name = parts.next().unwrap_or_default();
     let value = parts.next().unwrap_or_default();
-    text_response(200, "cookie set").with_header("Set-Cookie", format!("{name}={value}"))
+    // `?path=/x` scopes the cookie. Without it the cookie gets httpbin's
+    // `Path=/`: the RFC default path of the deep `/cookies/set/...` route
+    // would hide it from `/cookies`.
+    let path = query
+        .iter()
+        .find_map(|(key, value)| (key == "path").then_some(value.as_str()))
+        .unwrap_or("/");
+    // `?domain=example.co.uk` adds a `Domain` attribute so tests can exercise
+    // RFC 6265 domain matching (and public-suffix rejection).
+    let domain = query
+        .iter()
+        .find_map(|(key, value)| (key == "domain").then_some(format!("; Domain={value}")))
+        .unwrap_or_default();
+    text_response(200, "cookie set")
+        .with_header("Set-Cookie", format!("{name}={value}; Path={path}{domain}"))
 }
 
 fn handle_status(code: &str) -> TestResponse {
@@ -401,7 +533,13 @@ fn handle_redirect_to(query: &[(String, String)]) -> TestResponse {
         .iter()
         .find(|(key, _)| key == "url")
         .map_or("/", |(_, value)| value.as_str());
-    redirect_response(target)
+    let mut response = redirect_response(target);
+    // `?set-cookie=name=value` attaches a Set-Cookie to the redirect
+    // itself, the login-flow shape per-hop cookie handling exists for.
+    for (_, cookie) in query.iter().filter(|(key, _)| key == "set-cookie") {
+        response = response.with_header("Set-Cookie", cookie.clone());
+    }
+    response
 }
 
 fn redirect_response(location: &str) -> TestResponse {

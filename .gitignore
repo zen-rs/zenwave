@@ -8,3 +8,5 @@ tests/workerd/.skyzen/
 tests/fixture-server/target/
 .wrangler/
 tests/workerd/wrangler-dev.log
+onecrl.json
+public_suffix_list.dat

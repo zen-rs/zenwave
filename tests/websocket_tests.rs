@@ -1,5 +1,7 @@
 #![allow(missing_docs)]
 #![cfg(all(not(target_arch = "wasm32"), feature = "ws"))]
+mod common;
+
 use std::{
     env,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -140,6 +142,23 @@ async fn websocket_respects_max_message_size_config() {
     }
 
     server.await;
+}
+
+#[test_executors::async_test]
+async fn websocket_fixture_echo_roundtrip() {
+    let client = zenwave::websocket::connect(common::websocket_uri("/ws/echo"))
+        .await
+        .unwrap();
+
+    client.send_text("fixture echo").await.unwrap();
+    let message = client.recv().await.unwrap().expect("echo message");
+    assert_eq!(message.as_text(), Some("fixture echo"));
+
+    client.send_binary(vec![9_u8, 8, 7]).await.unwrap();
+    let message = client.recv().await.unwrap().expect("echo message");
+    assert_eq!(message.as_bytes(), Some(&[9_u8, 8, 7][..]));
+
+    client.close().await.unwrap();
 }
 
 #[test_executors::async_test]

@@ -1,22 +1,23 @@
 //! Tests for middleware components in Zenwave
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Duration;
 use std::{
     convert::Infallible,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
 };
 use zenwave::cookie::CookieStore;
 
+#[cfg(not(target_arch = "wasm32"))]
+use zenwave::HttpError;
 use zenwave::redirect::FollowRedirect;
-use zenwave::{
-    Body, Client, Endpoint, HttpError, Middleware, Request, Response, StatusCode, client,
-};
+use zenwave::{Body, Client, Endpoint, Middleware, Request, Response, StatusCode, client};
 
 mod common;
-use common::httpbin_uri;
+use common::{httpbin_base, httpbin_uri};
 
 #[test_executors::async_test]
 async fn test_cookie_store_middleware() {
@@ -37,6 +38,176 @@ async fn test_cookie_store_middleware() {
     let body = response.into_body().into_string().await.unwrap();
     assert!(body.contains("test"));
     assert!(body.contains("value"));
+}
+
+#[test_executors::async_test]
+async fn test_cookies_sent_only_to_matching_path() {
+    let mut client = client().enable_cookie();
+
+    client
+        .get(httpbin_uri("/cookies/set/pathed/1?path=/headers"))
+        .unwrap()
+        .await
+        .unwrap();
+
+    // Reaching the cookie's own Path sends it.
+    let body = client
+        .get(httpbin_uri("/headers"))
+        .unwrap()
+        .await
+        .unwrap()
+        .into_body()
+        .into_string()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("pathed=1"),
+        "cookie missing on its own path: {body}"
+    );
+
+    // Anywhere else it stays in the jar.
+    let body = client
+        .get(httpbin_uri("/cookies"))
+        .unwrap()
+        .await
+        .unwrap()
+        .into_body()
+        .into_string()
+        .await
+        .unwrap();
+    assert!(
+        !body.contains("pathed"),
+        "path-scoped cookie leaked: {body}"
+    );
+}
+
+#[test_executors::async_test]
+async fn test_cookie_set_by_redirect_reaches_next_hop() {
+    let mut client = client().enable_cookie();
+
+    // The 302 sets the session cookie; the hop it lands on must send it.
+    let response = client
+        .get(httpbin_uri("/redirect-to?url=/cookies&set-cookie=sess=abc"))
+        .unwrap()
+        .await
+        .unwrap();
+    let body = response.into_body().into_string().await.unwrap();
+    assert!(
+        body.contains("sess=abc"),
+        "redirect hop did not carry the cookie it set: {body}"
+    );
+}
+
+#[test_executors::async_test]
+async fn test_origin_scoped_cookie_not_sent_after_cross_origin_redirect() {
+    let mut client = client().enable_cookie();
+
+    // `localhost` and `127.0.0.1` are the same fixture but different
+    // origins: a host-only cookie for one must never reach the other.
+    let localhost = httpbin_base().replace("127.0.0.1", "localhost");
+    let target = httpbin_uri("/cookies")
+        .replace(':', "%3A")
+        .replace('/', "%2F");
+    let body = client
+        .get(format!(
+            "{localhost}/redirect-to?url={target}&set-cookie=onlyhost=1"
+        ))
+        .unwrap()
+        .await
+        .unwrap()
+        .into_body()
+        .into_string()
+        .await
+        .unwrap();
+    assert!(
+        !body.contains("onlyhost"),
+        "host-scoped cookie crossed origins: {body}"
+    );
+}
+
+/// A client whose plaintext requests all go through the fixture as a forward
+/// proxy: the proxy never resolves the request host, so the fixture answers
+/// URLs for hostnames no DNS record could give it — the only way to drive
+/// the cookie store with a real public suffix (`co.uk`) against it.
+#[cfg(all(not(target_arch = "wasm32"), feature = "public-suffix"))]
+fn proxied_client() -> impl Client {
+    let transport = zenwave::Transport::builder()
+        .proxy(zenwave::Proxy::builder().http(httpbin_base()).build())
+        .build()
+        .unwrap();
+    zenwave::client_with(transport).enable_cookie()
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "public-suffix"))]
+#[test_executors::async_test]
+async fn test_public_suffix_domain_cookie_is_rejected() {
+    let mut client = proxied_client();
+
+    // `co.uk` is a listed public suffix: a subdomain may not set it as a
+    // cookie Domain, so this Set-Cookie is dropped entirely.
+    client
+        .get("http://shop.example.co.uk/cookies/set/suffix/1?domain=co.uk")
+        .unwrap()
+        .await
+        .unwrap();
+
+    // A sibling host under the suffix must never see it — without the
+    // suffix check the `co.uk`-scoped cookie would be sent here.
+    let body = client
+        .get("http://other.example.co.uk/cookies")
+        .unwrap()
+        .await
+        .unwrap()
+        .into_body()
+        .into_string()
+        .await
+        .unwrap();
+    assert!(
+        !body.contains("suffix"),
+        "public-suffix cookie leaked to a sibling host: {body}"
+    );
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "public-suffix"))]
+#[test_executors::async_test]
+async fn test_public_suffix_domain_cookie_from_suffix_host_is_host_only() {
+    let mut client = proxied_client();
+
+    // RFC 6265 §5.3 step 5: the request host is the suffix itself, so the
+    // Domain attribute collapses to host-only instead of being rejected.
+    client
+        .get("http://co.uk/cookies/set/apex/1?domain=co.uk")
+        .unwrap()
+        .await
+        .unwrap();
+
+    let body = client
+        .get("http://co.uk/cookies")
+        .unwrap()
+        .await
+        .unwrap()
+        .into_body()
+        .into_string()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("apex=1"),
+        "host-only suffix cookie missing on its own host: {body}"
+    );
+
+    let body = client
+        .get("http://www.example.co.uk/cookies")
+        .unwrap()
+        .await
+        .unwrap()
+        .into_body()
+        .into_string()
+        .await
+        .unwrap();
+    assert!(
+        !body.contains("apex"),
+        "host-only suffix cookie leaked to a subdomain: {body}"
+    );
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]

@@ -158,11 +158,11 @@ pub enum CookieErrorKind {
 
     /// Failed to parse cookie data.
     #[error("failed to parse cookies: {0}")]
-    ParseFailed(#[source] serde_json::Error),
+    ParseFailed(#[source] cookie_store::Error),
 
     /// Failed to persist cookies to disk.
     #[error("failed to persist cookies: {0}")]
-    PersistFailed(#[source] std::io::Error),
+    PersistFailed(#[source] cookie_store::Error),
 
     /// Invalid cookie header.
     #[error("invalid cookie header")]
@@ -239,6 +239,16 @@ impl Error {
     #[must_use]
     pub const fn is_timeout(&self) -> bool {
         matches!(self, Self::Timeout)
+    }
+
+    /// Check if this failure could succeed on another attempt.
+    ///
+    /// A broken connection, a timeout or an I/O error may be transient;
+    /// anything else — a malformed request, a refused credential, an HTTP
+    /// error status — fails the same way every time.
+    #[must_use]
+    pub const fn is_transient(&self) -> bool {
+        matches!(self, Self::Transport(_) | Self::Timeout | Self::Io(_))
     }
 
     /// Check if this is a client error (4xx HTTP status).
