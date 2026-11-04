@@ -24,7 +24,6 @@ include = [
     "/Cargo.toml",
     "/LICENSE",
     "/README.md",
-    "/_typos.toml",
     "/build.rs",
     "/clippy.toml",
     "/onecrl.json",
