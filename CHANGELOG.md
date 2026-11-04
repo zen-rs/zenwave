@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/zen-rs/zenwave/compare/v0.8.0...v0.8.1) - 2026-11-04
+
+### Other
+
+- drop the typos check
+
 ## [0.8.0](https://github.com/zen-rs/zenwave/compare/v0.7.1...v0.8.0) - 2026-10-29
 
 ### Added
