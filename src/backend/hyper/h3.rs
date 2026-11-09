@@ -103,7 +103,9 @@ impl H3Connection {
         &mut self,
         request: http::Request<http_kit::Body>,
     ) -> Result<http::Response<http_kit::Body>, Error> {
-        let (parts, mut body) = request.into_parts();
+        let (parts, body) = request.into_parts();
+        // QUIC streams cannot send a file, so file regions are read out here.
+        let mut body = body.into_data_stream();
         let mut stream = self
             .sender
             .send_request(http::Request::from_parts(parts, ()))
@@ -179,7 +181,8 @@ mod tests {
     }
 
     async fn body_bytes(body: http_kit::Body) -> Vec<u8> {
-        body.try_collect::<Vec<Bytes>>()
+        body.into_data_stream()
+            .try_collect::<Vec<Bytes>>()
             .await
             .expect("body is valid")
             .concat()
@@ -293,7 +296,7 @@ mod tests {
                 .await
                 .expect("response arrives while the body is still streaming");
             assert_eq!(response.status(), http::StatusCode::OK);
-            let mut body = response.into_body();
+            let mut body = response.into_body().into_data_stream();
             // The server is still holding the second chunk; the first must
             // already be readable.
             let first = body

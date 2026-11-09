@@ -219,10 +219,12 @@ async fn retry_attempts_a_read_once_body_once() {
     let mut request = http::Request::builder()
         .method(http::Method::PUT)
         .uri("https://example.com/stream")
-        .body(Body::from_reader(
-            futures_util::io::Cursor::new(b"streamed".to_vec()),
-            8,
-        ))
+        .body(Body::from_stream(futures_util::stream::iter([Ok::<
+            _,
+            std::io::Error,
+        >(
+            b"streamed".to_vec(),
+        )])))
         .unwrap();
     let result = client.respond(&mut request).await;
     assert!(matches!(result, Err(zenwave::Error::Transport(_))));

@@ -122,7 +122,7 @@ pub async fn download_to_path<T: crate::Client>(
 
     let response = builder.await.map_err(DownloadError::Remote)?;
     let status = response.status();
-    let mut body = response.into_body();
+    let mut body = response.into_body().into_data_stream();
 
     if !(status.is_success() || status == StatusCode::PARTIAL_CONTENT) {
         return Err(DownloadError::Upstream(status));

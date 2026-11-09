@@ -536,7 +536,7 @@ impl HyperBackend {
         let mut response = response.map(|body| match lease {
             // The h1 connection is reusable once the body is finished or
             // dropped, so the lease rides along with it.
-            Some(lease) => http_kit::Body::from_stream(LeaseReturn::new(body, lease)),
+            Some(lease) => http_kit::Body::from_frames(LeaseReturn::new(body, lease)),
             None => body,
         });
 
@@ -1043,7 +1043,7 @@ mod tests {
             server.finish();
             panic!("response headers did not arrive before body completion");
         };
-        let mut body = response.into_body();
+        let mut body = response.into_body().into_data_stream();
         let (first_result_tx, first_result_rx) = mpsc::sync_channel(1);
         let body_worker = thread::spawn(move || {
             let first = futures_executor::block_on(body.next());
