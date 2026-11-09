@@ -107,9 +107,10 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
 
         // A 307/308 hop re-sends the body when it can be replayed. `try_clone` answers that only
         // for an in-memory body, so the snapshot is taken before the inner client can consume
-        // it; `None` marks a body that cannot be re-sent.
-        let body = request.body().try_clone();
-        let had_body = request.body().is_empty() != Some(true);
+        // it; `None` marks a body that cannot be re-sent. Both track the *current* request —
+        // once a hop drops the body it stays dropped for the rest of the chain.
+        let mut body = request.body().try_clone();
+        let mut had_body = request.body().is_empty() != Some(true);
 
         loop {
             let response = self
@@ -155,16 +156,20 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
                 .parse()
                 .map_err(|_| FollowRedirectError::InvalidLocationHeader)?;
 
-            // RFC 9110 §15.4 as the clients implement it: a 303 re-fetches with `GET` unless the
-            // method already is `GET` or `HEAD`, a 301/302 does so only when the method was
-            // `POST`, and a 307/308 preserves method and body.
+            // RFC 9110 §15.4 as the clients implement it: a 303 is always a plain retrieval —
+            // `GET` unless the method already is `GET` or `HEAD`, and the body never rides
+            // along — a 301/302 does so only when the method was `POST`, and a 307/308
+            // preserves method and body.
             let status = response.status();
             let (next_method, keeps_body) = match status {
-                StatusCode::SEE_OTHER
-                    if current_method != Method::GET && current_method != Method::HEAD =>
-                {
-                    (Method::GET, false)
-                }
+                StatusCode::SEE_OTHER => (
+                    if current_method == Method::GET || current_method == Method::HEAD {
+                        current_method.clone()
+                    } else {
+                        Method::GET
+                    },
+                    false,
+                ),
                 StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND
                     if current_method == Method::POST =>
                 {
@@ -182,6 +187,14 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
                     None => Body::empty(),
                 }
             } else {
+                // The body is gone for the rest of the chain — and the headers that
+                // described it with it.
+                body = None;
+                had_body = false;
+                redirect_headers.remove(CONTENT_LENGTH);
+                redirect_headers.remove(CONTENT_TYPE);
+                redirect_headers.remove(CONTENT_ENCODING);
+                redirect_headers.remove(TRANSFER_ENCODING);
                 Body::empty()
             };
 
@@ -205,13 +218,6 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
 
             let mut headers = redirect_headers.clone();
             headers.remove(HOST);
-            if !keeps_body {
-                // The payload headers describe a body the hop no longer carries.
-                headers.remove(CONTENT_LENGTH);
-                headers.remove(CONTENT_TYPE);
-                headers.remove(CONTENT_ENCODING);
-                headers.remove(TRANSFER_ENCODING);
-            }
 
             // A hop keeps the request's extensions — the jar moves with them, and the next
             // `Cookie` header comes from it for the new URL — replacing the carried-over one,

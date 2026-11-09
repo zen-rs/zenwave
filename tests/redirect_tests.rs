@@ -388,6 +388,66 @@ async fn a_hop_carries_the_requests_extensions() {
     drop(state);
 }
 
+/// A body dropped on a downgrade stays dropped: a later 307 must not bring it
+/// — or its payload headers — back.
+#[test_executors::async_test]
+async fn a_downgrade_keeps_the_body_dropped_through_later_hops() {
+    let mock = MockClient::with_responses(vec![
+        redirect_response(StatusCode::FOUND, "/middle"),
+        redirect_response(StatusCode::TEMPORARY_REDIRECT, "/final"),
+        ok_response(),
+    ]);
+    let state = mock.state();
+    let mut client = FollowRedirect::new(mock);
+
+    let mut request = http::Request::builder()
+        .method(Method::POST)
+        .uri("https://example.com/start")
+        .header("content-type", "application/octet-stream")
+        .header("content-length", "11")
+        .body(Body::from("secret-data"))
+        .unwrap();
+
+    client.respond(&mut request).await.unwrap();
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.seen.len(), 3);
+    assert_eq!(state.seen[1].method, Method::GET);
+    assert_eq!(state.seen[2].method, Method::GET);
+    assert!(state.seen[2].body.is_empty(), "the body must not resurrect");
+    assert!(state.seen[2].content_type.is_none());
+    assert!(state.seen[2].content_length.is_none());
+    drop(state);
+}
+
+/// A 303 is a plain retrieval even when the method already is `GET`: a body —
+/// replayable or not — never rides along.
+#[test_executors::async_test]
+async fn see_other_drops_the_body_even_when_the_method_stays_get() {
+    let mock = MockClient::with_responses(vec![
+        redirect_response(StatusCode::SEE_OTHER, "/next"),
+        ok_response(),
+    ]);
+    let state = mock.state();
+    let mut client = FollowRedirect::new(mock);
+
+    let mut request = http::Request::builder()
+        .method(Method::GET)
+        .uri("https://example.com/thing")
+        .header("content-length", "4")
+        .body(Body::from("data"))
+        .unwrap();
+
+    client.respond(&mut request).await.unwrap();
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.seen.len(), 2);
+    assert_eq!(state.seen[1].method, Method::GET);
+    assert!(state.seen[1].body.is_empty());
+    assert!(state.seen[1].content_length.is_none());
+    drop(state);
+}
+
 fn status_response(status: StatusCode, location: Option<&str>) -> Response {
     let mut builder = http::Response::builder().status(status);
     if let Some(location) = location {
