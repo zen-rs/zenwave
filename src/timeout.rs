@@ -52,6 +52,8 @@ impl From<TimeoutError> for crate::Error {
     }
 }
 
+http_kit::impl_send_middleware!(Timeout);
+
 impl Middleware for Timeout {
     type Error = TimeoutError;
     async fn handle<E: Endpoint>(

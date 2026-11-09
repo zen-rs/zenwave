@@ -231,6 +231,8 @@ impl core::fmt::Debug for AppleBackend {
     }
 }
 
+http_kit::impl_send_endpoint!(AppleBackend);
+
 impl Client for AppleBackend {}
 
 /// What a session is configured for.

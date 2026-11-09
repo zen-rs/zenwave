@@ -230,6 +230,8 @@ impl OAuth2ClientCredentials {
     }
 }
 
+http_kit::impl_send_middleware!(OAuth2ClientCredentials);
+
 impl Middleware for OAuth2ClientCredentials {
     type Error = TokenError;
     async fn handle<E: Endpoint>(

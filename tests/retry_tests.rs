@@ -97,6 +97,8 @@ impl Endpoint for MockClient {
     }
 }
 
+http_kit::impl_send_endpoint!(MockClient);
+
 impl Client for MockClient {}
 
 fn ok_response() -> Response {
@@ -245,7 +247,17 @@ impl<C: Client> Endpoint for CountAttempts<C> {
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         self.attempts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.client.respond(request).await
+        self.client.respond_send(request).await
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<C: Client> http_kit::SendEndpoint for CountAttempts<C> {
+    fn respond_send(
+        &mut self,
+        request: &mut Request,
+    ) -> impl std::future::Future<Output = Result<Response, Self::Error>> + Send {
+        self.respond(request)
     }
 }
 

@@ -83,7 +83,11 @@ tests/
 
 ## Architecture
 
-Everything is middleware. `Client` is a trait extending `http_kit::Endpoint`.
+Everything is middleware. `Client` is a trait extending `http_kit::SendEndpoint`,
+and the middleware it composes are `http_kit::SendMiddleware`, so a request's
+future is `Send` on every backend. A concrete type gets those impls from
+`http_kit::impl_send_endpoint!` / `impl_send_middleware!`; a type generic over
+its inner client calls `respond_send` on it.
 Each middleware wraps the inner client and transforms requests/responses.
 `zenwave::client()` returns a `DefaultClient` which is just the platform
 backend over `Transport::system()` wrapped in `FollowRedirect`;

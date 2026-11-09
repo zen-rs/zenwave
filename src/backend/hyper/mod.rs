@@ -868,6 +868,8 @@ async fn drive(connection: impl Future<Output = Result<(), hyper::Error>>) {
     }
 }
 
+http_kit::impl_send_endpoint!(HyperBackend);
+
 impl Client for HyperBackend {}
 
 #[cfg(test)]

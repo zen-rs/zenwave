@@ -2,7 +2,7 @@
 
 use http::{HeaderMap, Uri};
 use http_kit::{
-    Endpoint, HttpError, Method,
+    Endpoint, HttpError, Method, SendEndpoint,
     header::{
         AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION,
         TRANSFER_ENCODING,
@@ -228,6 +228,15 @@ where
     }
 }
 
+impl<C: Client> SendEndpoint for FollowRedirect<C> {
+    fn respond_send(
+        &mut self,
+        request: &mut Request,
+    ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        self.respond(request)
+    }
+}
+
 impl<C: Client> Endpoint for FollowRedirect<C> {
     type Error = FollowRedirectError<C::Error>;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
@@ -246,7 +255,7 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
         loop {
             let response = self
                 .client
-                .respond(request)
+                .respond_send(request)
                 .await
                 .map_err(FollowRedirectError::RemoteError)?;
 
@@ -313,6 +322,8 @@ mod tests {
             )))
         }
     }
+
+    http_kit::impl_send_endpoint!(RedirectBackend);
 
     impl crate::Client for RedirectBackend {}
 
