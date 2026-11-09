@@ -3,7 +3,10 @@
 use http::Uri;
 use http_kit::{
     Endpoint, HttpError, Method,
-    header::{AUTHORIZATION, CONTENT_LENGTH, COOKIE, HOST, LOCATION},
+    header::{
+        AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION,
+        TRANSFER_ENCODING,
+    },
 };
 use url::Url;
 
@@ -11,6 +14,18 @@ use crate::cookie::{RequestCookieJar, cookie_header, store_response_cookies};
 use crate::{Body, Request, Response, StatusCode, client::Client};
 
 /// Middleware that follows HTTP redirects.
+///
+/// A `301`/`302` converts a `POST` — and only a `POST` — into a bodyless `GET`, a `303`
+/// converts any method other than `GET`/`HEAD` the same way, and a `307`/`308` re-sends the
+/// request unchanged, body included, when the body is replayable; a redirect whose body cannot
+/// be replayed is returned to the caller rather than followed with an emptied one. Payload
+/// headers are dropped together with a dropped body, and `Authorization`/`Cookie` are stripped
+/// on a cross-origin hop.
+///
+/// Credential middleware belongs *outside* this one — `client.bearer_auth(t)` composes the
+/// bearer middleware around `FollowRedirect`, so the credential is applied before a hop and the
+/// cross-origin strip removes it. Wrapping the other way would let the inner middleware
+/// re-attach it on every hop.
 #[derive(Debug, Clone)]
 pub struct FollowRedirect<C: Client> {
     client: C,
@@ -90,6 +105,12 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
         let mut current_url = Url::parse(&request.uri().to_string())?;
         let mut redirect_count = 0;
 
+        // A 307/308 hop re-sends the body when it can be replayed. `try_clone` answers that only
+        // for an in-memory body, so the snapshot is taken before the inner client can consume
+        // it; `None` marks a body that cannot be re-sent.
+        let body = request.body().try_clone();
+        let had_body = request.body().is_empty() != Some(true);
+
         loop {
             let response = self
                 .client
@@ -134,20 +155,40 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
                 .parse()
                 .map_err(|_| FollowRedirectError::InvalidLocationHeader)?;
 
-            let next_method = match response.status() {
-                StatusCode::SEE_OTHER => Method::GET,
-                StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND
+            // RFC 9110 §15.4 as the clients implement it: a 303 re-fetches with `GET` unless the
+            // method already is `GET` or `HEAD`, a 301/302 does so only when the method was
+            // `POST`, and a 307/308 preserves method and body.
+            let status = response.status();
+            let (next_method, keeps_body) = match status {
+                StatusCode::SEE_OTHER
                     if current_method != Method::GET && current_method != Method::HEAD =>
                 {
-                    Method::GET
+                    (Method::GET, false)
                 }
-                _ => current_method.clone(),
+                StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND
+                    if current_method == Method::POST =>
+                {
+                    (Method::GET, false)
+                }
+                _ => (current_method.clone(), true),
+            };
+
+            let next_body = if keeps_body {
+                match body.as_ref().and_then(Body::try_clone) {
+                    Some(body) => body,
+                    // A body that cannot be replayed cannot be redirected safely — hand the
+                    // redirect back to the caller rather than send an empty one.
+                    None if had_body => return Ok(response),
+                    None => Body::empty(),
+                }
+            } else {
+                Body::empty()
             };
 
             let mut new_request = http::Request::builder()
                 .method(next_method.clone())
                 .uri(next_uri)
-                .body(Body::empty())
+                .body(next_body)
                 .expect("failed to build redirect request"); // Safety: We have already made sure method and uri are valid.
 
             if current_url.origin() != redirect_url.origin() {
@@ -164,13 +205,19 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
 
             let mut headers = redirect_headers.clone();
             headers.remove(HOST);
-            headers.remove(CONTENT_LENGTH);
+            if !keeps_body {
+                // The payload headers describe a body the hop no longer carries.
+                headers.remove(CONTENT_LENGTH);
+                headers.remove(CONTENT_TYPE);
+                headers.remove(CONTENT_ENCODING);
+                headers.remove(TRANSFER_ENCODING);
+            }
 
-            // The jar moves onto the next hop's request, and the next
-            // `Cookie` header comes from it for the new URL — replacing the
-            // carried-over one, including the value just stripped on a
-            // cross-origin hop.
-            if let Some(jar) = request.extensions_mut().remove::<RequestCookieJar>() {
+            // A hop keeps the request's extensions — the jar moves with them, and the next
+            // `Cookie` header comes from it for the new URL — replacing the carried-over one,
+            // including the value just stripped on a cross-origin hop.
+            *new_request.extensions_mut() = request.extensions().clone();
+            if let Some(jar) = new_request.extensions_mut().get_mut::<RequestCookieJar>() {
                 match cookie_header(&jar.store, &redirect_url) {
                     Some(cookie) => {
                         headers.insert(COOKIE, cookie);
@@ -179,7 +226,6 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
                         headers.remove(COOKIE);
                     }
                 }
-                new_request.extensions_mut().insert(jar);
             }
 
             *new_request.headers_mut() = headers;
