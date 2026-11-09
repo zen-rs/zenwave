@@ -264,7 +264,7 @@ async fn temporary_redirect_is_returned_when_the_body_cannot_be_replayed() {
     let state = mock.state();
     let mut client = FollowRedirect::new(mock);
 
-    let stream = futures_util::stream::iter([Ok::<_, std::io::Error>("payload".as_bytes())]);
+    let stream = futures_util::stream::iter([Ok::<_, std::io::Error>(&b"payload"[..])]);
     let mut request = http::Request::builder()
         .method(Method::POST)
         .uri("https://example.com/upload")
@@ -354,7 +354,7 @@ async fn payload_headers_leave_with_the_dropped_body() {
     let state = state.lock().unwrap();
     assert_eq!(state.seen.len(), 2);
     assert_eq!(state.seen[1].method, Method::GET);
-    assert!(state.seen[1].body.is_empty());
+    assert_eq!(state.seen[1].body, Vec::<u8>::new());
     assert!(state.seen[1].content_type.is_none());
     assert!(state.seen[1].content_length.is_none());
     drop(state);
@@ -414,7 +414,11 @@ async fn a_downgrade_keeps_the_body_dropped_through_later_hops() {
     assert_eq!(state.seen.len(), 3);
     assert_eq!(state.seen[1].method, Method::GET);
     assert_eq!(state.seen[2].method, Method::GET);
-    assert!(state.seen[2].body.is_empty(), "the body must not resurrect");
+    assert_eq!(
+        state.seen[2].body,
+        Vec::<u8>::new(),
+        "the body must not resurrect"
+    );
     assert!(state.seen[2].content_type.is_none());
     assert!(state.seen[2].content_length.is_none());
     drop(state);
@@ -443,7 +447,7 @@ async fn see_other_drops_the_body_even_when_the_method_stays_get() {
     let state = state.lock().unwrap();
     assert_eq!(state.seen.len(), 2);
     assert_eq!(state.seen[1].method, Method::GET);
-    assert!(state.seen[1].body.is_empty());
+    assert_eq!(state.seen[1].body, Vec::<u8>::new());
     assert!(state.seen[1].content_length.is_none());
     drop(state);
 }
