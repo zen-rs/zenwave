@@ -3,14 +3,31 @@
 //! with every leg on owned-buffer streams and TLS through `http-kit-tls`,
 //! the origin's session inside the proxy's when the proxy is HTTPS.
 
-use std::{future::Future, io, net::SocketAddr, time::Instant};
+use std::{
+    future::{Future, pending},
+    io,
+    net::SocketAddr,
+    pin::pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
-use futures_util::{FutureExt, future::LocalBoxFuture};
+use futures_channel::oneshot;
+use futures_util::{
+    FutureExt,
+    future::{Either, LocalBoxFuture, select},
+};
 use http::{HeaderValue, Method, header, uri::Scheme};
 use http_kit::{Body, Request};
-use http_kit_h1::{ClientConfig, ClientOutcome, RequestTarget, SendRequest, handshake_stream};
+use http_kit_h1::{
+    ClientConfig, ClientOutcome, RequestTarget, SendRequest, handshake, handshake_stream,
+};
 use http_kit_io::{
-    BufResult, IntoInner, Io, IoBuf, Read, SendFile, Split, TcpOptions, Write, poll::CopyingPoll,
+    BufResult, IntoInner, Io, IoBuf, IoBufMut, Read, SendFile, Split, TcpOptions, Timer, Write,
+    poll::CopyingPoll,
 };
 use http_kit_tls::{TlsConnector, Transport as TlsTransport, rustls::pki_types::ServerName};
 use tracing::debug;
@@ -56,6 +73,9 @@ pub struct Dialed {
 pub struct H1Send {
     pub requests: SendRequest,
     pub upgrade: Upgrade,
+    /// Set once a read on the connection outlasted the read timeout, which
+    /// closed it: what failed under a request then was the timeout.
+    pub stalled: Stalled,
 }
 
 impl H1Send {
@@ -65,20 +85,72 @@ impl H1Send {
     }
 }
 
+/// The mark a connection's read half sets when a read outlasted the read
+/// timeout. It is read on the request's thread, after the connection's
+/// channels closed.
+#[derive(Clone, Debug, Default)]
+pub struct Stalled(Arc<AtomicBool>);
+
+impl Stalled {
+    fn mark(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether the connection closed because a read timed out.
+    pub fn is_set(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// Connects to `origin` the way the transport's rules say — its unix domain
 /// socket when it has one, else TCP through whatever proxy the rules pick —
-/// and runs the HTTP/1.1 handshake over the result.
+/// and runs the HTTP/1.1 handshake over the result, within the transport's
+/// connect timeout.
 ///
 /// # Errors
 ///
-/// Every leg's failure.
+/// Every leg's failure; [`Error::Timeout`] when the connect timeout passed
+/// first.
 pub async fn dial<I: NativeIo>(
     io: &I,
     transport: &Transport,
     tls: &TlsConnector,
     origin: &Origin,
 ) -> Result<Dialed, Error> {
+    let Some(deadline) = transport
+        .connect_timeout()
+        .and_then(|timeout| Instant::now().checked_add(timeout))
+    else {
+        return dial_route(io, transport, tls, origin).await;
+    };
+    // Dropping the dial at the deadline closes whatever sockets it opened.
+    match select(
+        pin!(dial_route(io, transport, tls, origin)),
+        pin!(io.sleep_until(deadline)),
+    )
+    .await
+    {
+        Either::Left((dialed, _)) => dialed,
+        Either::Right(((), _)) => {
+            debug!(host = %origin.host, "connect timeout passed before the dial finished");
+            Err(Error::Timeout)
+        }
+    }
+}
+
+/// [`dial`], unbounded.
+async fn dial_route<I: NativeIo>(
+    io: &I,
+    transport: &Transport,
+    tls: &TlsConnector,
+    origin: &Origin,
+) -> Result<Dialed, Error> {
     let secure = origin.scheme == Scheme::HTTPS;
+    let last = LastLeg {
+        io,
+        tls,
+        read_timeout: transport.read_timeout(),
+    };
 
     #[cfg(unix_socket)]
     if let Some(path) = transport.unix_socket() {
@@ -88,7 +160,7 @@ pub async fn dial<I: NativeIo>(
                 format!("unix domain socket {}: {error}", path.display()),
             )))
         })?;
-        return finish(io, tls, &origin.host, secure, unix, Via::Direct).await;
+        return last.finish(&origin.host, secure, unix, Via::Direct).await;
     }
 
     let target = Target {
@@ -101,16 +173,14 @@ pub async fn dial<I: NativeIo>(
     match route(transport.proxy(), target)? {
         Route::Direct => {
             let tcp = tcp(io, &origin.host, origin.port).await?;
-            finish(io, tls, &origin.host, secure, tcp, Via::Direct).await
+            last.finish(&origin.host, secure, tcp, Via::Direct).await
         }
         Route::Forward {
             proxy,
             authorization,
         } => {
             let tcp = tcp(io, &proxy.host, proxy.port).await?;
-            finish(
-                io,
-                tls,
+            last.finish(
                 &proxy.host,
                 proxy.tls,
                 tcp,
@@ -132,10 +202,12 @@ pub async fn dial<I: NativeIo>(
                     .await
                     .map_err(Error::tls)?;
                 let tunneled = tunnel(io, secured, &authority, authorization).await?;
-                finish(io, tls, &origin.host, secure, tunneled, Via::Direct).await
+                last.finish(&origin.host, secure, tunneled, Via::Direct)
+                    .await
             } else {
                 let tunneled = tunnel(io, tcp, &authority, authorization).await?;
-                finish(io, tls, &origin.host, secure, tunneled, Via::Direct).await
+                last.finish(&origin.host, secure, tunneled, Via::Direct)
+                    .await
             }
         }
         Route::Socks5 {
@@ -155,40 +227,47 @@ pub async fn dial<I: NativeIo>(
                 resolve_remotely,
             )
             .await?;
-            finish(io, tls, &origin.host, secure, tcp, Via::Direct).await
+            last.finish(&origin.host, secure, tcp, Via::Direct).await
         }
     }
 }
 
-/// Wraps `stream` in TLS for `host` when `secure`, then starts
-/// HTTP/1.1 on it.
-async fn finish<I, S>(
-    io: &I,
-    tls: &TlsConnector,
-    host: &str,
-    secure: bool,
-    stream: S,
-    via: Via,
-) -> Result<Dialed, Error>
-where
-    I: Io,
-    S: TlsTransport,
-{
-    let config = ClientConfig {
-        request_target: match via {
-            Via::Direct => RequestTarget::Origin,
-            Via::HttpProxy { .. } => RequestTarget::Absolute,
-        },
-        ..ClientConfig::default()
-    };
-    if !secure {
-        return Ok(start(stream, io.clone(), config, via));
+/// What the last leg of every route needs: TLS to the host that leg
+/// reaches, and the read timeout the connection's reads run under.
+struct LastLeg<'a, I> {
+    io: &'a I,
+    tls: &'a TlsConnector,
+    read_timeout: Option<Duration>,
+}
+
+impl<I: Io> LastLeg<'_, I> {
+    /// Wraps `stream` in TLS for `host` when `secure`, then starts
+    /// HTTP/1.1 on it.
+    async fn finish<S: TlsTransport>(
+        &self,
+        host: &str,
+        secure: bool,
+        stream: S,
+        via: Via,
+    ) -> Result<Dialed, Error> {
+        let config = ClientConfig {
+            request_target: match via {
+                Via::Direct => RequestTarget::Origin,
+                Via::HttpProxy { .. } => RequestTarget::Absolute,
+            },
+            ..ClientConfig::default()
+        };
+        let io = self.io.clone();
+        if !secure {
+            return Ok(start(stream, io, config, via, self.read_timeout));
+        }
+        let stream = self
+            .tls
+            .connect(server_name(host)?, stream, self.io)
+            .await
+            .map_err(Error::tls)?;
+        Ok(start(stream, io, config, via, self.read_timeout))
     }
-    let stream = tls
-        .connect(server_name(host)?, stream, io)
-        .await
-        .map_err(Error::tls)?;
-    Ok(start(stream, io.clone(), config, via))
 }
 
 /// `host` as the name a TLS handshake sends and verifies.
@@ -196,24 +275,58 @@ fn server_name(host: &str) -> Result<ServerName<'static>, Error> {
     ServerName::try_from(host.to_owned()).map_err(Error::tls)
 }
 
-/// Runs the HTTP/1.1 client over `stream`; the driver logs how it ended,
-/// and when a request switched the connection, holds the switched stream
-/// on this thread until the request's [`Upgrade`] claims it.
-fn start<S, T>(stream: S, timer: T, config: ClientConfig, via: Via) -> Dialed
+/// Runs the HTTP/1.1 client over `stream`, each of its reads bounded by
+/// `read_timeout`; the driver logs how it ended, and when a request
+/// switched the connection, holds the switched stream on this thread until
+/// the request's [`Upgrade`] claims it.
+///
+/// A read that outlasts the timeout stops the driver, which drops the
+/// connection with the read still in flight. The switched stream is handed
+/// over without the bound: its idle time belongs to its owner.
+fn start<S, T>(
+    stream: S,
+    timer: T,
+    config: ClientConfig,
+    via: Via,
+    read_timeout: Option<Duration>,
+) -> Dialed
 where
     S: Split + 'static,
     S::ReadHalf: Read + 'static,
     S::WriteHalf: Write + SendFile + 'static,
-    T: http_kit_io::Timer + 'static,
+    T: Timer + Clone + 'static,
 {
-    let (requests, connection) = handshake_stream(stream, timer, config);
+    let (read, write) = stream.split();
+    let stalled = Stalled::default();
+    let (stall, stalls) = oneshot::channel();
+    let read = TimedRead {
+        inner: read,
+        timer: timer.clone(),
+        timeout: read_timeout,
+        stall: Some(stall),
+        stalled: stalled.clone(),
+    };
+    let (requests, connection) = handshake(read, write, timer, config);
     let (upgrade, claims) = upgrade::channel();
     let driver = async move {
-        match connection.run().await {
+        // Canceled only once the read half is gone, with the connection.
+        let stalled = async {
+            if stalls.await.is_err() {
+                pending::<()>().await;
+            }
+        };
+        let ended = match select(pin!(connection.run()), pin!(stalled)).await {
+            Either::Left((ended, _)) => ended,
+            Either::Right(((), _)) => {
+                debug!("HTTP/1.1 connection closed: a read outlasted the read timeout");
+                return;
+            }
+        };
+        match ended {
             Ok(ClientOutcome::Closed) => {}
             Ok(ClientOutcome::Upgraded(upgraded)) => {
                 let rejoined = Rejoined {
-                    read: upgraded.read,
+                    read: upgraded.read.inner,
                     write: upgraded.write,
                 };
                 let switched = Switched::new(upgraded.read_buf, CopyingPoll::new(rejoined));
@@ -224,9 +337,54 @@ where
     }
     .boxed_local();
     Dialed {
-        send: H1Send { requests, upgrade },
+        send: H1Send {
+            requests,
+            upgrade,
+            stalled,
+        },
         via,
         driver,
+    }
+}
+
+/// A connection's read half whose every read waits at most `timeout` for
+/// the server.
+///
+/// An owned-buffer read cannot be abandoned and still hand its buffer back,
+/// so a read that runs out never returns: it marks the connection
+/// [`Stalled`], signals the driver through `stall`, and stays pending until
+/// the driver drops the connection.
+struct TimedRead<R, T> {
+    inner: R,
+    timer: T,
+    timeout: Option<Duration>,
+    stall: Option<oneshot::Sender<()>>,
+    stalled: Stalled,
+}
+
+impl<R: Read, T: Timer> Read for TimedRead<R, T> {
+    async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+        let Some(deadline) = self
+            .timeout
+            .and_then(|timeout| Instant::now().checked_add(timeout))
+        else {
+            return self.inner.read(buf).await;
+        };
+        match select(
+            pin!(self.inner.read(buf)),
+            pin!(self.timer.sleep_until(deadline)),
+        )
+        .await
+        {
+            Either::Left((read, _)) => read,
+            Either::Right(((), _)) => {
+                self.stalled.mark();
+                if let Some(stall) = self.stall.take() {
+                    stall.send(()).ok();
+                }
+                pending().await
+            }
+        }
     }
 }
 

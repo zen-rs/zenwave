@@ -163,7 +163,12 @@ impl<I: NativeIo> Pool<I> {
         }
         let discover = slot.knowledge.begin_discovery(now);
         let dial = slot.knowledge.candidate(now).filter(|_| !slot.dialing);
-        let timeout = slot.knowledge.connect_timeout();
+        // The race's own deadline, or the transport's connect timeout when
+        // that is shorter.
+        let race = slot.knowledge.connect_timeout();
+        let timeout = transport
+            .connect_timeout()
+            .map_or(race, |bound| bound.min(race));
         if dial.is_some() {
             slot.dialing = true;
             slot.generation += 1;

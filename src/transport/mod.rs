@@ -34,7 +34,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 #[cfg(native)]
 use std::sync::Arc;
-#[cfg(onecrl)]
+#[cfg(any(onecrl, native_backend))]
 use std::time::Duration;
 #[cfg(any(all(connector, feature = "hyper-backend"), native_h3))]
 use std::{future::Future, pin::Pin};
@@ -131,6 +131,12 @@ struct Inner {
     /// when the transport was built with one.
     #[cfg(unix_socket)]
     unix_socket: Option<PathBuf>,
+    /// The bound on one connection attempt, when set.
+    #[cfg(native_backend)]
+    connect_timeout: Option<Duration>,
+    /// The bound on each wait for bytes from the server, when set.
+    #[cfg(native_backend)]
+    read_timeout: Option<Duration>,
     /// Platform roots plus extras as PEM, for libcurl. `None` without extras.
     #[cfg(feature = "curl-backend")]
     ca_bundle: Option<Vec<u8>>,
@@ -223,6 +229,20 @@ impl Transport {
         self.inner.unix_socket.as_deref()
     }
 
+    /// How long one connection attempt may take, when bounded
+    /// ([`TransportBuilder::connect_timeout`]).
+    #[cfg(native_backend)]
+    pub(crate) fn connect_timeout(&self) -> Option<Duration> {
+        self.inner.connect_timeout
+    }
+
+    /// How long each wait for bytes from the server may take, when bounded
+    /// ([`TransportBuilder::read_timeout`]).
+    #[cfg(native_backend)]
+    pub(crate) fn read_timeout(&self) -> Option<Duration> {
+        self.inner.read_timeout
+    }
+
     #[cfg(tls_engine)]
     pub(crate) fn tls(&self) -> &tls::TlsConnector {
         &self.inner.tls
@@ -311,6 +331,10 @@ impl fmt::Debug for Transport {
             .field("extra_roots", &self.inner.extra_roots.len());
         #[cfg(unix_socket)]
         debug.field("unix_socket", &self.inner.unix_socket);
+        #[cfg(native_backend)]
+        debug
+            .field("connect_timeout", &self.inner.connect_timeout)
+            .field("read_timeout", &self.inner.read_timeout);
         debug.finish_non_exhaustive()
     }
 }
@@ -328,6 +352,10 @@ pub struct TransportBuilder {
     extra_roots: Vec<CertificateDer<'static>>,
     #[cfg(unix_socket)]
     unix_socket: Option<PathBuf>,
+    #[cfg(native_backend)]
+    connect_timeout: Option<Duration>,
+    #[cfg(native_backend)]
+    read_timeout: Option<Duration>,
     /// OneCRL additions refresh — enabled by [`Self::onecrl_refresh`].
     #[cfg(onecrl)]
     onecrl: onecrl::refresh::Refresh,
@@ -346,6 +374,10 @@ impl fmt::Debug for TransportBuilder {
             .field("extra_roots", &self.extra_roots.len());
         #[cfg(unix_socket)]
         debug.field("unix_socket", &self.unix_socket);
+        #[cfg(native_backend)]
+        debug
+            .field("connect_timeout", &self.connect_timeout)
+            .field("read_timeout", &self.read_timeout);
         #[cfg(onecrl)]
         debug.field("onecrl_refresh", &self.onecrl.interval);
         debug.finish_non_exhaustive()
@@ -399,6 +431,48 @@ impl TransportBuilder {
     #[must_use]
     pub fn unix_socket(mut self, path: impl Into<PathBuf>) -> Self {
         self.unix_socket = Some(path.into());
+        self
+    }
+
+    /// Bound each connection attempt by `timeout`: resolving the host, the
+    /// TCP connect (every address happy eyeballs races), a proxy's TLS
+    /// handshake and `CONNECT` tunnel or SOCKS5 handshake, and the origin's
+    /// TLS handshake, together; for HTTP/3, the QUIC handshake. An attempt
+    /// that takes longer fails with [`Error::Timeout`].
+    ///
+    /// Off unless set. Applied by the native backend
+    /// ([`NativeBackend`](crate::backend::NativeBackend)); a caller that
+    /// needs several bounds builds one transport, and one backend, per
+    /// bound.
+    #[cfg(native_backend)]
+    #[must_use]
+    pub const fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Bound each wait for bytes from the server by `timeout`, on an
+    /// HTTP/1.1 connection over any route (direct, TLS, a proxy's tunnel, a
+    /// unix domain socket): the wait for the response head, which starts
+    /// when the request does, and each wait for more of the response body,
+    /// which starts when the body is read. Every read that yields data
+    /// starts the next wait afresh, so a slow body that keeps arriving
+    /// takes as long as it needs.
+    ///
+    /// A wait that runs out closes the connection and fails the request
+    /// with [`Error::Timeout`]; during the body, the body's read fails with
+    /// an [`std::io::Error`] of kind [`TimedOut`](std::io::ErrorKind::TimedOut)
+    /// whose inner error is [`Error::Timeout`]. An idle pooled connection
+    /// is not waiting and is never timed, and a stream a `101` handed over
+    /// ([`Switched`](crate::backend::Switched)) belongs to its owner and is
+    /// not timed either.
+    ///
+    /// Off unless set. Applied by the native backend's HTTP/1.1
+    /// connections ([`NativeBackend`](crate::backend::NativeBackend)).
+    #[cfg(native_backend)]
+    #[must_use]
+    pub const fn read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = Some(timeout);
         self
     }
 
@@ -494,6 +568,10 @@ impl TransportBuilder {
                     extra_roots: self.extra_roots,
                     #[cfg(unix_socket)]
                     unix_socket: self.unix_socket,
+                    #[cfg(native_backend)]
+                    connect_timeout: self.connect_timeout,
+                    #[cfg(native_backend)]
+                    read_timeout: self.read_timeout,
                     #[cfg(feature = "curl-backend")]
                     ca_bundle,
                     #[cfg(tls_engine)]
