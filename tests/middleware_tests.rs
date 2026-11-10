@@ -1,4 +1,6 @@
 //! Tests for middleware components in Zenwave
+// Every test here runs through `zenwave::client()`.
+#![cfg(default_backend)]
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;

@@ -12,7 +12,7 @@ use http_kit::{
 use serde::Deserialize;
 use url::form_urlencoded::Serializer;
 
-use crate::{Client, DefaultBackend, client};
+use crate::{Client, backend::DefaultBackend, client};
 
 type TokenError = OAuth2Error<<DefaultBackend as Endpoint>::Error>;
 

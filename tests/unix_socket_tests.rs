@@ -1,6 +1,8 @@
 //! HTTP over unix domain sockets: `Transport::unix_socket` routes every
 //! connection to the socket while request URIs stay ordinary `http` URIs.
-#![cfg(all(unix, not(target_arch = "wasm32")))]
+// Each backend's suite builds its own client, and every one of those
+// backends is also a default backend.
+#![cfg(all(unix, not(target_arch = "wasm32"), default_backend))]
 
 use std::path::PathBuf;
 

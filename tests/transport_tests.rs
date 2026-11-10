@@ -1,6 +1,7 @@
 //! Trust configuration through `Transport`: the system store rejects a locally
 //! issued certificate, extra roots make it acceptable, on HTTP and websockets alike.
-#![cfg(not(target_arch = "wasm32"))]
+// Every test here runs through the `DefaultBackend`.
+#![cfg(all(not(target_arch = "wasm32"), default_backend))]
 
 mod common;
 

@@ -234,13 +234,13 @@ async fn retry_attempts_a_read_once_body_once() {
 }
 
 /// Counts the attempts `Retry` hands to the client beneath it.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), default_backend))]
 struct CountAttempts<C> {
     client: C,
     attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), default_backend))]
 impl<C: Client> Endpoint for CountAttempts<C> {
     type Error = C::Error;
 
@@ -251,7 +251,7 @@ impl<C: Client> Endpoint for CountAttempts<C> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), default_backend))]
 impl<C: Client> http_kit::SendEndpoint for CountAttempts<C> {
     fn respond_send(
         &mut self,
@@ -261,13 +261,13 @@ impl<C: Client> http_kit::SendEndpoint for CountAttempts<C> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), default_backend))]
 impl<C: Client> Client for CountAttempts<C> {}
 
 /// A server that accepts a connection and drops it on the floor stands in
 /// for a transient transport failure. A backend may itself redial a dropped
 /// connection (`URLSession` does), so attempts are counted above the backend.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), default_backend))]
 #[test_executors::async_test]
 async fn retry_retries_a_dropped_connection_up_to_max_retries() {
     use std::{

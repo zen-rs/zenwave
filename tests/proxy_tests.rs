@@ -1,6 +1,7 @@
 //! Proxy rules through `Transport`: absolute-form forwarding, `CONNECT`
 //! tunnels, SOCKS5, `no_proxy`, and the errors a misbehaving proxy produces.
-#![cfg(not(target_arch = "wasm32"))]
+// Every test here runs through the `DefaultBackend`.
+#![cfg(all(not(target_arch = "wasm32"), default_backend))]
 
 mod common;
 
