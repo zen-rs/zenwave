@@ -49,6 +49,7 @@ src/
       h3.rs       — the pool's h3 slot: QUIC dials raced against TCP, the transport's verifier, discovery
       connect.rs  — route execution on http-kit-io: unix sockets, happy eyeballs, CONNECT (TLS in TLS), SOCKS5, TLS
       runtime.rs  — Driver: compio and tokio driver threads for callers on no runtime
+      upgrade.rs  — Upgrade/Switched: a 101's stream, claimed on the pool's thread
     curl.rs       — libcurl backend
     apple.rs      — URLSession backend (Apple platforms)
     web.rs        — Fetch API backend (wasm32)

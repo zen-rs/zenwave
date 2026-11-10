@@ -27,6 +27,10 @@ mod h3;
 mod pool;
 #[cfg(native_driver)]
 mod runtime;
+// A switched stream and the futures that claim it stay on the connection's
+// thread, so they are deliberately not `Send`.
+#[expect(clippy::future_not_send)]
+mod upgrade;
 
 use std::{
     fmt,
@@ -40,6 +44,7 @@ use futures_util::Stream;
 use http::uri::Scheme;
 use http_kit::{Body, Endpoint, Method, Request, Response};
 
+use connect::H1Send;
 pub use connect::NativeIo;
 pub use pool::PoolHandle;
 use pool::{Command, Grant, Want};
@@ -49,6 +54,7 @@ pub use runtime::Compio;
 pub use runtime::Driver;
 #[cfg(feature = "native-tokio")]
 pub use runtime::Tokio;
+pub use upgrade::{Switched, Upgrade};
 
 use super::shared::{
     error_for_status, replayable_request, request_origin, shape_h1_request, take_request,
@@ -164,11 +170,15 @@ impl NativeBackend {
     ///
     /// A fresh connection's failure is the request's: dialing again for a
     /// server that drops new connections would never end.
+    ///
+    /// A response that switched the connection (a `101`, or a `2xx` to
+    /// `CONNECT`) carries the connection's [`Upgrade`], and the connection
+    /// leaves the pool: it no longer speaks HTTP.
     async fn send_h1(
         &self,
         origin: &Origin,
         mut request: http::Request<Body>,
-        send: http_kit_h1::SendRequest,
+        send: H1Send,
         via: Via,
         reused: bool,
     ) -> Result<Result<Response, http::Request<Body>>, Error> {
@@ -181,10 +191,20 @@ impl NativeBackend {
         let replay = (reused && idempotent(request.method()))
             .then(|| replayable_request(&request))
             .flatten();
+        let connect = request.method() == Method::CONNECT;
         shape_h1_request(&mut request, &via)?;
         let sender = lease.send.as_ref().expect("a new lease holds its sender");
-        let mut failure = match sender.try_send(request).await {
-            Ok(response) => {
+        let mut failure = match sender.requests.try_send(request).await {
+            Ok(mut response) => {
+                let status = response.status();
+                if status == http::StatusCode::SWITCHING_PROTOCOLS
+                    || (connect && status.is_success())
+                {
+                    response.extensions_mut().insert(sender.upgrade.clone());
+                    // Dropped unreleased, the lease is discarded.
+                    drop(lease);
+                    return Ok(Ok(response));
+                }
                 return Ok(Ok(
                     response.map(|body| Body::from_frames(LeaseReturn::new(body, lease)))
                 ));
@@ -299,7 +319,7 @@ impl Client for NativeBackend {}
 /// An HTTP/1.1 connection leased from the pool: back to the pool when its
 /// response body ends, discarded when it is dropped first.
 struct H1Lease {
-    send: Option<http_kit_h1::SendRequest>,
+    send: Option<H1Send>,
     via: Via,
     origin: Origin,
     pool: PoolHandle,
@@ -400,7 +420,7 @@ mod tests {
 
     /// A sender whose connection takes no request: its driver is dropped
     /// before it ran, as when a connection stops while it sits idle.
-    async fn stopped<I: NativeIo>(io: &I) -> http_kit_h1::SendRequest {
+    async fn stopped<I: NativeIo>(io: &I) -> H1Send {
         let listener = io
             .bind_tcp("127.0.0.1:0".parse().expect("loopback"))
             .expect("bind");
@@ -413,7 +433,10 @@ mod tests {
             http_kit_h1::ClientConfig::default(),
         );
         drop(connection);
-        send
+        H1Send {
+            requests: send,
+            upgrade: upgrade::channel().0,
+        }
     }
 
     fn post() -> http::Request<Body> {

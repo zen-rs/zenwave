@@ -23,11 +23,10 @@ use std::{
 
 use futures_channel::{mpsc, oneshot};
 use futures_util::{FutureExt, StreamExt, future::LocalBoxFuture, stream::FuturesUnordered};
-use http_kit_h1::SendRequest;
 use http_kit_tls::TlsConnector;
 use tracing::debug;
 
-use super::connect::{self, Dialed, NativeIo};
+use super::connect::{self, Dialed, H1Send, NativeIo};
 use crate::{
     Error,
     transport::{
@@ -66,7 +65,7 @@ pub enum Grant {
     /// An HTTP/1.1 connection, leased until the request's response body
     /// ends; `reused` when it served a request before.
     H1 {
-        send: SendRequest,
+        send: H1Send,
         via: Via,
         reused: bool,
     },
@@ -87,7 +86,7 @@ pub enum Command {
     /// A leased HTTP/1.1 connection whose response body ended.
     Release {
         origin: Origin,
-        send: SendRequest,
+        send: H1Send,
         via: Via,
     },
     /// A leased HTTP/1.1 connection that cannot serve again: its request
@@ -196,7 +195,7 @@ impl Waiter {
     }
 
     /// Hands an HTTP/1.1 connection over, or back when the request is gone.
-    fn grant_h1(self, send: SendRequest, via: Via, reused: bool) -> Option<(SendRequest, Via)> {
+    fn grant_h1(self, send: H1Send, via: Via, reused: bool) -> Option<(H1Send, Via)> {
         match self.grant(Grant::H1 { send, via, reused })? {
             Grant::H1 { send, via, .. } => Some((send, via)),
             #[cfg(native_h3)]
@@ -213,7 +212,7 @@ impl Waiter {
 
 /// An HTTP/1.1 connection parked between requests.
 struct Idle {
-    send: SendRequest,
+    send: H1Send,
     via: Via,
     since: Instant,
 }
@@ -472,7 +471,7 @@ impl<I: NativeIo> Pool<I> {
 
     /// A free HTTP/1.1 connection: the first waiter that may take it does,
     /// or it parks. A closed one only frees its slot.
-    fn offer(&mut self, origin: &Origin, send: SendRequest, via: Via, reused: bool) {
+    fn offer(&mut self, origin: &Origin, send: H1Send, via: Via, reused: bool) {
         let now = Instant::now();
         let entry = self.entry(origin);
         let mut free = (!send.is_closed()).then_some((send, via));
