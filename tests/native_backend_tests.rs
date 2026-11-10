@@ -1,0 +1,783 @@
+//! The native backend against in-process `http-kit` servers on the same
+//! thread: HTTP/1.1 in plaintext and over `http-kit-tls`, through an HTTPS
+//! proxy's tunnel, on connections the server closes after each response,
+//! and HTTP/3 over `http-kit-h3` once the TLS server advertises it, each on
+//! compio and on tokio with the pool on the calling thread.
+#![cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "native-compio", feature = "native-tokio")
+))]
+#![expect(
+    clippy::future_not_send,
+    reason = "every scenario runs on one thread's local executor, beside the pool it drives"
+)]
+
+use std::{cell::RefCell, future::Future, net::SocketAddr, rc::Rc, sync::Arc, time::Duration};
+
+use executor_core::{LocalExecutor, Task as _};
+use futures_util::{future::select, pin_mut};
+use http_kit::{Body, Request, Response};
+use http_kit_io::{BufResult, Listener as _, Read, Split as _, Write};
+use http_kit_tls::TlsAcceptor;
+use rcgen::{
+    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+};
+use rustls::{
+    crypto::ring,
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+};
+use time::{Duration as TimeDelta, OffsetDateTime};
+use zenwave::{
+    Client as _, Proxy, ResponseExt as _, Transport,
+    backend::{NativeBackend, NativeIo},
+};
+
+/// A request body in Chinese, Japanese and Korean, echoed back by every
+/// server below.
+const GREETING: &str = "你好，世界。こんにちは、世界。안녕하세요, 세계.";
+
+/// A throwaway CA and one `localhost` leaf it signed.
+struct Pki {
+    ca_der: CertificateDer<'static>,
+    leaf_der: CertificateDer<'static>,
+    #[cfg_attr(not(feature = "native-http3"), expect(dead_code))]
+    leaf_pem: String,
+    leaf_key: KeyPair,
+}
+
+impl Pki {
+    fn new() -> Self {
+        let now = OffsetDateTime::now_utc();
+        let ca_key = KeyPair::generate().expect("generate CA key");
+        let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+        ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca.distinguished_name
+            .push(DnType::CommonName, "zenwave native test CA");
+        ca.not_before = now - TimeDelta::days(1);
+        ca.not_after = now + TimeDelta::days(30);
+        let ca_der = ca.self_signed(&ca_key).expect("self-sign CA").der().clone();
+        let issuer = Issuer::new(ca, ca_key);
+
+        let leaf_key = KeyPair::generate().expect("generate leaf key");
+        let mut leaf = CertificateParams::new(vec!["localhost".to_owned()]).expect("leaf params");
+        leaf.distinguished_name
+            .push(DnType::CommonName, "localhost");
+        leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        leaf.not_before = now - TimeDelta::days(1);
+        leaf.not_after = now + TimeDelta::days(30);
+        let leaf = leaf.signed_by(&leaf_key, &issuer).expect("sign leaf");
+        Self {
+            ca_der,
+            leaf_der: leaf.der().clone(),
+            leaf_pem: leaf.pem(),
+            leaf_key,
+        }
+    }
+
+    /// A transport trusting this CA, with no proxy whatever the environment
+    /// says.
+    fn transport(&self) -> Transport {
+        self.transport_through(Proxy::none())
+    }
+
+    /// A transport trusting this CA, following `proxy`.
+    fn transport_through(&self, proxy: Proxy) -> Transport {
+        Transport::builder()
+            .proxy(proxy)
+            .extra_root_certificate_der(self.ca_der.to_vec())
+            .build()
+            .expect("transport builds")
+    }
+
+    fn tls_acceptor(&self) -> TlsAcceptor {
+        let mut config =
+            rustls::ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("default versions")
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![self.leaf_der.clone()],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.leaf_key.serialize_der())),
+                )
+                .expect("server certificate");
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        TlsAcceptor::new(Arc::new(config))
+    }
+}
+
+/// How [`serve_h1`] serves.
+#[derive(Clone, Default)]
+struct H1Options {
+    /// TLS on every connection.
+    tls: Option<TlsAcceptor>,
+    /// An `Alt-Svc` field on every response.
+    alt_svc: Option<String>,
+    /// `Connection: close` on every response.
+    close: bool,
+    /// How long every connection after the first waits before its TLS
+    /// handshake.
+    stall_after_first: Option<Duration>,
+}
+
+/// Echoes the request body after the method and path, labelled with the
+/// protocol that carried it, with the fields `options` asks for.
+async fn echo(request: Request, protocol: &'static str, options: &H1Options) -> Response {
+    let head = format!("{} {} ", request.method(), request.uri().path());
+    let body = request
+        .into_body()
+        .into_bytes()
+        .await
+        .expect("request body reads");
+    let mut response = Response::new(Body::from_bytes([head.as_bytes(), body.as_ref()].concat()));
+    let headers = response.headers_mut();
+    headers.insert("x-protocol", protocol.parse().expect("header value"));
+    if let Some(alt_svc) = &options.alt_svc {
+        headers.insert(
+            http::header::ALT_SVC,
+            alt_svc.parse().expect("header value"),
+        );
+    }
+    if options.close {
+        headers.insert(http::header::CONNECTION, "close".parse().expect("value"));
+    }
+    response
+}
+
+/// Serves HTTP/1.1 on `listener` as `options` says, one local task per
+/// connection; runs until dropped.
+async fn serve_h1<I: NativeIo, E: LocalExecutor>(
+    io: I,
+    executor: &E,
+    listener: I::TcpListener,
+    options: H1Options,
+) {
+    let mut accepted = 0_usize;
+    loop {
+        let (stream, _) = listener.accept().await.expect("accept");
+        accepted += 1;
+        let stall = options.stall_after_first.filter(|_| accepted > 1);
+        let io = io.clone();
+        let options = options.clone();
+        let connection = async move {
+            let tls = options.tls.clone();
+            let service = move |request: Request| {
+                let options = options.clone();
+                async move { echo(request, "h1", &options).await }
+            };
+            let config = http_kit_h1::ServerConfig::default();
+            let served = match tls {
+                Some(tls) => {
+                    if let Some(stall) = stall {
+                        io.sleep(stall).await;
+                    }
+                    let stream = tls.accept(stream, &io).await.expect("TLS handshake");
+                    http_kit_h1::ServerConnection::from_stream(stream, io, config)
+                        .serve(&service)
+                        .await
+                        .map(drop)
+                }
+                None => http_kit_h1::ServerConnection::from_stream(stream, io, config)
+                    .serve(&service)
+                    .await
+                    .map(drop),
+            };
+            served.expect("connection serves");
+        };
+        executor.spawn_local(connection).detach();
+    }
+}
+
+/// An HTTPS proxy: TLS with `tls` on every connection, then one `CONNECT`
+/// to a loopback port, recorded in `connects`, and the bytes relayed both
+/// ways. Runs until dropped.
+async fn serve_tls_proxy<I: NativeIo, E: LocalExecutor>(
+    io: I,
+    executor: &E,
+    listener: I::TcpListener,
+    tls: TlsAcceptor,
+    connects: Rc<RefCell<Vec<String>>>,
+) {
+    loop {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let io = io.clone();
+        let tls = tls.clone();
+        let connects = Rc::clone(&connects);
+        let tunnel = async move {
+            let stream = tls.accept(stream, &io).await.expect("proxy TLS handshake");
+            let (mut read, mut write) = stream.split();
+            let head = read_head(&mut read).await;
+            let authority = head
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix("CONNECT "))
+                .and_then(|rest| rest.strip_suffix(" HTTP/1.1"))
+                .unwrap_or_else(|| panic!("a CONNECT request, got:\n{head}"))
+                .to_owned();
+            let port = authority
+                .rsplit_once(':')
+                .and_then(|(_, port)| port.parse::<u16>().ok())
+                .expect("the CONNECT target names a port");
+            connects.borrow_mut().push(authority);
+            let upstream = io
+                .connect(SocketAddr::from(([127, 0, 0, 1], port)))
+                .await
+                .expect("upstream connects");
+            let BufResult(answered, _) = write
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n".to_vec())
+                .await;
+            answered.expect("the tunnel answer writes");
+            let (upstream_read, upstream_write) = upstream.split();
+            futures_util::join!(pump(read, upstream_write), pump(upstream_read, write));
+        };
+        executor.spawn_local(tunnel).detach();
+    }
+}
+
+/// Reads a request head; the client sends nothing after it before the
+/// answer, so nothing past it is read.
+async fn read_head(read: &mut impl Read) -> String {
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let BufResult(filled, chunk) = read.read(Vec::with_capacity(1024)).await;
+        assert!(
+            filled.expect("the head reads") > 0,
+            "the client closed before its head ended"
+        );
+        head.extend_from_slice(&chunk);
+    }
+    String::from_utf8(head).expect("an ASCII head")
+}
+
+/// Copies `from` into `to` until either side ends.
+async fn pump(mut from: impl Read, mut to: impl Write) {
+    loop {
+        let BufResult(filled, chunk) = from.read(Vec::with_capacity(16 * 1024)).await;
+        if !matches!(filled, Ok(1..)) {
+            break;
+        }
+        if to.write_all(chunk).await.0.is_err() {
+            break;
+        }
+    }
+    to.shutdown().await.ok();
+}
+
+/// Runs `client` while `server` runs beside it; the server is dropped once
+/// the client finishes.
+async fn against<T>(server: impl Future<Output = ()>, client: impl Future<Output = T>) -> T {
+    pin_mut!(server, client);
+    match select(client, server).await {
+        futures_util::future::Either::Left((done, _)) => done,
+        futures_util::future::Either::Right(((), _)) => unreachable!("servers run forever"),
+    }
+}
+
+fn loopback() -> SocketAddr {
+    "127.0.0.1:0".parse().expect("loopback address")
+}
+
+/// Plaintext HTTP/1.1: a GET and a POST with a CJK body reuse one
+/// connection from the thread's pool.
+async fn plaintext<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let server = serve_h1(io.clone(), executor, listener, H1Options::default());
+    let transport = Transport::builder()
+        .proxy(Proxy::none())
+        .build()
+        .expect("transport builds");
+    let mut client = NativeBackend::on_current_thread(transport, io, executor);
+    against(server, async {
+        for _ in 0..2 {
+            let response = client
+                .post(format!("http://127.0.0.1:{port}/echo"))
+                .expect("request builds")
+                .bytes_body(GREETING.as_bytes().to_vec())
+                .await
+                .expect("plaintext POST succeeds");
+            assert_eq!(response.headers()["x-protocol"], "h1");
+            assert_eq!(
+                &*response.into_string().await.expect("body reads"),
+                format!("POST /echo {GREETING}")
+            );
+        }
+        let status = client
+            .get(format!("http://127.0.0.1:{port}/missing"))
+            .expect("request builds")
+            .await;
+        assert!(
+            status.is_ok(),
+            "the echo server answers every path: {status:?}"
+        );
+    })
+    .await;
+}
+
+/// A server that closes every connection after its response: the pool
+/// never hands a closed connection out again, so each POST, a request no
+/// client may send twice once written, goes out on a new one and succeeds.
+async fn closing<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let server = serve_h1(
+        io.clone(),
+        executor,
+        listener,
+        H1Options {
+            close: true,
+            ..H1Options::default()
+        },
+    );
+    let transport = Transport::builder()
+        .proxy(Proxy::none())
+        .build()
+        .expect("transport builds");
+    let mut client = NativeBackend::on_current_thread(transport, io, executor);
+    against(server, async {
+        for round in 0..10 {
+            let response = client
+                .post(format!("http://127.0.0.1:{port}/order/{round}"))
+                .expect("request builds")
+                .bytes_body(GREETING.as_bytes().to_vec())
+                .await
+                .unwrap_or_else(|error| panic!("POST {round} succeeds: {error}"));
+            assert_eq!(
+                &*response.into_string().await.expect("body reads"),
+                format!("POST /order/{round} {GREETING}")
+            );
+        }
+    })
+    .await;
+}
+
+/// HTTP/1.1 over `http-kit-tls`, verified against the test CA by the
+/// platform verifier.
+async fn tls<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    let pki = Pki::new();
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let server = serve_h1(
+        io.clone(),
+        executor,
+        listener,
+        H1Options {
+            tls: Some(pki.tls_acceptor()),
+            ..H1Options::default()
+        },
+    );
+    let mut client = NativeBackend::on_current_thread(pki.transport(), io.clone(), executor);
+    against(server, async {
+        let response = client
+            // `/安全`, percent-encoded as a URI path carries it.
+            .put(format!("https://localhost:{port}/%E5%AE%89%E5%85%A8"))
+            .expect("request builds")
+            .bytes_body(GREETING.as_bytes().to_vec())
+            .await
+            .expect("HTTPS PUT succeeds");
+        assert_eq!(response.headers()["x-protocol"], "h1");
+        assert_eq!(
+            &*response.into_string().await.expect("body reads"),
+            format!("PUT /%E5%AE%89%E5%85%A8 {GREETING}")
+        );
+    })
+    .await;
+
+    // A server whose certificate no configured root signed is refused.
+    let stranger = Pki::new();
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let server = serve_h1(
+        io.clone(),
+        executor,
+        listener,
+        H1Options {
+            tls: Some(stranger.tls_acceptor()),
+            ..H1Options::default()
+        },
+    );
+    let mut client = NativeBackend::on_current_thread(pki.transport(), io, executor);
+    against(server, async {
+        let error = client
+            .get(format!("https://localhost:{port}/"))
+            .expect("request builds")
+            .await
+            .expect_err("an untrusted certificate fails the handshake");
+        assert!(error.to_string().contains("TLS"), "{error}");
+    })
+    .await;
+}
+
+/// An https origin through an HTTPS proxy: the origin's TLS session runs
+/// inside the proxy's, both verified against the test CA, and the tunnel
+/// is pooled like any connection.
+async fn https_proxy<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    let pki = Pki::new();
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let origin = serve_h1(
+        io.clone(),
+        executor,
+        listener,
+        H1Options {
+            tls: Some(pki.tls_acceptor()),
+            ..H1Options::default()
+        },
+    );
+    let proxy_listener = io.bind_tcp(loopback()).expect("bind");
+    let proxy_port = proxy_listener.local_addr().expect("local address").port();
+    let connects = Rc::new(RefCell::new(Vec::new()));
+    let proxy = serve_tls_proxy(
+        io.clone(),
+        executor,
+        proxy_listener,
+        pki.tls_acceptor(),
+        Rc::clone(&connects),
+    );
+    let server = async {
+        futures_util::join!(origin, proxy);
+    };
+    let rules = Proxy::builder()
+        .https(format!("https://localhost:{proxy_port}"))
+        .build();
+    let mut client = NativeBackend::on_current_thread(pki.transport_through(rules), io, executor);
+    against(server, async {
+        for _ in 0..2 {
+            let response = client
+                .post(format!("https://localhost:{port}/tunnel"))
+                .expect("request builds")
+                .bytes_body(GREETING.as_bytes().to_vec())
+                .await
+                .expect("POST through the HTTPS proxy succeeds");
+            assert_eq!(response.headers()["x-protocol"], "h1");
+            assert_eq!(
+                &*response.into_string().await.expect("body reads"),
+                format!("POST /tunnel {GREETING}")
+            );
+        }
+    })
+    .await;
+    assert_eq!(
+        *connects.borrow(),
+        [format!("localhost:{port}")],
+        "one tunnel carries both requests"
+    );
+}
+
+#[cfg(feature = "native-compio")]
+mod compio_runtime {
+    use http_kit_io::compio::Compio;
+
+    fn run(test: impl AsyncFnOnce(Compio, &compio::runtime::Runtime)) {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime");
+        runtime.block_on(test(Compio, &runtime));
+    }
+
+    #[test]
+    fn plaintext_h1() {
+        run(super::plaintext);
+    }
+
+    #[test]
+    fn closing_connections_are_not_reused() {
+        run(super::closing);
+    }
+
+    #[test]
+    fn tls_h1() {
+        run(super::tls);
+    }
+
+    #[test]
+    fn tls_inside_an_https_proxy() {
+        run(super::https_proxy);
+    }
+
+    #[cfg(feature = "native-http3")]
+    #[test]
+    fn h3_after_alt_svc() {
+        run(super::h3::upgrade);
+    }
+
+    #[cfg(feature = "native-http3")]
+    #[test]
+    fn h3_wins_the_race_against_a_stalled_tcp_dial() {
+        run(super::h3::race);
+    }
+
+    #[cfg(feature = "native-http3")]
+    #[test]
+    fn h3_refuses_an_untrusted_chain() {
+        run(super::h3::untrusted);
+    }
+
+    #[cfg(feature = "native-http3")]
+    #[test]
+    fn h3_black_hole_falls_back() {
+        run(super::h3::black_hole);
+    }
+}
+
+#[cfg(feature = "native-tokio")]
+mod tokio_runtime {
+    use http_kit_io::tokio::Tokio;
+
+    fn run(test: impl AsyncFnOnce(Tokio, &tokio::task::LocalSet)) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&runtime, test(Tokio, &local));
+    }
+
+    #[test]
+    fn plaintext_h1() {
+        run(super::plaintext);
+    }
+
+    #[test]
+    fn closing_connections_are_not_reused() {
+        run(super::closing);
+    }
+
+    #[test]
+    fn tls_h1() {
+        run(super::tls);
+    }
+
+    #[test]
+    fn tls_inside_an_https_proxy() {
+        run(super::https_proxy);
+    }
+
+    #[cfg(feature = "native-http3")]
+    #[test]
+    fn h3_after_alt_svc() {
+        run(super::h3::upgrade);
+    }
+
+    #[cfg(feature = "native-http3")]
+    #[test]
+    fn h3_wins_the_race_against_a_stalled_tcp_dial() {
+        run(super::h3::race);
+    }
+
+    #[cfg(feature = "native-http3")]
+    #[test]
+    fn h3_refuses_an_untrusted_chain() {
+        run(super::h3::untrusted);
+    }
+
+    #[cfg(feature = "native-http3")]
+    #[test]
+    fn h3_black_hole_falls_back() {
+        run(super::h3::black_hole);
+    }
+}
+
+#[cfg(feature = "native-http3")]
+mod h3 {
+    use std::{
+        net::{Ipv6Addr, UdpSocket},
+        time::Instant,
+    };
+
+    use http_kit_io::Io;
+
+    use super::*;
+
+    /// Serves HTTP/3 with `pki`'s leaf on a dual-stack UDP socket —
+    /// `localhost` may resolve to `::1` first — and returns its port.
+    fn bind_h3<I: Io>(io: &I, pki: &Pki) -> (http_kit_h3::Server<I::UdpSocket, I>, u16) {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .expect("UDP socket");
+        socket.set_only_v6(false).expect("dual stack");
+        socket
+            .bind(&SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0).into())
+            .expect("UDP binds");
+        let socket: UdpSocket = socket.into();
+        let port = socket.local_addr().expect("local address").port();
+        let identity =
+            http_kit_h3::Identity::from_pem(pki.leaf_pem.clone(), pki.leaf_key.serialize_pem());
+        let config = http_kit_h3::ServerConfig::new(identity, 64 * 1024);
+        let server = http_kit_h3::Server::new(
+            io.udp_socket(socket).expect("adopt UDP socket"),
+            io.clone(),
+            &config,
+        )
+        .expect("h3 server");
+        (server, port)
+    }
+
+    /// A TLS HTTP/1.1 server signed by `pki` advertising an HTTP/3 server
+    /// signed by `h3_pki`, both running until dropped, and the TCP port.
+    fn advertised<'a, I: NativeIo, E: LocalExecutor>(
+        io: &I,
+        executor: &'a E,
+        pki: &Pki,
+        h3_pki: &Pki,
+        stall_after_first: Option<Duration>,
+    ) -> (impl Future<Output = ()> + 'a, u16) {
+        let (h3_server, h3_port) = bind_h3(io, h3_pki);
+        let listener = io.bind_tcp(loopback()).expect("bind");
+        let port = listener.local_addr().expect("local address").port();
+        let h1 = serve_h1(
+            io.clone(),
+            executor,
+            listener,
+            H1Options {
+                tls: Some(pki.tls_acceptor()),
+                alt_svc: Some(format!("h3=\":{h3_port}\"; ma=60")),
+                stall_after_first,
+                ..H1Options::default()
+            },
+        );
+        let h3 = async move {
+            let options = H1Options::default();
+            let service = |request: Request| echo(request, "h3", &options);
+            h3_server.serve(&service).await.expect("h3 server runs");
+        };
+        let server = async {
+            futures_util::join!(h1, h3);
+        };
+        (server, port)
+    }
+
+    /// GETs `uri` and returns the protocol that carried it. With `keep`
+    /// off the body is left unread, so the connection is not pooled and
+    /// the next request dials.
+    async fn get(client: &mut NativeBackend, uri: &str, keep: bool) -> String {
+        let response = client
+            .get(uri)
+            .expect("request builds")
+            .await
+            .expect("GET succeeds over either protocol");
+        let protocol = response.headers()["x-protocol"]
+            .to_str()
+            .expect("ASCII")
+            .to_owned();
+        if keep {
+            response.into_string().await.expect("body reads");
+        }
+        protocol
+    }
+
+    /// `Alt-Svc` names a UDP port that swallows every datagram. The request
+    /// that races the QUIC dial finds TCP first, and no request waits for
+    /// the QUIC connect timeout: QUIC only ever runs beside TCP.
+    pub async fn black_hole<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+        let pki = Pki::new();
+        let hole = UdpSocket::bind("[::]:0").expect("UDP binds");
+        let hole_port = hole.local_addr().expect("local address").port();
+        let listener = io.bind_tcp(loopback()).expect("bind");
+        let port = listener.local_addr().expect("local address").port();
+        let server = serve_h1(
+            io.clone(),
+            executor,
+            listener,
+            H1Options {
+                tls: Some(pki.tls_acceptor()),
+                alt_svc: Some(format!("h3=\":{hole_port}\"; ma=60")),
+                ..H1Options::default()
+            },
+        );
+        let mut client = NativeBackend::on_current_thread(pki.transport(), io.clone(), executor);
+        against(server, async {
+            let uri = format!("https://localhost:{port}/fallback");
+            let started = Instant::now();
+            // The first request learns the advertisement and leaves no idle
+            // connection, so the second races a TCP dial against QUIC.
+            assert_eq!(get(&mut client, &uri, false).await, "h1");
+            for _ in 0..3 {
+                assert_eq!(get(&mut client, &uri, true).await, "h1");
+                io.sleep(Duration::from_millis(200)).await;
+            }
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(4),
+                "no request waits on the black-holed QUIC dial: {elapsed:?}"
+            );
+        })
+        .await;
+        drop(hole);
+    }
+
+    /// The TLS server advertises the h3 one through `Alt-Svc`; requests
+    /// move to HTTP/3 once the pool's QUIC dial completes its handshake,
+    /// a POST with a CJK body among them.
+    pub async fn upgrade<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+        let pki = Pki::new();
+        let (server, port) = advertised(&io, executor, &pki, &pki, None);
+        let mut client = NativeBackend::on_current_thread(pki.transport(), io.clone(), executor);
+        against(server, async {
+            let uri = format!("https://localhost:{port}/upgrade");
+            let mut protocol = String::new();
+            for _ in 0..50 {
+                protocol = get(&mut client, &uri, true).await;
+                if protocol == "h3" {
+                    break;
+                }
+                io.sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(protocol, "h3", "the advertised h3 endpoint takes over");
+
+            let response = client
+                .post(&uri)
+                .expect("request builds")
+                .bytes_body(GREETING.as_bytes().to_vec())
+                .await
+                .expect("POST over HTTP/3 succeeds");
+            assert_eq!(response.headers()["x-protocol"], "h3");
+            assert_eq!(
+                &*response.into_string().await.expect("body reads"),
+                format!("POST /upgrade {GREETING}")
+            );
+        })
+        .await;
+    }
+
+    /// Once h3 is advertised, a request with no connection to reuse races
+    /// a QUIC dial against a TCP dial whose server stalls: the QUIC
+    /// handshake completes first and carries the request.
+    pub async fn race<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+        const STALL: Duration = Duration::from_secs(3);
+        let pki = Pki::new();
+        let (server, port) = advertised(&io, executor, &pki, &pki, Some(STALL));
+        let mut client = NativeBackend::on_current_thread(pki.transport(), io.clone(), executor);
+        against(server, async {
+            let uri = format!("https://localhost:{port}/race");
+            assert_eq!(get(&mut client, &uri, false).await, "h1");
+            let started = Instant::now();
+            assert_eq!(get(&mut client, &uri, true).await, "h3");
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < STALL,
+                "QUIC wins without waiting on the stalled TCP dial: {elapsed:?}"
+            );
+        })
+        .await;
+    }
+
+    /// The advertised HTTP/3 server presents a chain no configured root
+    /// signed: the transport's verifier refuses it, QUIC backs off, and
+    /// every request stays on TCP, the one that raced QUIC included.
+    pub async fn untrusted<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+        let pki = Pki::new();
+        let stranger = Pki::new();
+        let (server, port) = advertised(&io, executor, &pki, &stranger, None);
+        let mut client = NativeBackend::on_current_thread(pki.transport(), io.clone(), executor);
+        against(server, async {
+            let uri = format!("https://localhost:{port}/untrusted");
+            assert_eq!(get(&mut client, &uri, false).await, "h1");
+            for _ in 0..5 {
+                assert_eq!(get(&mut client, &uri, true).await, "h1");
+                io.sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+    }
+}

@@ -57,6 +57,27 @@ jobs:
       - name: Run hyper backend doctests
         run: cargo test --doc --no-default-features --features hyper-backend,rustls,ws --workspace
 
+  native-backend:
+    # The native backend on each driver runtime, HTTP/3 included.
+    name: Native backend (${{ matrix.os }}, ${{ matrix.runtime }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.tier == 'full' && '["ubuntu-latest","windows-latest","macos-latest"]' || '["ubuntu-latest"]') }}
+        runtime: [compio, tokio]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.os }}-native-${{ matrix.runtime }}
+      - uses: taiki-e/install-action@nextest
+      - name: Run native backend tests
+        run: cargo nextest run --no-default-features --features native-${{ matrix.runtime }},native-http3 --workspace
+      - name: Run native backend doctests
+        run: cargo test --doc --no-default-features --features native-${{ matrix.runtime }},native-http3 --workspace
+
   wasm-linux:
     name: wasm-pack (Linux - ${{ matrix.browser }})
     if: ${{ inputs.tier == 'full' }}

@@ -110,7 +110,7 @@ pub fn https(
 /// A spawner that runs every background task on a dedicated thread —
 /// the same fallback `HyperBackend` uses when no executor is supplied.
 pub fn spawn() -> Spawn {
-    crate::backend::test_support::thread_spawn()
+    std::sync::Arc::new(crate::transport::spawn_thread)
 }
 
 /// The next `(name, record type)` the server was asked for.

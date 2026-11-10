@@ -34,7 +34,7 @@ include = [
 ]
 
 [dependencies]
-http-kit = "0.5.0"
+http-kit = "0.6.0"
 serde = { version = "1.0.229", default-features = false, features = ["derive"]}
 serde_json = "1.0.154"
 base64 = "0.23.1"
@@ -119,6 +119,23 @@ rustls = [
 # driven on futures-io streams by an in-tree adapter.
 native-tls = ["dep:native-tls"]
 
+# The runtime-neutral backend on `http-kit-io`'s owned-buffer sockets:
+# HTTP/1.1 through `http-kit-h1`, TLS through `http-kit-tls` (rustls, verified
+# as the hyper backend verifies). It runs on whichever runtime the caller's
+# thread runs; `native-compio` or `native-tokio` adds that runtime as the
+# driver behind `NativeBackend::new` for callers on no runtime at all. It is
+# the default backend only when `hyper-backend` is off.
+native-backend = ["rustls", "dep:http-kit-io", "dep:http-kit-h1", "dep:http-kit-tls"]
+# compio (io_uring, IOCP, polling) for the native backend.
+native-compio = ["native-backend", "http-kit-io/compio", "executor-core/compio", "dep:compio"]
+# tokio's reactor for the native backend.
+native-tokio = ["native-backend", "http-kit-io/tokio", "executor-core/tokio", "dep:tokio"]
+# HTTP/3 for the native backend through `http-kit-h3` (quiche; builds
+# BoringSSL with cmake). The server's chain goes to the same verifier as a TCP
+# connection's: the platform verifier with the transport's extra roots, and
+# OneCRL where it applies.
+native-http3 = ["native-backend", "dep:http-kit-h3", "http-kit-h3/quiche"]
+
 # Shorthands.
 hyper-rustls = ["hyper-backend", "rustls"]
 hyper-native-tls = ["hyper-backend", "native-tls"]
@@ -194,7 +211,15 @@ async-trait = "0.1.92"
 blocking = { version = "1.7.0", optional = true }
 curl = { version = "0.4.51", optional = true }
 dns-lookup = "4.0.2"
-executor-core = { version = "0.7.1" }
+executor-core = { version = "0.7.2" }
+# The native backend: owned-buffer sockets, HTTP/1.1, TLS and HTTP/3 on them,
+# and the runtimes it can drive itself.
+http-kit-io = { version = "0.4.0", optional = true }
+http-kit-h1 = { version = "0.3.0", optional = true }
+http-kit-tls = { version = "0.2.0", optional = true }
+http-kit-h3 = { version = "0.3.0", optional = true }
+compio = { version = "0.19.2", default-features = false, features = ["runtime"], optional = true }
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time"], optional = true }
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 hickory-resolver = { version = "0.26.3", default-features = false, features = ["system-config"] }
 hyper = { version = "1.12.0", default-features = false, features = ["client", "http1"] }

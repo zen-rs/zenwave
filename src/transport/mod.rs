@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(onecrl)]
 use std::time::Duration;
-#[cfg(http3)]
+#[cfg(any(all(connector, feature = "hyper-backend"), native_h3))]
 use std::{future::Future, pin::Pin};
 
 #[cfg(native)]
@@ -44,17 +44,26 @@ use rustls_pki_types::{CertificateDer, pem::PemObject};
 
 use crate::Error;
 
+// RFC 7838 Alt-Svc parsing, for HTTP/3 discovery.
+#[cfg(https_rr)]
+pub(crate) mod alt_svc;
 #[cfg(android_verifier)]
 mod android;
 #[cfg(feature = "curl-backend")]
 mod ca_bundle;
 #[cfg(connector)]
 pub(crate) mod connect;
+// The per-origin HTTP/3 knowledge both h3 paths keep.
+#[cfg(https_rr)]
+pub(crate) mod discovery;
 // HTTPS records only feed HTTP/3 discovery, so the resolver exists only
-// where the hyper backend can dial QUIC.
-#[cfg(http3)]
+// where a backend can dial QUIC.
+#[cfg(https_rr)]
 pub(crate) mod dns;
-#[cfg(connector)]
+// Generic over the dialer: its futures are `Send` exactly when the dialer's
+// are — the async-net dialer's are, an `http-kit-io` one's are not.
+#[cfg(dialer)]
+#[expect(clippy::future_not_send)]
 pub(crate) mod happy_eyeballs;
 // Kept `crate::`-free so `tests/common` can include the same file for its
 // hyper test server.
@@ -75,8 +84,11 @@ pub mod proxy;
 // connection pool.
 #[cfg(http3)]
 pub(crate) mod quic;
-#[cfg(connector)]
-mod socks5;
+// Which legs a connection takes through the proxy rules, for every connector.
+#[cfg(dialer)]
+pub(crate) mod route;
+#[cfg(dialer)]
+pub(crate) mod socks5;
 #[cfg(connector)]
 pub(crate) mod stream;
 #[cfg(tls_engine)]
@@ -89,9 +101,17 @@ pub use proxy::{Proxy, ProxyBuilder};
 
 /// Schedules the futures a DNS resolver or QUIC driver runs in the
 /// background. The backend supplies its own spawner so that work runs
-/// wherever connection drivers already run; [`dns`] and [`quic`] share it.
-#[cfg(http3)]
+/// wherever connection drivers already run; `dns` and `quic` share it.
+#[cfg(https_rr)]
 pub(crate) type Spawn = Arc<dyn Fn(Pin<Box<dyn Future<Output = ()> + Send>>) + Send + Sync>;
+
+/// Runs `future` to completion on a thread of its own, on async-io's
+/// reactor: the background work of a caller that has no executor of its
+/// own to hand it.
+#[cfg(any(all(connector, feature = "hyper-backend"), native_h3))]
+pub(crate) fn spawn_thread(future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+    std::thread::spawn(move || async_io::block_on(future));
+}
 
 /// How connections are established: trusted roots and, on native platforms,
 /// the TLS engine configured with them.
@@ -124,13 +144,19 @@ struct Inner {
     quic: once_cell::sync::OnceCell<quinn::Endpoint>,
     /// The resolver configuration read once at build; on Android the unit
     /// config — `DnsResolver` is configured by the OS.
-    #[cfg(http3)]
+    #[cfg(https_rr)]
     dns: dns::Config,
     /// The hickory resolver over `dns`, built on first lookup so its runtime
     /// takes the caller's [`Spawn`]; kept for its pooled name-server
     /// connections and TTL response cache.
-    #[cfg(all(http3, not(target_os = "android")))]
+    #[cfg(all(https_rr, not(target_os = "android")))]
     resolver: once_cell::sync::OnceCell<dns::HickoryResolver>,
+    /// The native backend's pool on its own driver thread, one per runtime,
+    /// started by the first `NativeBackend::new` over this transport.
+    #[cfg(all(native_backend, feature = "native-compio"))]
+    native_compio: std::sync::OnceLock<crate::backend::native::PoolHandle>,
+    #[cfg(all(native_backend, feature = "native-tokio"))]
+    native_tokio: std::sync::OnceLock<crate::backend::native::PoolHandle>,
 }
 
 impl Transport {
@@ -222,10 +248,37 @@ impl Transport {
         self.inner.quic.get_or_try_init(|| quic::endpoint(spawn))
     }
 
+    /// A handle that does not keep the transport alive: a native pool holds
+    /// one, so a transport that owns the pool's driver can still drop.
+    #[cfg(native_backend)]
+    pub(crate) fn downgrade(&self) -> WeakTransport {
+        WeakTransport(Arc::downgrade(&self.inner))
+    }
+
+    /// The native pool driven by compio on its own thread, started on first
+    /// use.
+    #[cfg(all(native_backend, feature = "native-compio"))]
+    pub(crate) fn native_compio(
+        &self,
+        start: impl FnOnce() -> crate::backend::native::PoolHandle,
+    ) -> &crate::backend::native::PoolHandle {
+        self.inner.native_compio.get_or_init(start)
+    }
+
+    /// The native pool driven by tokio on its own thread, started on first
+    /// use.
+    #[cfg(all(native_backend, feature = "native-tokio"))]
+    pub(crate) fn native_tokio(
+        &self,
+        start: impl FnOnce() -> crate::backend::native::PoolHandle,
+    ) -> &crate::backend::native::PoolHandle {
+        self.inner.native_tokio.get_or_init(start)
+    }
+
     /// The HTTPS (SVCB) record for `host`:`port`, resolved through the
     /// transport's DNS resolver. `spawn` schedules the futures the resolver
     /// drives in the background.
-    #[cfg(http3)]
+    #[cfg(https_rr)]
     pub(crate) async fn https_record(
         &self,
         spawn: Spawn,
@@ -233,6 +286,19 @@ impl Transport {
         port: u16,
     ) -> Result<Option<dns::HttpsRecord>, Error> {
         dns::https_record(&self.inner, spawn, host, port).await
+    }
+}
+
+/// A [`Transport`] that does not keep its configuration alive.
+#[cfg(native_backend)]
+#[derive(Clone)]
+pub(crate) struct WeakTransport(std::sync::Weak<Inner>);
+
+#[cfg(native_backend)]
+impl WeakTransport {
+    /// The transport, while anything else still holds it.
+    pub(crate) fn upgrade(&self) -> Option<Transport> {
+        self.0.upgrade().map(|inner| Transport { inner })
     }
 }
 
@@ -267,7 +333,7 @@ pub struct TransportBuilder {
     onecrl: onecrl::refresh::Refresh,
     /// Resolver configuration override — tests point it at an in-process
     /// DNS server instead of the system's.
-    #[cfg(all(http3, not(target_os = "android")))]
+    #[cfg(all(https_rr, not(target_os = "android")))]
     dns: Option<dns::Config>,
 }
 
@@ -367,7 +433,7 @@ impl TransportBuilder {
 
     /// Resolve through `config` instead of the system resolver
     /// configuration — a constructor for tests, not a runtime hook.
-    #[cfg(all(http3, not(target_os = "android")))]
+    #[cfg(all(https_rr, not(target_os = "android")))]
     #[allow(dead_code)] // only the h3 discovery tests override the configuration
     #[must_use]
     pub(crate) fn dns_config(mut self, config: dns::Config) -> Self {
@@ -412,7 +478,7 @@ impl TransportBuilder {
             // binaries) still resolves names through `getaddrinfo`, so
             // `build` records the failure and `https_record` reports it
             // per lookup.
-            #[cfg(all(http3, not(target_os = "android")))]
+            #[cfg(all(https_rr, not(target_os = "android")))]
             let dns = self.dns.unwrap_or_else(|| {
                 let config = dns::Config::system();
                 if let dns::Config::Unavailable(reason) = &config {
@@ -420,7 +486,7 @@ impl TransportBuilder {
                 }
                 config
             });
-            #[cfg(all(http3, target_os = "android"))]
+            #[cfg(all(https_rr, target_os = "android"))]
             let dns = dns::Config;
             let transport = Transport {
                 inner: Arc::new(Inner {
@@ -436,10 +502,14 @@ impl TransportBuilder {
                     pool: pool::Pool::new(),
                     #[cfg(http3)]
                     quic: once_cell::sync::OnceCell::new(),
-                    #[cfg(http3)]
+                    #[cfg(https_rr)]
                     dns,
-                    #[cfg(all(http3, not(target_os = "android")))]
+                    #[cfg(all(https_rr, not(target_os = "android")))]
                     resolver: once_cell::sync::OnceCell::new(),
+                    #[cfg(all(native_backend, feature = "native-compio"))]
+                    native_compio: std::sync::OnceLock::new(),
+                    #[cfg(all(native_backend, feature = "native-tokio"))]
+                    native_tokio: std::sync::OnceLock::new(),
                 }),
             };
             // The refresher holds a `Weak`; spawning after `inner` exists also

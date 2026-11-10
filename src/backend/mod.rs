@@ -16,19 +16,31 @@
 //!
 //! - **`hyper-backend`** (default): Uses hyper with async-io/async-net. TLS comes
 //!   from `rustls` (default) or `native-tls`; `rustls` wins when both are on.
+//!   The only backend that speaks HTTP/2.
+//! - **`native-backend`**: `NativeBackend`, HTTP/1.1 on `http-kit-h1` and,
+//!   with `native-http3`, HTTP/3 on `http-kit-h3`, over `http-kit-io`'s
+//!   owned-buffer streams, generic over the runtime. Its connection pool is
+//!   an actor on one thread: a thread-per-core caller builds one per thread
+//!   with `NativeBackend::on_current_thread`. `native-compio` or
+//!   `native-tokio` adds a driver thread for callers on no runtime, and makes
+//!   it the default backend when `hyper-backend` is off.
 //! - **`curl-backend`**: Uses libcurl via the `curl` crate. Includes proxy support.
 //! - **`apple-backend`**: Uses Apple's native `NSURLSession` (macOS/iOS only).
 //!
 //! Every backend is built from a [`crate::Transport`], which carries the
 //! trusted roots; `Default` uses [`crate::Transport::system`].
 
+// Request and response handling the hyper and native backends share.
+#[cfg(any(default_hyper, native_backend))]
+mod shared;
+
 #[cfg(all(not(target_arch = "wasm32"), feature = "hyper-backend"))]
 mod hyper;
 #[cfg(all(not(target_arch = "wasm32"), feature = "hyper-backend"))]
 pub use hyper::HyperBackend;
-// The connection pool stores the h3 handle and applies the Alt-Svc parser.
+// The connection pool stores the h3 handle.
 #[cfg(http3)]
-pub(crate) use hyper::{alt_svc, h3};
+pub(crate) use hyper::h3;
 // The h3 fixtures also serve the pool's coalescing test.
 #[cfg(all(test, http3))]
 pub(crate) use hyper::test_support;
@@ -55,26 +67,35 @@ pub use apple::AppleBackend;
 #[cfg(all(not(target_arch = "wasm32"), feature = "hyper-backend"))]
 pub type DefaultBackend = HyperBackend;
 
+#[cfg(native_backend)]
+pub(crate) mod native;
+#[cfg(feature = "native-compio")]
+pub use native::Compio;
+#[cfg(native_driver)]
+pub use native::Driver;
+#[cfg(feature = "native-tokio")]
+pub use native::Tokio;
+#[cfg(native_backend)]
+pub use native::{NativeBackend, NativeIo};
+
+/// The default HTTP client backend: the native backend on its own driver
+/// runtime.
+///
+/// Selected when `native-backend` comes with a runtime (`native-compio` or
+/// `native-tokio`) and `hyper-backend` is off.
+#[cfg(default_native)]
+pub type DefaultBackend = NativeBackend;
+
 /// The default HTTP client backend: Apple's `NSURLSession`.
 ///
 /// This is selected on Apple platforms only when `apple-backend` is enabled
-/// without `hyper-backend`.
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    target_vendor = "apple",
-    feature = "apple-backend",
-    not(feature = "hyper-backend")
-))]
+/// without `hyper-backend` or a native backend runtime.
+#[cfg(default_apple)]
 pub type DefaultBackend = AppleBackend;
 
 /// The default HTTP client backend: libcurl.
-/// This is selected when `curl-backend` is enabled but `hyper-backend` is not.
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    not(feature = "hyper-backend"),
-    not(all(target_vendor = "apple", feature = "apple-backend")),
-    feature = "curl-backend"
-))]
+/// This is selected when `curl-backend` is enabled and no backend above is.
+#[cfg(default_curl)]
 pub type DefaultBackend = CurlBackend;
 
 // ============================================================================
@@ -100,11 +121,14 @@ pub type DefaultBackend = WebBackend;
     not(target_arch = "wasm32"),
     not(apple_backend),
     not(feature = "hyper-backend"),
-    not(feature = "curl-backend")
+    not(feature = "curl-backend"),
+    not(native_driver)
 ))]
 compile_error!(
-    "No backend enabled for native platform. \
-     Please enable one of: `hyper-backend` (recommended), `curl-backend`, or `apple-backend` (Apple platforms only). \
+    "No default backend enabled for native platform. \
+     Please enable one of: `hyper-backend` (recommended), `curl-backend`, \
+     `native-compio` or `native-tokio` (the native backend with a runtime of its own), \
+     or `apple-backend` (Apple platforms only). \
      The default feature set includes `hyper-backend` with `rustls` TLS."
 );
 

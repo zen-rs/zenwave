@@ -1,12 +1,40 @@
 //! SOCKS5 `CONNECT` (RFC 1928) with optional username/password
 //! authentication (RFC 1929).
+//!
+//! The handshake is written once over [`Handshake`], the two operations it
+//! needs from a stream; each connector supplies them for its own sockets.
 
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    future::Future,
+    io,
+    net::{IpAddr, SocketAddr},
+};
 
-use async_net::TcpStream;
-use futures_util::{AsyncReadExt, AsyncWriteExt};
-
+use super::happy_eyeballs;
 use crate::{Error, error::ProxyErrorKind};
+
+/// The byte exchange a SOCKS5 handshake runs over.
+pub trait Handshake {
+    /// Writes all of `bytes`.
+    fn send(&mut self, bytes: Vec<u8>) -> impl Future<Output = io::Result<()>>;
+
+    /// Reads exactly `len` bytes.
+    fn recv(&mut self, len: usize) -> impl Future<Output = io::Result<Vec<u8>>>;
+}
+
+/// A `futures_io` stream: async-net's sockets.
+#[cfg(connector)]
+impl Handshake for async_net::TcpStream {
+    async fn send(&mut self, bytes: Vec<u8>) -> io::Result<()> {
+        futures_util::AsyncWriteExt::write_all(self, &bytes).await
+    }
+
+    async fn recv(&mut self, len: usize) -> io::Result<Vec<u8>> {
+        let mut bytes = vec![0; len];
+        futures_util::AsyncReadExt::read_exact(self, &mut bytes).await?;
+        Ok(bytes)
+    }
+}
 
 const VERSION: u8 = 0x05;
 const METHOD_NONE: u8 = 0x00;
@@ -22,13 +50,13 @@ const AUTH_VERSION: u8 = 0x01;
 ///
 /// With `resolve_remotely` (`socks5h://`) the hostname is sent to the proxy;
 /// otherwise (`socks5://`) it is resolved here first, as curl does.
-pub async fn connect(
-    mut stream: TcpStream,
+pub async fn connect<S: Handshake>(
+    mut stream: S,
     host: &str,
     port: u16,
     credentials: Option<(&str, &str)>,
     resolve_remotely: bool,
-) -> Result<TcpStream, Error> {
+) -> Result<S, Error> {
     negotiate_method(&mut stream, credentials).await?;
 
     let mut request = vec![VERSION, COMMAND_CONNECT, 0x00];
@@ -50,10 +78,9 @@ pub async fn connect(
         }
     }
     request.extend_from_slice(&port.to_be_bytes());
-    stream.write_all(&request).await.map_err(io_error)?;
+    stream.send(request).await.map_err(io_error)?;
 
-    let mut head = [0_u8; 4];
-    stream.read_exact(&mut head).await.map_err(io_error)?;
+    let head = stream.recv(4).await.map_err(io_error)?;
     if head[0] != VERSION {
         return Err(socks("proxy answered with a non-SOCKS5 version"));
     }
@@ -63,31 +90,25 @@ pub async fn connect(
     let bound_address_len = match head[3] {
         ADDRESS_IPV4 => 4,
         ADDRESS_IPV6 => 16,
-        ADDRESS_DOMAIN => {
-            let mut len = [0_u8; 1];
-            stream.read_exact(&mut len).await.map_err(io_error)?;
-            usize::from(len[0])
-        }
+        ADDRESS_DOMAIN => usize::from(stream.recv(1).await.map_err(io_error)?[0]),
         _ => return Err(socks("proxy reported an unknown bound address type")),
     };
-    let mut bound = vec![0_u8; bound_address_len + 2];
-    stream.read_exact(&mut bound).await.map_err(io_error)?;
+    stream.recv(bound_address_len + 2).await.map_err(io_error)?;
     Ok(stream)
 }
 
-async fn negotiate_method(
-    stream: &mut TcpStream,
+async fn negotiate_method<S: Handshake>(
+    stream: &mut S,
     credentials: Option<(&str, &str)>,
 ) -> Result<(), Error> {
-    let greeting: &[u8] = if credentials.is_some() {
-        &[VERSION, 2, METHOD_NONE, METHOD_USERNAME_PASSWORD]
+    let greeting = if credentials.is_some() {
+        vec![VERSION, 2, METHOD_NONE, METHOD_USERNAME_PASSWORD]
     } else {
-        &[VERSION, 1, METHOD_NONE]
+        vec![VERSION, 1, METHOD_NONE]
     };
-    stream.write_all(greeting).await.map_err(io_error)?;
+    stream.send(greeting).await.map_err(io_error)?;
 
-    let mut choice = [0_u8; 2];
-    stream.read_exact(&mut choice).await.map_err(io_error)?;
+    let choice = stream.recv(2).await.map_err(io_error)?;
     if choice[0] != VERSION {
         return Err(socks("proxy answered with a non-SOCKS5 version"));
     }
@@ -105,7 +126,11 @@ async fn negotiate_method(
     }
 }
 
-async fn authenticate(stream: &mut TcpStream, username: &str, password: &str) -> Result<(), Error> {
+async fn authenticate<S: Handshake>(
+    stream: &mut S,
+    username: &str,
+    password: &str,
+) -> Result<(), Error> {
     let username_len =
         u8::try_from(username.len()).map_err(|_| socks("username longer than 255 bytes"))?;
     let password_len =
@@ -114,10 +139,9 @@ async fn authenticate(stream: &mut TcpStream, username: &str, password: &str) ->
     message.extend_from_slice(username.as_bytes());
     message.push(password_len);
     message.extend_from_slice(password.as_bytes());
-    stream.write_all(&message).await.map_err(io_error)?;
+    stream.send(message).await.map_err(io_error)?;
 
-    let mut status = [0_u8; 2];
-    stream.read_exact(&mut status).await.map_err(io_error)?;
+    let status = stream.recv(2).await.map_err(io_error)?;
     if status[1] == 0x00 {
         Ok(())
     } else {
@@ -145,7 +169,7 @@ async fn destination(
     if resolve_remotely {
         return Ok(Destination::Domain(host));
     }
-    let resolved = async_net::resolve((host, port))
+    let resolved = happy_eyeballs::resolve(host, port)
         .await
         .map_err(|error| Error::Transport(Box::new(error)))?;
     resolved

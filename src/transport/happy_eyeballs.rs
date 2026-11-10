@@ -1,18 +1,21 @@
 //! RFC 8305 Happy Eyeballs: resolve both address families concurrently and
 //! race connection attempts so a broken IPv6 path costs milliseconds, not a
 //! timeout.
+//!
+//! The state machine and the resolution are runtime-independent: names go
+//! to `getaddrinfo` on threads of their own, and the sockets and timers come
+//! from a [`Dialer`] — async-net for the hyper backend and websockets, an
+//! `http-kit-io` implementation for the native backend.
 
 use std::{
     collections::{HashSet, VecDeque},
+    future::Future,
     io,
     net::{IpAddr, SocketAddr},
-    pin::Pin,
     thread,
     time::{Duration, Instant},
 };
 
-use async_io::Timer;
-use async_net::TcpStream;
 use dns_lookup::{AddrFamily, AddrInfoHints, SockType, getaddrinfo};
 use futures_channel::mpsc::{UnboundedReceiver, unbounded};
 use futures_util::{
@@ -21,6 +24,39 @@ use futures_util::{
     pin_mut,
     stream::{FuturesUnordered, StreamExt},
 };
+
+/// Opens TCP connections and keeps the race's deadlines.
+pub trait Dialer {
+    /// A connected stream.
+    type Stream;
+
+    /// Connects to `addr`, with `TCP_NODELAY` set where the socket allows
+    /// it.
+    fn dial(&self, addr: SocketAddr) -> impl Future<Output = io::Result<Self::Stream>>;
+
+    /// Completes at `deadline`.
+    fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()>;
+}
+
+/// The async-io/async-net dialer the hyper backend and websockets use.
+#[cfg(connector)]
+#[derive(Clone, Copy, Debug)]
+pub struct AsyncNet;
+
+#[cfg(connector)]
+impl Dialer for AsyncNet {
+    type Stream = async_net::TcpStream;
+
+    async fn dial(&self, addr: SocketAddr) -> io::Result<Self::Stream> {
+        let stream = async_net::TcpStream::connect(addr).await?;
+        stream.set_nodelay(true)?;
+        Ok(stream)
+    }
+
+    async fn sleep_until(&self, deadline: Instant) {
+        async_io::Timer::at(deadline).await;
+    }
+}
 
 // RFC 8305 defaults: Resolution Delay = 50ms, First Address Family Count = 1,
 // Connection Attempt Delay = 250ms.
@@ -34,8 +70,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Resolve `host`:`port` to socket addresses in the order [`connect`] would
 /// attempt them — getaddrinfo's RFC 6724 ordering where the system reports
 /// it, otherwise the RFC 8305 interleave. QUIC dials share the result: a UDP
-/// handshake races in the same address order TCP would have used.
-#[cfg(http3)]
+/// handshake races in the same address order TCP would have used; a SOCKS5
+/// proxy that resolves nothing itself is handed the first.
 pub async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![SocketAddr::new(ip, port)]);
@@ -55,10 +91,12 @@ pub async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     Ok(ordered)
 }
 
-pub async fn connect(host: &str, port: u16) -> io::Result<TcpStream> {
+/// Connects to `host`:`port` through `dialer`, racing the resolved
+/// addresses as RFC 8305 describes.
+pub async fn connect<D: Dialer>(dialer: &D, host: &str, port: u16) -> io::Result<D::Stream> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         let addr = SocketAddr::new(ip, port);
-        return connect_with_timeout(addr)
+        return connect_with_timeout(dialer, addr)
             .await
             .map_err(|error| io::Error::new(error.kind(), format!("{addr}: {error}")));
     }
@@ -72,12 +110,11 @@ pub async fn connect(host: &str, port: u16) -> io::Result<TcpStream> {
         state.rebuild_pending();
 
         if let Some(addr) = state.pop_next_attempt(Instant::now()) {
-            let attempt: AttemptFuture = Box::pin(connect_attempt(addr));
-            attempts.push(attempt);
+            attempts.push(connect_attempt(dialer, addr));
             continue;
         }
 
-        if state.is_terminal(&attempts) {
+        if state.is_terminal(attempts.is_empty()) {
             return Err(state.into_connect_error());
         }
 
@@ -88,8 +125,8 @@ pub async fn connect(host: &str, port: u16) -> io::Result<TcpStream> {
                 resolver.next().await
             }
         };
-        let resolution_delay = timer_at(state.resolution_delay_deadline);
-        let next_attempt_due = timer_at(state.next_attempt_deadline());
+        let resolution_delay = timer_at(dialer, state.resolution_delay_deadline);
+        let next_attempt_due = timer_at(dialer, state.next_attempt_deadline());
 
         pin_mut!(resolver_event);
         pin_mut!(resolution_delay);
@@ -98,7 +135,7 @@ pub async fn connect(host: &str, port: u16) -> io::Result<TcpStream> {
         let attempt_result = async {
             match attempts.next().await {
                 Some(outcome) => outcome,
-                None => pending::<AttemptOutcome>().await,
+                None => pending::<AttemptOutcome<D::Stream>>().await,
             }
         }
         .fuse();
@@ -185,13 +222,10 @@ impl FamilyResolution {
     }
 }
 
-#[derive(Debug)]
-struct AttemptOutcome {
+struct AttemptOutcome<S> {
     addr: SocketAddr,
-    result: io::Result<TcpStream>,
+    result: io::Result<S>,
 }
-
-type AttemptFuture = Pin<Box<dyn Future<Output = AttemptOutcome> + Send>>;
 
 #[derive(Debug)]
 struct HappyEyeballsState {
@@ -395,8 +429,8 @@ impl HappyEyeballsState {
         self.ipv6.is_finished() && self.ipv4.is_finished()
     }
 
-    fn is_terminal(&self, attempts: &FuturesUnordered<AttemptFuture>) -> bool {
-        attempts.is_empty() && self.pending.is_empty() && self.resolution_complete()
+    fn is_terminal(&self, no_attempts_running: bool) -> bool {
+        no_attempts_running && self.pending.is_empty() && self.resolution_complete()
     }
 
     fn into_connect_error(self) -> io::Error {
@@ -416,17 +450,17 @@ impl HappyEyeballsState {
     }
 }
 
-async fn connect_attempt(addr: SocketAddr) -> AttemptOutcome {
+async fn connect_attempt<D: Dialer>(dialer: &D, addr: SocketAddr) -> AttemptOutcome<D::Stream> {
     AttemptOutcome {
         addr,
-        result: connect_with_timeout(addr).await,
+        result: connect_with_timeout(dialer, addr).await,
     }
 }
 
-async fn connect_with_timeout(addr: SocketAddr) -> io::Result<TcpStream> {
-    let connect = TcpStream::connect(addr);
+async fn connect_with_timeout<D: Dialer>(dialer: &D, addr: SocketAddr) -> io::Result<D::Stream> {
+    let connect = dialer.dial(addr);
     let timeout = async {
-        Timer::after(CONNECT_TIMEOUT).await;
+        dialer.sleep_until(Instant::now() + CONNECT_TIMEOUT).await;
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!("timed out connecting to {addr}"),
@@ -568,11 +602,9 @@ fn bounded_connection_attempt_delay() -> Duration {
         .min(MAX_CONNECTION_ATTEMPT_DELAY)
 }
 
-async fn timer_at(deadline: Option<Instant>) {
+async fn timer_at<D: Dialer>(dialer: &D, deadline: Option<Instant>) {
     match deadline {
-        Some(deadline) => {
-            Timer::at(deadline).await;
-        }
+        Some(deadline) => dialer.sleep_until(deadline).await,
         None => pending::<()>().await,
     }
 }
@@ -581,8 +613,10 @@ async fn timer_at(deadline: Option<Instant>) {
 mod tests {
     use super::{
         AddressFamilyKind, HappyEyeballsState, ResolutionEvent, ResolutionEventKind,
-        ResolutionResult, connect, interleave_address_families,
+        ResolutionResult, interleave_address_families,
     };
+    #[cfg(connector)]
+    use super::{AsyncNet, connect};
     use std::{net::SocketAddr, time::Instant};
 
     #[test]
@@ -671,9 +705,10 @@ mod tests {
         );
     }
 
+    #[cfg(connector)]
     #[test]
     fn literal_ip_connect_does_not_report_opposite_family_resolution() {
-        let error = smol::block_on(connect("127.0.0.1", 9))
+        let error = smol::block_on(connect(&AsyncNet, "127.0.0.1", 9))
             .expect_err("discard port should not accept connections in tests");
         let message = error.to_string();
         assert!(

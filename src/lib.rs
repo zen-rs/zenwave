@@ -42,6 +42,11 @@
 //!
 //! ### Features
 //! - **`hyper-backend`**: hyper over async-io. Needs `rustls` or `native-tls`.
+//! - **`native-compio`** / **`native-tokio`**: HTTP/1.1 (and HTTP/3 with
+//!   `native-http3`) on http-kit's owned-buffer I/O, driven by compio or
+//!   tokio; the default backend when `hyper-backend` is off. `native-backend`
+//!   alone gives the runtime-neutral backend for callers that drive it on
+//!   their own thread.
 //! - **`rustls`** / **`native-tls`**: the TLS engine for hyper and websockets.
 //!   Both may be enabled; `rustls` takes precedence.
 //! - **`curl-backend`**: libcurl-based backend with its own TLS.
