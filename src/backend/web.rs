@@ -335,4 +335,6 @@ fn transport_error(message: impl Into<String>) -> io::Error {
     io::Error::other(message.into())
 }
 
+http_kit::impl_send_endpoint!(WebBackend);
+
 impl Client for WebBackend {}

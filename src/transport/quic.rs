@@ -282,7 +282,8 @@ mod tests {
     }
 
     async fn body_bytes(body: http_kit::Body) -> Vec<u8> {
-        body.try_collect::<Vec<Bytes>>()
+        body.into_data_stream()
+            .try_collect::<Vec<Bytes>>()
             .await
             .expect("body is valid")
             .concat()

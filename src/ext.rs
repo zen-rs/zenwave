@@ -79,7 +79,7 @@ impl ResponseExt for crate::Response {
     }
 
     async fn into_bytes_with_limit(self, limit: usize) -> Result<Bytes, crate::Error> {
-        let mut body = self.into_body();
+        let mut body = self.into_body().into_data_stream();
         let mut bytes = Vec::new();
         while let Some(chunk) = body.next().await {
             let chunk = chunk?;

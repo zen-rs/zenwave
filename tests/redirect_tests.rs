@@ -111,6 +111,8 @@ impl Endpoint for MockClient {
     }
 }
 
+http_kit::impl_send_endpoint!(MockClient);
+
 impl Client for MockClient {}
 
 fn redirect_response(status: StatusCode, location: &str) -> Response {

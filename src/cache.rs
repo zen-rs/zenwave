@@ -38,6 +38,8 @@ impl Cache {
     }
 }
 
+http_kit::impl_send_middleware!(Cache);
+
 impl Middleware for Cache {
     type Error = CacheError;
     async fn handle<E: Endpoint>(

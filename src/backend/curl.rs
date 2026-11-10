@@ -105,6 +105,8 @@ impl Default for CurlBackend {
     }
 }
 
+http_kit::impl_send_endpoint!(CurlBackend);
+
 impl Client for CurlBackend {}
 
 impl Endpoint for CurlBackend {

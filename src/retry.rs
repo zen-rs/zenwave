@@ -1,7 +1,7 @@
 //! Middleware for retrying failed HTTP requests.
 
-use core::time::Duration;
-use http_kit::{Endpoint, Request, Response};
+use core::{future::Future, time::Duration};
+use http_kit::{Endpoint, Request, Response, SendEndpoint};
 
 use crate::client::Client;
 #[cfg(target_arch = "wasm32")]
@@ -63,6 +63,18 @@ where
 
 impl<C: Client> Client for Retry<C> where C::Error: Into<crate::Error> {}
 
+impl<C: Client> SendEndpoint for Retry<C>
+where
+    C::Error: Into<crate::Error>,
+{
+    fn respond_send(
+        &mut self,
+        request: &mut Request,
+    ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        self.respond(request)
+    }
+}
+
 impl<C: Client> Endpoint for Retry<C>
 where
     C::Error: Into<crate::Error>,
@@ -76,7 +88,7 @@ where
             let replay = (attempts < self.max_retries)
                 .then(|| replayable(request))
                 .flatten();
-            match self.client.respond(request).await {
+            match self.client.respond_send(request).await {
                 Ok(response) => return Ok(response),
                 Err(err) => {
                     let err = err.into();

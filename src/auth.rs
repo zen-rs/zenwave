@@ -20,6 +20,8 @@ impl BearerAuth {
     }
 }
 
+http_kit::impl_send_middleware!(BearerAuth, BasicAuth);
+
 impl Middleware for BearerAuth {
     type Error = Infallible;
     async fn handle<E: Endpoint>(

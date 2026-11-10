@@ -153,6 +153,8 @@ impl Endpoint for DefaultClient {
     }
 }
 
+http_kit::impl_send_endpoint!(DefaultClient);
+
 impl Client for DefaultClient {}
 
 /// The default client over the system transport: the operating system's
