@@ -34,6 +34,7 @@ use crate::{
         Inner, Transport,
         connect::{self, Protocols, Target, Via},
         hyper_io::HyperIo,
+        route::authority,
     },
 };
 
@@ -255,7 +256,7 @@ async fn fetch(transport: &Transport, plan: &Plan, since: u64) -> Result<Changes
         uri.path_and_query()
             .map_or("/", http::uri::PathAndQuery::as_str),
     )
-    .header(HOST, connect::authority(&host, port))
+    .header(HOST, authority(&host, port))
     .body(Empty::new())
     .map_err(|error| Error::InvalidRequest(error.to_string()))?;
     // An HTTP proxy serving a plaintext target speaks absolute-form; a

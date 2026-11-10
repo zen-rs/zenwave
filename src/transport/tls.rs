@@ -7,7 +7,7 @@
 //! built from the same verifier and roots, because the ALPN list has to be
 //! fixed before the handshake starts.
 
-use super::connect::Protocols;
+use super::route::Protocols;
 
 #[cfg(tls_rustls)]
 mod engine {
@@ -15,8 +15,11 @@ mod engine {
 
     #[cfg(onecrl)]
     use arc_swap::ArcSwap;
+    #[cfg(connector)]
     use futures_io::{AsyncRead, AsyncWrite};
-    use rustls::{ClientConfig, crypto::ring, pki_types::ServerName};
+    #[cfg(connector)]
+    use rustls::pki_types::ServerName;
+    use rustls::{ClientConfig, crypto::ring};
     use rustls_pki_types::CertificateDer;
     #[cfg(not(android_verifier))]
     use rustls_platform_verifier::Verifier;
@@ -26,6 +29,7 @@ mod engine {
     use super::Protocols;
     use crate::Error;
 
+    #[cfg(connector)]
     pub type TlsStream<S> = futures_rustls::client::TlsStream<S>;
 
     /// The platform verifier, extended with `extra_roots`.
@@ -98,7 +102,17 @@ mod engine {
         /// The ALPN-less base configuration; QUIC clones it and sets `h3`.
         #[cfg(http3)]
         base: Arc<ClientConfig>,
+        /// The `http/1.1` configuration, which the native backend hands to
+        /// `http-kit-tls` as is.
+        #[cfg(native_backend)]
+        http1_config: Arc<ClientConfig>,
+        /// The verifier every configuration above runs, which the native
+        /// backend's HTTP/3 handshakes call too.
+        #[cfg(native_h3)]
+        verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+        #[cfg(connector)]
         http1: futures_rustls::TlsConnector,
+        #[cfg(connector)]
         http2_or_http1: futures_rustls::TlsConnector,
     }
 
@@ -114,25 +128,49 @@ mod engine {
                 #[cfg(onecrl)]
                 additions,
             )?;
+            #[cfg(native_h3)]
+            let shared = Arc::clone(&verifier);
             let base = ClientConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions()
                 .map_err(Error::tls)?
                 .dangerous()
                 .with_custom_certificate_verifier(verifier)
                 .with_no_client_auth();
-            let mut http1 = base.clone();
-            http1.alpn_protocols = alpn_protocols(Protocols::Http1);
-            #[cfg(http3)]
-            let mut http2_or_http1 = base.clone();
-            #[cfg(not(http3))]
-            let mut http2_or_http1 = base;
-            http2_or_http1.alpn_protocols = alpn_protocols(Protocols::Http2OrHttp1);
+            let with_alpn = |protocols| {
+                let mut config = base.clone();
+                config.alpn_protocols = alpn_protocols(protocols);
+                Arc::new(config)
+            };
+            let http1 = with_alpn(Protocols::Http1);
             Ok(Self {
+                #[cfg(connector)]
+                http2_or_http1: futures_rustls::TlsConnector::from(with_alpn(
+                    Protocols::Http2OrHttp1,
+                )),
                 #[cfg(http3)]
                 base: Arc::new(base),
-                http1: futures_rustls::TlsConnector::from(Arc::new(http1)),
-                http2_or_http1: futures_rustls::TlsConnector::from(Arc::new(http2_or_http1)),
+                #[cfg(native_backend)]
+                http1_config: Arc::clone(&http1),
+                #[cfg(native_h3)]
+                verifier: shared,
+                #[cfg(connector)]
+                http1: futures_rustls::TlsConnector::from(http1),
             })
+        }
+
+        /// The server certificate verifier: the platform verifier with the
+        /// transport's extra roots, wrapped in OneCRL where it applies.
+        #[cfg(native_h3)]
+        pub fn verifier(&self) -> &Arc<dyn rustls::client::danger::ServerCertVerifier> {
+            &self.verifier
+        }
+
+        /// The configuration offering `http/1.1` alone, with the platform
+        /// verifier (and OneCRL, where it applies) — what the native
+        /// backend's `http-kit-tls` handshakes run with.
+        #[cfg(native_backend)]
+        pub const fn http1_config(&self) -> &Arc<ClientConfig> {
+            &self.http1_config
         }
 
         /// The shared client configuration; `transport::quic` clones it with
@@ -142,6 +180,7 @@ mod engine {
             &self.base
         }
 
+        #[cfg(connector)]
         pub async fn connect<S>(
             &self,
             host: &str,
@@ -166,6 +205,7 @@ mod engine {
     /// The protocol `stream`'s TLS session negotiated through ALPN, if any.
     ///
     /// Infallible for rustls — the signature matches the native-tls engine.
+    #[cfg(connector)]
     #[allow(clippy::unnecessary_wraps)] // the native-tls engine can fail here
     pub fn negotiated_alpn<S>(stream: &TlsStream<S>) -> Result<Option<Vec<u8>>, Error> {
         let (_, connection) = stream.get_ref();
@@ -247,7 +287,9 @@ mod engine {
     }
 }
 
-pub use engine::{TlsConnector, TlsStream, negotiated_alpn};
+pub use engine::TlsConnector;
+#[cfg(connector)]
+pub use engine::{TlsStream, negotiated_alpn};
 
 impl std::fmt::Debug for TlsConnector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

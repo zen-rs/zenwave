@@ -86,12 +86,28 @@ fn main() {
     cfg_aliases! {
         // Anything that is not the browser/Workers Fetch backend.
         native: { not(target_arch = "wasm32") },
-        // The shared TCP/TLS connector is needed by hyper and by native websockets.
-        connector: { all(not(target_arch = "wasm32"), any(feature = "hyper-backend", feature = "ws")) },
-        // TLS engine compiled into that connector; an engine feature enabled
-        // next to curl or URLSession alone has nothing to serve. Features are
-        // additive, so `rustls` wins when both engines are enabled.
-        tls_rustls: { all(connector, feature = "rustls") },
+        // The shared async-net TCP/TLS connector is needed by hyper, by native
+        // websockets, and by the OneCRL refresher wherever OneCRL applies.
+        connector: { all(not(target_arch = "wasm32"), any(
+            feature = "hyper-backend",
+            feature = "ws",
+            all(feature = "native-backend", feature = "onecrl", not(target_vendor = "apple"), not(windows))
+        )) },
+        // What every connector shares: the proxy route, happy eyeballs,
+        // SOCKS5 and the TLS verifier configuration.
+        dialer: { any(connector, all(not(target_arch = "wasm32"), feature = "native-backend")) },
+        // The backend on http-kit-io's owned-buffer sockets; `native_driver`
+        // when it also carries a runtime of its own for callers on none.
+        native_backend: { all(not(target_arch = "wasm32"), feature = "native-backend") },
+        native_driver: { all(native_backend, any(feature = "native-compio", feature = "native-tokio")) },
+        native_h3: { all(native_backend, feature = "native-http3") },
+        // A backend that pools connections per origin: hyper's and the native one.
+        pooled: { all(not(target_arch = "wasm32"), any(feature = "hyper-backend", feature = "native-backend")) },
+        // TLS engine compiled into that connector (and the native backend); an
+        // engine feature enabled next to curl or URLSession alone has nothing
+        // to serve. Features are additive, so `rustls` wins when both engines
+        // are enabled.
+        tls_rustls: { all(dialer, feature = "rustls") },
         tls_native: { all(connector, feature = "native-tls", not(feature = "rustls")) },
         tls_engine: { any(tls_rustls, tls_native) },
         // rustls-platform-verifier needs a JVM handle on Android.
@@ -99,6 +115,8 @@ fn main() {
         // QUIC transport and the h3 connection type exist only where the
         // shared connector, the hyper backend and the rustls engine do.
         http3: { all(connector, feature = "hyper-backend", feature = "http3") },
+        // HTTP/3 discovery (Alt-Svc, HTTPS records), shared by both h3 paths.
+        https_rr: { any(http3, native_h3) },
         // Unix domain sockets: every `unix` target has AF_UNIX, but wasm32-wasi
         // is `unix` without being `native` — the connector does not exist there.
         unix_socket: { all(unix, native) },
@@ -108,14 +126,17 @@ fn main() {
         // Apple and Windows verify through the OS trust service, which ships
         // its own distrust.
         onecrl: { all(tls_rustls, feature = "onecrl", not(target_vendor = "apple"), not(windows)) },
-        // Which backend `DefaultBackend` resolves to: hyper wins, then URLSession, then libcurl.
+        // Which backend `DefaultBackend` resolves to: hyper wins, then the
+        // native backend with a runtime, then URLSession, then libcurl.
         apple_backend: { all(target_vendor = "apple", feature = "apple-backend") },
         default_hyper: { all(not(target_arch = "wasm32"), feature = "hyper-backend") },
-        default_apple: { all(target_vendor = "apple", feature = "apple-backend", not(feature = "hyper-backend")) },
+        default_native: { all(native_driver, not(feature = "hyper-backend")) },
+        default_apple: { all(target_vendor = "apple", feature = "apple-backend", not(feature = "hyper-backend"), not(default_native)) },
         default_curl: { all(
             not(target_arch = "wasm32"),
             feature = "curl-backend",
             not(feature = "hyper-backend"),
+            not(default_native),
             not(all(target_vendor = "apple", feature = "apple-backend"))
         ) },
     }
@@ -172,7 +193,7 @@ mod onecrl {
     /// `CARGO_CFG_*`/`CARGO_FEATURE_*` environment instead.
     pub fn generate() {
         let feature = |name: &str| env::var_os(format!("CARGO_FEATURE_{name}")).is_some();
-        let connector = feature("HYPER_BACKEND") || feature("WS");
+        let connector = feature("HYPER_BACKEND") || feature("WS") || feature("NATIVE_BACKEND");
         let tls_rustls = connector && feature("RUSTLS");
         let applies = tls_rustls
             && env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("wasm32")

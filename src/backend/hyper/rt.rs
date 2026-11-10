@@ -1,13 +1,13 @@
 //! hyper's runtime traits over `async-io` and the backend's spawner.
 
-use std::{fmt, future::Future, sync::Arc, thread};
+use std::{fmt, future::Future, sync::Arc};
 
-use async_io::block_on;
 use executor_core::{AnyExecutor, Executor as _};
 use hyper::rt::Executor;
 
 #[cfg(http3)]
 use crate::transport::Spawn;
+use crate::transport::spawn_thread;
 #[cfg(feature = "http2")]
 use {
     hyper::rt::Sleep,
@@ -50,9 +50,7 @@ impl Spawner {
         if let Some(executor) = &self.executor {
             executor.spawn(future).detach();
         } else {
-            thread::spawn(move || {
-                block_on(future);
-            });
+            spawn_thread(Box::pin(future));
         }
     }
 }

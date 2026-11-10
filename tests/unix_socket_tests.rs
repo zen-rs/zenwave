@@ -7,7 +7,12 @@ use std::path::PathBuf;
 use zenwave::{Client as _, Transport};
 
 /// The unix socket server side, for the backends that can dial one.
-#[cfg(any(feature = "hyper-backend", feature = "curl-backend"))]
+#[cfg(any(
+    feature = "hyper-backend",
+    feature = "curl-backend",
+    feature = "native-compio",
+    feature = "native-tokio"
+))]
 mod server {
     use std::{
         io::{self, Read as _, Write as _},
@@ -64,59 +69,31 @@ mod server {
             socket.write_all(RESPONSE).expect("response must write");
         })
     }
-}
 
-fn unix_transport(socket_path: PathBuf) -> Transport {
-    Transport::builder()
-        .unix_socket(socket_path)
-        .build()
-        .expect("transport must build")
-}
+    /// Answer two requests, counting the connections they arrive on: one
+    /// when the client pools its connection, two when it does not.
+    #[cfg(any(
+        feature = "hyper-backend",
+        feature = "native-compio",
+        feature = "native-tokio"
+    ))]
+    pub fn serve_twice(
+        socket_path: &Path,
+    ) -> (
+        thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            time::Duration,
+        };
 
-#[cfg(feature = "hyper-backend")]
-mod hyper_backend {
-    use std::{
-        io::Write as _,
-        os::unix::net::UnixListener,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
-        thread,
-        time::Duration,
-    };
-
-    use zenwave::{ResponseExt as _, StatusCode, backend::HyperBackend};
-
-    use super::{
-        server::{RESPONSE, read_request, serve_once},
-        *,
-    };
-
-    #[test_executors::async_test]
-    async fn requests_are_served_over_the_unix_socket() {
-        let dir = tempfile::tempdir().expect("socket dir must be temporary");
-        let socket_path = dir.path().join("zenwave.sock");
-        let worker = serve_once(&socket_path);
-
-        let mut client = HyperBackend::new(unix_transport(socket_path));
-        let response = client
-            .get("http://daemon.local/over-unix")
-            .expect("request must build")
-            .await
-            .expect("request over the unix socket must succeed");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(&*response.into_string().await.expect("body reads"), "pong");
-        worker.join().expect("test server must finish");
-    }
-
-    #[test_executors::async_test]
-    async fn pooled_connections_reuse_the_socket() {
-        let dir = tempfile::tempdir().expect("socket dir must be temporary");
-        let socket_path = dir.path().join("zenwave-pool.sock");
         let accepts = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&accepts);
-        let listener = UnixListener::bind(&socket_path).expect("test unix socket must bind");
+        let listener = UnixListener::bind(socket_path).expect("test unix socket must bind");
         let worker = thread::spawn(move || {
             let (mut first, _) = listener.accept().expect("first connection must arrive");
             counter.fetch_add(1, Ordering::SeqCst);
@@ -143,6 +120,50 @@ mod hyper_backend {
                     .expect("second response must write");
             }
         });
+        (worker, accepts)
+    }
+}
+
+fn unix_transport(socket_path: PathBuf) -> Transport {
+    Transport::builder()
+        .unix_socket(socket_path)
+        .build()
+        .expect("transport must build")
+}
+
+#[cfg(feature = "hyper-backend")]
+mod hyper_backend {
+    use std::sync::atomic::Ordering;
+
+    use zenwave::{ResponseExt as _, StatusCode, backend::HyperBackend};
+
+    use super::{
+        server::{serve_once, serve_twice},
+        *,
+    };
+
+    #[test_executors::async_test]
+    async fn requests_are_served_over_the_unix_socket() {
+        let dir = tempfile::tempdir().expect("socket dir must be temporary");
+        let socket_path = dir.path().join("zenwave.sock");
+        let worker = serve_once(&socket_path);
+
+        let mut client = HyperBackend::new(unix_transport(socket_path));
+        let response = client
+            .get("http://daemon.local/over-unix")
+            .expect("request must build")
+            .await
+            .expect("request over the unix socket must succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(&*response.into_string().await.expect("body reads"), "pong");
+        worker.join().expect("test server must finish");
+    }
+
+    #[test_executors::async_test]
+    async fn pooled_connections_reuse_the_socket() {
+        let dir = tempfile::tempdir().expect("socket dir must be temporary");
+        let socket_path = dir.path().join("zenwave-pool.sock");
+        let (worker, accepts) = serve_twice(&socket_path);
 
         let mut client = HyperBackend::new(unix_transport(socket_path));
         for _ in 0..2 {
@@ -185,6 +206,89 @@ mod curl_backend {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(&*response.into_string().await.expect("body reads"), "pong");
         worker.join().expect("test server must finish");
+    }
+}
+
+/// The native backend dials the socket through `http-kit-io`, on each
+/// driver runtime.
+#[cfg(any(feature = "native-compio", feature = "native-tokio"))]
+mod native_backend {
+    use std::sync::atomic::Ordering;
+
+    use zenwave::{
+        ResponseExt as _, StatusCode,
+        backend::{Driver, NativeBackend},
+    };
+
+    use super::{
+        server::{serve_once, serve_twice},
+        *,
+    };
+
+    /// One request over the socket, answered in full.
+    async fn served<D: Driver>(name: &str) {
+        let dir = tempfile::tempdir().expect("socket dir must be temporary");
+        let socket_path = dir.path().join(format!("zenwave-{name}.sock"));
+        let worker = serve_once(&socket_path);
+
+        let mut client = NativeBackend::with_driver::<D>(unix_transport(socket_path));
+        let response = client
+            .get("http://daemon.local/over-unix")
+            .expect("request must build")
+            .await
+            .expect("request over the unix socket must succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(&*response.into_string().await.expect("body reads"), "pong");
+        worker.join().expect("test server must finish");
+    }
+
+    /// Two requests share one pooled connection to the socket.
+    async fn pooled<D: Driver>(name: &str) {
+        let dir = tempfile::tempdir().expect("socket dir must be temporary");
+        let socket_path = dir.path().join(format!("zenwave-{name}-pool.sock"));
+        let (worker, accepts) = serve_twice(&socket_path);
+
+        let mut client = NativeBackend::with_driver::<D>(unix_transport(socket_path));
+        for _ in 0..2 {
+            let response = client
+                .get("http://daemon.local/pool")
+                .expect("request must build")
+                .await
+                .expect("request over the unix socket must succeed");
+            assert_eq!(response.status(), StatusCode::OK);
+            // The lease returns to the pool with the body.
+            assert_eq!(&*response.into_string().await.expect("body reads"), "pong");
+        }
+        worker.join().expect("test server must finish");
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "both requests must reuse the pooled connection"
+        );
+    }
+
+    #[cfg(feature = "native-compio")]
+    #[test_executors::async_test]
+    async fn compio_requests_are_served_over_the_unix_socket() {
+        served::<zenwave::backend::Compio>("compio").await;
+    }
+
+    #[cfg(feature = "native-compio")]
+    #[test_executors::async_test]
+    async fn compio_pooled_connections_reuse_the_socket() {
+        pooled::<zenwave::backend::Compio>("compio").await;
+    }
+
+    #[cfg(feature = "native-tokio")]
+    #[test_executors::async_test]
+    async fn tokio_requests_are_served_over_the_unix_socket() {
+        served::<zenwave::backend::Tokio>("tokio").await;
+    }
+
+    #[cfg(feature = "native-tokio")]
+    #[test_executors::async_test]
+    async fn tokio_pooled_connections_reuse_the_socket() {
+        pooled::<zenwave::backend::Tokio>("tokio").await;
     }
 }
 

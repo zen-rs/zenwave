@@ -61,11 +61,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// mirroring `HyperBackend`'s fallback when no executor is supplied.
 #[cfg(http3)]
 pub fn thread_spawn() -> Spawn {
-    Arc::new(|future| {
-        thread::spawn(move || {
-            async_io::block_on(future);
-        });
-    })
+    Arc::new(crate::transport::spawn_thread)
 }
 
 /// Run `future` to completion inside the test timeout.
