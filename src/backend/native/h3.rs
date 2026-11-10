@@ -455,14 +455,16 @@ mod tests {
     use super::*;
     use crate::Proxy;
 
-    /// A CA's DER and the DER of a leaf it signed for `localhost`.
-    fn chain() -> (Vec<u8>, Vec<u8>) {
+    /// The DER of a CA named `ca_name` and the DER of a leaf it signed for
+    /// `localhost`. Distinct names matter: webpki matches an issuer by name
+    /// before its signature, so a stranger sharing a trusted root's name is a
+    /// bad signature, not an unknown CA.
+    fn chain(ca_name: &str) -> (Vec<u8>, Vec<u8>) {
         let now = OffsetDateTime::now_utc();
         let ca_key = KeyPair::generate().expect("generate CA key");
         let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
         ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        ca.distinguished_name
-            .push(DnType::CommonName, "zenwave h3 verifier test CA");
+        ca.distinguished_name.push(DnType::CommonName, ca_name);
         ca.not_before = now - Duration::days(1);
         ca.not_after = now + Duration::days(30);
         let ca_der = ca
@@ -489,8 +491,8 @@ mod tests {
     /// unknown CA, and the right chain for the wrong name is refused.
     #[test]
     fn h3_chains_meet_the_transport_verifier() {
-        let (ca, leaf) = chain();
-        let (_, stranger) = chain();
+        let (ca, leaf) = chain("zenwave h3 verifier test CA");
+        let (_, stranger) = chain("zenwave h3 verifier stranger CA");
         let transport = Transport::builder()
             .proxy(Proxy::none())
             .extra_root_certificate_der(ca)

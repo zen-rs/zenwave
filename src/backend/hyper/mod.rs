@@ -22,7 +22,9 @@ use http_body_util::BodyDataStream;
 use http_kit::{Endpoint, HttpError, Request, Response};
 use hyper::{body::Incoming, client::conn::TrySendError, http};
 use rt::Spawner;
-use tracing::{debug, warn};
+#[cfg(http3)]
+use tracing::debug;
+use tracing::warn;
 
 #[cfg(feature = "http2")]
 use super::shared::replayable_request;
