@@ -753,6 +753,8 @@ async fn serve_h3_request(
             serve_slow(&mut stream, slow_release.expect("one /slow per test")).await
         }
         ("GET", "/delayed") => serve_delayed(&mut stream).await,
+        ("GET", "/trailers") => serve_trailers(&mut stream).await,
+        ("POST", "/request-trailers") => serve_request_trailers(&mut stream).await,
         _ => serve_status(&mut stream, http::StatusCode::NOT_FOUND).await,
     };
     result.expect("request is served");
@@ -782,6 +784,48 @@ async fn serve_echo(stream: &mut ServerStream) -> Result<(), h3::error::StreamEr
         let data = chunk.copy_to_bytes(chunk.remaining());
         stream.send_data(data).await?;
     }
+    stream.finish().await
+}
+
+/// Chinese, Japanese and Korean text, the body `/trailers` answers with.
+#[cfg(http3)]
+pub const TRAILERS_BODY: &str = "你好世界 こんにちは 안녕하세요";
+
+/// A response whose body is followed by two trailer fields.
+#[cfg(http3)]
+async fn serve_trailers(stream: &mut ServerStream) -> Result<(), h3::error::StreamError> {
+    stream.send_response(h3_response()).await?;
+    stream
+        .send_data(Bytes::from_static(TRAILERS_BODY.as_bytes()))
+        .await?;
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert("x-checksum", http::HeaderValue::from_static("abc123"));
+    trailers.insert("x-status", http::HeaderValue::from_static("complete"));
+    stream.send_trailers(trailers).await?;
+    stream.finish().await
+}
+
+/// Reads the whole request, then answers with the request's `x-request-trailer`
+/// trailer in a response header and the request body as the response body.
+#[cfg(http3)]
+async fn serve_request_trailers(stream: &mut ServerStream) -> Result<(), h3::error::StreamError> {
+    let mut body = Vec::new();
+    while let Some(mut chunk) = stream.recv_data().await? {
+        body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+    }
+    let trailer = stream
+        .recv_trailers()
+        .await?
+        .and_then(|trailers| trailers.get("x-request-trailer").cloned())
+        .unwrap_or_else(|| http::HeaderValue::from_static("missing"));
+    let response = http::Response::builder()
+        .status(http::StatusCode::OK)
+        .header("x-zenwave-protocol", "h3")
+        .header("x-seen-trailer", trailer)
+        .body(())
+        .expect("response builds");
+    stream.send_response(response).await?;
+    stream.send_data(Bytes::from(body)).await?;
     stream.finish().await
 }
 

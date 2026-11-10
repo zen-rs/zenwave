@@ -122,6 +122,9 @@ struct H1Options {
 /// Echoes the request body after the method and path, labelled with the
 /// protocol that carried it, with the fields `options` asks for.
 async fn echo(request: Request, protocol: &'static str, options: &H1Options) -> Response {
+    if request.uri().path() == "/trailers" {
+        return trailers_response(protocol);
+    }
     let head = format!("{} {} ", request.method(), request.uri().path());
     let body = request
         .into_body()
@@ -140,6 +143,21 @@ async fn echo(request: Request, protocol: &'static str, options: &H1Options) -> 
     if options.close {
         headers.insert(http::header::CONNECTION, "close".parse().expect("value"));
     }
+    response
+}
+
+/// The CJK greeting followed by two trailer fields.
+fn trailers_response(protocol: &'static str) -> Response {
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert("x-checksum", "abc123".parse().expect("header value"));
+    trailers.insert("x-status", "complete".parse().expect("header value"));
+    let mut response = Response::new(Body::from_frames(futures_util::stream::iter([
+        Ok::<_, std::io::Error>(http_kit::BodyFrame::Data(GREETING.as_bytes().into())),
+        Ok(http_kit::BodyFrame::Trailers(trailers)),
+    ])));
+    response
+        .headers_mut()
+        .insert("x-protocol", protocol.parse().expect("header value"));
     response
 }
 
@@ -590,6 +608,12 @@ mod compio_runtime {
 
     #[cfg(feature = "native-http3")]
     #[test]
+    fn h3_delivers_response_trailers() {
+        run(super::h3::trailers);
+    }
+
+    #[cfg(feature = "native-http3")]
+    #[test]
     fn h3_wins_the_race_against_a_stalled_tcp_dial() {
         run(super::h3::race);
     }
@@ -649,6 +673,12 @@ mod tokio_runtime {
     #[test]
     fn h3_after_alt_svc() {
         run(super::h3::upgrade);
+    }
+
+    #[cfg(feature = "native-http3")]
+    #[test]
+    fn h3_delivers_response_trailers() {
+        run(super::h3::trailers);
     }
 
     #[cfg(feature = "native-http3")]
@@ -831,6 +861,50 @@ mod h3 {
                 &*response.into_string().await.expect("body reads"),
                 format!("POST /upgrade {GREETING}")
             );
+        })
+        .await;
+    }
+
+    /// A response over HTTP/3 delivers its trailers after the body, the
+    /// CJK body intact.
+    pub async fn trailers<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+        use futures_util::StreamExt as _;
+
+        let pki = Pki::new();
+        let (server, port) = advertised(&io, executor, &pki, &pki, None);
+        let mut client = NativeBackend::on_current_thread(pki.transport(), io.clone(), executor);
+        against(server, async {
+            let uri = format!("https://localhost:{port}/upgrade");
+            let mut protocol = String::new();
+            for _ in 0..50 {
+                protocol = get(&mut client, &uri, true).await;
+                if protocol == "h3" {
+                    break;
+                }
+                io.sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(protocol, "h3", "the advertised h3 endpoint takes over");
+
+            let response = client
+                .get(format!("https://localhost:{port}/trailers"))
+                .expect("request builds")
+                .await
+                .expect("GET succeeds over HTTP/3");
+            assert_eq!(response.headers()["x-protocol"], "h3");
+            let mut data = Vec::new();
+            let mut trailers = None;
+            let mut body = response.into_body();
+            while let Some(frame) = body.next().await {
+                match frame.expect("frame is valid") {
+                    http_kit::BodyFrame::Data(chunk) => data.extend_from_slice(&chunk),
+                    http_kit::BodyFrame::Trailers(map) => trailers = Some(map),
+                    _ => unreachable!("no file frames"),
+                }
+            }
+            assert_eq!(std::str::from_utf8(&data).expect("UTF-8"), GREETING);
+            let trailers = trailers.expect("the trailers frame arrives");
+            assert_eq!(trailers["x-checksum"], "abc123");
+            assert_eq!(trailers["x-status"], "complete");
         })
         .await;
     }
