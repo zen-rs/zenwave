@@ -34,7 +34,7 @@ include = [
 ]
 
 [dependencies]
-http-kit = "0.5.0"
+http-kit = "0.6.0"
 serde = { version = "1.0.229", default-features = false, features = ["derive"]}
 serde_json = "1.0.154"
 base64 = "0.23.1"
@@ -131,10 +131,10 @@ native-compio = ["native-backend", "http-kit-io/compio", "executor-core/compio",
 # tokio's reactor for the native backend.
 native-tokio = ["native-backend", "http-kit-io/tokio", "executor-core/tokio", "dep:tokio"]
 # HTTP/3 for the native backend through `http-kit-h3` (quiche; builds
-# BoringSSL with cmake). quiche verifies the server's chain with BoringSSL
-# against the system's default verify paths plus the transport's extra roots,
-# not with the platform verifier, and OneCRL does not apply to it.
-native-http3 = ["native-backend", "dep:http-kit-h3", "http-kit-h3/quiche", "dep:pem"]
+# BoringSSL with cmake). The server's chain goes to the same verifier as a TCP
+# connection's: the platform verifier with the transport's extra roots, and
+# OneCRL where it applies.
+native-http3 = ["native-backend", "dep:http-kit-h3", "http-kit-h3/quiche"]
 
 # Shorthands.
 hyper-rustls = ["hyper-backend", "rustls"]
@@ -214,10 +214,10 @@ dns-lookup = "4.0.2"
 executor-core = { version = "0.7.2" }
 # The native backend: owned-buffer sockets, HTTP/1.1, TLS and HTTP/3 on them,
 # and the runtimes it can drive itself.
-http-kit-io = { version = "0.3.2", optional = true }
-http-kit-h1 = { version = "0.2.3", optional = true }
-http-kit-tls = { version = "0.1.0", optional = true }
-http-kit-h3 = { version = "0.2.2", optional = true }
+http-kit-io = { version = "0.4.0", optional = true }
+http-kit-h1 = { version = "0.3.0", optional = true }
+http-kit-tls = { version = "0.2.0", optional = true }
+http-kit-h3 = { version = "0.3.0", optional = true }
 compio = { version = "0.19.2", default-features = false, features = ["runtime"], optional = true }
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time"], optional = true }
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }

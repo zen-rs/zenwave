@@ -11,7 +11,10 @@
 //!
 //! HTTP/1.1 follows the hyper pool's rules: at most
 //! [`MAX_H1_PER_ORIGIN`] connections leased or dialing per origin, idle
-//! connections parked until [`IDLE_TIMEOUT`], waiters served in order.
+//! connections parked until [`IDLE_TIMEOUT`], waiters served in order. A
+//! dial belongs to the origin, not to the request that caused it: the
+//! connection it opens goes to the first request still waiting, so a
+//! request that a QUIC connection served meanwhile leaves it to the next.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -36,25 +39,22 @@ use crate::{
 #[cfg(native_h3)]
 use super::h3::{self, H3Slot};
 
-/// How a request may use the origin's HTTP/3 connection.
+/// Whether a request may go over the origin's HTTP/3 connection.
 #[cfg(native_h3)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum H3Use {
     /// Never: the request is plaintext or goes through a proxy.
     Blocked,
-    /// Only once the connection has carried a response: the request cannot
-    /// be sent again on TCP if the QUIC handshake turns out to fail.
-    Proven,
-    /// Also while the connection is unproven: the request is idempotent and
-    /// its body replayable, so it goes again on TCP if QUIC fails.
-    Any,
+    /// Whenever the origin has a connection whose handshake completed, or
+    /// one completes while the request waits for HTTP/1.1.
+    Allowed,
 }
 
 /// What a request asks the pool for.
 #[derive(Clone, Copy, Debug)]
 pub struct Want {
     /// Dial a new HTTP/1.1 connection rather than reuse an idle one: the
-    /// retry after a reused connection closed under the request.
+    /// retry after a reused connection failed under the request.
     pub fresh: bool,
     #[cfg(native_h3)]
     pub h3: H3Use,
@@ -72,7 +72,7 @@ pub enum Grant {
     },
     /// The origin's HTTP/3 connection.
     #[cfg(native_h3)]
-    H3(h3::H3Grant),
+    H3(http_kit_h3::SendRequest),
 }
 
 /// What a request sends the pool.
@@ -93,9 +93,9 @@ pub enum Command {
     /// A leased HTTP/1.1 connection that cannot serve again: its request
     /// failed or its body was dropped unread.
     Discard { origin: Origin },
-    /// HTTP/3 news from a request.
+    /// A response for `origin` carried these `Alt-Svc` fields, joined.
     #[cfg(native_h3)]
-    H3(h3::H3Report),
+    AltSvc { origin: Origin, value: String },
 }
 
 /// The `Send` side of a pool: requests reach the pool's thread through it.
@@ -145,10 +145,9 @@ fn gone() -> Error {
 
 /// Something a pool task finished.
 pub enum Event {
-    /// An HTTP/1.1 dial for `waiter` ended.
+    /// An HTTP/1.1 dial for `origin` ended.
     H1Dialed {
         origin: Origin,
-        waiter: Waiter,
         result: Result<Dialed, Error>,
     },
     #[cfg(native_h3)]
@@ -156,15 +155,53 @@ pub enum Event {
 }
 
 /// A request waiting for a connection.
-pub struct Waiter {
+struct Waiter {
     reply: oneshot::Sender<Result<Grant, Error>>,
     fresh: bool,
+    /// The request may take an HTTP/3 connection whose dial completes
+    /// while it waits.
+    #[cfg(native_h3)]
+    h3: bool,
+    /// The TCP dial that would have served the request failed while a QUIC
+    /// dial still raced for it: the request waits on QUIC, and fails with
+    /// this if QUIC fails too.
+    #[cfg(native_h3)]
+    tcp_error: Option<Error>,
 }
 
 impl Waiter {
+    fn gone(&self) -> bool {
+        self.reply.is_canceled()
+    }
+
+    /// Whether the request is owed an HTTP/1.1 dial: unless its own failed
+    /// while it waits on QUIC.
+    #[cfg_attr(
+        not(native_h3),
+        expect(
+            clippy::unused_self,
+            reason = "without HTTP/3 every waiter is owed a dial"
+        )
+    )]
+    const fn awaits_dial(&self) -> bool {
+        #[cfg(native_h3)]
+        return self.tcp_error.is_none();
+        #[cfg(not(native_h3))]
+        true
+    }
+
     /// Hands `grant` over, or back when the request is gone.
     fn grant(self, grant: Grant) -> Option<Grant> {
         self.reply.send(Ok(grant)).err().and_then(Result::ok)
+    }
+
+    /// Hands an HTTP/1.1 connection over, or back when the request is gone.
+    fn grant_h1(self, send: SendRequest, via: Via, reused: bool) -> Option<(SendRequest, Via)> {
+        match self.grant(Grant::H1 { send, via, reused })? {
+            Grant::H1 { send, via, .. } => Some((send, via)),
+            #[cfg(native_h3)]
+            Grant::H3(_) => unreachable!("an HTTP/1.1 grant comes back as one"),
+        }
     }
 
     fn fail(self, error: Error) {
@@ -190,8 +227,10 @@ impl Idle {
 /// One origin's connections.
 pub struct Entry {
     idle: Vec<Idle>,
-    /// HTTP/1.1 connections leased or dialing.
-    busy: usize,
+    /// HTTP/1.1 connections leased to requests.
+    leased: usize,
+    /// HTTP/1.1 dials in flight.
+    dialing: usize,
     waiters: VecDeque<Waiter>,
     #[cfg(native_h3)]
     pub h3: H3Slot,
@@ -201,7 +240,8 @@ impl Entry {
     const fn new(#[cfg_attr(not(native_h3), expect(unused_variables))] origin: &Origin) -> Self {
         Self {
             idle: Vec::new(),
-            busy: 0,
+            leased: 0,
+            dialing: 0,
             waiters: VecDeque::new(),
             #[cfg(native_h3)]
             h3: H3Slot::new(origin.port),
@@ -218,7 +258,11 @@ impl Entry {
             let _ = now;
             true
         };
-        self.idle.is_empty() && self.busy == 0 && self.waiters.is_empty() && h3
+        self.idle.is_empty()
+            && self.leased == 0
+            && self.dialing == 0
+            && self.waiters.is_empty()
+            && h3
     }
 }
 
@@ -269,25 +313,22 @@ impl<I: NativeIo> Pool<I> {
                 want,
                 reply,
             } => self.checkout(&origin, want, reply),
-            Command::Release { origin, send, via } => self.release(&origin, send, via),
+            Command::Release { origin, send, via } => {
+                self.entry(&origin).leased -= 1;
+                self.offer(&origin, send, via, true);
+            }
             Command::Discard { origin } => {
-                if let Some(entry) = self.origins.get_mut(&origin) {
-                    entry.busy -= 1;
-                }
+                self.entry(&origin).leased -= 1;
                 self.serve_waiters(&origin);
             }
             #[cfg(native_h3)]
-            Command::H3(report) => self.h3_report(report),
+            Command::AltSvc { origin, value } => self.alt_svc(&origin, &value),
         }
     }
 
     fn event(&mut self, event: Event) {
         match event {
-            Event::H1Dialed {
-                origin,
-                waiter,
-                result,
-            } => self.h1_dialed(&origin, waiter, result),
+            Event::H1Dialed { origin, result } => self.h1_dialed(&origin, result),
             #[cfg(native_h3)]
             Event::H3(event) => self.h3_event(event),
         }
@@ -316,70 +357,89 @@ impl<I: NativeIo> Pool<I> {
             return;
         }
         #[cfg(native_h3)]
-        let Some(reply) = self.h3_checkout(origin, want.h3, reply) else {
+        let h3 = want.h3 == H3Use::Allowed;
+        #[cfg(native_h3)]
+        if h3 && let Some(send) = self.h3_checkout(origin) {
+            if reply.send(Ok(Grant::H3(send))).is_err() {
+                debug!("an HTTP/3 grant found its request gone");
+            }
             return;
-        };
+        }
         self.entry(origin).waiters.push_back(Waiter {
             reply,
             fresh: want.fresh,
+            #[cfg(native_h3)]
+            h3,
+            #[cfg(native_h3)]
+            tcp_error: None,
         });
         self.serve_waiters(origin);
     }
 
-    /// Serves `origin`'s waiters in order: an idle connection when one is
-    /// usable and the waiter may reuse it, a new dial while slots are free.
+    /// Serves `origin`'s waiters in order: idle connections to the first
+    /// that may reuse one, then a dial for each waiter no dial covers yet,
+    /// while the origin has slots free.
     fn serve_waiters(&mut self, origin: &Origin) {
         let Some(entry) = self.origins.get_mut(origin) else {
             return;
         };
+        let now = Instant::now();
         entry.idle.retain(Idle::usable);
-        let mut dials = Vec::new();
-        while let Some(waiter) = entry.waiters.pop_front() {
-            if waiter.reply.is_canceled() {
+        entry.waiters.retain(|waiter| !waiter.gone());
+        let mut next = 0;
+        while next < entry.waiters.len()
+            && let Some(idle) = entry.idle.pop()
+        {
+            if entry.waiters[next].fresh {
+                entry.idle.push(idle);
+                next += 1;
                 continue;
             }
-            if !waiter.fresh
-                && let Some(idle) = entry.idle.pop()
-            {
-                entry.busy += 1;
-                let grant = Grant::H1 {
-                    send: idle.send,
-                    via: idle.via,
-                    reused: true,
-                };
-                if let Some(Grant::H1 { send, via, .. }) = waiter.grant(grant) {
-                    entry.busy -= 1;
-                    entry.idle.push(Idle {
-                        send,
-                        via,
-                        since: Instant::now(),
-                    });
-                }
-                continue;
+            let waiter = entry.waiters.remove(next).expect("the index is in range");
+            match waiter.grant_h1(idle.send, idle.via, true) {
+                None => entry.leased += 1,
+                Some((send, via)) => entry.idle.push(Idle {
+                    send,
+                    via,
+                    since: now,
+                }),
             }
-            if entry.busy < MAX_H1_PER_ORIGIN {
-                // A slot is free; an idle connection beyond the limit gives
-                // way so the total stays within it.
-                if entry.busy + entry.idle.len() >= MAX_H1_PER_ORIGIN && !entry.idle.is_empty() {
-                    entry.idle.remove(0);
-                }
-                entry.busy += 1;
-                dials.push(waiter);
-                continue;
-            }
-            entry.waiters.push_front(waiter);
-            break;
         }
-        for waiter in dials {
-            self.dial_h1(origin.clone(), waiter);
+        let owed = entry
+            .waiters
+            .iter()
+            .filter(|waiter| waiter.awaits_dial())
+            .count()
+            .saturating_sub(entry.dialing);
+        let mut dials = 0;
+        while dials < owed && entry.leased + entry.dialing < MAX_H1_PER_ORIGIN {
+            // An idle connection beyond the limit gives way so the total
+            // stays within it.
+            if entry.leased + entry.dialing + entry.idle.len() >= MAX_H1_PER_ORIGIN
+                && !entry.idle.is_empty()
+            {
+                entry.idle.remove(0);
+            }
+            entry.dialing += 1;
+            dials += 1;
+        }
+        for _ in 0..dials {
+            self.dial_h1(origin.clone());
         }
     }
 
-    /// Starts an HTTP/1.1 dial for `waiter`.
-    fn dial_h1(&mut self, origin: Origin, waiter: Waiter) {
+    /// Starts an HTTP/1.1 dial for `origin`.
+    fn dial_h1(&mut self, origin: Origin) {
         let Some(transport) = self.transport.upgrade() else {
-            waiter.fail(gone());
-            self.entry(&origin).busy -= 1;
+            self.tasks.push(
+                async move {
+                    Some(Event::H1Dialed {
+                        origin,
+                        result: Err(gone()),
+                    })
+                }
+                .boxed_local(),
+            );
             return;
         };
         let tls = self
@@ -390,50 +450,103 @@ impl<I: NativeIo> Pool<I> {
         self.tasks.push(
             async move {
                 let result = connect::dial(&io, &transport, &tls, &origin).await;
-                Some(Event::H1Dialed {
-                    origin,
-                    waiter,
-                    result,
-                })
+                Some(Event::H1Dialed { origin, result })
             }
             .boxed_local(),
         );
     }
 
-    fn h1_dialed(&mut self, origin: &Origin, waiter: Waiter, result: Result<Dialed, Error>) {
+    fn h1_dialed(&mut self, origin: &Origin, result: Result<Dialed, Error>) {
+        self.entry(origin).dialing -= 1;
         match result {
             Ok(Dialed { send, via, driver }) => {
                 self.tasks.push(driver.map(|()| None).boxed_local());
-                let grant = Grant::H1 {
-                    send,
-                    via,
-                    reused: false,
-                };
-                if let Some(Grant::H1 { send, via, .. }) = waiter.grant(grant) {
-                    // The request is gone; the connection serves the next.
-                    self.release(origin, send, via);
-                }
+                self.offer(origin, send, via, false);
             }
             Err(error) => {
-                waiter.fail(error);
-                self.entry(origin).busy -= 1;
+                self.dial_failed(origin, error);
                 self.serve_waiters(origin);
             }
         }
     }
 
-    /// A leased connection is free again: the next waiter takes it, or it
-    /// parks. A closed one frees its slot instead.
-    fn release(&mut self, origin: &Origin, send: SendRequest, via: Via) {
+    /// A free HTTP/1.1 connection: the first waiter that may take it does,
+    /// or it parks. A closed one only frees its slot.
+    fn offer(&mut self, origin: &Origin, send: SendRequest, via: Via, reused: bool) {
+        let now = Instant::now();
         let entry = self.entry(origin);
-        entry.busy -= 1;
-        if !send.is_closed() {
-            entry.idle.push(Idle {
-                send,
-                via,
-                since: Instant::now(),
-            });
+        let mut free = (!send.is_closed()).then_some((send, via));
+        while let Some((send, via)) = free.take() {
+            entry.waiters.retain(|waiter| !waiter.gone());
+            let Some(at) = entry
+                .waiters
+                .iter()
+                .position(|waiter| !(reused && waiter.fresh))
+            else {
+                entry.idle.push(Idle {
+                    send,
+                    via,
+                    since: now,
+                });
+                break;
+            };
+            let waiter = entry.waiters.remove(at).expect("the position is in range");
+            match waiter.grant_h1(send, via, reused) {
+                None => entry.leased += 1,
+                Some(back) => free = Some(back),
+            }
         }
         self.serve_waiters(origin);
+    }
+
+    /// A dial for `origin` failed: the first waiter still owed one gets the
+    /// error, unless a QUIC dial races for it, which it then waits on.
+    fn dial_failed(&mut self, origin: &Origin, error: Error) {
+        let entry = self.entry(origin);
+        entry.waiters.retain(|waiter| !waiter.gone());
+        let Some(at) = entry.waiters.iter().position(Waiter::awaits_dial) else {
+            debug!(host = %origin.host, %error, "a dial failed with no request waiting on it");
+            return;
+        };
+        #[cfg(native_h3)]
+        if entry.h3.dialing() && entry.waiters[at].h3 {
+            debug!(host = %origin.host, %error, "TCP dial failed; the request waits on QUIC");
+            entry.waiters[at].tcp_error = Some(error);
+            return;
+        }
+        entry
+            .waiters
+            .remove(at)
+            .expect("the position is in range")
+            .fail(error);
+    }
+
+    /// A QUIC connection to `origin` completed its handshake: every waiter
+    /// that may use it takes it.
+    #[cfg(native_h3)]
+    pub(super) fn h3_won(&mut self, origin: &Origin, send: &http_kit_h3::SendRequest) {
+        let entry = self.entry(origin);
+        for waiter in std::mem::take(&mut entry.waiters) {
+            if waiter.h3 {
+                if waiter.grant(Grant::H3(send.clone())).is_some() {
+                    debug!("an HTTP/3 grant found its request gone");
+                }
+            } else {
+                entry.waiters.push_back(waiter);
+            }
+        }
+    }
+
+    /// The QUIC dial to `origin` failed: the waiters whose TCP dial had
+    /// failed too fail with that error; the rest stay on HTTP/1.1.
+    #[cfg(native_h3)]
+    pub(super) fn h3_lost(&mut self, origin: &Origin) {
+        let entry = self.entry(origin);
+        for mut waiter in std::mem::take(&mut entry.waiters) {
+            match waiter.tcp_error.take() {
+                Some(error) => waiter.fail(error),
+                None => entry.waiters.push_back(waiter),
+            }
+        }
     }
 }

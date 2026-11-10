@@ -1,6 +1,7 @@
 //! Opening an HTTP/1.1 connection on `http-kit-io` sockets, through the
 //! transport's proxy rules: the [`route`] the async-net connector follows,
-//! with every leg on owned-buffer streams and TLS through `http-kit-tls`.
+//! with every leg on owned-buffer streams and TLS through `http-kit-tls`,
+//! the origin's session inside the proxy's when the proxy is HTTPS.
 
 use std::{future::Future, io, net::SocketAddr, time::Instant};
 
@@ -8,8 +9,8 @@ use futures_util::{FutureExt, future::LocalBoxFuture};
 use http::{HeaderValue, Method, header, uri::Scheme};
 use http_kit::{Body, Request};
 use http_kit_h1::{ClientConfig, ClientOutcome, RequestTarget, SendRequest, handshake_stream};
-use http_kit_io::{BufResult, IntoInner, Io, IoBuf, Read, SendFile, Split, Write};
-use http_kit_tls::{TlsConnector, rustls::pki_types::ServerName};
+use http_kit_io::{BufResult, IntoInner, Io, IoBuf, Read, SendFile, Split, TcpOptions, Write};
+use http_kit_tls::{TlsConnector, Transport as TlsTransport, rustls::pki_types::ServerName};
 use tracing::debug;
 
 use crate::{
@@ -22,11 +23,21 @@ use crate::{
     },
 };
 
-/// An `http-kit-io` implementation whose TCP streams `http-kit-tls` can run
-/// over: every implementation `http-kit-io` ships is one.
-pub trait NativeIo: Io<TcpStream: http_kit_tls::Transport> {}
+/// An `http-kit-io` implementation whose stream sockets `http-kit-tls` can
+/// run over: every implementation `http-kit-io` ships is one.
+#[cfg(unix)]
+pub trait NativeIo: Io<TcpStream: TlsTransport, UnixStream: TlsTransport> {}
 
-impl<I: Io<TcpStream: http_kit_tls::Transport>> NativeIo for I {}
+#[cfg(unix)]
+impl<I: Io<TcpStream: TlsTransport, UnixStream: TlsTransport>> NativeIo for I {}
+
+/// An `http-kit-io` implementation whose stream sockets `http-kit-tls` can
+/// run over: every implementation `http-kit-io` ships is one.
+#[cfg(not(unix))]
+pub trait NativeIo: Io<TcpStream: TlsTransport> {}
+
+#[cfg(not(unix))]
+impl<I: Io<TcpStream: TlsTransport>> NativeIo for I {}
 
 /// A fresh HTTP/1.1 connection: its handle, how requests on it are shaped,
 /// and the future that drives its socket.
@@ -36,29 +47,32 @@ pub struct Dialed {
     pub driver: LocalBoxFuture<'static, ()>,
 }
 
-/// Connects to `origin` the way the transport's rules say and runs the
-/// HTTP/1.1 handshake over the result.
+/// Connects to `origin` the way the transport's rules say — its unix domain
+/// socket when it has one, else TCP through whatever proxy the rules pick —
+/// and runs the HTTP/1.1 handshake over the result.
 ///
 /// # Errors
 ///
-/// Every leg's failure, and the paths `http-kit` cannot carry yet: a unix
-/// domain socket, and TLS to the origin inside TLS to an HTTPS proxy.
+/// Every leg's failure.
 pub async fn dial<I: NativeIo>(
     io: &I,
     transport: &Transport,
     tls: &TlsConnector,
     origin: &Origin,
 ) -> Result<Dialed, Error> {
+    let secure = origin.scheme == Scheme::HTTPS;
+
     #[cfg(unix_socket)]
     if let Some(path) = transport.unix_socket() {
-        return Err(unsupported(format!(
-            "the native backend cannot dial the unix domain socket {}: \
-             http-kit-io 0.3 has no Unix-domain connect",
-            path.display()
-        )));
+        let unix = io.connect_unix(path).await.map_err(|error| {
+            Error::Transport(Box::new(io::Error::new(
+                error.kind(),
+                format!("unix domain socket {}: {error}", path.display()),
+            )))
+        })?;
+        return finish(io, tls, &origin.host, secure, unix, Via::Direct).await;
     }
 
-    let secure = origin.scheme == Scheme::HTTPS;
     let target = Target {
         host: &origin.host,
         port: origin.port,
@@ -91,15 +105,20 @@ pub async fn dial<I: NativeIo>(
             authority,
             authorization,
         } => {
-            if proxy.tls {
-                return Err(unsupported(
-                    "the native backend cannot run TLS to the origin inside TLS to an \
-                     HTTPS proxy: http-kit-tls 0.1 runs only over a socket's own halves",
-                ));
-            }
             let tcp = tcp(io, &proxy.host, proxy.port).await?;
-            let tunneled = tunnel(io, tcp, &authority, authorization).await?;
-            finish(io, tls, &origin.host, secure, tunneled, Via::Direct).await
+            if proxy.tls {
+                // The proxy's session carries the tunnel, and the origin's
+                // runs inside it.
+                let secured = tls
+                    .connect(server_name(&proxy.host)?, tcp, io)
+                    .await
+                    .map_err(Error::tls)?;
+                let tunneled = tunnel(io, secured, &authority, authorization).await?;
+                finish(io, tls, &origin.host, secure, tunneled, Via::Direct).await
+            } else {
+                let tunneled = tunnel(io, tcp, &authority, authorization).await?;
+                finish(io, tls, &origin.host, secure, tunneled, Via::Direct).await
+            }
         }
         Route::Socks5 {
             host,
@@ -123,19 +142,19 @@ pub async fn dial<I: NativeIo>(
     }
 }
 
-/// Wraps `stream` in TLS for `server_name` when `secure`, then starts
+/// Wraps `stream` in TLS for `host` when `secure`, then starts
 /// HTTP/1.1 on it.
 async fn finish<I, S>(
     io: &I,
     tls: &TlsConnector,
-    server_name: &str,
+    host: &str,
     secure: bool,
     stream: S,
     via: Via,
 ) -> Result<Dialed, Error>
 where
     I: Io,
-    S: http_kit_tls::Transport,
+    S: TlsTransport,
 {
     let config = ClientConfig {
         request_target: match via {
@@ -147,9 +166,16 @@ where
     if !secure {
         return Ok(start(stream, io.clone(), config, via));
     }
-    let name = ServerName::try_from(server_name.to_owned()).map_err(Error::tls)?;
-    let stream = tls.connect(name, stream, io).await.map_err(Error::tls)?;
+    let stream = tls
+        .connect(server_name(host)?, stream, io)
+        .await
+        .map_err(Error::tls)?;
     Ok(start(stream, io.clone(), config, via))
+}
+
+/// `host` as the name a TLS handshake sends and verifies.
+fn server_name(host: &str) -> Result<ServerName<'static>, Error> {
+    ServerName::try_from(host.to_owned()).map_err(Error::tls)
 }
 
 /// Runs the HTTP/1.1 client over `stream`; the driver logs how it ended.
@@ -254,17 +280,18 @@ async fn tcp<I: Io>(io: &I, host: &str, port: u16) -> Result<I::TcpStream, Error
         .map_err(|error| Error::Transport(Box::new(error)))
 }
 
-/// Happy eyeballs over an `http-kit-io` implementation.
-///
-/// `TCP_NODELAY` is left as the implementation sets it: `Io::connect` has no
-/// socket-option hook, and its stream types do not expose the socket.
+/// Happy eyeballs over an `http-kit-io` implementation. Every connection
+/// it opens has `TCP_NODELAY` on, as the async-net dialer's do: a request
+/// head or a TLS record goes out at once instead of waiting on Nagle.
 struct IoDialer<'a, I>(&'a I);
 
 impl<I: Io> Dialer for IoDialer<'_, I> {
     type Stream = I::TcpStream;
 
-    fn dial(&self, addr: SocketAddr) -> impl Future<Output = io::Result<I::TcpStream>> {
-        self.0.connect(addr)
+    async fn dial(&self, addr: SocketAddr) -> io::Result<I::TcpStream> {
+        let stream = self.0.connect(addr).await?;
+        stream.set_nodelay(true)?;
+        Ok(stream)
     }
 
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> {
@@ -295,12 +322,4 @@ impl<S: Read + Write> Handshake for OwnedBytes<S> {
         }
         Ok(bytes)
     }
-}
-
-/// A path `http-kit` cannot carry yet, as a transport error naming it.
-fn unsupported(message: impl Into<String>) -> Error {
-    Error::Transport(Box::new(io::Error::new(
-        io::ErrorKind::Unsupported,
-        message.into(),
-    )))
 }

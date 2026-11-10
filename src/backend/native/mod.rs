@@ -10,10 +10,10 @@
 //! backend's.
 //!
 //! Every transport feature runs on the same code as the hyper backend's:
-//! the proxy route, happy eyeballs, SOCKS5, the TLS verifier (platform
-//! verification and OneCRL), and the HTTP/3 discovery policy. What
-//! `http-kit` cannot carry yet fails with an error that names it: a unix
-//! domain socket, and TLS inside TLS through an HTTPS proxy.
+//! the proxy route (an HTTPS proxy's tunnel carrying the origin's TLS
+//! inside its own), unix domain sockets, happy eyeballs, SOCKS5, the TLS
+//! verifier (platform verification, extra roots and OneCRL, for HTTP/3 as
+//! for TCP), and the HTTP/3 discovery policy with its QUIC/TCP race.
 
 // The pool's futures run on the pool's thread: `http-kit-io` sockets are
 // deliberately not `Send`, and nothing below crosses a thread but the
@@ -129,10 +129,10 @@ impl NativeBackend {
         Self::with_driver::<runtime::DefaultDriver>(transport)
     }
 
-    /// Whether `request` to `origin` may go over HTTP/3, and how: only a
-    /// direct TLS origin, since QUIC bypasses proxies and unix sockets.
+    /// Whether a request to `origin` may go over HTTP/3: only to a direct
+    /// TLS origin, since QUIC bypasses proxies and unix sockets.
     #[cfg(native_h3)]
-    fn h3_use(&self, origin: &Origin, request: &http::Request<Body>) -> Result<pool::H3Use, Error> {
+    fn h3_use(&self, origin: &Origin) -> Result<pool::H3Use, Error> {
         use crate::transport::route::{Protocols, proxied};
         #[cfg(unix_socket)]
         if self.transport.unix_socket().is_some() {
@@ -148,19 +148,22 @@ impl NativeBackend {
                 protocols: Protocols::Http1,
             },
         )?;
-        Ok(if origin.scheme != Scheme::HTTPS || !direct {
-            pool::H3Use::Blocked
-        } else if idempotent(request.method()) && request.body().try_clone().is_some() {
-            pool::H3Use::Any
+        Ok(if origin.scheme == Scheme::HTTPS && direct {
+            pool::H3Use::Allowed
         } else {
-            pool::H3Use::Proven
+            pool::H3Use::Blocked
         })
     }
 
-    /// Sends `request` on a leased HTTP/1.1 connection. A connection reused
-    /// from the pool may have been closed by the server while it sat idle;
-    /// an idempotent request with a replayable body is handed back for one
-    /// more try on a fresh dial.
+    /// Sends `request` on a leased HTTP/1.1 connection, handing it back for
+    /// a fresh dial when a connection reused from the pool fails under it:
+    /// whatever the request, when none of it was written (the connection
+    /// had stopped taking requests); an idempotent one with a replayable
+    /// body also when it was written, since the server may have closed the
+    /// idle connection as the request went out.
+    ///
+    /// A fresh connection's failure is the request's: dialing again for a
+    /// server that drops new connections would never end.
     async fn send_h1(
         &self,
         origin: &Origin,
@@ -180,71 +183,50 @@ impl NativeBackend {
             .flatten();
         shape_h1_request(&mut request, &via)?;
         let sender = lease.send.as_ref().expect("a new lease holds its sender");
-        match (sender.send(request).await, replay) {
-            (Ok(response), _) => {
-                Ok(Ok(response.map(|body| {
-                    Body::from_frames(LeaseReturn::new(body, lease))
-                })))
+        let mut failure = match sender.try_send(request).await {
+            Ok(response) => {
+                return Ok(Ok(
+                    response.map(|body| Body::from_frames(LeaseReturn::new(body, lease)))
+                ));
             }
-            (Err(http_kit_h1::Error::ConnectionClosed), Some(replay)) => {
-                tracing::debug!(host = %origin.host, "reused connection closed; dialing fresh");
-                Ok(Err(replay))
+            Err(failure) => failure,
+        };
+        if reused {
+            if let Some(unsent) = failure.take_request() {
+                tracing::debug!(
+                    host = %origin.host,
+                    error = %failure,
+                    "reused connection took none of the request; dialing fresh"
+                );
+                return Ok(Err(unsent));
             }
-            (Err(error), _) => Err(Error::Transport(Box::new(error))),
+            if let Some(replay) = replay
+                && matches!(
+                    failure.error(),
+                    http_kit_h1::Error::ConnectionClosed | http_kit_h1::Error::Io(_)
+                )
+            {
+                tracing::debug!(
+                    host = %origin.host,
+                    error = %failure,
+                    "reused connection failed under an idempotent request; dialing fresh"
+                );
+                return Ok(Err(replay));
+            }
         }
+        Err(Error::Transport(Box::new(failure.into_error())))
     }
 
-    /// Sends `request` on the origin's HTTP/3 connection. On an unproven
-    /// connection a failure, or the pool abandoning it, hands the request
-    /// back for TCP.
+    /// Sends `request` on the origin's HTTP/3 connection, whose handshake
+    /// has completed.
     #[cfg(native_h3)]
     async fn send_h3(
         &self,
-        origin: &Origin,
         request: http::Request<Body>,
-        grant: h3::H3Grant,
-    ) -> Result<Result<Response, http::Request<Body>>, Error> {
-        use futures_util::future::{Either, select};
-
-        let h3::H3Grant {
-            send,
-            generation,
-            verdict,
-        } = grant;
-        let Some(verdict) = verdict else {
-            let response = send.send(request).await.map_err(h3::h3_error)?;
-            return Ok(Ok(response.map(|body| keep_pool(body, &self.pool))));
-        };
-        let replay = replayable_request(&request)
-            .expect("only a replayable request is granted an unproven connection");
-        let abandoned = async {
-            if verdict.await.is_err() {
-                // Proven meanwhile: the request keeps its connection.
-                std::future::pending::<()>().await;
-            }
-        };
-        let sent = {
-            let sending = send.send(request);
-            futures_util::pin_mut!(sending, abandoned);
-            match select(sending, abandoned).await {
-                Either::Left((sent, _)) => sent.ok(),
-                Either::Right(((), _)) => None,
-            }
-        };
-        let report = match &sent {
-            Some(_) => h3::H3Report::Proven {
-                origin: origin.clone(),
-                generation,
-            },
-            None => h3::H3Report::Failed {
-                origin: origin.clone(),
-                generation,
-            },
-        };
-        self.pool.send(Command::H3(report));
-        Ok(sent
-            .map(|response| response.map(|body| keep_pool(body, &self.pool)))
-            .ok_or(replay))
+        send: http_kit_h3::SendRequest,
+    ) -> Result<Response, Error> {
+        let response = send.send(request).await.map_err(h3::h3_error)?;
+        Ok(response.map(|body| keep_pool(body, &self.pool)))
     }
 }
 
@@ -274,9 +256,9 @@ impl Endpoint for NativeBackend {
         let uri = request.uri().clone();
         let origin = request_origin(&uri)?;
         let mut fresh = false;
+        #[cfg(native_h3)]
+        let h3 = self.h3_use(&origin)?;
         loop {
-            #[cfg(native_h3)]
-            let h3 = self.h3_use(&origin, &request)?;
             let want = Want {
                 fresh,
                 #[cfg(native_h3)]
@@ -291,7 +273,7 @@ impl Endpoint for NativeBackend {
                     sent
                 }
                 #[cfg(native_h3)]
-                Grant::H3(grant) => self.send_h3(&origin, request, grant).await?,
+                Grant::H3(send) => Ok(self.send_h3(request, send).await?),
             };
             match sent {
                 Ok(response) => {
@@ -399,5 +381,95 @@ impl<S: Stream + Unpin> Stream for KeepPool<S> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.get_mut().inner).poll_next(cx)
+    }
+}
+
+#[cfg(all(test, native_driver))]
+#[expect(
+    clippy::future_not_send,
+    reason = "the scenario runs on one runtime thread, as the pool's connections do"
+)]
+mod tests {
+    use http_kit_io::Listener as _;
+
+    use super::*;
+    use crate::Proxy;
+
+    /// An order in Chinese, Japanese and Korean.
+    const ORDER: &str = "订单：一杯茶。注文：お茶を一杯。주문: 차 한 잔.";
+
+    /// A sender whose connection takes no request: its driver is dropped
+    /// before it ran, as when a connection stops while it sits idle.
+    async fn stopped<I: NativeIo>(io: &I) -> http_kit_h1::SendRequest {
+        let listener = io
+            .bind_tcp("127.0.0.1:0".parse().expect("loopback"))
+            .expect("bind");
+        let addr = listener.local_addr().expect("local address");
+        let (stream, accepted) = futures_util::join!(io.connect(addr), listener.accept());
+        accepted.expect("accept");
+        let (send, connection) = http_kit_h1::handshake_stream(
+            stream.expect("connect"),
+            io.clone(),
+            http_kit_h1::ClientConfig::default(),
+        );
+        drop(connection);
+        send
+    }
+
+    fn post() -> http::Request<Body> {
+        let mut request = http::Request::new(Body::from_bytes(ORDER.as_bytes().to_vec()));
+        *request.method_mut() = Method::POST;
+        *request.uri_mut() = "http://127.0.0.1:9/orders".parse().expect("URI");
+        request
+    }
+
+    /// A POST that a reused connection took none of comes back for another
+    /// connection, body intact; on a fresh connection the same failure is
+    /// the request's.
+    async fn unsent_requests_come_back<I: NativeIo>(io: I) {
+        // A pool that never runs: the leases' reports go nowhere.
+        let (pool, _receiver) = PoolHandle::channel();
+        let transport = Transport::builder()
+            .proxy(Proxy::none())
+            .build()
+            .expect("transport builds");
+        let backend = NativeBackend { transport, pool };
+        let origin = request_origin(&post().uri().clone()).expect("origin");
+
+        let sent = backend
+            .send_h1(&origin, post(), stopped(&io).await, Via::Direct, true)
+            .await;
+        let Ok(Err(returned)) = sent else {
+            panic!("the unsent POST must come back, got {sent:?}");
+        };
+        assert_eq!(returned.method(), Method::POST);
+        let body = returned.into_body().into_bytes().await.expect("body reads");
+        assert_eq!(body.as_ref(), ORDER.as_bytes());
+
+        let sent = backend
+            .send_h1(&origin, post(), stopped(&io).await, Via::Direct, false)
+            .await;
+        assert!(
+            sent.is_err(),
+            "a fresh connection's failure is the request's"
+        );
+    }
+
+    #[cfg(feature = "native-compio")]
+    #[test]
+    fn unsent_requests_come_back_on_compio() {
+        compio::runtime::Runtime::new()
+            .expect("compio runtime")
+            .block_on(unsent_requests_come_back(Compio));
+    }
+
+    #[cfg(feature = "native-tokio")]
+    #[test]
+    fn unsent_requests_come_back_on_tokio() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(unsent_requests_come_back(Tokio));
     }
 }

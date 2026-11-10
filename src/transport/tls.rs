@@ -106,6 +106,10 @@ mod engine {
         /// `http-kit-tls` as is.
         #[cfg(native_backend)]
         http1_config: Arc<ClientConfig>,
+        /// The verifier every configuration above runs, which the native
+        /// backend's HTTP/3 handshakes call too.
+        #[cfg(native_h3)]
+        verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
         #[cfg(connector)]
         http1: futures_rustls::TlsConnector,
         #[cfg(connector)]
@@ -124,6 +128,8 @@ mod engine {
                 #[cfg(onecrl)]
                 additions,
             )?;
+            #[cfg(native_h3)]
+            let shared = Arc::clone(&verifier);
             let base = ClientConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions()
                 .map_err(Error::tls)?
@@ -145,9 +151,18 @@ mod engine {
                 base: Arc::new(base),
                 #[cfg(native_backend)]
                 http1_config: Arc::clone(&http1),
+                #[cfg(native_h3)]
+                verifier: shared,
                 #[cfg(connector)]
                 http1: futures_rustls::TlsConnector::from(http1),
             })
+        }
+
+        /// The server certificate verifier: the platform verifier with the
+        /// transport's extra roots, wrapped in OneCRL where it applies.
+        #[cfg(native_h3)]
+        pub fn verifier(&self) -> &Arc<dyn rustls::client::danger::ServerCertVerifier> {
+            &self.verifier
         }
 
         /// The configuration offering `http/1.1` alone, with the platform

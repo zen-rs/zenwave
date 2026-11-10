@@ -2,35 +2,41 @@
 //! `http-kit-io` UDP sockets, discovered through `Alt-Svc` and HTTPS records
 //! with the hyper backend's [`H3Knowledge`] policy.
 //!
-//! `http-kit-h3` starts a connection without waiting for its handshake and
-//! reports no handshake outcome, so a new connection is *unproven* until a
-//! response arrives on it. The request that triggers the dial goes over TCP;
-//! afterwards an unproven connection carries only requests that can be sent
-//! again on TCP — idempotent, with a replayable body — and it is abandoned,
-//! with QUIC put into backoff for the origin, if it fails or carries no
-//! response within the connect timeout. Once proven it carries every
-//! request.
+//! A QUIC dial races TCP, as in the hyper backend. Once an origin has
+//! advertised h3, a request that finds no live HTTP/3 connection starts a
+//! QUIC dial and also waits in the origin's HTTP/1.1 queue, which serves it
+//! from an idle connection or a TCP dial; whichever is usable first carries
+//! it. A QUIC connection joins the pool only once its handshake completed
+//! ([`SendRequest::ready`]), so the server's chain has passed the same
+//! verifier TCP connections use, and from then on it carries every request
+//! that may use HTTP/3. A dial that fails, or does not complete within the
+//! connect timeout, puts the origin into QUIC backoff.
 
 use std::{
     cell::RefCell,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     rc::Rc,
+    sync::Arc,
     time::Instant,
 };
 
-use futures_channel::oneshot;
 use futures_util::{
     FutureExt,
     future::{Either, LocalBoxFuture, select},
     pin_mut,
 };
-use http_kit_h3::{Client, ClientConfig, Roots, SendRequest};
+use http_kit_h3::{Client, ClientConfig, Rejection, SendRequest, Verifier};
 use http_kit_io::Io;
+use rustls::{
+    CertificateError,
+    client::danger::ServerCertVerifier,
+    pki_types::{CertificateDer, ServerName, UnixTime},
+};
 use tracing::debug;
 
 use super::{
     connect::NativeIo,
-    pool::{Command, Event, Grant, H3Use, Pool},
+    pool::{Command, Event, Pool},
 };
 use crate::{
     Error, Transport,
@@ -46,41 +52,21 @@ use crate::{
 /// head limit, so both protocols bound a head alike.
 const MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
 
-/// The origin's HTTP/3 connection, as handed to a request.
-#[derive(Debug)]
-pub struct H3Grant {
-    pub send: SendRequest,
-    /// Which of the origin's connections this is, for the report back.
-    pub generation: u64,
-    /// For an unproven connection: fires when the pool abandons it, so the
-    /// request stops waiting on it and goes over TCP. Dropped unfired once
-    /// the connection is proven.
-    pub verdict: Option<oneshot::Receiver<()>>,
-}
-
-/// What a request learned about HTTP/3.
-#[derive(Debug)]
-pub enum H3Report {
-    /// A response arrived on connection `generation`.
-    Proven { origin: Origin, generation: u64 },
-    /// A request on unproven connection `generation` failed.
-    Failed { origin: Origin, generation: u64 },
-    /// A response for `origin` carried these `Alt-Svc` fields, joined.
-    AltSvc { origin: Origin, value: String },
-}
+/// A QUIC connection whose handshake completed, and the future that drives
+/// it from here on.
+type Established = (
+    SendRequest,
+    LocalBoxFuture<'static, Result<(), http_kit_h3::Error>>,
+);
 
 /// What an HTTP/3 task finished.
 pub enum H3Event {
+    /// Dial `generation` ended: a connection whose handshake completed, or
+    /// why none did.
     Connected {
         origin: Origin,
         generation: u64,
-        result: Result<
-            (
-                SendRequest,
-                LocalBoxFuture<'static, Result<(), http_kit_h3::Error>>,
-            ),
-            Error,
-        >,
+        result: Result<Established, Error>,
     },
     /// Connection `generation`'s driver returned.
     Ended {
@@ -88,19 +74,14 @@ pub enum H3Event {
         generation: u64,
         result: Result<(), http_kit_h3::Error>,
     },
-    /// Connection `generation` has had its connect timeout to prove itself.
-    Deadline {
-        origin: Origin,
-        generation: u64,
-    },
     Discovered {
         origin: Origin,
         rr: HttpsRr,
     },
 }
 
-/// The pool's prepared `http-kit-h3` client, built on first use from the
-/// transport's roots. Shared with connect tasks, which borrow it only for
+/// The pool's prepared `http-kit-h3` client, built on first use with the
+/// transport's verifier. Shared with dial tasks, which borrow it only for
 /// the synchronous `connect` call.
 #[derive(Default, Clone)]
 pub struct H3Client(Rc<RefCell<Option<Client>>>);
@@ -110,6 +91,8 @@ pub struct H3Slot {
     knowledge: H3Knowledge,
     conn: Option<Pooled>,
     dialing: bool,
+    /// Numbers dials, so a late event about a replaced connection is
+    /// recognised as such.
     generation: u64,
 }
 
@@ -117,8 +100,6 @@ struct Pooled {
     send: SendRequest,
     generation: u64,
     since: Instant,
-    proven: bool,
-    verdicts: Vec<oneshot::Sender<()>>,
 }
 
 impl H3Slot {
@@ -137,6 +118,11 @@ impl H3Slot {
         self.conn.is_none() && !self.dialing && !self.knowledge.is_live(now)
     }
 
+    /// Whether a QUIC dial is racing for the origin.
+    pub const fn dialing(&self) -> bool {
+        self.dialing
+    }
+
     /// Drops a closed connection, or one unused for the idle window.
     fn evict(&mut self) {
         if self
@@ -148,129 +134,73 @@ impl H3Slot {
         }
     }
 
-    /// The connection for a request that may use it as `using` says.
-    fn lease(&mut self, using: H3Use, now: Instant) -> Option<H3Grant> {
+    /// The live connection's handle, its idle clock restarted.
+    fn lease(&mut self, now: Instant) -> Option<SendRequest> {
         self.evict();
         let conn = self.conn.as_mut()?;
-        let verdict = if conn.proven {
-            None
-        } else if using == H3Use::Any {
-            let (abandon, verdict) = oneshot::channel();
-            conn.verdicts.push(abandon);
-            Some(verdict)
-        } else {
-            return None;
-        };
         conn.since = now;
-        Some(H3Grant {
-            send: conn.send.clone(),
-            generation: conn.generation,
-            verdict,
-        })
+        Some(conn.send.clone())
     }
 
-    /// The live connection, when it is connection `generation`.
-    fn current(&mut self, generation: u64) -> Option<&mut Pooled> {
-        self.conn
-            .as_mut()
-            .filter(|conn| conn.generation == generation)
-    }
-
-    /// Abandons the unproven connection and keeps QUIC off for the backoff;
-    /// requests waiting on it go over TCP.
-    fn fail(&mut self, now: Instant) {
-        self.knowledge.mark_broken(now);
-        if let Some(conn) = self.conn.take() {
-            for abandon in conn.verdicts {
-                abandon.send(()).ok();
-            }
-        }
+    /// Whether `generation` is the dial or connection the slot knows now.
+    const fn is_current(&self, generation: u64) -> bool {
+        self.generation == generation
     }
 }
 
 impl<I: NativeIo> Pool<I> {
-    /// Serves `reply` from the origin's HTTP/3 connection when `using`
-    /// allows, and starts discovery or a QUIC dial when they are due. Hands
-    /// `reply` back when HTTP/1.1 must serve it.
-    pub(super) fn h3_checkout(
-        &mut self,
-        origin: &Origin,
-        using: H3Use,
-        reply: oneshot::Sender<Result<Grant, Error>>,
-    ) -> Option<oneshot::Sender<Result<Grant, Error>>> {
-        if using == H3Use::Blocked {
-            return Some(reply);
-        }
+    /// The origin's live HTTP/3 connection for a request that may use it.
+    /// Without one, starts the HTTPS record lookup and the QUIC dial when
+    /// they are due; the request then waits in the HTTP/1.1 queue, where a
+    /// dial that completes in time finds it.
+    pub(super) fn h3_checkout(&mut self, origin: &Origin) -> Option<SendRequest> {
         let now = Instant::now();
+        // Without the transport no dial can start; HTTP/1.1 reports why.
+        let transport = self.transport.upgrade()?;
         let slot = &mut self.entry(origin).h3;
-        if let Some(grant) = slot.lease(using, now) {
-            if reply.send(Ok(Grant::H3(grant))).is_err() {
-                debug!("an HTTP/3 grant found its request gone");
-            }
-            return None;
+        if let Some(send) = slot.lease(now) {
+            return Some(send);
         }
         let discover = slot.knowledge.begin_discovery(now);
-        let dial = slot
-            .knowledge
-            .candidate(now)
-            .filter(|_| !slot.dialing && slot.conn.is_none());
+        let dial = slot.knowledge.candidate(now).filter(|_| !slot.dialing);
         let timeout = slot.knowledge.connect_timeout();
         if dial.is_some() {
             slot.dialing = true;
             slot.generation += 1;
         }
         let generation = slot.generation;
-        if let Some(transport) = self.transport.upgrade() {
-            if discover {
-                self.tasks
-                    .push(discover_task(transport.clone(), origin.clone()));
-            }
-            if let Some(port) = dial {
-                let io = self.io.clone();
-                let client = self.h3.clone();
-                let origin = origin.clone();
-                self.tasks.push(
-                    async move {
-                        let deadline = Instant::now() + timeout;
-                        let result =
-                            connect(&io, &transport, &client, &origin.host, port, deadline).await;
-                        Some(Event::H3(H3Event::Connected {
-                            origin,
-                            generation,
-                            result,
-                        }))
-                    }
-                    .boxed_local(),
-                );
-            }
+        if discover {
+            self.tasks
+                .push(discover_task(transport.clone(), origin.clone()));
         }
-        Some(reply)
+        if let Some(port) = dial {
+            let io = self.io.clone();
+            let client = self.h3.clone();
+            let origin = origin.clone();
+            self.tasks.push(
+                async move {
+                    let deadline = Instant::now() + timeout;
+                    let result =
+                        connect(&io, &transport, &client, &origin.host, port, deadline).await;
+                    Some(Event::H3(H3Event::Connected {
+                        origin,
+                        generation,
+                        result,
+                    }))
+                }
+                .boxed_local(),
+            );
+        }
+        None
     }
 
-    pub(super) fn h3_report(&mut self, report: H3Report) {
-        let now = Instant::now();
-        match report {
-            H3Report::Proven { origin, generation } => {
-                if let Some(conn) = self.entry(&origin).h3.current(generation) {
-                    conn.proven = true;
-                    conn.verdicts.clear();
-                }
-            }
-            H3Report::Failed { origin, generation } => {
-                let slot = &mut self.entry(&origin).h3;
-                if slot.current(generation).is_some_and(|conn| !conn.proven) {
-                    debug!(host = %origin.host, "HTTP/3 connection failed unproven; backing off");
-                    slot.fail(now);
-                }
-            }
-            H3Report::AltSvc { origin, value } => {
-                let host = origin.host.clone();
-                self.entry(&origin)
-                    .h3
-                    .knowledge
-                    .insert_alt_svc(&host, &value, now);
-            }
-        }
+    /// A response for `origin` carried these `Alt-Svc` fields, joined.
+    pub(super) fn alt_svc(&mut self, origin: &Origin, value: &str) {
+        let host = origin.host.clone();
+        self.entry(origin)
+            .h3
+            .knowledge
+            .insert_alt_svc(&host, value, Instant::now());
     }
 
     pub(super) fn h3_event(&mut self, event: H3Event) {
@@ -281,19 +211,15 @@ impl<I: NativeIo> Pool<I> {
                 generation,
                 result,
             } => {
-                let timeout = {
-                    let slot = &mut self.entry(&origin).h3;
-                    slot.dialing = false;
-                    slot.knowledge.connect_timeout()
-                };
+                let slot = &mut self.entry(&origin).h3;
+                debug_assert!(slot.is_current(generation), "one QUIC dial at a time");
+                slot.dialing = false;
                 match result {
                     Ok((send, driver)) => {
-                        self.entry(&origin).h3.conn = Some(Pooled {
-                            send,
+                        slot.conn = Some(Pooled {
+                            send: send.clone(),
                             generation,
                             since: now,
-                            proven: false,
-                            verdicts: Vec::new(),
                         });
                         let ended = origin.clone();
                         self.tasks.push(
@@ -307,18 +233,12 @@ impl<I: NativeIo> Pool<I> {
                                 })
                                 .boxed_local(),
                         );
-                        let io = self.io.clone();
-                        self.tasks.push(
-                            async move {
-                                io.sleep(timeout).await;
-                                Some(Event::H3(H3Event::Deadline { origin, generation }))
-                            }
-                            .boxed_local(),
-                        );
+                        self.h3_won(&origin, &send);
                     }
                     Err(error) => {
                         debug!(host = %origin.host, %error, "QUIC dial failed; backing off");
-                        self.entry(&origin).h3.knowledge.mark_broken(now);
+                        slot.knowledge.mark_broken(now);
+                        self.h3_lost(&origin);
                     }
                 }
             }
@@ -331,17 +251,12 @@ impl<I: NativeIo> Pool<I> {
                     debug!(host = %origin.host, %error, "HTTP/3 connection ended with an error");
                 }
                 let slot = &mut self.entry(&origin).h3;
-                match slot.current(generation).map(|conn| conn.proven) {
-                    Some(false) => slot.fail(now),
-                    Some(true) => slot.conn = None,
-                    None => {}
-                }
-            }
-            H3Event::Deadline { origin, generation } => {
-                let slot = &mut self.entry(&origin).h3;
-                if slot.current(generation).is_some_and(|conn| !conn.proven) {
-                    debug!(host = %origin.host, "HTTP/3 connection unproven at its deadline");
-                    slot.fail(now);
+                if slot
+                    .conn
+                    .as_ref()
+                    .is_some_and(|conn| conn.generation == generation)
+                {
+                    slot.conn = None;
                 }
             }
             H3Event::Discovered { origin, rr } => {
@@ -367,12 +282,13 @@ fn discover_task(transport: Transport, origin: Origin) -> LocalBoxFuture<'static
 /// transport's resolver is shared by every pool and outlives any one of
 /// them, so its tasks cannot live on a pool's thread.
 fn spawn_on_threads() -> Spawn {
-    std::sync::Arc::new(crate::transport::spawn_thread)
+    Arc::new(crate::transport::spawn_thread)
 }
 
-/// Starts a QUIC connection to `host`:`port` on a UDP socket of the pool's
-/// I/O, the address chosen as a TCP dial would order them. Resolution is
-/// bounded by `deadline`.
+/// A QUIC connection to `host`:`port` whose handshake completed by
+/// `deadline`. The resolved addresses are tried one after another in the
+/// order a TCP dial would race them, each on a UDP socket of the pool's
+/// I/O, with `deadline` covering resolution and every attempt together.
 async fn connect<I: Io>(
     io: &I,
     transport: &Transport,
@@ -380,33 +296,47 @@ async fn connect<I: Io>(
     host: &str,
     port: u16,
     deadline: Instant,
-) -> Result<
-    (
-        SendRequest,
-        LocalBoxFuture<'static, Result<(), http_kit_h3::Error>>,
-    ),
-    Error,
-> {
+) -> Result<Established, Error> {
     let addrs = {
         let resolve = happy_eyeballs::resolve(host, port);
         let expire = io.sleep_until(deadline);
-        pin_mut!(resolve);
-        pin_mut!(expire);
+        pin_mut!(resolve, expire);
         match select(resolve, expire).await {
             Either::Left((addrs, _)) => addrs.map_err(|error| Error::Transport(Box::new(error)))?,
-            Either::Right(((), _)) => {
-                return Err(Error::Transport(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("resolving {host} for QUIC timed out"),
-                ))));
-            }
+            Either::Right(((), _)) => Vec::new(),
         }
     };
-    let peer = *addrs.first().ok_or_else(|| {
-        Error::Transport(Box::new(std::io::Error::other(format!(
-            "{host} resolved to no address"
-        ))))
-    })?;
+    let mut last_error = None;
+    for peer in addrs {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match attempt(io, transport, client, host, peer, deadline).await {
+            Ok(established) => return Ok(established),
+            Err(error) => {
+                debug!(%host, %peer, %error, "QUIC attempt failed");
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        Error::Transport(Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("QUIC connect to {host}:{port} timed out"),
+        )))
+    }))
+}
+
+/// One QUIC handshake with `peer`, driven until it completes, fails or
+/// `deadline` passes.
+async fn attempt<I: Io>(
+    io: &I,
+    transport: &Transport,
+    client: &H3Client,
+    host: &str,
+    peer: SocketAddr,
+    deadline: Instant,
+) -> Result<Established, Error> {
     let local = SocketAddr::new(
         match peer.ip() {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -417,26 +347,87 @@ async fn connect<I: Io>(
     let socket = io
         .bind_udp(local)
         .map_err(|error| Error::Transport(Box::new(error)))?;
-    let mut client = client.0.borrow_mut();
-    let client = match &mut *client {
-        Some(client) => client,
-        empty => empty.insert(Client::new(&client_config(transport)).map_err(h3_error)?),
+    let (send, connection) = {
+        let mut client = client.0.borrow_mut();
+        let client = match &mut *client {
+            Some(client) => client,
+            empty => empty.insert(Client::new(&client_config(transport)).map_err(h3_error)?),
+        };
+        client
+            .connect(socket, io.clone(), host, peer)
+            .map_err(h3_error)?
     };
-    let (send, connection) = client
-        .connect(socket, io.clone(), host, peer)
-        .map_err(h3_error)?;
-    Ok((send, connection.run().boxed_local()))
+    let mut run = connection.run().boxed_local();
+    let handshake = {
+        let ready = send.ready();
+        let expire = io.sleep_until(deadline);
+        pin_mut!(ready, expire);
+        match select(select(ready, &mut run), expire).await {
+            Either::Left((Either::Left((ready, _)), _)) => ready.map_err(h3_error),
+            Either::Left((Either::Right((ended, _)), _)) => Err(h3_error(
+                ended.err().unwrap_or(http_kit_h3::Error::ConnectionClosed),
+            )),
+            Either::Right(((), _)) => Err(Error::Transport(Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("QUIC handshake with {host} at {peer} timed out"),
+            )))),
+        }
+    };
+    handshake.map(|()| (send, run))
 }
 
-/// The client configuration: `BoringSSL`'s default verify paths plus the
-/// transport's extra roots.
+/// The client configuration: the server's chain goes to the transport's
+/// verifier, the one its TCP connections use.
 fn client_config(transport: &Transport) -> ClientConfig {
-    let pem = transport
-        .extra_roots()
+    let verifier = Arc::clone(transport.tls().verifier());
+    ClientConfig::with_verifier(
+        Verifier::new(move |chain, name| verify(&*verifier, chain, name)),
+        MAX_FIELD_SECTION_SIZE,
+    )
+}
+
+/// Judges the DER `chain` (leaf first) a server presented for `name`. No
+/// OCSP response reaches this point; the verifier checks revocation as it
+/// does for a TCP handshake that carried none.
+fn verify(
+    verifier: &dyn ServerCertVerifier,
+    chain: &[Vec<u8>],
+    name: &str,
+) -> Result<(), Rejection> {
+    let (leaf, intermediates) = chain.split_first().ok_or(Rejection::BadCertificate)?;
+    let intermediates: Vec<_> = intermediates
         .iter()
-        .map(|root| pem::encode(&pem::Pem::new("CERTIFICATE", root.to_vec())).into_bytes())
+        .map(|der| CertificateDer::from(der.as_slice()))
         .collect();
-    ClientConfig::new(Roots { system: true, pem }, MAX_FIELD_SECTION_SIZE)
+    let server_name = ServerName::try_from(name).map_err(|_| Rejection::BadCertificate)?;
+    verifier
+        .verify_server_cert(
+            &CertificateDer::from(leaf.as_slice()),
+            &intermediates,
+            &server_name,
+            &[],
+            UnixTime::now(),
+        )
+        .map(drop)
+        .map_err(|error| {
+            debug!(%name, %error, "HTTP/3 server certificate refused");
+            rejection(&error)
+        })
+}
+
+/// The TLS alert a verification failure is reported to the server with.
+const fn rejection(error: &rustls::Error) -> Rejection {
+    match error {
+        rustls::Error::InvalidCertificate(
+            CertificateError::Expired
+            | CertificateError::ExpiredContext { .. }
+            | CertificateError::NotValidYet
+            | CertificateError::NotValidYetContext { .. },
+        ) => Rejection::Expired,
+        rustls::Error::InvalidCertificate(CertificateError::Revoked) => Rejection::Revoked,
+        rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer) => Rejection::UnknownCa,
+        _ => Rejection::BadCertificate,
+    }
 }
 
 pub(super) fn h3_error(error: http_kit_h3::Error) -> Error {
@@ -447,9 +438,80 @@ pub(super) fn h3_error(error: http_kit_h3::Error) -> Error {
 /// any.
 pub(super) fn report_alt_svc(pool: &super::PoolHandle, origin: &Origin, headers: &http::HeaderMap) {
     if let Some(value) = crate::transport::discovery::joined_alt_svc(headers) {
-        pool.send(Command::H3(H3Report::AltSvc {
+        pool.send(Command::AltSvc {
             origin: origin.clone(),
             value,
-        }));
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    };
+    use time::{Duration, OffsetDateTime};
+
+    use super::*;
+    use crate::Proxy;
+
+    /// A CA's DER and the DER of a leaf it signed for `localhost`.
+    fn chain() -> (Vec<u8>, Vec<u8>) {
+        let now = OffsetDateTime::now_utc();
+        let ca_key = KeyPair::generate().expect("generate CA key");
+        let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+        ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca.distinguished_name
+            .push(DnType::CommonName, "zenwave h3 verifier test CA");
+        ca.not_before = now - Duration::days(1);
+        ca.not_after = now + Duration::days(30);
+        let ca_der = ca
+            .self_signed(&ca_key)
+            .expect("self-sign CA")
+            .der()
+            .to_vec();
+        let issuer = Issuer::new(ca, ca_key);
+        let leaf_key = KeyPair::generate().expect("generate leaf key");
+        let mut leaf = CertificateParams::new(vec!["localhost".to_owned()]).expect("leaf params");
+        leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        leaf.not_before = now - Duration::days(1);
+        leaf.not_after = now + Duration::days(30);
+        let leaf_der = leaf
+            .signed_by(&leaf_key, &issuer)
+            .expect("sign leaf")
+            .der()
+            .to_vec();
+        (ca_der, leaf_der)
+    }
+
+    /// The HTTP/3 verifier is the transport's: a chain to one of its extra
+    /// roots passes for the leaf's name, a chain to any other root is an
+    /// unknown CA, and the right chain for the wrong name is refused.
+    #[test]
+    fn h3_chains_meet_the_transport_verifier() {
+        let (ca, leaf) = chain();
+        let (_, stranger) = chain();
+        let transport = Transport::builder()
+            .proxy(Proxy::none())
+            .extra_root_certificate_der(ca)
+            .build()
+            .expect("transport builds");
+        let verifier = transport.tls().verifier();
+        assert_eq!(
+            verify(&**verifier, std::slice::from_ref(&leaf), "localhost"),
+            Ok(())
+        );
+        assert_eq!(
+            verify(&**verifier, &[stranger], "localhost"),
+            Err(Rejection::UnknownCa)
+        );
+        assert_eq!(
+            verify(&**verifier, &[leaf], "example.com"),
+            Err(Rejection::BadCertificate)
+        );
+        assert_eq!(
+            verify(&**verifier, &[], "localhost"),
+            Err(Rejection::BadCertificate)
+        );
     }
 }
