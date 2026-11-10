@@ -443,18 +443,12 @@ impl HyperBackend {
             .record_alt_svc(&origin.host, response.headers());
     }
 
-    /// Wrap the h1 lease around its body's tail and harvest `Alt-Svc`. The
-    /// response comes back whatever its status, its body still streaming.
+    /// Wrap the h1 lease around its body's tail. The response comes back
+    /// whatever its status, its body still streaming.
     fn finish_response(
-        &self,
-        #[cfg(http3)] origin: &Origin,
-        #[cfg(http3)] h3: H3,
         response: http::Response<http_kit::Body>,
         lease: Option<H1Lease>,
     ) -> Response {
-        #[cfg(http3)]
-        self.record_alt_svc(origin, h3, &response);
-
         let response = response.map(|body| match lease {
             // The h1 connection is reusable once the body is finished or
             // dropped, so the lease rides along with it.
@@ -583,14 +577,9 @@ impl Endpoint for HyperBackend {
             }
         };
 
-        Ok(self.finish_response(
-            #[cfg(http3)]
-            &origin,
-            #[cfg(http3)]
-            h3,
-            response,
-            lease,
-        ))
+        #[cfg(http3)]
+        self.record_alt_svc(&origin, h3, &response);
+        Ok(Self::finish_response(response, lease))
     }
 }
 
