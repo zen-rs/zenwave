@@ -246,6 +246,8 @@ impl CookieStore {
     }
 }
 
+http_kit::impl_send_middleware!(CookieStore);
+
 impl Middleware for CookieStore {
     type Error = CookieError;
     async fn handle<E: Endpoint>(

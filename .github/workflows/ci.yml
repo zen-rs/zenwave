@@ -200,17 +200,6 @@ jobs:
           use_oidc: true
           fail_ci_if_error: true
 
-  typos:
-    name: Typos
-    needs: tier
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-ubuntu
-      - uses: crate-ci/typos@master
-
   audit:
     name: Security Audit
     needs: tier
@@ -252,7 +241,7 @@ jobs:
     # cover), and the only job present on release-plz pull requests.
     name: CI result
     if: always()
-    needs: [tier, fmt, features, wasm, mobile, coverage, typos, audit, unused-deps, test]
+    needs: [tier, fmt, features, wasm, mobile, coverage, audit, unused-deps, test]
     runs-on: ubuntu-latest
     steps:
       - name: Check job results

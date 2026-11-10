@@ -1,9 +1,12 @@
 //! Middleware for following HTTP redirects.
 
-use http::Uri;
+use http::{HeaderMap, Uri};
 use http_kit::{
-    Endpoint, HttpError, Method,
-    header::{AUTHORIZATION, CONTENT_LENGTH, COOKIE, HOST, LOCATION},
+    Endpoint, HttpError, Method, SendEndpoint,
+    header::{
+        AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION,
+        TRANSFER_ENCODING,
+    },
 };
 use url::Url;
 
@@ -11,6 +14,18 @@ use crate::cookie::{RequestCookieJar, cookie_header, store_response_cookies};
 use crate::{Body, Request, Response, StatusCode, client::Client};
 
 /// Middleware that follows HTTP redirects.
+///
+/// A `301`/`302` converts a `POST` — and only a `POST` — into a bodyless `GET`, a `303`
+/// converts any method other than `GET`/`HEAD` the same way, and a `307`/`308` re-sends the
+/// request unchanged, body included, when the body is replayable; a redirect whose body cannot
+/// be replayed is returned to the caller rather than followed with an emptied one. Payload
+/// headers are dropped together with a dropped body, and `Authorization`/`Cookie` are stripped
+/// on a cross-origin hop.
+///
+/// Credential middleware belongs *outside* this one — `client.bearer_auth(t)` composes the
+/// bearer middleware around `FollowRedirect`, so the credential is applied before a hop and the
+/// cross-origin strip removes it. Wrapping the other way would let the inner middleware
+/// re-attach it on every hop.
 #[derive(Debug, Clone)]
 pub struct FollowRedirect<C: Client> {
     client: C,
@@ -29,6 +44,138 @@ impl<C: Client> FollowRedirect<C> {
     pub fn disable_redirect(self) -> C {
         self.client
     }
+
+    /// The absolute URL a redirect response points at, resolved against the URL that
+    /// produced it; `Err` when `Location` is missing or does not resolve.
+    fn redirect_target(
+        current_url: &Url,
+        response: &Response,
+    ) -> Result<Url, FollowRedirectError<C::Error>> {
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .ok_or(FollowRedirectError::MissingLocationHeader)?
+            .to_str()
+            .map_err(|_| FollowRedirectError::InvalidLocationHeader)?;
+        Url::parse(location)
+            .or_else(|_| current_url.join(location))
+            .map_err(|_| FollowRedirectError::InvalidLocationHeader)
+    }
+
+    /// Builds the request for the next hop of a redirect chain and advances `state` to it.
+    ///
+    /// `Ok(None)` means the redirect must be handed back to the caller untouched: the hop
+    /// would preserve a body that cannot be replayed.
+    fn next_hop(
+        request: &mut Request,
+        response: &Response,
+        state: &mut RedirectState,
+    ) -> Result<Option<Request>, FollowRedirectError<C::Error>> {
+        let redirect_url = Self::redirect_target(&state.url, response)?;
+
+        let next_uri: Uri = redirect_url
+            .as_str()
+            .parse()
+            .map_err(|_| FollowRedirectError::InvalidLocationHeader)?;
+
+        // RFC 9110 §15.4 as the clients implement it: a 303 is always a plain retrieval —
+        // `GET` unless the method already is `GET` or `HEAD`, and the body never rides
+        // along — a 301/302 does so only when the method was `POST`, and a 307/308
+        // preserves method and body.
+        let status = response.status();
+        let (next_method, keeps_body) = match status {
+            StatusCode::SEE_OTHER => (
+                if state.method == Method::GET || state.method == Method::HEAD {
+                    state.method.clone()
+                } else {
+                    Method::GET
+                },
+                false,
+            ),
+            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND if state.method == Method::POST => {
+                (Method::GET, false)
+            }
+            _ => (state.method.clone(), true),
+        };
+
+        let next_body = if keeps_body {
+            match state.body.as_ref().and_then(Body::try_clone) {
+                Some(body) => body,
+                // A body that cannot be replayed cannot be redirected safely — hand the
+                // redirect back to the caller rather than send an empty one.
+                None if state.had_body => return Ok(None),
+                None => Body::empty(),
+            }
+        } else {
+            // The body is gone for the rest of the chain — and the headers that
+            // described it with it.
+            state.body = None;
+            state.had_body = false;
+            state.headers.remove(CONTENT_LENGTH);
+            state.headers.remove(CONTENT_TYPE);
+            state.headers.remove(CONTENT_ENCODING);
+            state.headers.remove(TRANSFER_ENCODING);
+            Body::empty()
+        };
+
+        let mut new_request = http::Request::builder()
+            .method(next_method.clone())
+            .uri(next_uri)
+            .body(next_body)
+            .expect("failed to build redirect request"); // Safety: We have already made sure method and uri are valid.
+
+        if state.url.origin() != redirect_url.origin() {
+            state.headers.remove(AUTHORIZATION);
+            state.headers.remove(COOKIE);
+        }
+
+        // A response that redirects is a hop: its `Set-Cookie` headers
+        // belong to this hop's URL.
+        if let Some(jar) = request.extensions_mut().get_mut::<RequestCookieJar>() {
+            jar.changed |= store_response_cookies(&mut jar.store, response.headers(), &state.url);
+        }
+
+        let mut headers = state.headers.clone();
+        headers.remove(HOST);
+
+        // A hop keeps the request's extensions — the jar moves with them, and the next
+        // `Cookie` header comes from it for the new URL — replacing the carried-over one,
+        // including the value just stripped on a cross-origin hop.
+        *new_request.extensions_mut() = request.extensions().clone();
+        if let Some(jar) = new_request.extensions_mut().get_mut::<RequestCookieJar>() {
+            match cookie_header(&jar.store, &redirect_url) {
+                Some(cookie) => {
+                    headers.insert(COOKIE, cookie);
+                }
+                None => {
+                    headers.remove(COOKIE);
+                }
+            }
+        }
+
+        *new_request.headers_mut() = headers;
+        state.method = next_method;
+        state.url = redirect_url;
+        Ok(Some(new_request))
+    }
+}
+
+/// State carried between the hops of one redirect chain.
+#[derive(Debug)]
+struct RedirectState {
+    /// The header set each hop is built from: credentials are stripped on cross-origin hops
+    /// and payload headers leave once a hop drops the body.
+    headers: HeaderMap,
+    /// Method of the request that produced the latest response.
+    method: Method,
+    /// URL of the request that produced the latest response.
+    url: Url,
+    /// Replayable snapshot of the current body, `None` once consumed or dropped.
+    body: Option<Body>,
+    /// Whether the current, not-yet-replayed request carried a body at all.
+    had_body: bool,
+    /// Hops taken so far.
+    count: u32,
 }
 
 /// Errors encountered while following HTTP redirects.
@@ -81,26 +228,41 @@ where
     }
 }
 
+impl<C: Client> SendEndpoint for FollowRedirect<C> {
+    fn respond_send(
+        &mut self,
+        request: &mut Request,
+    ) -> impl Future<Output = Result<Response, Self::Error>> + Send {
+        self.respond(request)
+    }
+}
+
 impl<C: Client> Endpoint for FollowRedirect<C> {
     type Error = FollowRedirectError<C::Error>;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         const MAX_REDIRECTS: u32 = 10;
-        let mut redirect_headers = request.headers().clone();
-        let mut current_method = request.method().clone();
-        let mut current_url = Url::parse(&request.uri().to_string())?;
-        let mut redirect_count = 0;
+        // The body snapshot is taken with `try_clone` — replayable only for an in-memory
+        // body — before the inner client can consume it.
+        let mut state = RedirectState {
+            headers: request.headers().clone(),
+            method: request.method().clone(),
+            url: Url::parse(&request.uri().to_string())?,
+            body: request.body().try_clone(),
+            had_body: request.body().is_empty() != Some(true),
+            count: 0,
+        };
 
         loop {
             let response = self
                 .client
-                .respond(request)
+                .respond_send(request)
                 .await
                 .map_err(FollowRedirectError::RemoteError)?;
 
             // `request` holds whatever the endpoint left behind — the jar,
             // when the chain carries one, rides along in its extensions.
             if let Some(jar) = request.extensions_mut().get_mut::<RequestCookieJar>() {
-                jar.response_url = Some(current_url.clone());
+                jar.response_url = Some(state.url.clone());
             }
 
             if !matches!(
@@ -114,80 +276,15 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
                 return Ok(response);
             }
 
-            if redirect_count >= MAX_REDIRECTS {
+            if state.count >= MAX_REDIRECTS {
                 return Err(FollowRedirectError::TooManyRedirects);
             }
+            state.count += 1;
 
-            let location = response
-                .headers()
-                .get(LOCATION)
-                .ok_or(FollowRedirectError::MissingLocationHeader)?
-                .to_str()
-                .map_err(|_| FollowRedirectError::InvalidLocationHeader)?;
-
-            let redirect_url = Url::parse(location)
-                .or_else(|_| current_url.join(location))
-                .map_err(|_| FollowRedirectError::InvalidLocationHeader)?;
-
-            let next_uri: Uri = redirect_url
-                .as_str()
-                .parse()
-                .map_err(|_| FollowRedirectError::InvalidLocationHeader)?;
-
-            let next_method = match response.status() {
-                StatusCode::SEE_OTHER => Method::GET,
-                StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND
-                    if current_method != Method::GET && current_method != Method::HEAD =>
-                {
-                    Method::GET
-                }
-                _ => current_method.clone(),
-            };
-
-            let mut new_request = http::Request::builder()
-                .method(next_method.clone())
-                .uri(next_uri)
-                .body(Body::empty())
-                .expect("failed to build redirect request"); // Safety: We have already made sure method and uri are valid.
-
-            if current_url.origin() != redirect_url.origin() {
-                redirect_headers.remove(AUTHORIZATION);
-                redirect_headers.remove(COOKIE);
+            match Self::next_hop(request, &response, &mut state)? {
+                Some(next_request) => *request = next_request,
+                None => return Ok(response),
             }
-
-            // A response that redirects is a hop: its `Set-Cookie` headers
-            // belong to this hop's URL.
-            if let Some(jar) = request.extensions_mut().get_mut::<RequestCookieJar>() {
-                jar.changed |=
-                    store_response_cookies(&mut jar.store, response.headers(), &current_url);
-            }
-
-            let mut headers = redirect_headers.clone();
-            headers.remove(HOST);
-            headers.remove(CONTENT_LENGTH);
-
-            // The jar moves onto the next hop's request, and the next
-            // `Cookie` header comes from it for the new URL — replacing the
-            // carried-over one, including the value just stripped on a
-            // cross-origin hop.
-            if let Some(jar) = request.extensions_mut().remove::<RequestCookieJar>() {
-                match cookie_header(&jar.store, &redirect_url) {
-                    Some(cookie) => {
-                        headers.insert(COOKIE, cookie);
-                    }
-                    None => {
-                        headers.remove(COOKIE);
-                    }
-                }
-                new_request.extensions_mut().insert(jar);
-            }
-
-            *new_request.headers_mut() = headers;
-
-            *request = new_request;
-            current_url = redirect_url;
-            current_method = next_method;
-            redirect_count += 1;
         }
     }
 }
@@ -225,6 +322,8 @@ mod tests {
             )))
         }
     }
+
+    http_kit::impl_send_endpoint!(RedirectBackend);
 
     impl crate::Client for RedirectBackend {}
 

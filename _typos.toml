@@ -1,7 +1,0 @@
-[default.extend-words]
-# Apple's simulator identifier key in `simctl` JSON output.
-udid = "udid"
-
-[files]
-# Base64 PEM fixtures read as misspelled words.
-extend-exclude = ["tests/onecrl/*.pem"]

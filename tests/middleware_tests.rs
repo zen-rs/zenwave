@@ -294,6 +294,8 @@ async fn test_middleware_with_custom_middleware() {
         }
     }
 
+    http_kit::impl_send_middleware!(TestMiddleware);
+
     let mut client = client().with(TestMiddleware);
 
     let response = client.get(httpbin_uri("/headers")).unwrap().await;
@@ -325,6 +327,9 @@ impl Endpoint for SlowClient {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+http_kit::impl_send_endpoint!(SlowClient);
+
+#[cfg(not(target_arch = "wasm32"))]
 impl Client for SlowClient {}
 
 #[derive(Clone)]
@@ -352,6 +357,8 @@ impl Endpoint for CountingBackend {
             .unwrap()))
     }
 }
+
+http_kit::impl_send_endpoint!(CountingBackend);
 
 impl Client for CountingBackend {}
 

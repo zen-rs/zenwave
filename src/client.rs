@@ -9,7 +9,7 @@ use futures_io::AsyncRead;
 use futures_util::{Stream, StreamExt};
 use http::{HeaderName, HeaderValue, header};
 use http_kit::{
-    Endpoint, Method, Middleware, Request, Response, Uri,
+    Method, Request, Response, SendEndpoint, SendMiddleware, Uri,
     endpoint::WithMiddleware,
     sse::SseStream,
     utils::{ByteStr, Bytes},
@@ -46,7 +46,7 @@ impl<'a, T: Client> IntoFuture for RequestBuilder<'a, T> {
     fn into_future(mut self) -> Self::IntoFuture {
         Box::pin(async move {
             let mut request = self.request;
-            self.client.respond(&mut request).await
+            self.client.respond_send(&mut request).await
         })
     }
 }
@@ -292,7 +292,7 @@ mod tests {
     use async_lock::Mutex;
     use futures_util::stream;
     use http::Response;
-    use http_kit::StatusCode;
+    use http_kit::{Endpoint, StatusCode};
     use std::{convert::Infallible, sync::Arc};
     use tempfile::tempdir;
 
@@ -470,6 +470,8 @@ mod tests {
         }
     }
 
+    http_kit::impl_send_endpoint!(FakeBackend, RecordingBackend);
+
     impl Client for FakeBackend {}
 
     #[derive(Clone, Default)]
@@ -512,9 +514,13 @@ mod tests {
 }
 
 /// Trait representing an HTTP client with middleware support.
-pub trait Client: Endpoint + Sized {
+///
+/// A client's requests may be awaited on any executor, a work-stealing one
+/// included, so a client is a [`SendEndpoint`] and its middleware are
+/// [`SendMiddleware`].
+pub trait Client: SendEndpoint + Sized {
     /// Add middleware to the client.
-    fn with(self, middleware: impl Middleware) -> impl Client {
+    fn with(self, middleware: impl SendMiddleware) -> impl Client {
         WithMiddleware::new(self, middleware)
     }
 
@@ -664,6 +670,6 @@ pub trait Client: Endpoint + Sized {
     }
 }
 
-impl<C: Client, M: Middleware> Client for WithMiddleware<C, M> {}
+impl<C: Client, M: SendMiddleware> Client for WithMiddleware<C, M> {}
 
 impl<T: Client> Client for &mut T {}

@@ -97,6 +97,8 @@ impl Endpoint for MockClient {
     }
 }
 
+http_kit::impl_send_endpoint!(MockClient);
+
 impl Client for MockClient {}
 
 fn ok_response() -> Response {
@@ -219,10 +221,12 @@ async fn retry_attempts_a_read_once_body_once() {
     let mut request = http::Request::builder()
         .method(http::Method::PUT)
         .uri("https://example.com/stream")
-        .body(Body::from_reader(
-            futures_util::io::Cursor::new(b"streamed".to_vec()),
-            8,
-        ))
+        .body(Body::from_stream(futures_util::stream::iter([Ok::<
+            _,
+            std::io::Error,
+        >(
+            b"streamed".to_vec(),
+        )])))
         .unwrap();
     let result = client.respond(&mut request).await;
     assert!(matches!(result, Err(zenwave::Error::Transport(_))));
@@ -243,7 +247,17 @@ impl<C: Client> Endpoint for CountAttempts<C> {
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         self.attempts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.client.respond(request).await
+        self.client.respond_send(request).await
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<C: Client> http_kit::SendEndpoint for CountAttempts<C> {
+    fn respond_send(
+        &mut self,
+        request: &mut Request,
+    ) -> impl std::future::Future<Output = Result<Response, Self::Error>> + Send {
+        self.respond(request)
     }
 }
 
