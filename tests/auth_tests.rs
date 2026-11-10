@@ -1,4 +1,6 @@
 //! Tests for authentication middleware and request builders
+// Every test here runs through `zenwave::client()`.
+#![cfg(default_backend)]
 
 mod common;
 use common::httpbin_uri;
@@ -180,17 +182,12 @@ async fn test_unauthorized_access() {
     let mut client = client();
 
     // Test accessing an endpoint that requires auth without providing it
-    let response = client.get(httpbin_uri("/bearer")).unwrap().await;
-    assert!(
-        response.is_err(),
-        "expected unauthenticated access to return an error"
-    );
-    let err = response.unwrap_err();
-    let description = format!("{err}");
-    assert!(
-        description.contains("401"),
-        "error should mention 401 status: {description}"
-    );
+    let response = client
+        .get(httpbin_uri("/bearer"))
+        .unwrap()
+        .await
+        .expect("a refusal is a response");
+    assert_eq!(response.status().as_u16(), 401);
 }
 
 #[test_executors::async_test]
@@ -202,16 +199,7 @@ async fn test_invalid_basic_auth() {
         .get(httpbin_uri("/basic-auth/correct/password"))
         .unwrap()
         .basic_auth("wrong", Some("credentials"))
-        .await;
-
-    assert!(
-        response.is_err(),
-        "expected invalid credentials to produce an error"
-    );
-    let err = response.unwrap_err();
-    let description = format!("{err}");
-    assert!(
-        description.contains("401"),
-        "error should mention 401 status: {description}"
-    );
+        .await
+        .expect("a refusal is a response");
+    assert_eq!(response.status().as_u16(), 401);
 }

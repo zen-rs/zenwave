@@ -46,7 +46,7 @@ use security_framework::{certificate::SecCertificate, trust::SecTrust};
 
 use crate::{
     Client, Transport,
-    error::{HttpErrorResponse, ProxyErrorKind},
+    error::ProxyErrorKind,
     transport::proxy::{self, Intercept, Source},
 };
 
@@ -69,12 +69,6 @@ pub enum AppleError {
     Tls(#[source] anyhow::Error),
     #[error(transparent)]
     Proxy(#[from] ProxyErrorKind),
-    #[error("remote error: {status}")]
-    Remote {
-        status: StatusCode,
-        body: Option<String>,
-        raw_response: Box<Response>,
-    },
 }
 
 impl AppleError {
@@ -92,7 +86,6 @@ impl HttpError for AppleError {
         match self {
             Self::BadRequest(_) | Self::Proxy(_) => StatusCode::BAD_REQUEST,
             Self::BadGateway(_) | Self::Tls(_) => StatusCode::BAD_GATEWAY,
-            Self::Remote { status, .. } => *status,
         }
     }
 }
@@ -107,23 +100,6 @@ impl From<AppleError> for crate::Error {
             }
             AppleError::Tls(e) => Self::tls(e),
             AppleError::Proxy(kind) => Self::Proxy(kind),
-            AppleError::Remote {
-                status,
-                body,
-                raw_response,
-            } => Self::Http {
-                status,
-                message: body.clone().unwrap_or_else(|| {
-                    status
-                        .canonical_reason()
-                        .unwrap_or("Unknown error")
-                        .to_string()
-                }),
-                response: Box::new(HttpErrorResponse {
-                    response: *raw_response,
-                    body_text: body,
-                }),
-            },
         }
     }
 }
@@ -505,21 +481,6 @@ async fn send_with_url_session(
     let mut http_response = http::Response::new(Body::from(body));
     *http_response.status_mut() = status;
     *http_response.headers_mut() = headers;
-
-    if status.is_client_error() || status.is_server_error() {
-        let body = http_response
-            .body_mut()
-            .as_str()
-            .await
-            .ok()
-            .map(std::borrow::ToOwned::to_owned);
-        return Err(AppleError::Remote {
-            status,
-            body,
-            raw_response: Box::new(http_response),
-        });
-    }
-
     Ok(http_response)
 }
 

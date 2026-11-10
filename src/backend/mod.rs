@@ -76,7 +76,7 @@ pub use native::Driver;
 #[cfg(feature = "native-tokio")]
 pub use native::Tokio;
 #[cfg(native_backend)]
-pub use native::{NativeBackend, NativeIo};
+pub use native::{NativeBackend, NativeIo, Switched, Upgrade};
 
 /// The default HTTP client backend: the native backend on its own driver
 /// runtime.
@@ -117,17 +117,22 @@ pub type DefaultBackend = WebBackend;
 // Compile-time validation for native platforms
 // ============================================================================
 
+// `native-backend` alone is a backend without a default: its caller drives
+// `NativeBackend::on_current_thread` on its own runtime, and the items that
+// need a `DefaultBackend` (`zenwave::client()`, `DefaultClient`, the
+// one-shot request functions) are absent.
 #[cfg(all(
     not(target_arch = "wasm32"),
     not(apple_backend),
     not(feature = "hyper-backend"),
     not(feature = "curl-backend"),
-    not(native_driver)
+    not(native_backend)
 ))]
 compile_error!(
-    "No default backend enabled for native platform. \
+    "No backend enabled for native platform. \
      Please enable one of: `hyper-backend` (recommended), `curl-backend`, \
      `native-compio` or `native-tokio` (the native backend with a runtime of its own), \
+     `native-backend` (the native backend on the caller's runtime, with no default client), \
      or `apple-backend` (Apple platforms only). \
      The default feature set includes `hyper-backend` with `rustls` TLS."
 );

@@ -1,7 +1,6 @@
 //! The request and response handling the hyper and native backends share:
 //! what origin a request belongs to, how an HTTP/1.1 request is shaped for
-//! the path its connection took, and how an error status becomes
-//! [`Error::Http`].
+//! the path its connection took, and how a received response is logged.
 
 use std::mem::replace;
 
@@ -11,7 +10,6 @@ use tracing::debug;
 
 use crate::{
     Error,
-    error::HttpErrorResponse,
     transport::route::{Origin, Via},
 };
 
@@ -102,39 +100,14 @@ pub fn shape_h1_request(request: &mut http::Request<Body>, via: &Via) -> Result<
     Ok(())
 }
 
-/// Passes a successful response through and turns a 4xx or 5xx into
-/// [`Error::Http`], its body read as the message.
-///
-/// # Errors
-///
-/// The response's status is a client or server error.
-pub async fn error_for_status(mut response: Response) -> Result<Response, Error> {
+/// Logs the head of a response the backend is about to return. Its status
+/// is the caller's to judge: a backend hands back what it received, and
+/// [`crate::ErrorForStatus`] is the layer that turns an error status into
+/// an error.
+pub fn received(response: &Response) {
     debug!(
         status = %response.status(),
         headers = ?response.headers(),
         "received response"
     );
-    let status = response.status();
-    if !(status.is_client_error() || status.is_server_error()) {
-        return Ok(response);
-    }
-    let body = response
-        .body_mut()
-        .as_str()
-        .await
-        .ok()
-        .map(ToOwned::to_owned);
-    Err(Error::Http {
-        status,
-        message: body.clone().unwrap_or_else(|| {
-            status
-                .canonical_reason()
-                .unwrap_or("Unknown error")
-                .to_string()
-        }),
-        response: Box::new(HttpErrorResponse {
-            response,
-            body_text: body,
-        }),
-    })
 }

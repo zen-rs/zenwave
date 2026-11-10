@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/zen-rs/zenwave/compare/v0.9.1...v0.10.0) - 2026-11-10
+
+### Added
+
+- hand the stream a 101 switched to the native backend's caller
+
+### Fixed
+
+- *(hyper)* record Alt-Svc at the call site so finish_response needs no self
+- [**breaking**] return error statuses as responses, with an opt-in layer to fail on them
+- build `native-backend` without a driver runtime
+
+### Other
+
+- Merge remote-tracking branch 'origin/dev' into feat/159-native-upgrade
+- build the status tests only with a default backend
+- Merge remote-tracking branch 'origin/dev' into fix/160-error-status-layer
+
 ## [0.9.1](https://github.com/zen-rs/zenwave/compare/v0.9.0...v0.9.1) - 2026-11-10
 
 ### Added

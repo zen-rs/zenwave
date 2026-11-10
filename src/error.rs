@@ -2,7 +2,8 @@
 //!
 //! This module provides a single, unified error type [`Error`] that encompasses
 //! all possible errors that can occur during HTTP operations. This includes:
-//! - HTTP server errors (4xx/5xx responses)
+//! - HTTP server errors (4xx/5xx responses, for a caller that opted into
+//!   [`crate::ErrorForStatus`])
 //! - Network transport errors (connection failures, DNS errors, etc.)
 //! - Request/response parsing errors
 //! - Middleware-specific errors (timeout, redirect, authentication, etc.)
@@ -20,9 +21,12 @@ use thiserror::Error;
 pub enum Error {
     /// HTTP server returned an error response (4xx/5xx status code).
     ///
-    /// This represents a successful HTTP connection where the server returned
-    /// an error status. The response body may contain additional error details
-    /// that can be deserialized using [`Error::deserialize_http_error`].
+    /// No backend produces this: a backend returns every response it
+    /// receives. It comes from a caller opting in, through
+    /// [`crate::ErrorForStatus`] (`Client::error_for_status`) or
+    /// [`crate::ResponseExt::error_for_status`]. The response body may contain
+    /// additional error details that can be deserialized using
+    /// [`Error::deserialize_http_error`].
     #[error("HTTP error {status}: {message}")]
     Http {
         /// HTTP status code
@@ -312,16 +316,15 @@ impl Error {
     /// }
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let mut client = zenwave::client();
-    /// match client.get("https://api.example.com/data") {
+    /// let mut client = zenwave::client().error_for_status();
+    /// let result = client.get("https://api.example.com/data")?.await;
+    /// match result.map_err(zenwave::Error::from) {
     ///     Err(e) => {
     ///         if let Some(api_err) = e.deserialize_http_error::<ApiError>() {
     ///             println!("API error: {} - {}", api_err.code, api_err.message);
     ///         }
     ///     }
-    ///     Ok(builder) => {
-    ///         let _resp = builder.await?;
-    ///     }
+    ///     Ok(_response) => {}
     /// }
     /// # Ok(())
     /// # }

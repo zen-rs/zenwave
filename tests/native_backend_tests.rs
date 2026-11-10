@@ -313,6 +313,91 @@ async fn plaintext<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
     .await;
 }
 
+/// What the server sends in the same write as its `101` head, before the
+/// client speaks the new protocol.
+const EARLY: &str = "协议已切换。プロトコルを切り替えました。프로토콜이 전환되었습니다.";
+const PING: &str = "乒——ピン——핑";
+const PONG: &str = "乓——ポン——퐁";
+
+/// Reads from `read` until `len` bytes have arrived.
+async fn read_len(read: &mut impl Read, len: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    while bytes.len() < len {
+        let BufResult(filled, chunk) = read.read(Vec::with_capacity(1024)).await;
+        assert!(
+            filled.expect("the stream reads") > 0,
+            "the peer closed early"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    bytes
+}
+
+/// A request that asks to switch protocols gets the `101`, then the
+/// switched stream: first the bytes the server wrote right behind its head,
+/// then a ping out and a pong back on the same connection.
+async fn upgrade<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    use futures_util::{AsyncReadExt as _, AsyncWriteExt as _};
+    use zenwave::backend::Upgrade;
+
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let server = async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let (mut read, mut write) = stream.split();
+        let head = read_head(&mut read).await.to_ascii_lowercase();
+        assert!(
+            head.contains("upgrade: echo"),
+            "the request asks to switch: {head}"
+        );
+        let mut answer =
+            b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: echo\r\n\r\n"
+                .to_vec();
+        answer.extend_from_slice(EARLY.as_bytes());
+        write.write_all(answer).await.0.expect("the 101 writes");
+        let ping = read_len(&mut read, PING.len()).await;
+        assert_eq!(ping, PING.as_bytes());
+        write
+            .write_all(PONG.as_bytes().to_vec())
+            .await
+            .0
+            .expect("the pong writes");
+        futures_util::future::pending::<()>().await;
+    };
+    let transport = Transport::builder()
+        .proxy(Proxy::none())
+        .build()
+        .expect("transport builds");
+    let mut client = NativeBackend::on_current_thread(transport, io, executor);
+    against(server, async {
+        let mut response = client
+            .get(format!("http://127.0.0.1:{port}/echo"))
+            .expect("request builds")
+            .header("connection", "upgrade")
+            .expect("header")
+            .header("upgrade", "echo")
+            .expect("header")
+            .await
+            .expect("the upgrade is answered");
+        assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+        let mut switched = Upgrade::on(&mut response)
+            .expect("a 101 carries its upgrade")
+            .switched()
+            .await
+            .expect("the switched stream is handed over");
+
+        let mut early = vec![0; EARLY.len()];
+        switched.read_exact(&mut early).await.expect("early bytes");
+        assert_eq!(early, EARLY.as_bytes());
+        switched.write_all(PING.as_bytes()).await.expect("ping");
+        switched.flush().await.expect("flush");
+        let mut pong = vec![0; PONG.len()];
+        switched.read_exact(&mut pong).await.expect("pong");
+        assert_eq!(pong, PONG.as_bytes());
+    })
+    .await;
+}
+
 /// A server that closes every connection after its response: the pool
 /// never hands a closed connection out again, so each POST, a request no
 /// client may send twice once written, goes out on a new one and succeeds.
@@ -478,6 +563,11 @@ mod compio_runtime {
     }
 
     #[test]
+    fn upgrade_hands_over_the_switched_stream() {
+        run(super::upgrade);
+    }
+
+    #[test]
     fn closing_connections_are_not_reused() {
         run(super::closing);
     }
@@ -533,6 +623,11 @@ mod tokio_runtime {
     #[test]
     fn plaintext_h1() {
         run(super::plaintext);
+    }
+
+    #[test]
+    fn upgrade_hands_over_the_switched_stream() {
+        run(super::upgrade);
     }
 
     #[test]

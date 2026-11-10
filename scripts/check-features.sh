@@ -57,11 +57,16 @@ without_engine() {
 }
 
 native() {
-  # The native backend brings rustls itself and needs a driver runtime to
-  # be a default backend; `native-http3` adds quiche on top of either.
+  # The native backend brings rustls itself; alone it has no default backend
+  # (its caller drives it), and a driver runtime makes it one. `native-http3`
+  # adds quiche on top of any of them.
   echo "::group::native backend powerset"
-  "${powerset[@]}" --include-features native-compio,native-tokio,native-http3 \
-    --at-least-one-of native-compio,native-tokio -- -D warnings
+  "${powerset[@]}" --include-features native-backend,native-compio,native-tokio,native-http3 \
+    --at-least-one-of native-backend,native-compio,native-tokio,native-http3 -- -D warnings
+  echo "::endgroup::"
+
+  echo "::group::native backend beside the native-tls engine"
+  cargo clippy --all-targets --no-default-features --features native-backend,native-tls -- -D warnings
   echo "::endgroup::"
 
   echo "::group::native backend beside the default features"
