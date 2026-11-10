@@ -454,13 +454,16 @@ impl TransportBuilder {
     /// Bound each wait for bytes from the server by `timeout`, on an
     /// HTTP/1.1 connection over any route (direct, TLS, a proxy's tunnel, a
     /// unix domain socket): the wait for the response head, which starts
-    /// when the request does, and each wait for more of the response body,
-    /// which starts when the body is read. Every read that yields data
+    /// when the request does (interim `1xx` responses included), and each
+    /// wait for more of the response body. Every read that yields data
     /// starts the next wait afresh, so a slow body that keeps arriving
-    /// takes as long as it needs.
+    /// takes as long as it needs. The bound is on the socket, not on a
+    /// consumer slow to read the body. HTTP/3 response reads are not
+    /// timed.
     ///
     /// A wait that runs out closes the connection and fails the request
-    /// with [`Error::Timeout`]; during the body, the body's read fails with
+    /// with [`Error::Timeout`], never retried since the server may have the
+    /// request; during the body, the body's read fails with
     /// an [`std::io::Error`] of kind [`TimedOut`](std::io::ErrorKind::TimedOut)
     /// whose inner error is [`Error::Timeout`]. An idle pooled connection
     /// is not waiting and is never timed, and a stream a `101` handed over

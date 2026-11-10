@@ -209,7 +209,7 @@ impl NativeBackend {
             }
             Err(failure) => failure,
         };
-        if sender.stalled.is_set() {
+        if matches!(failure.error(), http_kit_h1::Error::Timeout(_)) {
             // The read timeout closed the connection: no retry, since the
             // server may have the request.
             return Err(Error::Timeout);
@@ -384,17 +384,24 @@ where
                 }
                 Poll::Ready(None)
             }
-            Poll::Ready(Some(Err(_)))
-                if lease
-                    .as_ref()
-                    .and_then(|lease| lease.send.as_ref())
-                    .is_some_and(|send| send.stalled.is_set()) =>
-            {
+            Poll::Ready(Some(Err(error))) if is_body_timeout(&error) => {
                 Poll::Ready(Some(Err(timed_out())))
             }
             poll => poll,
         }
     }
+}
+
+/// Whether `error` is the HTTP/1.1 client's read timeout expiring during the
+/// body.
+fn is_body_timeout(error: &BodyError) -> bool {
+    let BodyError::Other(error) = error else {
+        return false;
+    };
+    matches!(
+        error.downcast_ref::<http_kit_h1::Error>(),
+        Some(http_kit_h1::Error::Timeout(http_kit_h1::Timeout::BodyRead))
+    )
 }
 
 /// How a body read the read timeout cut short fails: an I/O timeout, as
@@ -463,7 +470,6 @@ mod tests {
         H1Send {
             requests: send,
             upgrade: upgrade::channel().0,
-            stalled: connect::Stalled::default(),
         }
     }
 
