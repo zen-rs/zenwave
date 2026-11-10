@@ -32,6 +32,8 @@ cargo build --target wasm32-unknown-unknown
 ```
 src/
   lib.rs          — public API, re-exports, compile-time feature checks
+  default_client.rs — DefaultClient, client(), get/post/put/delete: absent
+                    without a DefaultBackend (`native-backend` with no driver)
   client.rs       — Client trait, RequestBuilder, middleware composition
   client/
     download.rs   — resumable file downloads (native only)

@@ -1,4 +1,6 @@
 //! Tests for error handling in Zenwave
+// Every test here runs through `zenwave::client()`.
+#![cfg(default_backend)]
 
 use http_kit::Method;
 mod common;

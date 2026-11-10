@@ -139,6 +139,9 @@ fn main() {
             not(default_native),
             not(all(target_vendor = "apple", feature = "apple-backend"))
         ) },
+        // Whether there is a `DefaultBackend` at all: `native-backend` without
+        // a driver runtime has none, and neither has `zenwave::client()`.
+        default_backend: { any(target_arch = "wasm32", default_hyper, default_native, default_apple, default_curl) },
     }
 
     // The pins and their packaged assets are inputs to the compiled tables.

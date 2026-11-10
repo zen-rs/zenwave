@@ -1,4 +1,6 @@
 //! Integration tests for Zenwave using real HTTP requests.
+// Every test here runs through `zenwave::client()`.
+#![cfg(default_backend)]
 
 mod common;
 use common::httpbin_uri;

@@ -1,4 +1,6 @@
 //! Tests for authentication middleware and request builders
+// Every test here runs through `zenwave::client()`.
+#![cfg(default_backend)]
 
 mod common;
 use common::httpbin_uri;
