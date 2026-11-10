@@ -188,6 +188,30 @@ mod curl_backend {
     }
 }
 
+/// `http-kit-io` has no Unix-domain connect yet; the native backend must say
+/// so rather than dial anything else.
+#[cfg(feature = "native-backend")]
+mod native_backend {
+    use zenwave::backend::NativeBackend;
+
+    use super::*;
+
+    #[test_executors::async_test]
+    async fn unix_sockets_are_rejected() {
+        let dir = tempfile::tempdir().expect("socket dir must be temporary");
+        let mut client = NativeBackend::new(unix_transport(dir.path().join("zenwave.sock")));
+        let error = client
+            .get("http://daemon.local/over-unix")
+            .expect("request must build")
+            .await
+            .expect_err("the native backend cannot dial unix sockets yet");
+        assert!(
+            error.to_string().contains("unix"),
+            "the error must name unix sockets, got: {error}"
+        );
+    }
+}
+
 /// `URLSession` cannot dial unix domain sockets; the backend must say so.
 #[cfg(all(target_vendor = "apple", feature = "apple-backend"))]
 mod apple_backend {

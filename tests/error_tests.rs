@@ -109,9 +109,9 @@ async fn test_empty_response_handling() {
 /// connection the first request dialed — a dropped lease would free its
 /// slot without returning the connection, forcing a visible redial. Only a
 /// body abandoned mid-stream legitimately dials again: unread bytes make
-/// the h1 connection unusable. The pool is the hyper backend's; the curl
-/// and Apple backends reuse connections on their own terms.
-#[cfg(all(feature = "hyper-backend", not(target_arch = "wasm32")))]
+/// the h1 connection unusable. The pool is the hyper or native backend's;
+/// the curl and Apple backends reuse connections on their own terms.
+#[cfg(any(default_hyper, default_native))]
 #[test_executors::async_test]
 async fn test_pooled_connection_released_on_every_path() {
     use futures_util::StreamExt as _;

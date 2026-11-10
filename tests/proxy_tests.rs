@@ -140,7 +140,7 @@ async fn rejected_tunnel_is_an_error() {
         .expect("valid request")
         .await
         .expect_err("the proxy demands credentials");
-    #[cfg(any(default_hyper, default_apple))]
+    #[cfg(any(default_hyper, default_native, default_apple))]
     assert!(
         matches!(
             error,
