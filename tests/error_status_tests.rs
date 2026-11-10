@@ -3,7 +3,7 @@
 //! one) hand it over as soon as its head arrives, before the server has
 //! finished the body; libcurl and `URLSession` deliver a response only once
 //! it is complete, and neither surfaces trailers.
-#![cfg(not(target_arch = "wasm32"))]
+#![cfg(all(not(target_arch = "wasm32"), default_backend))]
 
 use std::{
     io::{Read as _, Write as _},
