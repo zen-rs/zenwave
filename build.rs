@@ -101,6 +101,8 @@ fn main() {
         native_backend: { all(not(target_arch = "wasm32"), feature = "native-backend") },
         native_driver: { all(native_backend, any(feature = "native-compio", feature = "native-tokio")) },
         native_h3: { all(native_backend, feature = "native-http3") },
+        // A backend that pools connections per origin: hyper's and the native one.
+        pooled: { all(not(target_arch = "wasm32"), any(feature = "hyper-backend", feature = "native-backend")) },
         // TLS engine compiled into that connector (and the native backend); an
         // engine feature enabled next to curl or URLSession alone has nothing
         // to serve. Features are additive, so `rustls` wins when both engines

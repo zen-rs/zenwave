@@ -4,9 +4,12 @@
 //! for every connector; each connector then opens the legs it names on its
 //! own sockets.
 
+#[cfg(pooled)]
 use std::time::Duration;
 
-use http::{HeaderValue, Uri, uri::Scheme};
+#[cfg(pooled)]
+use http::uri::Scheme;
+use http::{HeaderValue, Uri};
 
 use super::{Proxy, proxy::Intercept};
 use crate::{Error, error::ProxyErrorKind};
@@ -45,14 +48,17 @@ pub enum Via {
 /// The most HTTP/1.1 connections one origin may have open at once in a pool:
 /// leased or dialing — parked idle connections hold no slot and a new lease
 /// always takes one first.
+#[cfg(pooled)]
 pub const MAX_H1_PER_ORIGIN: usize = 6;
 
 /// An idle h1 connection is dropped once it has gone unused for this long.
 /// The same window bounds a pooled h3 connection: QUIC keep-alives stop the
 /// protocol's own idle timeout from closing it, so the pool applies its own.
+#[cfg(pooled)]
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// The authority a pooled connection belongs to.
+#[cfg(pooled)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Origin {
     /// `http` or `https`: whether the connection carries TLS.
