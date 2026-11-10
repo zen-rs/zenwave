@@ -56,28 +56,40 @@ async fn test_json_parsing_error() {
     assert!(result.is_err());
 }
 
-#[test_executors::async_test]
-async fn test_404_not_found() {
-    let result = get(httpbin_uri("/status/404")).await;
-    assert!(result.is_err(), "expected 404 to surface as error");
-    let error = result.unwrap_err();
-    let description = format!("{error}");
+/// The default client answers an error status with the response; a client
+/// that opted into `error_for_status` fails with `Error::Http` naming it.
+async fn error_status(status: u16) {
+    let path = format!("/status/{status}");
+    let response = get(httpbin_uri(&path))
+        .await
+        .expect("an error status is a response");
+    assert_eq!(response.status().as_u16(), status);
+
+    let error = client()
+        .error_for_status()
+        .get(httpbin_uri(&path))
+        .unwrap()
+        .await
+        .expect_err("an opted-in client fails on an error status");
+    let error: zenwave::Error = error.into();
     assert!(
-        description.contains("404"),
-        "error message should mention status code: {description}"
+        matches!(&error, zenwave::Error::Http { status: got, .. } if got.as_u16() == status),
+        "unexpected error: {error}"
+    );
+    assert!(
+        format!("{error}").contains(&status.to_string()),
+        "error message should mention status code: {error}"
     );
 }
 
 #[test_executors::async_test]
+async fn test_404_not_found() {
+    error_status(404).await;
+}
+
+#[test_executors::async_test]
 async fn test_500_server_error() {
-    let result = get(httpbin_uri("/status/500")).await;
-    assert!(result.is_err(), "expected 500 to surface as error");
-    let error = result.unwrap_err();
-    let description = format!("{error}");
-    assert!(
-        description.contains("500"),
-        "error message should mention status code: {description}"
-    );
+    error_status(500).await;
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
@@ -103,7 +115,7 @@ async fn test_empty_response_handling() {
 }
 
 /// The h1 pool must return its connection on every response path: error
-/// statuses consume the body into the error, a 204's empty body may never be
+/// statuses read to the end like any other, a 204's empty body may never be
 /// polled, a streamed body is read to the end, and a `POST` carries a body.
 /// The fixture's accept counter proves each of them reused the single
 /// connection the first request dialed — a dropped lease would free its
@@ -122,8 +134,8 @@ async fn test_pooled_connection_released_on_every_path() {
     let before = server.accepted();
 
     // Every fully-consumed path reuses the connection the first request
-    // dialed: error statuses (the backend reads the body into the error), a
-    // 204's empty body, and a streamed body read to the end.
+    // dialed: error statuses, a 204's empty body, and a streamed body, each
+    // read to the end.
     for path in [
         "/status/200",
         "/status/204",
@@ -131,13 +143,13 @@ async fn test_pooled_connection_released_on_every_path() {
         "/status/500",
         "/status/404",
     ] {
-        if let Ok(response) = get(server.uri(path)).await {
-            response
-                .into_body()
-                .into_bytes()
-                .await
-                .expect("the response body must read to the end");
-        }
+        get(server.uri(path))
+            .await
+            .expect("every status is a response")
+            .into_body()
+            .into_bytes()
+            .await
+            .expect("the response body must read to the end");
     }
     let mut client = client();
     let response = client

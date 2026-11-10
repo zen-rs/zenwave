@@ -7,7 +7,7 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::wasm_bindgen::{JsCast, JsValue};
 
 use crate::single_threaded::SingleThreaded;
-use crate::{Client, Transport, error::HttpErrorResponse};
+use crate::{Client, Transport};
 /// HTTP client backend for browser environments using `fetch`.
 pub struct WebBackend {
     scope: SingleThreaded<FetchScope>,
@@ -55,14 +55,6 @@ pub enum WebError {
         source: Box<dyn StdError + Send + Sync>,
         status: StatusCode,
     },
-    #[error("remote error: {status}")]
-    Remote {
-        status: StatusCode,
-        body: Option<String>,
-        // Boxed: a full `Response` dwarfs the rest of the enum and would make
-        // every `Result<_, WebError>` carry it inline (`result_large_err`).
-        raw_response: Box<http_kit::Response>,
-    },
 }
 
 impl WebError {
@@ -72,20 +64,12 @@ impl WebError {
             status,
         }
     }
-
-    fn remote(status: StatusCode, body: Option<String>, raw_response: http_kit::Response) -> Self {
-        Self::Remote {
-            status,
-            body,
-            raw_response: Box::new(raw_response),
-        }
-    }
 }
 
 impl HttpError for WebError {
     fn status(&self) -> StatusCode {
         match self {
-            Self::Transport { status, .. } | Self::Remote { status, .. } => *status,
+            Self::Transport { status, .. } => *status,
         }
     }
 }
@@ -95,23 +79,6 @@ impl From<WebError> for crate::Error {
     fn from(err: WebError) -> Self {
         match err {
             WebError::Transport { source, .. } => Self::Transport(source),
-            WebError::Remote {
-                status,
-                body,
-                raw_response,
-            } => Self::Http {
-                status,
-                message: body.clone().unwrap_or_else(|| {
-                    status
-                        .canonical_reason()
-                        .unwrap_or("Unknown error")
-                        .to_string()
-                }),
-                response: Box::new(HttpErrorResponse {
-                    response: *raw_response,
-                    body_text: body,
-                }),
-            },
         }
     }
 }
@@ -178,20 +145,9 @@ fn fetch(
         let headers = response_headers(&response)?;
         let body = response_body(&response);
 
-        let is_error = status.is_client_error() || status.is_server_error();
         let mut response: http::Response<http_kit::Body> = http::Response::new(body);
         *response.headers_mut() = headers;
         *response.status_mut() = status;
-
-        if is_error {
-            let body = response
-                .body_mut()
-                .as_str()
-                .await
-                .ok()
-                .map(ToOwned::to_owned);
-            return Err(WebError::remote(status, body, response));
-        }
         Ok(response)
     })
 }

@@ -80,6 +80,8 @@ src/
   redirect.rs     — redirect-following middleware (on by default)
   retry.rs        — retry middleware
   timeout.rs      — per-request timeout middleware
+  status.rs       — ErrorForStatus: the opt-in layer turning 4xx/5xx into
+                    Error::Http (backends return every status as Ok)
   websocket.rs    — cross-platform WebSocket client
   multipart.rs    — multipart/form-data
   error.rs        — error types

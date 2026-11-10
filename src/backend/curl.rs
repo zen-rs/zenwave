@@ -14,7 +14,6 @@ use thiserror::Error;
 
 use crate::{
     Client, Transport,
-    error::HttpErrorResponse,
     transport::proxy::{self, Intercept},
 };
 
@@ -32,12 +31,6 @@ pub enum CurlError {
     BadGateway(#[source] anyhow::Error),
     #[error("TLS failure: {0}")]
     Tls(#[source] curl::Error),
-    #[error("remote error: {status}")]
-    Remote {
-        status: StatusCode,
-        body: Option<String>,
-        raw_response: Box<Response>,
-    },
 }
 
 impl HttpError for CurlError {
@@ -45,7 +38,6 @@ impl HttpError for CurlError {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::BadGateway(_) | Self::Tls(_) => StatusCode::BAD_GATEWAY,
-            Self::Remote { status, .. } => *status,
         }
     }
 }
@@ -70,23 +62,6 @@ impl From<CurlError> for crate::Error {
                 Self::Transport(Box::new(io_err))
             }
             CurlError::Tls(e) => Self::tls(e),
-            CurlError::Remote {
-                status,
-                body,
-                raw_response,
-            } => Self::Http {
-                status,
-                message: body.clone().unwrap_or_else(|| {
-                    status
-                        .canonical_reason()
-                        .unwrap_or("Unknown error")
-                        .to_string()
-                }),
-                response: Box::new(HttpErrorResponse {
-                    response: *raw_response,
-                    body_text: body,
-                }),
-            },
         }
     }
 }
@@ -236,25 +211,9 @@ fn perform(request: PreparedRequest) -> Result<Response, CurlError> {
         body,
     } = response;
 
-    let is_error = status.is_client_error() || status.is_server_error();
-    let error_body = if is_error {
-        String::from_utf8(body.clone()).ok()
-    } else {
-        None
-    };
-
     let mut http_response = http::Response::new(Body::from(body));
     *http_response.status_mut() = status;
     *http_response.headers_mut() = headers;
-
-    if is_error {
-        return Err(CurlError::Remote {
-            status,
-            body: error_body,
-            raw_response: Box::new(http_response),
-        });
-    }
-
     Ok(http_response)
 }
 

@@ -1,22 +1,13 @@
 //! Tests for backend implementations
 
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    any(feature = "hyper-backend", feature = "curl-backend")
-))]
+#[cfg(default_hyper)]
 use http_kit::{Endpoint, Method};
 #[cfg(default_hyper)]
 use zenwave::backend::HyperBackend;
 
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    any(feature = "hyper-backend", feature = "curl-backend")
-))]
+#[cfg(default_hyper)]
 mod common;
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    any(feature = "hyper-backend", feature = "curl-backend")
-))]
+#[cfg(default_hyper)]
 use common::httpbin_uri;
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
@@ -92,42 +83,6 @@ async fn test_hyper_backend_invalid_uri() {
         .unwrap();
     let response = backend.respond(&mut request).await;
     assert!(response.is_err());
-}
-
-#[test_executors::async_test]
-#[cfg(default_hyper)]
-async fn test_hyper_backend_http_error_returns_err() {
-    let mut backend = HyperBackend::default();
-    let mut request = http::Request::builder()
-        .method(Method::GET)
-        .uri(httpbin_uri("/status/404"))
-        .body(http_kit::Body::empty())
-        .unwrap();
-
-    let response = backend.respond(&mut request).await;
-    assert!(
-        response.is_err(),
-        "expected non-success status to surface as Err"
-    );
-}
-
-#[test_executors::async_test]
-#[cfg(all(not(target_arch = "wasm32"), feature = "curl-backend"))]
-async fn test_curl_backend_http_error_returns_err() {
-    use zenwave::backend::CurlBackend;
-
-    let mut backend = CurlBackend::default();
-    let mut request = http::Request::builder()
-        .method(Method::GET)
-        .uri(httpbin_uri("/status/500"))
-        .body(http_kit::Body::empty())
-        .unwrap();
-
-    let response = backend.respond(&mut request).await;
-    assert!(
-        response.is_err(),
-        "expected non-success status to surface as Err"
-    );
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
