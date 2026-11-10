@@ -12,7 +12,7 @@ use tracing::debug;
 use crate::{
     Error,
     error::HttpErrorResponse,
-    transport::{connect::Via, route::Origin},
+    transport::route::{Origin, Via},
 };
 
 /// Takes the request out of the endpoint's slot. Extensions are caller
@@ -26,6 +26,21 @@ pub fn take_request(slot: &mut Request) -> http::Request<Body> {
         .expect("a GET to `/` is a valid request");
     std::mem::swap(placeholder.extensions_mut(), slot.extensions_mut());
     replace(slot, placeholder)
+}
+
+/// A copy of `request` for a replay on a fresh connection, or `None` when
+/// the body cannot be sent twice — `http_kit::Body::try_clone` yields a
+/// body only for buffered bytes (or an empty one); a reader, stream, or
+/// frozen body is not replayed.
+#[cfg(any(feature = "http2", native_backend))]
+pub fn replayable_request(request: &http::Request<Body>) -> Option<http::Request<Body>> {
+    let mut replay = http::Request::new(request.body().try_clone()?);
+    *replay.method_mut() = request.method().clone();
+    *replay.uri_mut() = request.uri().clone();
+    *replay.version_mut() = request.version();
+    *replay.headers_mut() = request.headers().clone();
+    *replay.extensions_mut() = request.extensions().clone();
+    Some(replay)
 }
 
 /// The request's authority as a pool origin.

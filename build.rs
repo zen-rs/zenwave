@@ -87,8 +87,15 @@ fn main() {
         // Anything that is not the browser/Workers Fetch backend.
         native: { not(target_arch = "wasm32") },
         // The shared async-net TCP/TLS connector is needed by hyper, by native
-        // websockets, and by the OneCRL refresher wherever rustls verifies.
-        connector: { all(not(target_arch = "wasm32"), any(feature = "hyper-backend", feature = "ws", feature = "native-backend")) },
+        // websockets, and by the OneCRL refresher wherever OneCRL applies.
+        connector: { all(not(target_arch = "wasm32"), any(
+            feature = "hyper-backend",
+            feature = "ws",
+            all(feature = "native-backend", feature = "onecrl", not(target_vendor = "apple"), not(windows))
+        )) },
+        // What every connector shares: the proxy route, happy eyeballs,
+        // SOCKS5 and the TLS verifier configuration.
+        dialer: { any(connector, all(not(target_arch = "wasm32"), feature = "native-backend")) },
         // The backend on http-kit-io's owned-buffer sockets; `native_driver`
         // when it also carries a runtime of its own for callers on none.
         native_backend: { all(not(target_arch = "wasm32"), feature = "native-backend") },
@@ -98,7 +105,7 @@ fn main() {
         // engine feature enabled next to curl or URLSession alone has nothing
         // to serve. Features are additive, so `rustls` wins when both engines
         // are enabled.
-        tls_rustls: { all(connector, feature = "rustls") },
+        tls_rustls: { all(dialer, feature = "rustls") },
         tls_native: { all(connector, feature = "native-tls", not(feature = "rustls")) },
         tls_engine: { any(tls_rustls, tls_native) },
         // rustls-platform-verifier needs a JVM handle on Android.

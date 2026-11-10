@@ -24,6 +24,8 @@ use hyper::{body::Incoming, client::conn::TrySendError, http};
 use rt::Spawner;
 use tracing::{debug, warn};
 
+#[cfg(feature = "http2")]
+use super::shared::replayable_request;
 use super::shared::{error_for_status, request_origin, shape_h1_request, take_request};
 #[cfg(http3)]
 use crate::transport::{
@@ -653,23 +655,6 @@ fn is_remote_go_away(error: &hyper::Error) -> bool {
     std::error::Error::source(error)
         .and_then(|cause| cause.downcast_ref::<h2::Error>())
         .is_some_and(|error| error.is_go_away() && error.is_remote())
-}
-
-/// A copy of `request` for a replay on a fresh connection, or `None` when
-/// the body cannot be sent twice — `http_kit::Body::try_clone` yields a
-/// body only for buffered bytes (or an empty one); a reader, stream, or
-/// frozen body is not replayed.
-#[cfg(feature = "http2")]
-fn replayable_request(
-    request: &http::Request<http_kit::Body>,
-) -> Option<http::Request<http_kit::Body>> {
-    let mut replay = http::Request::new(request.body().try_clone()?);
-    *replay.method_mut() = request.method().clone();
-    *replay.uri_mut() = request.uri().clone();
-    *replay.version_mut() = request.version();
-    *replay.headers_mut() = request.headers().clone();
-    *replay.extensions_mut() = request.extensions().clone();
-    Some(replay)
 }
 
 /// An h1 response body that returns its connection's lease to the pool when

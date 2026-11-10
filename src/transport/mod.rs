@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(onecrl)]
 use std::time::Duration;
-#[cfg(https_rr)]
+#[cfg(any(all(connector, feature = "hyper-backend"), native_h3))]
 use std::{future::Future, pin::Pin};
 
 #[cfg(native)]
@@ -60,7 +60,10 @@ pub(crate) mod discovery;
 // where a backend can dial QUIC.
 #[cfg(https_rr)]
 pub(crate) mod dns;
-#[cfg(connector)]
+// Generic over the dialer: its futures are `Send` exactly when the dialer's
+// are — the async-net dialer's are, an `http-kit-io` one's are not.
+#[cfg(dialer)]
+#[expect(clippy::future_not_send)]
 pub(crate) mod happy_eyeballs;
 // Kept `crate::`-free so `tests/common` can include the same file for its
 // hyper test server.
@@ -82,9 +85,9 @@ pub mod proxy;
 #[cfg(http3)]
 pub(crate) mod quic;
 // Which legs a connection takes through the proxy rules, for every connector.
-#[cfg(connector)]
+#[cfg(dialer)]
 pub(crate) mod route;
-#[cfg(connector)]
+#[cfg(dialer)]
 pub(crate) mod socks5;
 #[cfg(connector)]
 pub(crate) mod stream;
@@ -101,6 +104,14 @@ pub use proxy::{Proxy, ProxyBuilder};
 /// wherever connection drivers already run; `dns` and `quic` share it.
 #[cfg(https_rr)]
 pub(crate) type Spawn = Arc<dyn Fn(Pin<Box<dyn Future<Output = ()> + Send>>) + Send + Sync>;
+
+/// Runs `future` to completion on a thread of its own, on async-io's
+/// reactor: the background work of a caller that has no executor of its
+/// own to hand it.
+#[cfg(any(all(connector, feature = "hyper-backend"), native_h3))]
+pub(crate) fn spawn_thread(future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+    std::thread::spawn(move || async_io::block_on(future));
+}
 
 /// How connections are established: trusted roots and, on native platforms,
 /// the TLS engine configured with them.

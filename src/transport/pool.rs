@@ -35,15 +35,7 @@ use hyper::{
     client::conn::{TrySendError, http1},
 };
 
-/// The most HTTP/1.1 connections one origin may have open at once: leased
-/// or dialing — parked idle connections hold no slot and a new lease always
-/// takes one first.
-pub const MAX_H1_PER_ORIGIN: usize = 6;
-
-/// An idle h1 connection is dropped once it has gone unused for this long.
-/// The same window bounds a pooled h3 connection: QUIC keep-alives stop the
-/// protocol's own idle timeout from closing it, so the pool applies its own.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+pub use super::route::{IDLE_TIMEOUT, MAX_H1_PER_ORIGIN};
 
 /// The connection table a [`Transport`](crate::Transport) owns, keyed by
 /// origin. Backends built over the same transport check out of it together.

@@ -192,7 +192,7 @@ impl H3Knowledge {
 
     /// Ends the lookup [`begin_discovery`](Self::begin_discovery) started,
     /// storing its answer when it produced one.
-    pub fn end_discovery(&mut self, answer: Option<HttpsRr>) {
+    pub const fn end_discovery(&mut self, answer: Option<HttpsRr>) {
         if let Some(rr) = answer {
             self.insert_https_rr(rr);
         }
@@ -217,21 +217,21 @@ impl H3Knowledge {
 
     /// Overrides the QUIC dial deadline and failure backoff — the race tests
     /// shorten the deadline so a dead UDP port falls back fast.
-    #[cfg(test)]
+    #[cfg(all(test, http3))]
     pub const fn set_timeouts(&mut self, connect_timeout: Duration, backoff: Duration) {
         self.connect_timeout = connect_timeout;
         self.backoff = backoff;
     }
 
     /// The cached HTTPS record answer — tests read it to see discovery ran.
-    #[cfg(test)]
+    #[cfg(all(test, http3))]
     pub const fn https_rr(&self) -> Option<HttpsRr> {
         self.https_rr
     }
 
     /// When QUIC backoff ends, if it is active — tests read it to see a
     /// failed handshake put the origin into backoff.
-    #[cfg(test)]
+    #[cfg(all(test, http3))]
     pub const fn broken_until(&self) -> Option<Instant> {
         self.broken_until
     }

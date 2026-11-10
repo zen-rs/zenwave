@@ -4,10 +4,53 @@
 //! for every connector; each connector then opens the legs it names on its
 //! own sockets.
 
+use std::time::Duration;
+
 use http::{HeaderValue, Uri, uri::Scheme};
 
-use super::{Proxy, connect::Protocols, proxy::Intercept};
+use super::{Proxy, proxy::Intercept};
 use crate::{Error, error::ProxyErrorKind};
+
+/// The HTTP versions a TLS connection may offer the server through ALPN.
+#[derive(Clone, Copy, Debug)]
+pub enum Protocols {
+    /// Offer `http/1.1` only: plaintext connections, websockets, the TLS leg
+    /// to a forward proxy (hyper's h2 client cannot speak absolute-form), and
+    /// every native-backend connection.
+    Http1,
+    /// Offer `h2` and `http/1.1`, letting the server pick. Without the `http2`
+    /// feature this offers `http/1.1` alone.
+    #[cfg_attr(not(feature = "hyper-backend"), allow(dead_code))]
+    // only the hyper backend asks for h2; websockets never do
+    Http2OrHttp1,
+}
+
+/// How requests on a connection must be written.
+#[derive(Clone, Debug)]
+pub enum Via {
+    /// The stream ends at the target: requests use origin-form.
+    Direct,
+    /// The stream ends at an HTTP proxy that forwards absolute-form requests.
+    HttpProxy {
+        /// `Proxy-Authorization` to attach to every request.
+        #[cfg_attr(
+            not(any(feature = "hyper-backend", feature = "native-backend")),
+            allow(dead_code)
+        )]
+        // websockets always tunnel
+        authorization: Option<HeaderValue>,
+    },
+}
+
+/// The most HTTP/1.1 connections one origin may have open at once in a pool:
+/// leased or dialing — parked idle connections hold no slot and a new lease
+/// always takes one first.
+pub const MAX_H1_PER_ORIGIN: usize = 6;
+
+/// An idle h1 connection is dropped once it has gone unused for this long.
+/// The same window bounds a pooled h3 connection: QUIC keep-alives stop the
+/// protocol's own idle timeout from closing it, so the pool applies its own.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// The authority a pooled connection belongs to.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -31,6 +74,7 @@ pub struct Target<'a> {
     /// instead of sending absolute-form requests. Websockets need this.
     pub tunnel_plaintext: bool,
     /// The HTTP versions offered to the target through ALPN.
+    #[cfg_attr(not(connector), allow(dead_code))] // the native backend offers http/1.1 alone
     pub protocols: Protocols,
 }
 

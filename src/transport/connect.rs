@@ -8,11 +8,10 @@ use std::path::Path;
 use async_net::TcpStream;
 #[cfg(unix_socket)]
 use async_net::unix::UnixStream;
-use http::HeaderValue;
 
-pub use super::route::Target;
-#[cfg(https_rr)]
+#[cfg(http3)]
 pub use super::route::proxied;
+pub use super::route::{Protocols, Target, Via};
 use super::{
     Transport, happy_eyeballs,
     route::{Route, route},
@@ -22,19 +21,6 @@ use super::{
 };
 use crate::Error;
 
-/// The HTTP versions a TLS connection may offer the server through ALPN.
-#[derive(Clone, Copy, Debug)]
-pub enum Protocols {
-    /// Offer `http/1.1` only: plaintext connections, websockets, and the TLS
-    /// leg to a forward proxy (hyper's h2 client cannot speak absolute-form).
-    Http1,
-    /// Offer `h2` and `http/1.1`, letting the server pick. Without the `http2`
-    /// feature this offers `http/1.1` alone.
-    #[cfg_attr(not(feature = "hyper-backend"), allow(dead_code))]
-    // only the hyper backend asks for h2; websockets never do
-    Http2OrHttp1,
-}
-
 /// The HTTP version a [`Connection`] negotiated, or will speak.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Protocol {
@@ -43,20 +29,6 @@ pub enum Protocol {
     /// HTTP/2, negotiated through ALPN on the innermost TLS layer.
     #[cfg(feature = "http2")]
     Http2,
-}
-
-/// How requests on a [`Connection`] must be written.
-#[derive(Clone, Debug)]
-pub enum Via {
-    /// The stream ends at the target: requests use origin-form.
-    Direct,
-    /// The stream ends at an HTTP proxy that forwards absolute-form requests.
-    HttpProxy {
-        /// `Proxy-Authorization` to attach to every request.
-        #[cfg_attr(not(feature = "hyper-backend"), allow(dead_code))]
-        // websockets always tunnel
-        authorization: Option<HeaderValue>,
-    },
 }
 
 /// An established connection.
