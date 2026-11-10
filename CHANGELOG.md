@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/zen-rs/zenwave/compare/v0.9.0...v0.9.1) - 2026-11-10
+
+### Added
+
+- *(native)* unix sockets, TLS through HTTPS proxies, verified h3 and a true QUIC/TCP race
+- *(backend)* native backend on http-kit-h1 and http-kit-h3 over http-kit-io
+
+### Fixed
+
+- compile the pool's route items only with a pooling backend
+- gate the QUIC-only debug import and give the h3 test CAs distinct names
+
+### Other
+
+- test the native backend on compio and tokio and clippy its feature powerset
+- *(native)* h1, TLS and h3 against in-process http-kit servers on compio and tokio
+- *(transport)* share routing, happy eyeballs, SOCKS5 and h3 discovery across connectors
+
 ## [0.9.0](https://github.com/zen-rs/zenwave/compare/v0.8.0...v0.9.0) - 2026-11-10
 
 ### Added
