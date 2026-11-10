@@ -10,6 +10,8 @@
 #   check-features.sh native-tls  the same with native-tls
 #   check-features.sh none        backends that need no engine, the default
 #                                 feature set, and the engine shorthands
+#   check-features.sh native      powerset of the native backend's runtimes
+#                                 and HTTP/3, alone and beside the defaults
 #   check-features.sh             all of the above, in sequence
 set -euo pipefail
 
@@ -54,13 +56,28 @@ without_engine() {
   echo "::endgroup::"
 }
 
+native() {
+  # The native backend brings rustls itself and needs a driver runtime to
+  # be a default backend; `native-http3` adds quiche on top of either.
+  echo "::group::native backend powerset"
+  "${powerset[@]}" --include-features native-compio,native-tokio,native-http3 \
+    --at-least-one-of native-compio,native-tokio -- -D warnings
+  echo "::endgroup::"
+
+  echo "::group::native backend beside the default features"
+  cargo clippy --all-targets --features native-compio,native-tokio,native-http3 -- -D warnings
+  echo "::endgroup::"
+}
+
 case "${1:-all}" in
   rustls | native-tls) with_engine "$1" ;;
   none) without_engine ;;
+  native) native ;;
   all)
     with_engine rustls
     with_engine native-tls
     without_engine
+    native
     ;;
-  *) echo "usage: $0 [rustls|native-tls|none|all]" >&2; exit 2 ;;
+  *) echo "usage: $0 [rustls|native-tls|none|native|all]" >&2; exit 2 ;;
 esac

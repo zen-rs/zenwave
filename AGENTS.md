@@ -46,8 +46,8 @@ src/
     native/
       mod.rs      — NativeBackend: h1 on http-kit-h1, h3 on http-kit-h3, over http-kit-io
       pool.rs     — the per-thread pool actor: h1 leases, waiters, dial results
-      h3.rs       — the pool's h3 slot: unproven connections, verdicts, discovery
-      connect.rs  — route execution on http-kit-io: happy eyeballs, CONNECT, SOCKS5, TLS
+      h3.rs       — the pool's h3 slot: QUIC dials raced against TCP, the transport's verifier, discovery
+      connect.rs  — route execution on http-kit-io: unix sockets, happy eyeballs, CONNECT (TLS in TLS), SOCKS5, TLS
       runtime.rs  — Driver: compio and tokio driver threads for callers on no runtime
     curl.rs       — libcurl backend
     apple.rs      — URLSession backend (Apple platforms)
@@ -137,10 +137,11 @@ is the required check on `main`.
 - `cargo fmt --check`
 - Features: clippy over every valid feature combination (`scripts/check-features.sh`,
   cargo-hack powerset) on Linux, Windows and macOS (Linux only outside
-  `main` PRs), one slice per TLS engine
+  `main` PRs), one slice per TLS engine plus one for the native backend
 - WASM build + clippy; mobile cross-compilation (iOS device/simulator,
   Android arm64/x86_64/armv7; `main` PRs only) with tests
-- Tests: hyper (rustls and native-tls) and curl on Linux/Windows/macOS
+- Tests: hyper (rustls and native-tls), curl, and native (compio and tokio,
+  HTTP/3 included) on Linux/Windows/macOS
   (Linux only outside `main` PRs); `main` PRs also run apple-backend on
   macOS, the suite on an iOS simulator (`scripts/test-ios.sh`,
   `simctl spawn`), wasm-pack in Chrome/Firefox/Safari, workerd
