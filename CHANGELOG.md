@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/zen-rs/zenwave/compare/v0.8.0...v0.9.0) - 2026-11-10
+
+### Added
+
+- [**breaking**] clients are SendEndpoint, their middleware SendMiddleware
+
+### Fixed
+
+- adapt to http-kit's frame-based Body
+- *(redirect)* preserve method and body across 307/308 hops ([#149](https://github.com/zen-rs/zenwave/pull/149))
+
+### Other
+
+- depend on http-kit 0.5
+- drop the typos check
+
 ## [0.8.0](https://github.com/zen-rs/zenwave/compare/v0.7.1...v0.8.0) - 2026-10-29
 
 ### Added
