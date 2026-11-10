@@ -98,6 +98,10 @@ mod engine {
         /// The ALPN-less base configuration; QUIC clones it and sets `h3`.
         #[cfg(http3)]
         base: Arc<ClientConfig>,
+        /// The `http/1.1` configuration, which the native backend hands to
+        /// `http-kit-tls` as is.
+        #[cfg(native_backend)]
+        http1_config: Arc<ClientConfig>,
         http1: futures_rustls::TlsConnector,
         http2_or_http1: futures_rustls::TlsConnector,
     }
@@ -122,6 +126,7 @@ mod engine {
                 .with_no_client_auth();
             let mut http1 = base.clone();
             http1.alpn_protocols = alpn_protocols(Protocols::Http1);
+            let http1 = Arc::new(http1);
             #[cfg(http3)]
             let mut http2_or_http1 = base.clone();
             #[cfg(not(http3))]
@@ -130,9 +135,19 @@ mod engine {
             Ok(Self {
                 #[cfg(http3)]
                 base: Arc::new(base),
-                http1: futures_rustls::TlsConnector::from(Arc::new(http1)),
+                #[cfg(native_backend)]
+                http1_config: Arc::clone(&http1),
+                http1: futures_rustls::TlsConnector::from(http1),
                 http2_or_http1: futures_rustls::TlsConnector::from(Arc::new(http2_or_http1)),
             })
+        }
+
+        /// The configuration offering `http/1.1` alone, with the platform
+        /// verifier (and OneCRL, where it applies) — what the native
+        /// backend's `http-kit-tls` handshakes run with.
+        #[cfg(native_backend)]
+        pub const fn http1_config(&self) -> &Arc<ClientConfig> {
+            &self.http1_config
         }
 
         /// The shared client configuration; `transport::quic` clones it with

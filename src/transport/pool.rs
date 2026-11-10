@@ -19,6 +19,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::connect::{Protocol, Via};
+#[cfg(http3)]
+pub use super::discovery::HttpsRr;
+#[cfg(http3)]
+use super::discovery::{H3Knowledge, joined_alt_svc};
+#[cfg(http3)]
+use crate::backend::h3::H3Connection;
 use async_lock::{MutexGuardArc, Semaphore, SemaphoreGuardArc};
 use http::{Request, Response, uri::Scheme};
 #[cfg(feature = "http2")]
@@ -26,15 +33,6 @@ use hyper::client::conn::http2;
 use hyper::{
     body::Incoming,
     client::conn::{TrySendError, http1},
-};
-#[cfg(http3)]
-use tracing::debug;
-
-use super::connect::{Protocol, Via};
-#[cfg(http3)]
-use crate::backend::{
-    alt_svc::{self, AltSvc},
-    h3::H3Connection,
 };
 
 /// The most HTTP/1.1 connections one origin may have open at once: leased
@@ -45,26 +43,7 @@ pub const MAX_H1_PER_ORIGIN: usize = 6;
 /// An idle h1 connection is dropped once it has gone unused for this long.
 /// The same window bounds a pooled h3 connection: QUIC keep-alives stop the
 /// protocol's own idle timeout from closing it, so the pool applies its own.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-
-/// How long a racing QUIC dial is given to finish before it loses; a detached
-/// loser also ends at this deadline.
-#[cfg(http3)]
-const H3_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// After a QUIC handshake fails, the origin is not offered QUIC again until
-/// this much time has passed.
-#[cfg(http3)]
-// `Duration::from_mins` is not a stable const fn yet.
-#[expect(clippy::duration_suboptimal_units)]
-const H3_BACKOFF: Duration = Duration::from_secs(5 * 60);
-
-/// A "no HTTPS record" answer is retried after this long — short enough to
-/// pick a record up when one appears, long enough not to re-query per request.
-#[cfg(http3)]
-// `Duration::from_mins` is not a stable const fn yet.
-#[expect(clippy::duration_suboptimal_units)]
-const HTTPS_RR_NEGATIVE_TTL: Duration = Duration::from_secs(5 * 60);
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// The connection table a [`Transport`](crate::Transport) owns, keyed by
 /// origin. Backends built over the same transport check out of it together.
@@ -73,16 +52,7 @@ pub struct Pool {
     idle_timeout: Duration,
 }
 
-/// The authority a connection belongs to.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Origin {
-    /// `http` or `https`: whether the connection carries TLS.
-    pub scheme: Scheme,
-    /// The target's hostname.
-    pub host: String,
-    /// The target's port.
-    pub port: u16,
-}
+pub use super::route::Origin;
 
 /// Per-origin connection state. The synchronous mutexes are never held
 /// across an `.await`; `dialing` and `h1_slots` are the only async waits.
@@ -113,72 +83,13 @@ pub struct OriginEntry {
     /// a `Pool` handle — applies the same bound the checkouts do.
     #[cfg(http3)]
     idle_timeout: Duration,
-    /// The h3 alternative the origin last advertised through `Alt-Svc`.
+    /// What is known about the origin's HTTP/3: `Alt-Svc`, the HTTPS record,
+    /// discovery and backoff.
     #[cfg(http3)]
-    alt_svc: Mutex<Option<AltSvc>>,
-    /// The origin's HTTPS record answer — positive or negative, until its
-    /// TTL runs out.
-    #[cfg(http3)]
-    https_rr: Mutex<Option<HttpsRr>>,
-    /// Whether the HTTPS record lookup is owed, running, or cached.
-    #[cfg(http3)]
-    h3_discovery: Mutex<H3Discovery>,
-    /// QUIC to this origin is refused until this instant: the last QUIC
-    /// handshake failed, so racing it again would just cost a timeout.
-    #[cfg(http3)]
-    h3_broken_until: Mutex<Option<Instant>>,
-    /// How long a racing QUIC dial is given; a test seam shrinks it so a
-    /// dead UDP port falls back fast.
-    #[cfg(http3)]
-    h3_connect_timeout: Mutex<Duration>,
-    /// How long QUIC backoff lasts; a test seam lengthens it so a third
-    /// request provably stays on TCP.
-    #[cfg(http3)]
-    h3_backoff: Mutex<Duration>,
-    /// The origin's port — the implicit `port` of an HTTPS record that
-    /// overrides none.
-    #[cfg(http3)]
-    port: u16,
+    knowledge: Mutex<H3Knowledge>,
     /// Held while dialing an origin that is or may be h2, so concurrent first
     /// requests open one connection instead of N.
     dialing: Arc<async_lock::Mutex<()>>,
-}
-
-/// What the origin's HTTPS record says about HTTP/3 — negative answers are
-/// cached for their TTL too.
-#[cfg(http3)]
-#[derive(Clone, Copy, Debug)]
-pub struct HttpsRr {
-    /// The record's ALPN list advertises `h3`.
-    pub h3: bool,
-    /// The record's port override, if any.
-    pub port: Option<u16>,
-    /// When the cached answer stops being valid.
-    pub expires: Instant,
-}
-
-#[cfg(http3)]
-impl HttpsRr {
-    /// A cached negative answer: no record, or the lookup failed.
-    pub(crate) fn negative(now: Instant) -> Self {
-        Self {
-            h3: false,
-            port: None,
-            expires: now + HTTPS_RR_NEGATIVE_TTL,
-        }
-    }
-}
-
-/// Where the entry's HTTPS record lookup stands.
-#[cfg(http3)]
-#[derive(Clone, Copy, Debug)]
-enum H3Discovery {
-    /// No lookup has been issued.
-    NotStarted,
-    /// A lookup is in flight.
-    InFlight,
-    /// The lookup finished; `https_rr` holds the answer until it expires.
-    Done,
 }
 
 /// The in-flight HTTPS record lookup [`OriginEntry::begin_h3_discovery`]
@@ -194,14 +105,14 @@ impl DiscoveryGuard {
     /// Store the lookup's answer and end discovery: the guard drops at the
     /// end of this call, marking the entry `Done`.
     pub(crate) fn insert_https_rr(self, rr: HttpsRr) {
-        self.0.insert_https_rr(rr);
+        self.0.knowledge().end_discovery(Some(rr));
     }
 }
 
 #[cfg(http3)]
 impl Drop for DiscoveryGuard {
     fn drop(&mut self) {
-        *self.0.h3_discovery.lock().expect("pool state poisoned") = H3Discovery::Done;
+        self.0.knowledge().end_discovery(None);
     }
 }
 
@@ -218,19 +129,7 @@ impl OriginEntry {
             #[cfg(http3)]
             idle_timeout,
             #[cfg(http3)]
-            alt_svc: Mutex::new(None),
-            #[cfg(http3)]
-            https_rr: Mutex::new(None),
-            #[cfg(http3)]
-            h3_discovery: Mutex::new(H3Discovery::NotStarted),
-            #[cfg(http3)]
-            h3_broken_until: Mutex::new(None),
-            #[cfg(http3)]
-            h3_connect_timeout: Mutex::new(H3_CONNECT_TIMEOUT),
-            #[cfg(http3)]
-            h3_backoff: Mutex::new(H3_BACKOFF),
-            #[cfg(http3)]
-            port: origin.port,
+            knowledge: Mutex::new(H3Knowledge::new(origin.port)),
             dialing: Arc::new(async_lock::Mutex::new(())),
         }
     }
@@ -284,88 +183,36 @@ impl OriginEntry {
             }
             h3.is_some()
         };
-        live || self.has_live_h3_knowledge(Instant::now())
+        live || self.knowledge().is_live(Instant::now())
     }
 
-    /// Whether the entry still holds h3 state the next request would need:
-    /// an unexpired `alt_svc` or `https_rr`, or an active
-    /// `h3_broken_until`. Expired values are evicted as they are read,
-    /// exactly as [`Self::h3_candidate`] does.
+    /// The origin's h3 knowledge. The lock is never held across an await.
     #[cfg(http3)]
-    fn has_live_h3_knowledge(&self, now: Instant) -> bool {
-        if self
-            .h3_broken_until
-            .lock()
-            .expect("pool state poisoned")
-            .is_some_and(|until| until > now)
-        {
-            return true;
-        }
-        {
-            let mut alt_svc = self.alt_svc.lock().expect("pool state poisoned");
-            if alt_svc.as_ref().is_some_and(|alt| alt.expires <= now) {
-                *alt_svc = None;
-            }
-            if alt_svc.is_some() {
-                return true;
-            }
-        }
-        let mut https_rr = self.https_rr.lock().expect("pool state poisoned");
-        if https_rr.as_ref().is_some_and(|rr| rr.expires <= now) {
-            *https_rr = None;
-        }
-        https_rr.is_some()
+    fn knowledge(&self) -> std::sync::MutexGuard<'_, H3Knowledge> {
+        self.knowledge.lock().expect("pool state poisoned")
     }
 
-    /// The UDP port an h3 dial to this origin should race for, or `None`
-    /// when the origin has not advertised h3 (or QUIC is in backoff).
-    /// `Alt-Svc` wins over the DNS answer, as the more recent claim.
-    /// Expired knowledge is evicted as it is read.
+    /// The UDP port an h3 dial to this origin should race for; see
+    /// [`H3Knowledge::candidate`].
     #[cfg(http3)]
     fn h3_candidate(&self, now: Instant) -> Option<u16> {
-        if self
-            .h3_broken_until
-            .lock()
-            .expect("pool state poisoned")
-            .is_some_and(|until| until > now)
-        {
-            return None;
-        }
-        {
-            let mut alt_svc = self.alt_svc.lock().expect("pool state poisoned");
-            if alt_svc.as_ref().is_some_and(|alt| alt.expires <= now) {
-                *alt_svc = None;
-            }
-            if let Some(alt) = *alt_svc {
-                return Some(alt.port);
-            }
-        }
-        let mut https_rr = self.https_rr.lock().expect("pool state poisoned");
-        if https_rr.as_ref().is_some_and(|rr| rr.expires <= now) {
-            *https_rr = None;
-        }
-        https_rr.and_then(|rr| rr.h3.then(|| rr.port.unwrap_or(self.port)))
+        self.knowledge().candidate(now)
     }
 
-    /// Store an `Alt-Svc` response header: `accept` picks the origin's own
-    /// h3 alternative out of it, `clear` — and any advertisement with no
-    /// acceptable h3 — drops the cached one. A malformed header is logged
-    /// and ignored: it never fails the response that carried it.
+    /// Store a response's `Alt-Svc` value; see
+    /// [`H3Knowledge::insert_alt_svc`].
     #[cfg(http3)]
     pub(crate) fn insert_alt_svc(&self, origin_host: &str, value: &str, now: Instant) {
-        match alt_svc::parse(value) {
-            Ok(advertised) => {
-                *self.alt_svc.lock().expect("pool state poisoned") =
-                    alt_svc::accept(&advertised, origin_host, now);
-            }
-            Err(error) => debug!(%value, %error, "ignoring malformed Alt-Svc header"),
-        }
+        self.knowledge().insert_alt_svc(origin_host, value, now);
     }
 
-    /// Cache an HTTPS record answer, positive or negative.
+    /// Store the `Alt-Svc` fields of a response's `headers`, joined as one
+    /// list.
     #[cfg(http3)]
-    pub(crate) fn insert_https_rr(&self, rr: HttpsRr) {
-        *self.https_rr.lock().expect("pool state poisoned") = Some(rr);
+    pub(crate) fn record_alt_svc(&self, origin_host: &str, headers: &http::HeaderMap) {
+        if let Some(joined) = joined_alt_svc(headers) {
+            self.insert_alt_svc(origin_host, &joined, Instant::now());
+        }
     }
 
     /// Mark an HTTPS record lookup in flight and hand out the guard that
@@ -373,59 +220,49 @@ impl OriginEntry {
     /// stale. `None` means a lookup is running or the fresh answer stands.
     #[cfg(http3)]
     pub(crate) fn begin_h3_discovery(self: &Arc<Self>, now: Instant) -> Option<DiscoveryGuard> {
-        {
-            let mut discovery = self.h3_discovery.lock().expect("pool state poisoned");
-            let due = match *discovery {
-                H3Discovery::NotStarted => true,
-                H3Discovery::InFlight => false,
-                H3Discovery::Done => self
-                    .https_rr
-                    .lock()
-                    .expect("pool state poisoned")
-                    .is_none_or(|rr| rr.expires <= now),
-            };
-            if !due {
-                return None;
-            }
-            *discovery = H3Discovery::InFlight;
-        }
-        Some(DiscoveryGuard(self.clone()))
+        self.knowledge()
+            .begin_discovery(now)
+            .then(|| DiscoveryGuard(self.clone()))
     }
 
-    /// The cached HTTPS record answer, when it is still fresh — tests read
-    /// it to see discovery ran.
+    /// Cache an HTTPS record answer, as a finished lookup would — tests seed
+    /// discovery with it.
+    #[cfg(all(http3, test))]
+    pub(crate) fn insert_https_rr(&self, rr: HttpsRr) {
+        self.knowledge().insert_https_rr(rr);
+    }
+
+    /// The cached HTTPS record answer — tests read it to see discovery ran.
     #[cfg(all(http3, test))]
     pub(crate) fn https_rr(&self) -> Option<HttpsRr> {
-        *self.https_rr.lock().expect("pool state poisoned")
+        self.knowledge().https_rr()
     }
 
-    /// A QUIC handshake to this origin failed; no h3 attempt until
-    /// `h3_broken_until` lapses.
+    /// A QUIC handshake to this origin failed; no h3 attempt until the
+    /// backoff lapses.
     #[cfg(http3)]
     pub(crate) fn mark_h3_broken(&self, now: Instant) {
-        let backoff = *self.h3_backoff.lock().expect("pool state poisoned");
-        *self.h3_broken_until.lock().expect("pool state poisoned") = Some(now + backoff);
+        self.knowledge().mark_broken(now);
     }
 
     /// When QUIC backoff ends for this origin, if it is active — tests read
     /// it to see a failed handshake put the origin into backoff.
     #[cfg(all(http3, test))]
     pub(crate) fn h3_broken_until(&self) -> Option<Instant> {
-        *self.h3_broken_until.lock().expect("pool state poisoned")
+        self.knowledge().broken_until()
     }
 
     /// How long a racing QUIC dial is given to finish.
     #[cfg(http3)]
     pub(crate) fn h3_connect_timeout(&self) -> Duration {
-        *self.h3_connect_timeout.lock().expect("pool state poisoned")
+        self.knowledge().connect_timeout()
     }
 
     /// Override the QUIC dial deadline and failure backoff — the race tests
     /// shorten the deadline so a dead UDP port falls back fast.
     #[cfg(all(http3, test))]
     pub(crate) fn set_h3_timeouts(&self, connect_timeout: Duration, backoff: Duration) {
-        *self.h3_connect_timeout.lock().expect("pool state poisoned") = connect_timeout;
-        *self.h3_backoff.lock().expect("pool state poisoned") = backoff;
+        self.knowledge().set_timeouts(connect_timeout, backoff);
     }
 
     /// Store `connection` as the origin's shared h3 handle unless a live,

@@ -6,7 +6,6 @@ use std::time::Duration;
 #[cfg(http3)]
 use std::time::Instant;
 use std::{
-    mem::replace,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -20,11 +19,12 @@ use futures_util::{
 };
 use http::{StatusCode, uri::Scheme};
 use http_body_util::BodyDataStream;
-use http_kit::{Endpoint, HttpError, Method, Request, Response};
+use http_kit::{Endpoint, HttpError, Request, Response};
 use hyper::{body::Incoming, client::conn::TrySendError, http};
 use rt::Spawner;
 use tracing::{debug, warn};
 
+use super::shared::{error_for_status, request_origin, shape_h1_request, take_request};
 #[cfg(http3)]
 use crate::transport::{
     Spawn,
@@ -35,7 +35,6 @@ use crate::transport::{
 };
 use crate::{
     Client, Transport,
-    error::HttpErrorResponse,
     transport::{
         connect::{Protocol, Protocols, Target, Via, connect},
         hyper_io::HyperIo,
@@ -50,8 +49,6 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(feature = "http2")]
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[cfg(http3)]
-pub mod alt_svc;
 #[cfg(http3)]
 pub mod h3;
 #[cfg(all(test, any(feature = "http2", http3)))]
@@ -269,19 +266,8 @@ impl HyperBackend {
         let host = origin.host.clone();
         let port = origin.port;
         self.spawner.spawn(async move {
-            let now = Instant::now();
-            let rr = match transport.https_record(spawn, &host, port).await {
-                Ok(Some(record)) => HttpsRr {
-                    h3: record.alpn.iter().any(|alpn| alpn == "h3"),
-                    port: record.port,
-                    expires: now + record.ttl,
-                },
-                Ok(None) => HttpsRr::negative(now),
-                Err(error) => {
-                    debug!(%host, port, %error, "HTTPS record lookup failed");
-                    HttpsRr::negative(now)
-                }
-            };
+            let lookup = transport.https_record(spawn, &host, port).await;
+            let rr = HttpsRr::from_lookup(lookup, &host, port, Instant::now());
             // The guard marks the entry Done however this task ends — a
             // dropped future leaves the origin discoverable again instead of
             // stuck InFlight.
@@ -301,12 +287,6 @@ pub enum HyperError {
     Connection(hyper::Error),
     #[cfg(http3)]
     Http3(Box<dyn core::error::Error + Send + Sync>),
-    InvalidUri(String),
-    Remote {
-        status: StatusCode,
-        body: Option<String>,
-        raw_response: Box<Response>,
-    },
 }
 
 impl HyperError {
@@ -393,14 +373,6 @@ impl core::fmt::Display for HyperError {
             Self::Connection(err) => write!(f, "connection error: {err}"),
             #[cfg(http3)]
             Self::Http3(err) => write!(f, "http/3 error: {err}"),
-            Self::InvalidUri(uri) => write!(f, "invalid uri: {uri}"),
-            Self::Remote { status, body, .. } => {
-                if let Some(body) = body {
-                    write!(f, "remote error: {status} - {body}")
-                } else {
-                    write!(f, "remote error: {status}")
-                }
-            }
         }
     }
 }
@@ -409,10 +381,7 @@ impl core::error::Error for HyperError {}
 
 impl HttpError for HyperError {
     fn status(&self) -> StatusCode {
-        match self {
-            Self::Remote { status, .. } => *status,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        }
+        StatusCode::INTERNAL_SERVER_ERROR
     }
 }
 
@@ -420,48 +389,11 @@ impl HttpError for HyperError {
 impl From<HyperError> for crate::Error {
     fn from(err: HyperError) -> Self {
         match err {
-            HyperError::Remote {
-                status,
-                body,
-                raw_response,
-            } => Self::Http {
-                status,
-                message: body.clone().unwrap_or_else(|| {
-                    status
-                        .canonical_reason()
-                        .unwrap_or("Unknown error")
-                        .to_string()
-                }),
-                response: Box::new(HttpErrorResponse {
-                    response: *raw_response,
-                    body_text: body,
-                }),
-            },
             HyperError::Connection(e) => Self::Transport(Box::new(e)),
             #[cfg(http3)]
             HyperError::Http3(e) => Self::Transport(e),
-            HyperError::InvalidUri(uri) => Self::InvalidUri(uri),
         }
     }
-}
-
-/// The request's authority as a pool origin.
-fn request_origin(uri: &http::Uri) -> Result<Origin, HyperError> {
-    let host = uri
-        .host()
-        .ok_or_else(|| HyperError::InvalidUri(uri.to_string()))?;
-    let scheme = match uri.scheme_str().unwrap_or("http") {
-        "https" => Scheme::HTTPS,
-        "http" => Scheme::HTTP,
-        other => return Err(HyperError::InvalidUri(other.to_string())),
-    };
-    Ok(Origin {
-        host: host.to_owned(),
-        port: uri
-            .port_u16()
-            .unwrap_or(if scheme == Scheme::HTTPS { 443 } else { 80 }),
-        scheme,
-    })
 }
 
 impl HyperBackend {
@@ -474,7 +406,7 @@ impl HyperBackend {
             return Ok(H3::Blocked);
         }
         let proxied = proxied(
-            &self.transport,
+            self.transport.proxy(),
             Target {
                 host: &origin.host,
                 port: origin.port,
@@ -501,28 +433,14 @@ impl HyperBackend {
         if !matches!(h3, H3::Allowed) {
             return;
         }
-        let mut joined = String::new();
-        for value in response.headers().get_all(http::header::ALT_SVC) {
-            if let Ok(value) = value.to_str() {
-                if !joined.is_empty() {
-                    joined.push(',');
-                }
-                joined.push_str(value);
-            } else {
-                debug!(?value, "ignoring non-ASCII Alt-Svc header");
-            }
-        }
-        if joined.is_empty() {
-            return;
-        }
         self.transport
             .pool()
             .entry(origin)
-            .insert_alt_svc(&origin.host, &joined, Instant::now());
+            .record_alt_svc(&origin.host, response.headers());
     }
 
     /// Wrap the h1 lease around its body's tail, harvest `Alt-Svc`, and turn
-    /// an error status into [`HyperError::Remote`].
+    /// an error status into [`crate::Error::Http`].
     async fn finish_response(
         &self,
         #[cfg(http3)] origin: &Origin,
@@ -533,52 +451,20 @@ impl HyperBackend {
         #[cfg(http3)]
         self.record_alt_svc(origin, h3, &response);
 
-        let mut response = response.map(|body| match lease {
+        let response = response.map(|body| match lease {
             // The h1 connection is reusable once the body is finished or
             // dropped, so the lease rides along with it.
             Some(lease) => http_kit::Body::from_frames(LeaseReturn::new(body, lease)),
             None => body,
         });
-
-        debug!(
-            status = %response.status(),
-            headers = ?response.headers(),
-            "HyperBackend received response"
-        );
-
-        let is_error = response.status().is_client_error() || response.status().is_server_error();
-        if is_error {
-            let error_msg: Option<String> = response
-                .body_mut()
-                .as_str()
-                .await
-                .ok()
-                .map(std::borrow::ToOwned::to_owned);
-            return Err(HyperError::Remote {
-                status: response.status(),
-                body: error_msg,
-                raw_response: Box::new(response),
-            }
-            .into());
-        }
-
-        Ok(response)
+        error_for_status(response).await
     }
 }
 
 impl Endpoint for HyperBackend {
     type Error = crate::Error;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-        let mut dummy_request = http::Request::builder()
-            .method(Method::GET)
-            .uri("/")
-            .body(http_kit::Body::empty())
-            .unwrap();
-        // Extensions are caller context, not wire data: they stay on the
-        // request slot handed to the endpoint so middleware (e.g. the
-        // cookie jar) finds them again once `respond` returns.
-        std::mem::swap(dummy_request.extensions_mut(), request.extensions_mut());
-        let mut request: http::Request<http_kit::Body> = replace(request, dummy_request);
+        let mut request = take_request(request);
         // The absolute URI, kept so a request taken back from a dead
         // connection can be reshaped for whichever checkout serves the retry.
         let uri = request.uri().clone();
@@ -784,41 +670,6 @@ fn replayable_request(
     *replay.headers_mut() = request.headers().clone();
     *replay.extensions_mut() = request.extensions().clone();
     Some(replay)
-}
-
-/// Shape an h1 request for the path its connection took: origin-form and a
-/// `Host` header for direct connections, absolute-form plus the proxy's
-/// `Proxy-Authorization` through a forward proxy.
-fn shape_h1_request(
-    request: &mut http::Request<http_kit::Body>,
-    via: &Via,
-) -> Result<(), HyperError> {
-    if request.headers().get(http::header::HOST).is_none()
-        && let Some(authority) = request.uri().authority()
-        && let Ok(value) = http::header::HeaderValue::from_str(authority.as_str())
-    {
-        request.headers_mut().insert(http::header::HOST, value);
-    }
-    match via {
-        Via::Direct => {
-            let origin_form = request
-                .uri()
-                .path_and_query()
-                .map_or("/", http::uri::PathAndQuery::as_str);
-            *request.uri_mut() = origin_form
-                .parse()
-                .map_err(|err| HyperError::InvalidUri(format!("{origin_form}: {err}")))?;
-        }
-        Via::HttpProxy { authorization } => {
-            // Absolute-form request line: the proxy needs the full URI.
-            if let Some(authorization) = authorization {
-                request
-                    .headers_mut()
-                    .insert(http::header::PROXY_AUTHORIZATION, authorization.clone());
-            }
-        }
-    }
-    Ok(())
 }
 
 /// An h1 response body that returns its connection's lease to the pool when

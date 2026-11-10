@@ -8,10 +8,19 @@ use std::path::Path;
 use async_net::TcpStream;
 #[cfg(unix_socket)]
 use async_net::unix::UnixStream;
-use http::{HeaderValue, Uri};
+use http::HeaderValue;
 
-use super::{Transport, happy_eyeballs, socks5, stream::Stream, tunnel};
-use crate::{Error, error::ProxyErrorKind};
+pub use super::route::Target;
+#[cfg(https_rr)]
+pub use super::route::proxied;
+use super::{
+    Transport, happy_eyeballs,
+    route::{Route, route},
+    socks5,
+    stream::Stream,
+    tunnel,
+};
+use crate::Error;
 
 /// The HTTP versions a TLS connection may offer the server through ALPN.
 #[derive(Clone, Copy, Debug)]
@@ -34,20 +43,6 @@ pub enum Protocol {
     /// HTTP/2, negotiated through ALPN on the innermost TLS layer.
     #[cfg(feature = "http2")]
     Http2,
-}
-
-/// Where a connection should end up.
-#[derive(Clone, Copy, Debug)]
-pub struct Target<'a> {
-    pub host: &'a str,
-    pub port: u16,
-    /// Speak TLS to the target.
-    pub tls: bool,
-    /// Through an HTTP proxy, tunnel even a plaintext target with `CONNECT`
-    /// instead of sending absolute-form requests. Websockets need this.
-    pub tunnel_plaintext: bool,
-    /// The HTTP versions offered to the target through ALPN.
-    pub protocols: Protocols,
 }
 
 /// How requests on a [`Connection`] must be written.
@@ -76,17 +71,6 @@ pub struct Connection {
     pub protocol: Protocol,
 }
 
-/// Whether a connection to `target` would go through a proxy — HTTP/3 is
-/// never dialed to a proxied origin: QUIC bypasses the proxy, so the pool
-/// keeps such origins on TCP regardless of what they advertise.
-#[cfg(http3)]
-pub fn proxied(transport: &Transport, target: Target<'_>) -> Result<bool, Error> {
-    Ok(transport
-        .proxy()
-        .intercept(&destination_uri(target)?)
-        .is_some())
-}
-
 /// Connect to `target` following the transport's proxy rules — or through
 /// its unix domain socket when the transport was built with one: the socket
 /// replaces host, port, and proxies alike, while `target` still decides
@@ -97,54 +81,44 @@ pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connec
         return unix_connect(transport, path, target).await;
     }
 
-    let Some(intercept) = transport.proxy().intercept(&destination_uri(target)?) else {
-        let tcp = tcp(target.host, target.port).await?;
-        let stream = finish(transport, target, tcp).await?;
-        return connection(stream, Via::Direct, target);
-    };
-
-    let proxy_uri = intercept.uri();
-    let scheme = proxy_uri.scheme_str().unwrap_or("http");
-    let proxy_host = proxy_uri.host().ok_or(ProxyErrorKind::MissingHost)?;
-
-    match scheme {
-        "http" | "https" => {
-            let proxy_tls = scheme == "https";
-            let proxy_port = proxy_uri
-                .port_u16()
-                .unwrap_or(if proxy_tls { 443 } else { 80 });
-            let tcp = tcp(proxy_host, proxy_port).await?;
-
-            if !target.tls && !target.tunnel_plaintext {
-                // Absolute-form requests to a forward proxy are HTTP/1.1, so
-                // the TLS leg to the proxy offers no h2.
-                let stream = if proxy_tls {
-                    Stream::Tls(Box::new(
-                        transport
-                            .tls()
-                            .connect(proxy_host, tcp, Protocols::Http1)
-                            .await?,
-                    ))
-                } else {
-                    Stream::Tcp(tcp)
-                };
-                return connection(
-                    stream,
-                    Via::HttpProxy {
-                        authorization: intercept.basic_auth().cloned(),
-                    },
-                    target,
-                );
-            }
-
-            let authority = authority(target.host, target.port);
-            let stream = if proxy_tls {
+    match route(transport.proxy(), target)? {
+        Route::Direct => {
+            let tcp = tcp(target.host, target.port).await?;
+            let stream = finish(transport, target, tcp).await?;
+            connection(stream, Via::Direct, target)
+        }
+        Route::Forward {
+            proxy,
+            authorization,
+        } => {
+            let tcp = tcp(&proxy.host, proxy.port).await?;
+            // Absolute-form requests to a forward proxy are HTTP/1.1, so the
+            // TLS leg to the proxy offers no h2.
+            let stream = if proxy.tls {
+                Stream::Tls(Box::new(
+                    transport
+                        .tls()
+                        .connect(&proxy.host, tcp, Protocols::Http1)
+                        .await?,
+                ))
+            } else {
+                Stream::Tcp(tcp)
+            };
+            connection(stream, Via::HttpProxy { authorization }, target)
+        }
+        Route::Tunnel {
+            proxy,
+            authority,
+            authorization,
+        } => {
+            let tcp = tcp(&proxy.host, proxy.port).await?;
+            let stream = if proxy.tls {
                 let to_proxy = transport
                     .tls()
-                    .connect(proxy_host, tcp, Protocols::Http1)
+                    .connect(&proxy.host, tcp, Protocols::Http1)
                     .await?;
                 let tunneled =
-                    tunnel::connect(to_proxy, &authority, intercept.basic_auth()).await?;
+                    tunnel::connect(to_proxy, &authority, authorization.as_ref()).await?;
                 if target.tls {
                     Stream::TlsOverTls(Box::new(
                         transport
@@ -156,26 +130,31 @@ pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connec
                     Stream::Tls(Box::new(tunneled))
                 }
             } else {
-                let tunneled = tunnel::connect(tcp, &authority, intercept.basic_auth()).await?;
+                let tunneled = tunnel::connect(tcp, &authority, authorization.as_ref()).await?;
                 finish(transport, target, tunneled).await?
             };
             connection(stream, Via::Direct, target)
         }
-        "socks5" | "socks5h" => {
-            let proxy_port = proxy_uri.port_u16().unwrap_or(1080);
-            let tcp = tcp(proxy_host, proxy_port).await?;
+        Route::Socks5 {
+            host,
+            port,
+            credentials,
+            resolve_remotely,
+        } => {
+            let tcp = tcp(&host, port).await?;
             let tcp = socks5::connect(
                 tcp,
                 target.host,
                 target.port,
-                intercept.raw_auth(),
-                scheme == "socks5h",
+                credentials
+                    .as_ref()
+                    .map(|(user, password)| (user.as_str(), password.as_str())),
+                resolve_remotely,
             )
             .await?;
             let stream = finish(transport, target, tcp).await?;
             connection(stream, Via::Direct, target)
         }
-        other => Err(ProxyErrorKind::UnsupportedScheme(other.to_owned()).into()),
     }
 }
 
@@ -236,29 +215,7 @@ async fn finish(
 }
 
 async fn tcp(host: &str, port: u16) -> Result<TcpStream, Error> {
-    let tcp = happy_eyeballs::connect(host, port)
+    happy_eyeballs::connect(&happy_eyeballs::AsyncNet, host, port)
         .await
-        .map_err(|error| Error::Transport(Box::new(error)))?;
-    tcp.set_nodelay(true)
-        .map_err(|error| Error::Transport(Box::new(error)))?;
-    Ok(tcp)
-}
-
-/// `host:port`, bracketing IPv6 literals.
-pub fn authority(host: &str, port: u16) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
-}
-
-/// The destination as the proxy matcher sees it: scheme decides which rule applies.
-fn destination_uri(target: Target<'_>) -> Result<Uri, Error> {
-    Uri::builder()
-        .scheme(if target.tls { "https" } else { "http" })
-        .authority(authority(target.host, target.port))
-        .path_and_query("/")
-        .build()
-        .map_err(|error| Error::InvalidUri(error.to_string()))
+        .map_err(|error| Error::Transport(Box::new(error)))
 }
