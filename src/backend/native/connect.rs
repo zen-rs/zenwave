@@ -9,10 +9,13 @@ use futures_util::{FutureExt, future::LocalBoxFuture};
 use http::{HeaderValue, Method, header, uri::Scheme};
 use http_kit::{Body, Request};
 use http_kit_h1::{ClientConfig, ClientOutcome, RequestTarget, SendRequest, handshake_stream};
-use http_kit_io::{BufResult, IntoInner, Io, IoBuf, Read, SendFile, Split, TcpOptions, Write};
+use http_kit_io::{
+    BufResult, IntoInner, Io, IoBuf, Read, SendFile, Split, TcpOptions, Write, poll::CopyingPoll,
+};
 use http_kit_tls::{TlsConnector, Transport as TlsTransport, rustls::pki_types::ServerName};
 use tracing::debug;
 
+use super::upgrade::{self, Switched, Upgrade};
 use crate::{
     Error, Transport,
     error::ProxyErrorKind,
@@ -42,9 +45,24 @@ impl<I: Io<TcpStream: TlsTransport>> NativeIo for I {}
 /// A fresh HTTP/1.1 connection: its handle, how requests on it are shaped,
 /// and the future that drives its socket.
 pub struct Dialed {
-    pub send: SendRequest,
+    pub send: H1Send,
     pub via: Via,
     pub driver: LocalBoxFuture<'static, ()>,
+}
+
+/// An HTTP/1.1 connection's request handle, with the token to the stream a
+/// request on it may switch the connection to.
+#[derive(Debug)]
+pub struct H1Send {
+    pub requests: SendRequest,
+    pub upgrade: Upgrade,
+}
+
+impl H1Send {
+    /// Whether the connection stopped taking requests.
+    pub fn is_closed(&self) -> bool {
+        self.requests.is_closed()
+    }
 }
 
 /// Connects to `origin` the way the transport's rules say — its unix domain
@@ -178,21 +196,38 @@ fn server_name(host: &str) -> Result<ServerName<'static>, Error> {
     ServerName::try_from(host.to_owned()).map_err(Error::tls)
 }
 
-/// Runs the HTTP/1.1 client over `stream`; the driver logs how it ended.
+/// Runs the HTTP/1.1 client over `stream`; the driver logs how it ended,
+/// and when a request switched the connection, holds the switched stream
+/// on this thread until the request's [`Upgrade`] claims it.
 fn start<S, T>(stream: S, timer: T, config: ClientConfig, via: Via) -> Dialed
 where
     S: Split + 'static,
-    S::WriteHalf: SendFile,
+    S::ReadHalf: Read + 'static,
+    S::WriteHalf: Write + SendFile + 'static,
     T: http_kit_io::Timer + 'static,
 {
-    let (send, connection) = handshake_stream(stream, timer, config);
+    let (requests, connection) = handshake_stream(stream, timer, config);
+    let (upgrade, claims) = upgrade::channel();
     let driver = async move {
-        if let Err(error) = connection.run().await {
-            debug!(%error, "HTTP/1.1 connection ended with an error");
+        match connection.run().await {
+            Ok(ClientOutcome::Closed) => {}
+            Ok(ClientOutcome::Upgraded(upgraded)) => {
+                let rejoined = Rejoined {
+                    read: upgraded.read,
+                    write: upgraded.write,
+                };
+                let switched = Switched::new(upgraded.read_buf, CopyingPoll::new(rejoined));
+                claims.hand_over(switched).await;
+            }
+            Err(error) => debug!(%error, "HTTP/1.1 connection ended with an error"),
         }
     }
     .boxed_local();
-    Dialed { send, via, driver }
+    Dialed {
+        send: H1Send { requests, upgrade },
+        via,
+        driver,
+    }
 }
 
 /// Asks the HTTP proxy on `stream` for a `CONNECT` tunnel to `authority` and
