@@ -1,4 +1,6 @@
 //! Tests for convenience functions in Zenwave
+// The one-shot functions exist only beside a default backend.
+#![cfg(default_backend)]
 
 mod common;
 use common::httpbin_uri;

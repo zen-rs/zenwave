@@ -11,14 +11,14 @@ use std::{
 };
 
 use executor_core::{AnyExecutor, Executor};
-use futures_util::{Stream, TryStreamExt};
+use futures_util::Stream;
 #[cfg(http3)]
 use futures_util::{
     future::{Either, select},
     pin_mut,
 };
 use http::{StatusCode, uri::Scheme};
-use http_body_util::BodyDataStream;
+use http_body_util::BodyExt as _;
 use http_kit::{Endpoint, HttpError, Request, Response};
 use hyper::{body::Incoming, client::conn::TrySendError, http};
 use rt::Spawner;
@@ -28,7 +28,7 @@ use tracing::warn;
 
 #[cfg(feature = "http2")]
 use super::shared::replayable_request;
-use super::shared::{error_for_status, request_origin, shape_h1_request, take_request};
+use super::shared::{received, request_origin, shape_h1_request, take_request};
 #[cfg(http3)]
 use crate::transport::{
     Spawn,
@@ -443,25 +443,20 @@ impl HyperBackend {
             .record_alt_svc(&origin.host, response.headers());
     }
 
-    /// Wrap the h1 lease around its body's tail, harvest `Alt-Svc`, and turn
-    /// an error status into [`crate::Error::Http`].
-    async fn finish_response(
-        &self,
-        #[cfg(http3)] origin: &Origin,
-        #[cfg(http3)] h3: H3,
+    /// Wrap the h1 lease around its body's tail. The response comes back
+    /// whatever its status, its body still streaming.
+    fn finish_response(
         response: http::Response<http_kit::Body>,
         lease: Option<H1Lease>,
-    ) -> Result<Response, crate::Error> {
-        #[cfg(http3)]
-        self.record_alt_svc(origin, h3, &response);
-
+    ) -> Response {
         let response = response.map(|body| match lease {
             // The h1 connection is reusable once the body is finished or
             // dropped, so the lease rides along with it.
             Some(lease) => http_kit::Body::from_frames(LeaseReturn::new(body, lease)),
             None => body,
         });
-        error_for_status(response).await
+        received(&response);
+        response
     }
 }
 
@@ -582,24 +577,19 @@ impl Endpoint for HyperBackend {
             }
         };
 
-        self.finish_response(
-            #[cfg(http3)]
-            &origin,
-            #[cfg(http3)]
-            h3,
-            response,
-            lease,
-        )
-        .await
+        #[cfg(http3)]
+        self.record_alt_svc(&origin, h3, &response);
+        Ok(Self::finish_response(response, lease))
     }
 }
 
 /// A response body repacked as `http_kit::Body`.
+///
+/// The whole `http_body` frame stream is kept, so a chunked response's
+/// trailers reach the caller after its data.
 fn into_body(response: http::Response<Incoming>) -> http::Response<http_kit::Body> {
     response.map(|body| {
-        http_kit::Body::from_stream(
-            BodyDataStream::new(body).map_err(|error| http_kit::BodyError::Other(Box::new(error))),
-        )
+        http_kit::Body::new(body.map_err(|error| http_kit::BodyError::Other(Box::new(error))))
     })
 }
 

@@ -32,6 +32,8 @@ cargo build --target wasm32-unknown-unknown
 ```
 src/
   lib.rs          — public API, re-exports, compile-time feature checks
+  default_client.rs — DefaultClient, client(), get/post/put/delete: absent
+                    without a DefaultBackend (`native-backend` with no driver)
   client.rs       — Client trait, RequestBuilder, middleware composition
   client/
     download.rs   — resumable file downloads (native only)
@@ -81,6 +83,8 @@ src/
   redirect.rs     — redirect-following middleware (on by default)
   retry.rs        — retry middleware
   timeout.rs      — per-request timeout middleware
+  status.rs       — ErrorForStatus: the opt-in layer turning 4xx/5xx into
+                    Error::Http (backends return every status as Ok)
   websocket.rs    — cross-platform WebSocket client
   multipart.rs    — multipart/form-data
   error.rs        — error types

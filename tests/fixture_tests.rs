@@ -1,6 +1,8 @@
 //! The local fixture's CORS contract: the wasm lanes call it from the
 //! wasm-bindgen server's origin, so every response must carry the origin
 //! headers and a preflight must be answered on any path.
+// Every test here runs through `zenwave::client()`.
+#![cfg(default_backend)]
 
 mod common;
 use common::httpbin_uri;

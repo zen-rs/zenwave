@@ -56,9 +56,7 @@ pub use runtime::Driver;
 pub use runtime::Tokio;
 pub use upgrade::{Switched, Upgrade};
 
-use super::shared::{
-    error_for_status, replayable_request, request_origin, shape_h1_request, take_request,
-};
+use super::shared::{received, replayable_request, request_origin, shape_h1_request, take_request};
 use crate::{
     Client, Error, Transport,
     transport::route::{Origin, Via},
@@ -301,7 +299,8 @@ impl Endpoint for NativeBackend {
                     if h3 != pool::H3Use::Blocked {
                         h3::report_alt_svc(&self.pool, &origin, response.headers());
                     }
-                    return error_for_status(response).await;
+                    received(&response);
+                    return Ok(response);
                 }
                 Err(unsent) => {
                     request = unsent;

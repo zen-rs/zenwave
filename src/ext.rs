@@ -46,17 +46,20 @@ pub trait ResponseExt {
         limit: usize,
     ) -> impl Future<Output = Result<Bytes, crate::Error>> + Send;
 
-    /// Consumes the response, returning it unchanged when the status is a
-    /// success (2xx) and a rich [`crate::Error::Http`] otherwise.
+    /// Consumes the response, returning it unchanged unless its status is a
+    /// client or server error (4xx or 5xx), which becomes a rich
+    /// [`crate::Error::Http`]. Informational and redirect statuses pass
+    /// through: they are not failures.
     ///
-    /// On error the body is read and captured as `body_text` (when valid
-    /// UTF-8), mirroring what backend-level HTTP errors report — so server
+    /// On error the body is read whole and captured as `body_text` (when
+    /// valid UTF-8), and the response the error holds keeps it, so server
     /// error messages surface in the returned error instead of being
-    /// silently dropped.
+    /// silently dropped. [`crate::ErrorForStatus`] applies this to every
+    /// response of a client.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::Http`] when the status is not 2xx.
+    /// Returns [`crate::Error::Http`] when the status is 4xx or 5xx.
     fn error_for_status(self) -> impl Future<Output = Result<Self, crate::Error>> + Send
     where
         Self: Sized;
@@ -95,13 +98,12 @@ impl ResponseExt for crate::Response {
         Ok(bytes.into())
     }
 
-    async fn error_for_status(self) -> Result<Self, crate::Error> {
+    async fn error_for_status(mut self) -> Result<Self, crate::Error> {
         let status = self.status();
-        if status.is_success() {
+        if !(status.is_client_error() || status.is_server_error()) {
             return Ok(self);
         }
-        let (parts, body) = self.into_parts();
-        let body_text = body.into_string().await.ok().map(|text| text.to_string());
+        let body_text = self.body_mut().as_str().await.ok().map(ToOwned::to_owned);
         let message = body_text.clone().unwrap_or_else(|| {
             status
                 .canonical_reason()
@@ -112,7 +114,7 @@ impl ResponseExt for crate::Response {
             status,
             message,
             response: Box::new(crate::error::HttpErrorResponse {
-                response: Self::from_parts(parts, http_kit::Body::empty()),
+                response: self,
                 body_text,
             }),
         })

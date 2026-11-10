@@ -13,7 +13,9 @@ use http_kit::{
 use zenwave::Client;
 use zenwave::redirect::{FollowRedirect, FollowRedirectError};
 
+#[cfg(default_backend)]
 mod common;
+#[cfg(default_backend)]
 use common::httpbin_uri;
 
 /// An extension type with no meaning beyond proving hops carry request extensions.
@@ -636,6 +638,7 @@ async fn redirect_status_without_location_errors() {
 /// End to end through the real client: the fixture's /status/304 has no
 /// Location, and the 304 must still come back delivered rather than error
 /// as a malformed redirect.
+#[cfg(default_backend)]
 #[test_executors::async_test]
 async fn real_client_delivers_a_304_without_location() {
     let response = zenwave::client()
