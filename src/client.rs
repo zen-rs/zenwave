@@ -27,6 +27,7 @@ use crate::{
     cookie::CookieStore,
     redirect::FollowRedirect,
     retry::Retry,
+    status::ErrorForStatus,
     timeout::Timeout,
 };
 
@@ -539,6 +540,16 @@ pub trait Client: SendEndpoint + Sized {
         Self::Error: Into<crate::Error>,
     {
         Retry::new(self, max_retries)
+    }
+
+    /// Turn a 4xx or 5xx response into [`crate::Error::Http`].
+    ///
+    /// Off by default: a backend returns every response it receives, error
+    /// statuses included, with the body still streaming. See
+    /// [`ErrorForStatus`]. The client's error converts into
+    /// [`crate::Error`], so the status can be matched on.
+    fn error_for_status(self) -> WithMiddleware<Self, ErrorForStatus> {
+        WithMiddleware::new(self, ErrorForStatus)
     }
 
     /// Enable HTTP caching middleware.

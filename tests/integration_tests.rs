@@ -54,14 +54,19 @@ async fn test_post_with_json_body() {
 
 #[test_executors::async_test]
 async fn test_response_status_codes() {
+    let mut strict = client().error_for_status();
     for status_code in [200, 201, 400, 401, 403, 404, 500, 502, 503] {
         let url = endpoint(&format!("/status/{status_code}"));
-        let response = get(url).await;
+        // The default client hands back every status as the answer it is.
+        let response = get(url.clone()).await.expect("every status is a response");
+        assert_eq!(response.status().as_u16(), status_code);
+
+        // A client that opted in turns 4xx and 5xx into errors.
+        let response = strict.get(url).unwrap().await;
         if status_code < 400 {
-            let response = response.unwrap();
-            assert_eq!(response.status().as_u16(), status_code);
+            assert_eq!(response.unwrap().status().as_u16(), status_code);
         } else {
-            let error = response.expect_err("expected error status to surface as Err");
+            let error = response.expect_err("an opted-in client fails on an error status");
             let description = format!("{error}");
             assert!(
                 description.contains(&status_code.to_string()),

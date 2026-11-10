@@ -99,6 +99,7 @@ pub mod redirect;
 pub mod retry;
 #[cfg(target_arch = "wasm32")]
 mod single_threaded;
+pub mod status;
 
 // Re-export the unified error type
 pub use error::Error;
@@ -111,6 +112,7 @@ pub mod multipart;
 pub mod websocket;
 
 pub use ext::ResponseExt;
+pub use status::ErrorForStatus;
 pub use timeout::Timeout;
 
 #[cfg(default_backend)]
