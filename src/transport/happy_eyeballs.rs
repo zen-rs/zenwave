@@ -3,7 +3,9 @@
 //! timeout.
 //!
 //! The state machine and the resolution are runtime-independent: names go
-//! to `getaddrinfo` on threads of their own, and the sockets and timers come
+//! to `getaddrinfo` on threads of their own — except localhost names, which
+//! are the loopback addresses without a query (RFC 6761 §6.3), so a stalled
+//! system resolver cannot hold up a local connection — and the sockets and timers come
 //! from a [`Dialer`] — async-net for the hyper backend and websockets, an
 //! `http-kit-io` implementation for the native backend.
 
@@ -11,7 +13,7 @@ use std::{
     collections::{HashSet, VecDeque},
     future::Future,
     io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     thread,
     time::{Duration, Instant},
 };
@@ -125,7 +127,7 @@ pub async fn connect<D: Dialer>(dialer: &D, host: &str, port: u16) -> io::Result
                 resolver.next().await
             }
         };
-        let resolution_delay = timer_at(dialer, state.resolution_delay_deadline);
+        let resolution_delay = timer_at(dialer, state.resolution_delay.deadline());
         let next_attempt_due = timer_at(dialer, state.next_attempt_deadline());
 
         pin_mut!(resolver_event);
@@ -227,13 +229,42 @@ struct AttemptOutcome<S> {
     result: io::Result<S>,
 }
 
+/// The Resolution Delay an A answer that beats AAAA waits out (RFC 8305
+/// §3) before IPv4 may start.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResolutionDelay {
+    /// Not running: no A answer is waiting on AAAA.
+    Idle,
+    /// IPv4 waits until then for AAAA.
+    Until(Instant),
+    /// The delay ran out with AAAA still pending: IPv4 may start.
+    Passed,
+}
+
+impl ResolutionDelay {
+    const fn deadline(self) -> Option<Instant> {
+        match self {
+            Self::Until(deadline) => Some(deadline),
+            Self::Idle | Self::Passed => None,
+        }
+    }
+
+    fn has_passed(self, now: Instant) -> bool {
+        match self {
+            Self::Idle => false,
+            Self::Until(deadline) => now >= deadline,
+            Self::Passed => true,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct HappyEyeballsState {
     ipv6: FamilyResolution,
     ipv4: FamilyResolution,
     sorted_snapshot: Option<Vec<SocketAddr>>,
     first_positive_family: Option<AddressFamilyKind>,
-    resolution_delay_deadline: Option<Instant>,
+    resolution_delay: ResolutionDelay,
     pending: VecDeque<SocketAddr>,
     attempted: HashSet<SocketAddr>,
     last_attempt_started_at: Option<Instant>,
@@ -247,7 +278,7 @@ impl HappyEyeballsState {
             ipv4: FamilyResolution::Pending,
             sorted_snapshot: None,
             first_positive_family: None,
-            resolution_delay_deadline: None,
+            resolution_delay: ResolutionDelay::Idle,
             pending: VecDeque::new(),
             attempted: HashSet::new(),
             last_attempt_started_at: None,
@@ -275,9 +306,9 @@ impl HappyEyeballsState {
                                 self.first_positive_family
                                     .get_or_insert(AddressFamilyKind::Ipv6);
                             }
-                            self.resolution_delay_deadline = None;
+                            self.resolution_delay = ResolutionDelay::Idle;
                         } else if self.ipv6.is_finished() && self.ipv4.is_positive() {
-                            self.resolution_delay_deadline = None;
+                            self.resolution_delay = ResolutionDelay::Idle;
                         }
                     }
                     AddressFamilyKind::Ipv4 => {
@@ -287,8 +318,8 @@ impl HappyEyeballsState {
                         if ipv4_became_positive && self.first_positive_family.is_none() {
                             self.first_positive_family = Some(AddressFamilyKind::Ipv4);
                             if !self.ipv6.is_finished() {
-                                self.resolution_delay_deadline =
-                                    Some(Instant::now() + RESOLUTION_DELAY);
+                                self.resolution_delay =
+                                    ResolutionDelay::Until(Instant::now() + RESOLUTION_DELAY);
                             }
                         }
                     }
@@ -392,8 +423,7 @@ impl HappyEyeballsState {
             return true;
         }
 
-        self.resolution_delay_deadline
-            .is_some_and(|deadline| now >= deadline)
+        self.resolution_delay.has_passed(now)
     }
 
     fn next_attempt_deadline(&self) -> Option<Instant> {
@@ -404,8 +434,9 @@ impl HappyEyeballsState {
             .map(|started_at| started_at + bounded_connection_attempt_delay())
     }
 
+    /// The Resolution Delay's timer fired: IPv4 no longer waits on AAAA.
     const fn open_resolution_gate(&mut self) {
-        self.resolution_delay_deadline = None;
+        self.resolution_delay = ResolutionDelay::Passed;
     }
 
     fn record_attempt_failure(&mut self, addr: SocketAddr, error: &io::Error) {
@@ -477,6 +508,14 @@ async fn connect_with_timeout<D: Dialer>(dialer: &D, addr: SocketAddr) -> io::Re
 
 fn start_resolution(host: &str, port: u16) -> UnboundedReceiver<ResolutionEvent> {
     let (sender, receiver) = unbounded();
+    if is_localhost(host) {
+        for event in loopback_resolution(port) {
+            sender
+                .unbounded_send(event)
+                .expect("the receiver is still held here");
+        }
+        return receiver;
+    }
     for query in [
         ResolveQuery::Family(AddressFamilyKind::Ipv6),
         ResolveQuery::Family(AddressFamilyKind::Ipv4),
@@ -486,6 +525,45 @@ fn start_resolution(host: &str, port: u16) -> UnboundedReceiver<ResolutionEvent>
     }
     drop(sender);
     receiver
+}
+
+/// Whether `host` is a localhost name: `localhost` or a name under it, in
+/// any case, with or without the root label (RFC 6761 §6.3).
+fn is_localhost(host: &str) -> bool {
+    const LOCALHOST: &[u8] = b"localhost";
+    let name = host.strip_suffix('.').unwrap_or(host).as_bytes();
+    let Some(split) = name.len().checked_sub(LOCALHOST.len()) else {
+        return false;
+    };
+    let (parent, last) = name.split_at(split);
+    last.eq_ignore_ascii_case(LOCALHOST) && (parent.is_empty() || parent.ends_with(b"."))
+}
+
+/// What resolving a localhost name yields: the loopback addresses, with no
+/// query sent, since RFC 6761 §6.3 makes them the only answer. `::1` comes
+/// first, as RFC 6724's default policy table orders it.
+fn loopback_resolution(port: u16) -> [ResolutionEvent; 3] {
+    let ipv6 = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port);
+    let ipv4 = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
+    [
+        ResolutionEvent {
+            kind: ResolutionEventKind::Family {
+                family: AddressFamilyKind::Ipv6,
+                result: ResolutionResult::Addresses(vec![ipv6]),
+            },
+        },
+        ResolutionEvent {
+            kind: ResolutionEventKind::Family {
+                family: AddressFamilyKind::Ipv4,
+                result: ResolutionResult::Addresses(vec![ipv4]),
+            },
+        },
+        ResolutionEvent {
+            kind: ResolutionEventKind::SortedSnapshot(ResolutionResult::Addresses(vec![
+                ipv6, ipv4,
+            ])),
+        },
+    ]
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -613,11 +691,58 @@ async fn timer_at<D: Dialer>(dialer: &D, deadline: Option<Instant>) {
 mod tests {
     use super::{
         AddressFamilyKind, HappyEyeballsState, ResolutionEvent, ResolutionEventKind,
-        ResolutionResult, interleave_address_families,
+        ResolutionResult, interleave_address_families, is_localhost, resolve, start_resolution,
     };
     #[cfg(connector)]
     use super::{AsyncNet, connect};
+    use futures_channel::mpsc::TryRecvError;
     use std::{net::SocketAddr, time::Instant};
+
+    #[test]
+    fn localhost_names_are_recognised() {
+        for host in [
+            "localhost",
+            "localhost.",
+            "LocalHost",
+            "app.localhost",
+            "a.b.LOCALHOST.",
+        ] {
+            assert!(is_localhost(host), "{host} is a localhost name");
+        }
+        for host in [
+            "notlocalhost",
+            "localhost.example.com",
+            "localhost..",
+            "localhos",
+            "example.com",
+        ] {
+            assert!(!is_localhost(host), "{host} is not a localhost name");
+        }
+    }
+
+    #[test]
+    fn localhost_names_resolve_to_loopback_without_a_query() {
+        let loopback: Vec<SocketAddr> = vec![
+            "[::1]:8443".parse().expect("valid IPv6"),
+            "127.0.0.1:8443".parse().expect("valid IPv4"),
+        ];
+        for host in ["localhost", "zenwave-test.localhost."] {
+            // Every answer is in, and the stream closed, before anything ran:
+            // no resolver thread holds a sender.
+            let mut events = start_resolution(host, 8443);
+            let mut answers = 0;
+            loop {
+                match events.try_recv() {
+                    Ok(_) => answers += 1,
+                    Err(TryRecvError::Closed) => break,
+                    Err(TryRecvError::Empty) => panic!("{host} is waiting on a lookup"),
+                }
+            }
+            assert_eq!(answers, 3, "{host}: both families and the sorted snapshot");
+            let addrs = futures_executor::block_on(resolve(host, 8443)).expect("resolves");
+            assert_eq!(addrs, loopback, "{host}");
+        }
+    }
 
     #[test]
     fn interleaves_addresses_with_first_family_count() {
@@ -696,12 +821,36 @@ mod tests {
 
         assert_eq!(state.first_positive_family, Some(AddressFamilyKind::Ipv4));
         assert!(
-            state.resolution_delay_deadline.is_some(),
+            state.resolution_delay.deadline().is_some(),
             "A responses must wait for the resolution delay while AAAA remains pending",
         );
         assert!(
             !state.initial_attempt_gate_open(Instant::now()),
             "IPv4 must not start immediately while AAAA is still pending",
+        );
+    }
+
+    #[test]
+    fn starts_ipv4_once_the_resolution_delay_passes_with_aaaa_still_pending() {
+        let mut state = HappyEyeballsState::new();
+        state.apply_resolution(ResolutionEvent {
+            kind: ResolutionEventKind::Family {
+                family: AddressFamilyKind::Ipv4,
+                result: ResolutionResult::Addresses(vec![
+                    "203.0.113.10:443"
+                        .parse::<SocketAddr>()
+                        .expect("valid IPv4"),
+                ]),
+            },
+        });
+        // The delay's timer fires; AAAA has still not answered.
+        state.open_resolution_gate();
+        state.rebuild_pending();
+
+        assert_eq!(
+            state.pop_next_attempt(Instant::now()),
+            Some("203.0.113.10:443".parse().expect("valid IPv4")),
+            "IPv4 starts once the resolution delay passes, without waiting on AAAA",
         );
     }
 

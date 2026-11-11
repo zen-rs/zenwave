@@ -42,7 +42,7 @@ use executor_core::{LocalExecutor, Task as _};
 use futures_util::Stream;
 #[cfg(native_h3)]
 use http::uri::Scheme;
-use http_kit::{Body, Endpoint, Method, Request, Response};
+use http_kit::{Body, BodyError, BodyFrame, Endpoint, Method, Request, Response};
 
 use connect::H1Send;
 pub use connect::NativeIo;
@@ -209,6 +209,11 @@ impl NativeBackend {
             }
             Err(failure) => failure,
         };
+        if matches!(failure.error(), http_kit_h1::Error::Timeout(_)) {
+            // The read timeout closed the connection: no retry, since the
+            // server may have the request.
+            return Err(Error::Timeout);
+        }
         if reused {
             if let Some(unsent) = failure.take_request() {
                 tracing::debug!(
@@ -348,7 +353,8 @@ impl Drop for H1Lease {
 
 /// An HTTP/1.1 response body that returns its connection's lease when it
 /// ends. Dropped unfinished, the lease is discarded: the connection still
-/// holds the rest of the body.
+/// holds the rest of the body. A read the read timeout cut short fails as
+/// [`timed_out`].
 struct LeaseReturn<S> {
     inner: S,
     lease: Option<H1Lease>,
@@ -363,19 +369,48 @@ impl<S> LeaseReturn<S> {
     }
 }
 
-impl<S: Stream + Unpin> Stream for LeaseReturn<S> {
+impl<S> Stream for LeaseReturn<S>
+where
+    S: Stream<Item = Result<BodyFrame, BodyError>> + Unpin,
+{
     type Item = S::Item;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let Self { inner, lease } = self.get_mut();
-        let poll = Pin::new(inner).poll_next(cx);
-        if matches!(poll, Poll::Ready(None))
-            && let Some(lease) = lease.take()
-        {
-            lease.release();
+        match Pin::new(inner).poll_next(cx) {
+            Poll::Ready(None) => {
+                if let Some(lease) = lease.take() {
+                    lease.release();
+                }
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) if is_body_timeout(&error) => {
+                Poll::Ready(Some(Err(timed_out())))
+            }
+            poll => poll,
         }
-        poll
     }
+}
+
+/// Whether `error` is the HTTP/1.1 client's read timeout expiring during the
+/// body.
+fn is_body_timeout(error: &BodyError) -> bool {
+    let BodyError::Other(error) = error else {
+        return false;
+    };
+    matches!(
+        error.downcast_ref::<http_kit_h1::Error>(),
+        Some(http_kit_h1::Error::Timeout(http_kit_h1::Timeout::BodyRead))
+    )
+}
+
+/// How a body read the read timeout cut short fails: an I/O timeout, as
+/// every reader of bytes recognises one, carrying [`Error::Timeout`].
+fn timed_out() -> BodyError {
+    BodyError::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        Error::Timeout,
+    ))
 }
 
 /// An HTTP/3 response body that keeps the pool, and with it the
