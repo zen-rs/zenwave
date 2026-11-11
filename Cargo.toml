@@ -136,6 +136,12 @@ native-tokio = ["native-backend", "http-kit-io/tokio", "executor-core/tokio", "d
 # OneCRL where it applies.
 native-http3 = ["native-backend", "dep:http-kit-h3", "http-kit-h3/quiche"]
 
+# Kernel TLS for the native backend on Linux: once a handshake completes and
+# the kernel takes the negotiated suite, the connection's record layer moves
+# to the kernel. A connection the kernel cannot take stays in user space.
+# Compiles to nothing elsewhere.
+native-kernel-tls = ["native-backend", "http-kit-tls/kernel"]
+
 # Shorthands.
 hyper-rustls = ["hyper-backend", "rustls"]
 hyper-native-tls = ["hyper-backend", "native-tls"]

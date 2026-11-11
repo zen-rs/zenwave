@@ -8,6 +8,7 @@ use std::{
     io,
     net::SocketAddr,
     pin::pin,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -57,6 +58,37 @@ pub struct Dialed {
     pub send: H1Send,
     pub via: Via,
     pub driver: LocalBoxFuture<'static, ()>,
+    /// Where the origin's TLS records are encrypted, for a TLS connection.
+    #[cfg(all(
+        test,
+        target_os = "linux",
+        feature = "native-kernel-tls",
+        native_driver
+    ))]
+    pub tls_mode: Option<http_kit_tls::Mode>,
+}
+
+/// The TLS connector for `config`. With `native-kernel-tls` on Linux the
+/// kernel is probed here, once for the connector the pool keeps, and each
+/// handshake the kernel can take moves to kernel TLS.
+///
+/// # Errors
+///
+/// The kernel probe failed: its loopback sockets could not be opened, or it
+/// refused a suite for a reason other than not supporting it.
+#[cfg_attr(
+    not(all(feature = "native-kernel-tls", target_os = "linux")),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "only a Linux kernel TLS build can fail to probe"
+    )
+)]
+pub fn connector(config: Arc<http_kit_tls::rustls::ClientConfig>) -> Result<TlsConnector, Error> {
+    let connector = TlsConnector::new(config);
+    #[cfg(all(feature = "native-kernel-tls", target_os = "linux"))]
+    let connector =
+        connector.with_kernel_tls(http_kit_tls::KernelTls::probe().map_err(Error::tls)?);
+    Ok(connector)
 }
 
 /// An HTTP/1.1 connection's request handle, with the token to the stream a
@@ -237,7 +269,22 @@ impl<I: Io> LastLeg<'_, I> {
             .connect(server_name(host)?, stream, self.io)
             .await
             .map_err(Error::tls)?;
-        Ok(start(stream, io, config, via))
+        #[cfg(all(
+            test,
+            target_os = "linux",
+            feature = "native-kernel-tls",
+            native_driver
+        ))]
+        let tls_mode = Some(stream.mode());
+        let dialed = start(stream, io, config, via);
+        #[cfg(all(
+            test,
+            target_os = "linux",
+            feature = "native-kernel-tls",
+            native_driver
+        ))]
+        let dialed = Dialed { tls_mode, ..dialed };
+        Ok(dialed)
     }
 }
 
@@ -277,6 +324,13 @@ where
         send: H1Send { requests, upgrade },
         via,
         driver,
+        #[cfg(all(
+            test,
+            target_os = "linux",
+            feature = "native-kernel-tls",
+            native_driver
+        ))]
+        tls_mode: None,
     }
 }
 
@@ -406,5 +460,161 @@ impl<S: Read + Write> Handshake for OwnedBytes<S> {
             }
         }
         Ok(bytes)
+    }
+}
+
+/// Kernel TLS: a dial over a handshake the kernel can take hands the
+/// connection's record layer to it.
+#[cfg(all(
+    test,
+    target_os = "linux",
+    feature = "native-kernel-tls",
+    native_driver
+))]
+#[expect(
+    clippy::future_not_send,
+    reason = "the scenario runs on one runtime thread, as the pool's connections do"
+)]
+mod tests {
+    use std::sync::Arc;
+
+    use futures_util::future::{Either, select};
+    use http_kit::Response;
+    use http_kit_io::Listener as _;
+    use http_kit_tls::{Mode, TlsAcceptor};
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    };
+    use rustls::{
+        crypto::ring,
+        pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+    };
+    use time::{Duration as TimeDelta, OffsetDateTime};
+
+    use super::*;
+    use crate::{Proxy, backend::shared::request_origin};
+
+    /// A greeting in Chinese, Japanese and Korean.
+    const GREETING: &str = "你好，世界。こんにちは、世界。안녕하세요, 세계.";
+
+    /// A transport trusting a throwaway CA, and a user-space TLS acceptor
+    /// for a `localhost` certificate that CA signed, so the kernel is the
+    /// client's alone.
+    fn pki() -> (Transport, TlsAcceptor) {
+        let now = OffsetDateTime::now_utc();
+        let ca_key = KeyPair::generate().expect("CA key");
+        let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+        ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca.distinguished_name
+            .push(DnType::CommonName, "zenwave kernel TLS test CA");
+        ca.not_before = now - TimeDelta::days(1);
+        ca.not_after = now + TimeDelta::days(30);
+        let ca_der = ca.self_signed(&ca_key).expect("self-sign CA").der().clone();
+        let issuer = Issuer::new(ca, ca_key);
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let mut leaf = CertificateParams::new(vec!["localhost".to_owned()]).expect("leaf params");
+        leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        leaf.not_before = now - TimeDelta::days(1);
+        leaf.not_after = now + TimeDelta::days(30);
+        let leaf = leaf.signed_by(&leaf_key, &issuer).expect("sign leaf");
+        let mut config =
+            rustls::ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("default versions")
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![leaf.der().clone()],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+                )
+                .expect("server certificate");
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let transport = Transport::builder()
+            .proxy(Proxy::none())
+            .extra_root_certificate_der(ca_der.to_vec())
+            .build()
+            .expect("transport builds");
+        (transport, TlsAcceptor::new(Arc::new(config)))
+    }
+
+    /// Echoes the request body, over one TLS connection.
+    async fn serve_once<I: NativeIo>(io: I, listener: I::TcpListener, tls: TlsAcceptor) {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let stream = tls.accept(stream, &io).await.expect("TLS handshake");
+        let service = |request: Request| async move {
+            let body = request.into_body().into_bytes().await.expect("body reads");
+            Response::new(Body::from_bytes(body))
+        };
+        http_kit_h1::ServerConnection::from_stream(
+            stream,
+            io,
+            http_kit_h1::ServerConfig::default(),
+        )
+        .serve(&service)
+        .await
+        .expect("connection serves");
+    }
+
+    /// A native-backend dial to an HTTPS origin, through the connector the
+    /// pool builds, settles on kernel TLS and carries a request.
+    async fn https_runs_over_kernel_tls<I: NativeIo>(io: I) {
+        let (transport, acceptor) = pki();
+        let listener = io
+            .bind_tcp("127.0.0.1:0".parse().expect("loopback"))
+            .expect("bind");
+        let port = listener.local_addr().expect("local address").port();
+        let tls = connector(transport.tls().http1_config().clone()).expect("the kernel probes");
+        let origin = request_origin(
+            &format!("https://localhost:{port}/")
+                .parse()
+                .expect("origin URI"),
+        )
+        .expect("origin");
+
+        let server = serve_once(io.clone(), listener, acceptor);
+        let client = async {
+            let dialed = dial(&io, &transport, &tls, &origin)
+                .await
+                .expect("the dial succeeds");
+            assert_eq!(
+                dialed.tls_mode,
+                Some(Mode::Kernel),
+                "the handshake stayed in user space; is the kernel's `tls` module loaded?"
+            );
+            let mut request = Request::new(Body::from_bytes(GREETING.as_bytes().to_vec()));
+            *request.method_mut() = Method::POST;
+            *request.uri_mut() = format!("https://localhost:{port}/echo")
+                .parse()
+                .expect("request URI");
+            let Dialed { send, driver, .. } = dialed;
+            let exchange = async {
+                let response = send.requests.send(request).await.expect("request sends");
+                let body = response.into_body().into_bytes().await.expect("body reads");
+                assert_eq!(body.as_ref(), GREETING.as_bytes());
+                drop(send);
+            };
+            futures_util::join!(driver, exchange);
+        };
+        match select(pin!(client), pin!(server)).await {
+            Either::Left(((), _)) => {}
+            Either::Right(((), _)) => panic!("the server ended before the client"),
+        }
+    }
+
+    #[cfg(feature = "native-compio")]
+    #[test]
+    fn https_runs_over_kernel_tls_on_compio() {
+        compio::runtime::Runtime::new()
+            .expect("compio runtime")
+            .block_on(https_runs_over_kernel_tls(super::super::Compio));
+    }
+
+    #[cfg(feature = "native-tokio")]
+    #[test]
+    fn https_runs_over_kernel_tls_on_tokio() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(https_runs_over_kernel_tls(super::super::Tokio));
     }
 }
