@@ -535,7 +535,7 @@ mod tests {
 
     use futures_util::future::{Either, select};
     use http_kit::Response;
-    use http_kit_io::{Listen, Listener as _};
+    use http_kit_io::{Listen, Listener};
     use http_kit_tls::{Mode, TlsAcceptor};
     use rcgen::{
         BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -592,7 +592,11 @@ mod tests {
     }
 
     /// Echoes the request body, over one TLS connection.
-    async fn serve_once<I: NativeIo + Listen>(io: I, listener: I::Listener, tls: TlsAcceptor) {
+    async fn serve_once<I: NativeIo + Listen<Listener: Listener<Stream: TlsTransport>>>(
+        io: I,
+        listener: I::Listener,
+        tls: TlsAcceptor,
+    ) {
         let (stream, _) = listener.accept().await.expect("accept");
         let stream = tls.accept(stream, &io).await.expect("TLS handshake");
         let service = |request: Request| async move {
@@ -611,7 +615,11 @@ mod tests {
 
     /// A native-backend dial to an HTTPS origin, through the connector the
     /// pool builds, settles on kernel TLS and carries a request.
-    async fn https_runs_over_kernel_tls<I: NativeIo + Listen>(io: I) {
+    async fn https_runs_over_kernel_tls<
+        I: NativeIo + Listen<Listener: Listener<Stream: TlsTransport>>,
+    >(
+        io: I,
+    ) {
         let (transport, acceptor) = pki();
         let listener = io
             .bind_tcp("127.0.0.1:0".parse().expect("loopback"))
@@ -675,7 +683,11 @@ mod tests {
 
     /// Answers one TLS connection's request with a `101` and, in the same
     /// write, a greeting, then holds the connection open.
-    async fn serve_switch<I: NativeIo + Listen>(io: I, listener: I::Listener, tls: TlsAcceptor) {
+    async fn serve_switch<I: NativeIo + Listen<Listener: Listener<Stream: TlsTransport>>>(
+        io: I,
+        listener: I::Listener,
+        tls: TlsAcceptor,
+    ) {
         let (stream, _) = listener.accept().await.expect("accept");
         let stream = tls.accept(stream, &io).await.expect("TLS handshake");
         let (mut read, mut write) = stream.split();
@@ -700,7 +712,10 @@ mod tests {
     /// records are the kernel's (`kernel`), and is given back by
     /// `into_splice`, still carrying the bytes behind the head, when rustls
     /// holds them in user space.
-    async fn switched_over_tls<I: NativeIo + Listen>(io: I, kernel: bool) {
+    async fn switched_over_tls<I: NativeIo + Listen<Listener: Listener<Stream: TlsTransport>>>(
+        io: I,
+        kernel: bool,
+    ) {
         use futures_util::AsyncReadExt as _;
 
         let (transport, acceptor) = pki();

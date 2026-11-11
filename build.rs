@@ -124,6 +124,11 @@ fn main() {
         http3: { all(connector, feature = "hyper-backend", feature = "http3") },
         // HTTP/3 discovery (Alt-Svc, HTTPS records), shared by both h3 paths.
         https_rr: { any(http3, native_h3) },
+        // The HTTPS record lookup machinery (hickory or `DnsResolver`, the
+        // transport's resolver configuration): where something calls it —
+        // the hyper h3 path, or the `System` resolver. A native h3 host with
+        // a resolver of its own never reaches it.
+        https_lookup: { any(http3, all(native_h3, getaddrinfo)) },
         // Unix domain sockets: every `unix` target has AF_UNIX, but wasm32-wasi
         // is `unix` without being `native` — the connector does not exist there.
         unix_socket: { all(unix, native) },
