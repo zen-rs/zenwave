@@ -34,7 +34,7 @@ include = [
 ]
 
 [dependencies]
-http-kit = "0.6.0"
+http-kit = "0.7.0"
 serde = { version = "1.0.229", default-features = false, features = ["derive"]}
 serde_json = "1.0.154"
 base64 = "0.23.1"
@@ -125,7 +125,18 @@ native-tls = ["dep:native-tls"]
 # thread runs; `native-compio` or `native-tokio` adds that runtime as the
 # driver behind `NativeBackend::new` for callers on no runtime at all. It is
 # the default backend only when `hyper-backend` is off.
-native-backend = ["rustls", "dep:http-kit-io", "dep:http-kit-h1", "dep:http-kit-tls"]
+#
+# On Linux and Android a response body whose consumer offers a pipe arrives
+# as `BodyFrame::Pipe` frames, and a switched stream can be spliced
+# (`Switched::into_splice`); elsewhere the `pipe` features compile to nothing.
+native-backend = [
+    "rustls",
+    "dep:http-kit-io",
+    "dep:http-kit-h1",
+    "dep:http-kit-tls",
+    "http-kit/pipe",
+    "http-kit-h1/pipe",
+]
 # compio (io_uring, IOCP, polling) for the native backend.
 native-compio = ["native-backend", "http-kit-io/compio", "executor-core/compio", "dep:compio"]
 # tokio's reactor for the native backend.
@@ -134,7 +145,7 @@ native-tokio = ["native-backend", "http-kit-io/tokio", "executor-core/tokio", "d
 # BoringSSL with cmake). The server's chain goes to the same verifier as a TCP
 # connection's: the platform verifier with the transport's extra roots, and
 # OneCRL where it applies.
-native-http3 = ["native-backend", "dep:http-kit-h3", "http-kit-h3/quiche"]
+native-http3 = ["native-backend", "dep:http-kit-h3", "http-kit-h3/quiche", "http-kit-h3/pipe"]
 
 # Kernel TLS for the native backend on Linux: once a handshake completes and
 # the kernel takes the negotiated suite, the connection's record layer moves
@@ -220,10 +231,10 @@ dns-lookup = "4.0.2"
 executor-core = { version = "0.7.2" }
 # The native backend: owned-buffer sockets, HTTP/1.1, TLS and HTTP/3 on them,
 # and the runtimes it can drive itself.
-http-kit-io = { version = "0.4.0", optional = true }
-http-kit-h1 = { version = "0.4.0", optional = true }
-http-kit-tls = { version = "0.2.2", optional = true }
-http-kit-h3 = { version = "0.4.0", optional = true }
+http-kit-io = { version = "0.5.0", optional = true }
+http-kit-h1 = { version = "0.5.0", optional = true }
+http-kit-tls = { version = "0.3.0", optional = true }
+http-kit-h3 = { version = "0.5.0", optional = true }
 compio = { version = "0.19.2", default-features = false, features = ["runtime"], optional = true }
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time"], optional = true }
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }

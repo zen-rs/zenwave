@@ -855,9 +855,173 @@ async fn idle_outlives_read_timeout<I: NativeIo, E: LocalExecutor>(io: I, execut
     assert_eq!(accepted.get(), 1, "the idle connection carried both");
 }
 
+/// A response body whose consumer offers a pipe arrives as pipe frames, the
+/// bytes of a run still in the kernel; one polled without an offer is plain
+/// data on the same pooled connection, which the first body's end released.
+#[cfg(target_os = "linux")]
+async fn pipe_body<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    use futures_util::future::poll_fn;
+    use http_kit::{BodyFrame, PipeOffer};
+
+    let payload = GREETING.repeat(20_000);
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let reply = payload.clone();
+    let server = async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let (mut read, mut write) = stream.split();
+        for _ in 0..2 {
+            read_head(&mut read).await;
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", reply.len());
+            write
+                .write_all(head.into_bytes())
+                .await
+                .0
+                .expect("the head writes");
+            write
+                .write_all(reply.clone().into_bytes())
+                .await
+                .0
+                .expect("the body writes");
+        }
+        futures_util::future::pending::<()>().await;
+    };
+    let mut client = NativeBackend::on_current_thread(
+        Transport::builder()
+            .proxy(Proxy::none())
+            .build()
+            .expect("transport builds"),
+        io,
+        executor,
+    );
+    against(server, async {
+        let url = format!("http://127.0.0.1:{port}/big");
+        let mut body = client
+            .get(&url)
+            .expect("request builds")
+            .await
+            .expect("the GET succeeds")
+            .into_body();
+        let mut offer = PipeOffer::new(64 * 1024);
+        let mut received = Vec::new();
+        let mut pipes = 0_usize;
+        while let Some(frame) =
+            poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame_offering(cx, &mut offer)).await
+        {
+            match frame.expect("the frame reads") {
+                BodyFrame::Data(data) => received.extend_from_slice(&data),
+                BodyFrame::Pipe(pipe) => {
+                    pipes += 1;
+                    let (data, _empty) = pipe.read_out().expect("the pipe reads out");
+                    received.extend_from_slice(&data);
+                }
+                frame => panic!("a response body holds no {frame:?}"),
+            }
+        }
+        assert!(pipes > 0, "no run of the body arrived as a pipe frame");
+        assert_eq!(received, payload.as_bytes());
+
+        let again = client
+            .get(&url)
+            .expect("request builds")
+            .await
+            .expect("the second GET succeeds");
+        assert_eq!(&*again.into_string().await.expect("body reads"), payload);
+    })
+    .await;
+}
+
+/// The switched stream of a plain TCP connection splices: the bytes the
+/// server wrote behind its `101` head go to the tunnel's other end first,
+/// then each direction is forwarded by the kernel until both end.
+#[cfg(target_os = "linux")]
+async fn splice_upgrade<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    use http_kit::utils::Bytes;
+    use http_kit_io::splice::SpliceDuplex;
+    use zenwave::backend::Upgrade;
+
+    let upstream = io.bind_tcp(loopback()).expect("bind");
+    let port = upstream.local_addr().expect("local address").port();
+    let peer = io.bind_tcp(loopback()).expect("bind");
+    let peer_addr = peer.local_addr().expect("local address");
+    let server = async move {
+        let (stream, _) = upstream.accept().await.expect("accept");
+        let (mut read, mut write) = stream.split();
+        read_head(&mut read).await;
+        let mut answer =
+            b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: echo\r\n\r\n"
+                .to_vec();
+        answer.extend_from_slice(EARLY.as_bytes());
+        write.write_all(answer).await.0.expect("the 101 writes");
+        assert_eq!(read_len(&mut read, PING.len()).await, PING.as_bytes());
+        write
+            .write_all(PONG.as_bytes().to_vec())
+            .await
+            .0
+            .expect("the pong writes");
+        write.shutdown().await.expect("the server ends its side");
+    };
+    let far_end = async move {
+        let (stream, _) = peer.accept().await.expect("accept");
+        let (mut read, mut write) = stream.split();
+        assert_eq!(read_len(&mut read, EARLY.len()).await, EARLY.as_bytes());
+        write
+            .write_all(PING.as_bytes().to_vec())
+            .await
+            .0
+            .expect("the ping writes");
+        assert_eq!(read_len(&mut read, PONG.len()).await, PONG.as_bytes());
+        write.shutdown().await.expect("the far end ends its side");
+    };
+    let mut client = NativeBackend::on_current_thread(
+        Transport::builder()
+            .proxy(Proxy::none())
+            .build()
+            .expect("transport builds"),
+        io.clone(),
+        executor,
+    );
+    let tunnel = async {
+        let mut response = client
+            .get(format!("http://127.0.0.1:{port}/echo"))
+            .expect("request builds")
+            .header("connection", "upgrade")
+            .expect("header")
+            .header("upgrade", "echo")
+            .expect("header")
+            .await
+            .expect("the upgrade is answered");
+        let switched = Upgrade::on(&mut response)
+            .expect("a 101 carries its upgrade")
+            .switched()
+            .await
+            .expect("the switched stream is handed over");
+        assert!(switched.can_splice());
+        let ours = switched.into_splice().expect("a plain socket splices");
+        let (read, write) = io.connect(peer_addr).await.expect("connect").split();
+        let theirs = SpliceDuplex::new(Bytes::new(), read, write);
+        let (forward, backward) = ours.join(theirs).await.expect("the tunnel forwards");
+        assert_eq!(forward, (EARLY.len() + PONG.len()) as u64);
+        assert_eq!(backward, PING.len() as u64);
+    };
+    futures_util::join!(server, far_end, tunnel);
+}
+
 #[cfg(feature = "native-compio")]
 mod compio_runtime {
     use http_kit_io::compio::Compio;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_response_body_arrives_as_pipe_frames() {
+        run(super::pipe_body);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_switched_plain_socket_splices() {
+        run(super::splice_upgrade);
+    }
 
     fn run(test: impl AsyncFnOnce(Compio, &compio::runtime::Runtime)) {
         let runtime = compio::runtime::Runtime::new().expect("compio runtime");
@@ -958,6 +1122,18 @@ mod compio_runtime {
 #[cfg(feature = "native-tokio")]
 mod tokio_runtime {
     use http_kit_io::tokio::Tokio;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_response_body_arrives_as_pipe_frames() {
+        run(super::pipe_body);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_switched_plain_socket_splices() {
+        run(super::splice_upgrade);
+    }
 
     fn run(test: impl AsyncFnOnce(Tokio, &tokio::task::LocalSet)) {
         let runtime = tokio::runtime::Builder::new_current_thread()
