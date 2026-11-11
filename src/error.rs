@@ -559,7 +559,7 @@ pub enum Cause {
     #[error(transparent)]
     NativeTls(native_tls::Error),
     /// A PEM document that is not one.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(native)]
     #[error(transparent)]
     Pem(rustls_pki_types::pem::Error),
     /// hyper.
@@ -583,7 +583,7 @@ pub enum Cause {
     #[error(transparent)]
     H3Stream(h3::error::StreamError),
     /// libcurl.
-    #[cfg(all(not(target_arch = "wasm32"), feature = "curl-backend"))]
+    #[cfg(all(reactor, feature = "curl-backend"))]
     #[error(transparent)]
     Curl(curl::Error),
     /// `URLSession`: an `NSError`.
@@ -761,24 +761,19 @@ pub enum WebSocketErrorKind {
 impl Error {
     /// A TLS configuration failure: the engine could not be built from the
     /// transport's settings.
-    #[cfg(any(
-        tls_engine,
-        http3,
-        native_h3,
-        all(not(target_arch = "wasm32"), feature = "curl-backend")
-    ))]
+    #[cfg(any(tls_engine, http3, native_h3, all(reactor, feature = "curl-backend")))]
     pub(crate) fn tls_config(cause: impl Into<Cause>) -> Self {
         Self::Config(ConfigError::Tls(cause.into()))
     }
 
     /// A trust-store failure.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(native)]
     pub(crate) fn trust_store(cause: impl Into<Cause>) -> Self {
         Self::Config(ConfigError::TrustStore(cause.into()))
     }
 
     /// A failure to connect to `host`:`port`, the `hop` of the route.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(native)]
     pub(crate) fn connect(
         hop: Hop,
         host: impl Into<String>,

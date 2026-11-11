@@ -312,7 +312,7 @@ impl CacheControl {
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, reactor))]
 mod tests {
     use super::*;
     use http::Request as HttpRequest;

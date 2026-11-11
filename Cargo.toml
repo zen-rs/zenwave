@@ -44,12 +44,6 @@ futures-channel = "0.3.34"
 thiserror = "2.0.21"
 futures-io = "0.3.34"
 async-lock = "3.4.2"
-# Capped at the wasm-bindgen 0.2.120 generation: `tests/workerd` deploys through
-# the `skyzen` CLI, whose embedded bindings generator is wasm-bindgen 0.2.120
-# and refuses any other resolved version. js-sys/web-sys 0.3.98+ and
-# wasm-bindgen 0.2.121+ cannot satisfy that pin, so the declared minimums must
-# not exclude 0.2.120-generation releases.
-js-sys = "0.3.97"
 http = "1.5.0"
 httpdate = "1.0.3"
 tracing = "0.1.44"
@@ -117,6 +111,7 @@ rustls = [
     "dep:rustls",
     "dep:rustls-platform-verifier",
     "dep:webpki-root-certs",
+    "dep:webpki-roots",
 ]
 # The platform's native TLS library (OpenSSL, SChannel, or Security.framework),
 # driven on futures-io streams by an in-tree adapter.
@@ -185,7 +180,14 @@ public-suffix = [
     "dep:webpki-roots",
 ]
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The browser and Workers Fetch backend: wasm32 without a WASI host.
+[target.'cfg(all(target_arch = "wasm32", not(target_os = "wasi")))'.dependencies]
+# Capped at the wasm-bindgen 0.2.120 generation: `tests/workerd` deploys through
+# the `skyzen` CLI, whose embedded bindings generator is wasm-bindgen 0.2.120
+# and refuses any other resolved version. js-sys/web-sys 0.3.98+ and
+# wasm-bindgen 0.2.121+ cannot satisfy that pin, so the declared minimums must
+# not exclude 0.2.120-generation releases.
+js-sys = "0.3.97"
 web-sys = { version = "0.3.97", features = [
     "Window",
     "Request",
@@ -212,7 +214,7 @@ cookie_store = { version = "0.22.1", default-features = false, features = [
     "wasm-bindgen",
 ] }
 
-[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+[target.'cfg(all(target_arch = "wasm32", not(target_os = "wasi")))'.dev-dependencies]
 wasm-bindgen-test = "0.3.79"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
@@ -224,19 +226,42 @@ hyper = { version = "1.12.0", features = ["server", "http1", "http2"] }
 # The websocket echo endpoint in `tests/common/fixture.rs`.
 async-tungstenite = { version = "0.35.0", default-features = false, features = ["smol-runtime"] }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-async-io = "2.6.0"
-async-net = "2.0.0"
+# What the native backend over a caller's `http-kit-io` sockets needs, on every
+# native target including WASI, whose host supplies sockets, resolver and clock.
+[target.'cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))'.dependencies]
 async-trait = "0.1.92"
-blocking = { version = "1.7.0", optional = true }
-curl = { version = "0.4.51", optional = true }
-dns-lookup = { version = "4.0.2", optional = true }
 executor-core = { version = "0.7.2" }
-# The native backend: owned-buffer sockets, HTTP/1.1, TLS and HTTP/3 on them,
-# and the runtimes it can drive itself.
+# The native backend: owned-buffer sockets, HTTP/1.1 and TLS on them.
 http-kit-io = { version = "0.6.1", optional = true }
 http-kit-h1 = { version = "0.6.0", optional = true }
 http-kit-tls = { version = "0.4.0", optional = true }
+futures-rustls = { version = "0.26.0", optional = true, default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23.46", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+# The environment's proxy rules (`transport::proxy`).
+hyper-util = { version = "0.1.21", default-features = false, features = ["client-proxy", "client-proxy-system"] }
+bytes = { version = "1.12.1", optional = true }
+async-fs = { version = "2.2.0", default-features = false }
+dirs = "7.0.0"
+once_cell = "1.21.4"
+time = "0.3.55"
+tower-service = "0.3.3"
+
+# WASI has no platform trust store to verify against: Mozilla's roots are
+# compiled in, through the `rustls` feature.
+[target.'cfg(target_os = "wasi")'.dependencies]
+webpki-roots = { version = "1.0.11", optional = true }
+
+# What needs an OS reactor or a platform with processes and sockets of its own
+# (async-io's `polling` has no WASI backend): the async-io/async-net sockets
+# and timers, `getaddrinfo`, hyper, hickory, curl, QUIC and the driver runtimes.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+async-io = "2.6.0"
+async-net = "2.0.0"
+blocking = { version = "1.7.0", optional = true }
+curl = { version = "0.4.51", optional = true }
+dns-lookup = { version = "4.0.2", optional = true }
+# HTTP/3 for the native backend: quiche.
 http-kit-h3 = { version = "0.6.0", optional = true }
 compio = { version = "0.19.2", default-features = false, features = ["runtime"], optional = true }
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time"], optional = true }
@@ -245,11 +270,7 @@ hickory-resolver = { version = "0.26.3", default-features = false, features = ["
 hyper = { version = "1.12.0", default-features = false, features = ["client", "http1"] }
 # The h2 error type the hyper backend inspects to recognize a remote GOAWAY.
 h2 = { version = "0.4.20", optional = true }
-hyper-util = { version = "0.1.21", default-features = false, features = ["client-proxy", "client-proxy-system"] }
 http-body-util = "0.1.5"
-futures-rustls = { version = "0.26.0", optional = true, default-features = false, features = ["ring", "tls12"] }
-rustls = { version = "0.23.46", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pki-types = { version = "1.15.1", features = ["std"] }
 rustls-native-certs = { version = "0.8.5", optional = true }
 pem = { version = "4.0.0", optional = true }
 native-tls = { version = "0.2.18", optional = true, features = ["alpn"] }
@@ -259,17 +280,12 @@ h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
 # Nonblocking socket work in `transport::dns::runtime` and `transport::quic`.
 socket2 = "0.6.5"
-bytes = { version = "1.12.1", optional = true }
-async-fs = { version = "2.2.0", default-features = false }
-dirs = "7.0.0"
-once_cell = "1.21.4"
-time = "0.3.55"
-tower-service = "0.3.3"
 
 # The OneCRL baseline applies where `rustls` chains are checked by webpki:
-# every target but Apple and Windows (whose trust services distrust on their
-# own) and wasm32 (no native TLS at all).
-[target.'cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple"), not(windows)))'.dependencies]
+# every native target (WASI included, over its compiled-in roots) but Apple and
+# Windows (whose trust services distrust on their own) and the browser (no
+# native TLS at all).
+[target.'cfg(all(any(not(target_arch = "wasm32"), target_os = "wasi"), not(target_vendor = "apple"), not(windows)))'.dependencies]
 webpki = { package = "rustls-webpki", version = "0.103.16", optional = true, default-features = false, features = ["alloc"] }
 ring = { version = "0.17.14", optional = true, default-features = false }
 # The refresher swaps in a merged additions table per round.

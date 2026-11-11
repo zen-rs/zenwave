@@ -4,7 +4,7 @@ use core::{fmt::Display, pin::Pin, time::Duration};
 use std::marker::PhantomData;
 use std::{fmt::Debug, future::Future};
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(native)]
 use futures_io::AsyncRead;
 use futures_util::{Stream, StreamExt};
 use http::{HeaderName, HeaderValue, header};
@@ -16,9 +16,9 @@ use http_kit::{
 };
 use serde::de::DeserializeOwned;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(native)]
 mod download;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(native)]
 pub use download::{DownloadError, DownloadOptions, DownloadReport};
 
 use crate::{
@@ -145,7 +145,7 @@ impl<T: Client> RequestBuilder<'_, T> {
     }
 
     /// Provide an async reader as the request body.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(native)]
     pub fn reader_body<R>(mut self, reader: R, length: Option<u64>) -> Self
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
@@ -178,7 +178,7 @@ impl<T: Client> RequestBuilder<'_, T> {
     }
 
     /// Stream a file from disk as the request body without loading it into memory.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(native)]
     ///
     /// # Errors
     ///
@@ -207,7 +207,7 @@ impl<T: Client> RequestBuilder<'_, T> {
     }
 
     /// Download the response body into the provided path, resuming partial files automatically.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(native)]
     pub async fn download_to_path(
         self,
         path: impl AsRef<std::path::Path>,
@@ -216,7 +216,7 @@ impl<T: Client> RequestBuilder<'_, T> {
     }
 
     /// Download the response body into a path using custom [`DownloadOptions`].
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(native)]
     pub async fn download_to_path_with(
         self,
         path: impl AsRef<std::path::Path>,
@@ -287,7 +287,7 @@ where
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, reactor))]
 mod tests {
     use super::*;
     use async_fs as fs;
@@ -569,7 +569,7 @@ pub trait Client: SendEndpoint + Sized {
     }
 
     /// Enable cookie management with persistent backing storage (native targets only).
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(native)]
     fn enable_persistent_cookie(self) -> WithMiddleware<Self, CookieStore> {
         WithMiddleware::new(self, CookieStore::persistent_default())
     }

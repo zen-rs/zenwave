@@ -11,6 +11,17 @@
 //! No backend selection is available or needed - the web backend uses the browser's
 //! native Fetch API.
 //!
+//! ## WASI (`wasm32-wasip2`)
+//! A WASI host has no browser and no OS reactor, but sockets, name resolution
+//! and a clock through the host. Only `native-backend` exists there:
+//! `NativeBackend::on_current_thread` over the host's `http-kit-io`
+//! implementation (`Dial`, `Resolve`, `Timer`), HTTP/1.1, and TLS verified
+//! against `webpki-roots` compiled into the binary, with the compiled OneCRL
+//! table applied (its refresher needs a thread and a connector, and is left
+//! out). `hyper-backend`, `curl-backend`, `ws`, `native-tls`, `native-compio`,
+//! `native-tokio`, `native-http3` and `native-kernel-tls` are refused with a
+//! compile error.
+//!
 //! ## Native Platforms
 //! On native platforms, users can choose their preferred backend:
 //!
@@ -34,9 +45,9 @@
 #[cfg(any(default_hyper, native_backend))]
 mod shared;
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "hyper-backend"))]
+#[cfg(all(reactor, feature = "hyper-backend"))]
 mod hyper;
-#[cfg(all(not(target_arch = "wasm32"), feature = "hyper-backend"))]
+#[cfg(all(reactor, feature = "hyper-backend"))]
 pub use hyper::HyperBackend;
 // The connection pool stores the h3 handle.
 #[cfg(http3)]
@@ -45,9 +56,9 @@ pub(crate) use hyper::h3;
 #[cfg(all(test, http3))]
 pub(crate) use hyper::test_support;
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "curl-backend"))]
+#[cfg(all(reactor, feature = "curl-backend"))]
 mod curl;
-#[cfg(all(not(target_arch = "wasm32"), feature = "curl-backend"))]
+#[cfg(all(reactor, feature = "curl-backend"))]
 pub use curl::CurlBackend;
 
 #[cfg(apple_backend)]
@@ -64,7 +75,7 @@ pub use apple::AppleBackend;
 /// Hyper takes precedence whenever it is enabled so Cargo feature unification
 /// cannot silently replace an explicitly requested Hyper transport with a
 /// platform backend pulled in by an unrelated dependency.
-#[cfg(all(not(target_arch = "wasm32"), feature = "hyper-backend"))]
+#[cfg(default_hyper)]
 pub type DefaultBackend = HyperBackend;
 
 #[cfg(native_backend)]
@@ -102,15 +113,15 @@ pub type DefaultBackend = CurlBackend;
 // WASM backend (always used on wasm32, no user selection)
 // ============================================================================
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(browser)]
 mod web;
-#[cfg(target_arch = "wasm32")]
+#[cfg(browser)]
 pub use web::WebBackend;
 
 /// The default HTTP client backend for WebAssembly.
 /// On wasm32 targets, the built-in web backend using the Fetch API is always used.
 /// This cannot be changed - it's the only backend available for wasm32.
-#[cfg(target_arch = "wasm32")]
+#[cfg(browser)]
 pub type DefaultBackend = WebBackend;
 
 // ============================================================================
@@ -122,7 +133,7 @@ pub type DefaultBackend = WebBackend;
 // need a `DefaultBackend` (`zenwave::client()`, `DefaultClient`, the
 // one-shot request functions) are absent.
 #[cfg(all(
-    not(target_arch = "wasm32"),
+    native,
     not(apple_backend),
     not(feature = "hyper-backend"),
     not(feature = "curl-backend"),
@@ -144,30 +155,84 @@ compile_error!(
 // Users cannot explicitly select backends on wasm32 - the web backend is always used.
 // These compile errors help catch misconfigurations early.
 
-#[cfg(all(target_arch = "wasm32", feature = "hyper-native-tls"))]
+#[cfg(all(browser, feature = "hyper-native-tls"))]
 compile_error!(
     "Backend selection is not allowed on wasm32 targets. \
      The web backend using the browser's Fetch API is always used automatically. \
      Please remove the `hyper-native-tls` feature when targeting wasm32."
 );
 
-#[cfg(all(target_arch = "wasm32", feature = "hyper-rustls"))]
+#[cfg(all(browser, feature = "hyper-rustls"))]
 compile_error!(
     "Backend selection is not allowed on wasm32 targets. \
      The web backend using the browser's Fetch API is always used automatically. \
      Please remove the `hyper-rustls` feature when targeting wasm32."
 );
 
-#[cfg(all(target_arch = "wasm32", feature = "apple-backend"))]
+#[cfg(all(browser, feature = "apple-backend"))]
 compile_error!(
     "Backend selection is not allowed on wasm32 targets. \
      The web backend using the browser's Fetch API is always used automatically. \
      Please remove the `apple-backend` feature when targeting wasm32."
 );
 
-#[cfg(all(target_arch = "wasm32", feature = "curl-backend"))]
+#[cfg(all(browser, feature = "curl-backend"))]
 compile_error!(
     "Backend selection is not allowed on wasm32 targets. \
      The web backend using the browser's Fetch API is always used automatically. \
      Please remove the `curl-backend` feature when targeting wasm32."
+);
+
+// ============================================================================
+// Compile-time validation for WASI: the native backend over the host's sockets
+// ============================================================================
+
+// A WASI host has no OS reactor, no `getaddrinfo`, no QUIC socket and no
+// kernel TLS: the native backend runs there on the caller's `Dial`, `Resolve`
+// and `Timer` with HTTP/1.1 over TLS, and every feature that needs more is
+// refused instead of compiling to nothing.
+
+#[cfg(all(target_os = "wasi", feature = "hyper-backend"))]
+compile_error!(
+    "`hyper-backend` needs an OS reactor, which WASI does not have. \
+     Use `native-backend` with the host's `Dial`, `Resolve` and `Timer`."
+);
+
+#[cfg(all(target_os = "wasi", feature = "curl-backend"))]
+compile_error!(
+    "`curl-backend` needs libcurl and an OS reactor, which WASI does not have. \
+     Use `native-backend` with the host's `Dial`, `Resolve` and `Timer`."
+);
+
+#[cfg(all(target_os = "wasi", feature = "ws"))]
+compile_error!(
+    "`ws` needs an OS reactor, which WASI does not have. \
+     Disable it when targeting WASI."
+);
+
+#[cfg(all(target_os = "wasi", feature = "native-tls"))]
+compile_error!(
+    "`native-tls` needs the platform's TLS library, which WASI does not have. \
+     `rustls` verifies against compiled-in `webpki-roots` there."
+);
+
+#[cfg(all(
+    target_os = "wasi",
+    any(feature = "native-compio", feature = "native-tokio")
+))]
+compile_error!(
+    "`native-compio` and `native-tokio` drive the native backend on an OS reactor, \
+     which WASI does not have. Construct `NativeBackend::on_current_thread` on the \
+     host's executor instead."
+);
+
+#[cfg(all(target_os = "wasi", feature = "native-http3"))]
+compile_error!(
+    "`native-http3` needs QUIC sockets and a C toolchain for quiche, which are not \
+     available on WASI."
+);
+
+#[cfg(all(target_os = "wasi", feature = "native-kernel-tls"))]
+compile_error!(
+    "`native-kernel-tls` moves a connection's record layer into the Linux kernel; it does not exist on WASI."
 );
