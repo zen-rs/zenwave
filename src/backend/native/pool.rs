@@ -441,10 +441,24 @@ impl<I: NativeIo> Pool<I> {
             );
             return;
         };
-        let tls = self
-            .tls
-            .get_or_insert_with(|| TlsConnector::new(transport.tls().http1_config().clone()))
-            .clone();
+        let tls = match &self.tls {
+            Some(tls) => tls.clone(),
+            None => match connect::connector(transport.tls().http1_config().clone()) {
+                Ok(tls) => self.tls.insert(tls).clone(),
+                Err(error) => {
+                    self.tasks.push(
+                        async move {
+                            Some(Event::H1Dialed {
+                                origin,
+                                result: Err(error),
+                            })
+                        }
+                        .boxed_local(),
+                    );
+                    return;
+                }
+            },
+        };
         let io = self.io.clone();
         self.tasks.push(
             async move {
@@ -458,7 +472,9 @@ impl<I: NativeIo> Pool<I> {
     fn h1_dialed(&mut self, origin: &Origin, result: Result<Dialed, Error>) {
         self.entry(origin).dialing -= 1;
         match result {
-            Ok(Dialed { send, via, driver }) => {
+            Ok(Dialed {
+                send, via, driver, ..
+            }) => {
                 self.tasks.push(driver.map(|()| None).boxed_local());
                 self.offer(origin, send, via, false);
             }

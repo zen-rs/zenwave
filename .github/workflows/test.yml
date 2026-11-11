@@ -67,10 +67,13 @@ jobs:
         with:
           shared-key: test-${{ matrix.os }}-native-${{ matrix.runtime }}
       - uses: taiki-e/install-action@nextest
+      - name: Load kernel TLS
+        if: runner.os == 'Linux'
+        run: sudo modprobe tls
       - name: Run native backend tests
-        run: cargo nextest run --no-default-features --features native-${{ matrix.runtime }},native-http3 --workspace
+        run: cargo nextest run --no-default-features --features native-${{ matrix.runtime }},native-http3,native-kernel-tls --workspace
       - name: Run native backend doctests
-        run: cargo test --doc --no-default-features --features native-${{ matrix.runtime }},native-http3 --workspace
+        run: cargo test --doc --no-default-features --features native-${{ matrix.runtime }},native-http3,native-kernel-tls --workspace
 
   wasm-linux:
     name: wasm-pack (Linux - ${{ matrix.browser }})
