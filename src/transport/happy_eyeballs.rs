@@ -71,9 +71,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Resolve `host`:`port` to socket addresses in the order [`connect`] would
 /// attempt them — getaddrinfo's RFC 6724 ordering where the system reports
-/// it, otherwise the RFC 8305 interleave. QUIC dials share the result: a UDP
-/// handshake races in the same address order TCP would have used; a SOCKS5
-/// proxy that resolves nothing itself is handed the first.
+/// it, otherwise the RFC 8305 interleave, once every lookup has finished:
+/// the hyper backend's QUIC dial and a SOCKS5 proxy that resolves nothing
+/// itself, which is handed the first.
 pub async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![SocketAddr::new(ip, port)]);
@@ -94,7 +94,8 @@ pub async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
 }
 
 /// Connects to `host`:`port` through `dialer`, racing the resolved
-/// addresses as RFC 8305 describes.
+/// addresses as RFC 8305 describes. The dialer's streams are TCP or
+/// anything else one address connects to, QUIC included.
 pub async fn connect<D: Dialer>(dialer: &D, host: &str, port: u16) -> io::Result<D::Stream> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         let addr = SocketAddr::new(ip, port);
@@ -103,9 +104,57 @@ pub async fn connect<D: Dialer>(dialer: &D, host: &str, port: u16) -> io::Result
             .map_err(|error| io::Error::new(error.kind(), format!("{addr}: {error}")));
     }
 
+    race(dialer, Resolution(start_resolution(host, port))).await
+}
+
+/// A name's lookups in flight: each family's answer and the system's
+/// sorted snapshot, as they arrive.
+pub struct Resolution(UnboundedReceiver<ResolutionEvent>);
+
+#[cfg(all(
+    test,
+    native_h3,
+    any(feature = "native-compio", feature = "native-tokio")
+))]
+impl Resolution {
+    /// `answer`'s family answered at once and the other family's lookup
+    /// never does for as long as the returned sender lives, as a system
+    /// resolver holding one query for seconds behaves. No sorted snapshot
+    /// arrives either: it waits on the same resolver.
+    pub(crate) fn with_other_family_stalled(answer: SocketAddr) -> (Self, Stall) {
+        let (sender, receiver) = unbounded();
+        let family = if answer.is_ipv6() {
+            AddressFamilyKind::Ipv6
+        } else {
+            AddressFamilyKind::Ipv4
+        };
+        sender
+            .unbounded_send(ResolutionEvent {
+                kind: ResolutionEventKind::Family {
+                    family,
+                    result: ResolutionResult::Addresses(vec![answer]),
+                },
+            })
+            .expect("the receiver is still held here");
+        (Self(receiver), Stall(sender))
+    }
+}
+
+/// Holds a stalled lookup open: the lookup answers nothing until this is
+/// dropped.
+#[cfg(all(
+    test,
+    native_h3,
+    any(feature = "native-compio", feature = "native-tokio")
+))]
+pub struct Stall(#[expect(dead_code)] futures_channel::mpsc::UnboundedSender<ResolutionEvent>);
+
+/// Races the addresses `resolution` delivers, starting with those known
+/// and taking the rest as they arrive.
+pub async fn race<D: Dialer>(dialer: &D, resolution: Resolution) -> io::Result<D::Stream> {
     let mut state = HappyEyeballsState::new();
     let mut attempts = FuturesUnordered::new();
-    let mut resolver = start_resolution(host, port);
+    let mut resolver = resolution.0;
     let mut resolver_closed = false;
 
     loop {

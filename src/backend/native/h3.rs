@@ -14,6 +14,7 @@
 
 use std::{
     cell::RefCell,
+    future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     rc::Rc,
     sync::Arc,
@@ -43,7 +44,7 @@ use crate::{
     transport::{
         Spawn,
         discovery::{H3Knowledge, HttpsRr},
-        happy_eyeballs,
+        happy_eyeballs::{self, Dialer},
         route::{IDLE_TIMEOUT, Origin},
     },
 };
@@ -291,9 +292,11 @@ fn spawn_on_threads() -> Spawn {
 }
 
 /// A QUIC connection to `host`:`port` whose handshake completed by
-/// `deadline`. The resolved addresses are tried one after another in the
-/// order a TCP dial would race them, each on a UDP socket of the pool's
-/// I/O, with `deadline` covering resolution and every attempt together.
+/// `deadline`. The addresses are raced as a TCP dial races them (RFC 8305),
+/// each attempt on a UDP socket of the pool's I/O: the dial starts with the
+/// addresses known and takes a late family's as its lookup answers, so one
+/// stalled lookup does not hold the other family back. `deadline` covers
+/// resolution and every attempt together.
 async fn connect<I: Io>(
     io: &I,
     transport: &Transport,
@@ -302,34 +305,73 @@ async fn connect<I: Io>(
     port: u16,
     deadline: Instant,
 ) -> Result<Established, Error> {
-    let addrs = {
-        let resolve = happy_eyeballs::resolve(host, port);
-        let expire = io.sleep_until(deadline);
-        pin_mut!(resolve, expire);
-        match select(resolve, expire).await {
-            Either::Left((addrs, _)) => addrs.map_err(|error| Error::Transport(Box::new(error)))?,
-            Either::Right(((), _)) => Vec::new(),
-        }
+    let dialer = QuicDialer {
+        io,
+        transport,
+        client,
+        host,
+        deadline,
     };
-    let mut last_error = None;
-    for peer in addrs {
-        if Instant::now() >= deadline {
-            break;
-        }
-        match attempt(io, transport, client, host, peer, deadline).await {
-            Ok(established) => return Ok(established),
-            Err(error) => {
-                debug!(%host, %peer, %error, "QUIC attempt failed");
-                last_error = Some(error);
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| {
-        Error::Transport(Box::new(std::io::Error::new(
+    within(
+        io,
+        host,
+        port,
+        deadline,
+        happy_eyeballs::connect(&dialer, host, port),
+    )
+    .await
+}
+
+/// `dial`'s outcome, or a timeout once `deadline` passes.
+async fn within<I: Io>(
+    io: &I,
+    host: &str,
+    port: u16,
+    deadline: Instant,
+    dial: impl Future<Output = std::io::Result<Established>>,
+) -> Result<Established, Error> {
+    let expire = io.sleep_until(deadline);
+    pin_mut!(dial, expire);
+    match select(dial, expire).await {
+        Either::Left((result, _)) => result.map_err(|error| Error::Transport(Box::new(error))),
+        Either::Right(((), _)) => Err(Error::Transport(Box::new(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             format!("QUIC connect to {host}:{port} timed out"),
-        )))
-    }))
+        )))),
+    }
+}
+
+/// The happy eyeballs dialer for QUIC: an address is one handshake.
+struct QuicDialer<'a, I> {
+    io: &'a I,
+    transport: &'a Transport,
+    client: &'a H3Client,
+    host: &'a str,
+    deadline: Instant,
+}
+
+impl<I: Io> Dialer for QuicDialer<'_, I> {
+    type Stream = Established;
+
+    async fn dial(&self, addr: SocketAddr) -> std::io::Result<Established> {
+        attempt(
+            self.io,
+            self.transport,
+            self.client,
+            self.host,
+            addr,
+            self.deadline,
+        )
+        .await
+        .map_err(|error| {
+            debug!(host = %self.host, peer = %addr, %error, "QUIC attempt failed");
+            std::io::Error::other(error)
+        })
+    }
+
+    fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> {
+        self.io.sleep_until(deadline)
+    }
 }
 
 /// One QUIC handshake with `peer`, driven until it completes, fails or
@@ -710,6 +752,94 @@ mod tests {
         let (outcome, seen) = handshake(io, None).await;
         assert!(outcome.is_ok(), "no staple passes: {outcome:?}");
         assert_eq!(seen, vec![Vec::<u8>::new()]);
+    }
+
+    /// A QUIC dial to a name whose AAAA lookup never answers connects over
+    /// the IPv4 address that did, once the resolution delay passes, far
+    /// inside the dial's deadline: the dial does not wait on the stalled
+    /// lookup.
+    #[cfg(any(feature = "native-compio", feature = "native-tokio"))]
+    async fn stalled_aaaa_does_not_hold_the_dial<I: Io>(io: I) {
+        let issued = issue("zenwave h3 stalled lookup CA");
+        let transport = Transport::builder()
+            .proxy(Proxy::none())
+            .extra_root_certificate_der(issued.ca_der.clone())
+            .build()
+            .expect("transport builds");
+        let identity = http_kit_h3::Identity::from_pem(issued.leaf_pem, issued.leaf_key_pem);
+        let server_socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("UDP binds");
+        let peer = server_socket.local_addr().expect("local address");
+        let server = http_kit_h3::Server::new(
+            io.udp_socket(server_socket).expect("adopt UDP socket"),
+            io.clone(),
+            &http_kit_h3::ServerConfig::new(identity, MAX_FIELD_SECTION_SIZE),
+        )
+        .expect("h3 server");
+        let service = |_request: http_kit::Request| async {
+            http_kit::Response::new(http_kit::Body::from_bytes("你好 こんにちは 안녕"))
+        };
+        let serving = async {
+            server.serve(&service).await.expect("h3 server runs");
+        };
+
+        // The A lookup answers with the server; the AAAA lookup is held for
+        // as long as `stalled` lives.
+        let (resolution, stalled) = happy_eyeballs::Resolution::with_other_family_stalled(peer);
+        let client = H3Client::default();
+        let dialer = QuicDialer {
+            io: &io,
+            transport: &transport,
+            client: &client,
+            host: "localhost",
+            deadline: Instant::now() + std::time::Duration::from_secs(5),
+        };
+        let started = Instant::now();
+        let dial = within(
+            &io,
+            "localhost",
+            peer.port(),
+            dialer.deadline,
+            happy_eyeballs::race(&dialer, resolution),
+        );
+        pin_mut!(serving, dial);
+        let established = match select(dial, serving).await {
+            Either::Left((established, _)) => established,
+            Either::Right(_) => unreachable!("the server runs until dropped"),
+        };
+        assert!(
+            established.is_ok(),
+            "the dial connects over IPv4 while AAAA is stalled: {:?}",
+            established.err()
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "connected in {:?}, well inside the 5 s deadline",
+            started.elapsed()
+        );
+        drop(stalled);
+    }
+
+    #[cfg(feature = "native-compio")]
+    #[test]
+    fn h3_dial_survives_a_stalled_aaaa_on_compio() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime");
+        runtime.block_on(stalled_aaaa_does_not_hold_the_dial(
+            http_kit_io::compio::Compio,
+        ));
+    }
+
+    #[cfg(feature = "native-tokio")]
+    #[test]
+    fn h3_dial_survives_a_stalled_aaaa_on_tokio() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(
+            &runtime,
+            stalled_aaaa_does_not_hold_the_dial(http_kit_io::tokio::Tokio),
+        );
     }
 
     /// The verifier's verdict on a revoked staple is the TLS one:
