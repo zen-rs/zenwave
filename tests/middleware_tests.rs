@@ -334,6 +334,15 @@ http_kit::impl_send_endpoint!(SlowClient);
 #[cfg(not(target_arch = "wasm32"))]
 impl Client for SlowClient {}
 
+#[cfg(not(target_arch = "wasm32"))]
+impl zenwave::clock::Clocked for SlowClient {
+    type Clock = zenwave::clock::AsyncIoClock;
+
+    fn clock(&self) -> zenwave::clock::AsyncIoClock {
+        zenwave::clock::AsyncIoClock
+    }
+}
+
 #[derive(Clone)]
 struct CountingBackend {
     hits: Arc<AtomicUsize>,

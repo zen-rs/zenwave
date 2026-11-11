@@ -1,36 +1,34 @@
-//! Timeout middleware backed by a runtime-agnostic timer.
+//! Timeout middleware on a [`Clock`].
 //!
 //! This middleware cancels in-flight requests when the configured duration
-//! elapses and surfaces a `504 Gateway Timeout` error. It relies on
-//! `async-io`'s timers so it works uniformly across targets without pulling
-//! in a dedicated async runtime.
+//! elapses and surfaces a `504 Gateway Timeout` error. The sleep comes from
+//! the clock it is built with, which a [`Clocked`](crate::clock::Clocked)
+//! client supplies itself ([`Client::timeout`](crate::Client::timeout)).
 
 use core::time::Duration;
 
-#[cfg(not(target_arch = "wasm32"))]
-use async_io::Timer;
 use futures_util::{future::Either, pin_mut};
-#[cfg(target_arch = "wasm32")]
-use gloo_timers::future::TimeoutFuture;
 use http_kit::{
-    Endpoint, HttpError, Middleware, Request, Response, StatusCode, middleware::MiddlewareError,
+    Endpoint, HttpError, Middleware, Request, Response, SendEndpoint, SendMiddleware, StatusCode,
+    middleware::MiddlewareError,
 };
 use thiserror::Error;
 
-#[cfg(target_arch = "wasm32")]
-use crate::single_threaded::SingleThreaded;
+use crate::clock::Clock;
 
 /// Middleware that fails requests exceeding the configured duration.
 #[derive(Debug, Clone, Copy)]
-pub struct Timeout {
+pub struct Timeout<K> {
+    clock: K,
     duration: Duration,
 }
 
-impl Timeout {
-    /// Construct a timeout middleware that limits requests to `duration`.
+impl<K: Clock> Timeout<K> {
+    /// Construct a timeout middleware that limits requests to `duration` on
+    /// `clock`.
     #[must_use]
-    pub const fn new(duration: Duration) -> Self {
-        Self { duration }
+    pub const fn new(clock: K, duration: Duration) -> Self {
+        Self { clock, duration }
     }
 }
 
@@ -52,9 +50,17 @@ impl From<TimeoutError> for crate::Error {
     }
 }
 
-http_kit::impl_send_middleware!(Timeout);
+impl<K: Clock> SendMiddleware for Timeout<K> {
+    fn handle_send<E: SendEndpoint>(
+        &mut self,
+        request: &mut Request,
+        next: E,
+    ) -> impl Future<Output = Result<Response, MiddlewareError<E::Error, Self::Error>>> + Send {
+        self.handle(request, http_kit::endpoint::SendNext::new(next))
+    }
+}
 
-impl Middleware for Timeout {
+impl<K: Clock> Middleware for Timeout<K> {
     type Error = TimeoutError;
     async fn handle<E: Endpoint>(
         &mut self,
@@ -62,36 +68,25 @@ impl Middleware for Timeout {
         mut next: E,
     ) -> Result<Response, http_kit::middleware::MiddlewareError<E::Error, Self::Error>> {
         let response_future = next.respond(request);
-        let timeout_future = timeout_future(self.duration);
+        // The sleep's output is discarded: `select` reports which side
+        // finished first.
+        let timeout_future = self.clock.sleep(self.duration);
 
         pin_mut!(response_future);
         pin_mut!(timeout_future);
 
         match futures_util::future::select(response_future, timeout_future).await {
             Either::Left((result, _)) => Ok(result.map_err(MiddlewareError::Endpoint)?),
-            Either::Right(((), _)) => Err(MiddlewareError::Middleware(TimeoutError)),
+            Either::Right(_) => Err(MiddlewareError::Middleware(TimeoutError)),
         }
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-fn timeout_future(duration: Duration) -> SingleThreaded<TimeoutFuture> {
-    // gloo expects milliseconds as u32; saturate to avoid overflow for long durations.
-    let millis = duration.as_millis().try_into().unwrap_or(u32::MAX);
-    SingleThreaded(TimeoutFuture::new(millis))
-}
-
-// The timer's output is discarded either way (`select` reports which side
-// finished first), so both flavours produce `()` and the match arm can be
-// target-independent.
-#[cfg(not(target_arch = "wasm32"))]
-async fn timeout_future(duration: Duration) {
-    Timer::after(duration).await;
-}
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, reactor))]
 mod tests {
     use super::*;
+    use crate::clock::AsyncIoClock;
+    use async_io::Timer;
     use http_kit::{Body, HttpError, Method};
     use std::{convert::Infallible, time::Duration};
 
@@ -123,7 +118,7 @@ mod tests {
 
     #[test]
     fn completes_before_timeout() {
-        let mut middleware = Timeout::new(Duration::from_millis(50));
+        let mut middleware = Timeout::new(AsyncIoClock, Duration::from_millis(50));
         let backend = SlowEndpoint {
             delay: Duration::from_millis(10),
             status: StatusCode::OK,
@@ -145,7 +140,7 @@ mod tests {
         // Both sides are timers and `select` prefers a ready response, so the
         // backend stays far behind the timeout even when the reactor's first
         // wake-up is late (a simulator on a busy CI runner).
-        let mut middleware = Timeout::new(Duration::from_millis(5));
+        let mut middleware = Timeout::new(AsyncIoClock, Duration::from_millis(5));
         let backend = SlowEndpoint {
             delay: Duration::from_secs(5),
             status: StatusCode::OK,

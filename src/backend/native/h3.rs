@@ -27,7 +27,7 @@ use futures_util::{
     pin_mut,
 };
 use http_kit_h3::{Client, ClientConfig, Presented, Rejection, SendRequest, Verifier};
-use http_kit_io::Io;
+use http_kit_io::{Datagram, Resolve, Timer};
 use rustls::{
     CertificateError,
     client::danger::ServerCertVerifier,
@@ -36,13 +36,13 @@ use rustls::{
 use tracing::debug;
 
 use super::{
-    connect::NativeIo,
+    connect::{NativeIo, NativeResolve},
     pool::{Command, Event, Pool},
 };
 use crate::{
     Error, Transport,
+    dns::ResolveHttps,
     transport::{
-        Spawn,
         discovery::{H3Knowledge, HttpsRr},
         happy_eyeballs::{self, Dialer},
         route::{IDLE_TIMEOUT, Origin},
@@ -149,7 +149,7 @@ impl H3Slot {
     }
 }
 
-impl<I: NativeIo> Pool<I> {
+impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
     /// The origin's live HTTP/3 connection for a request that may use it.
     /// Without one, starts the HTTPS record lookup and the QUIC dial when
     /// they are due; the request then waits in the HTTP/1.1 queue, where a
@@ -177,17 +177,26 @@ impl<I: NativeIo> Pool<I> {
         let generation = slot.generation;
         if discover {
             self.tasks
-                .push(discover_task(transport.clone(), origin.clone()));
+                .push(discover_task(Rc::clone(&self.resolver), origin.clone()));
         }
         if let Some(port) = dial {
             let io = self.io.clone();
+            let resolver = Rc::clone(&self.resolver);
             let client = self.h3.clone();
             let origin = origin.clone();
             self.tasks.push(
                 async move {
                     let deadline = Instant::now() + timeout;
-                    let result =
-                        connect(&io, &transport, &client, &origin.host, port, deadline).await;
+                    let result = connect(
+                        &io,
+                        &*resolver,
+                        &transport,
+                        &client,
+                        &origin.host,
+                        port,
+                        deadline,
+                    )
+                    .await;
                     Some(Event::H3(H3Event::Connected {
                         origin,
                         generation,
@@ -273,22 +282,16 @@ impl<I: NativeIo> Pool<I> {
 }
 
 /// The HTTPS record lookup for `origin`, as a pool task.
-fn discover_task(transport: Transport, origin: Origin) -> LocalBoxFuture<'static, Option<Event>> {
+fn discover_task<R: ResolveHttps + 'static>(
+    resolver: Rc<R>,
+    origin: Origin,
+) -> LocalBoxFuture<'static, Option<Event>> {
     async move {
-        let lookup = transport
-            .https_record(spawn_on_threads(), &origin.host, origin.port)
-            .await;
+        let lookup = resolver.https_record(&origin.host, origin.port).await;
         let rr = HttpsRr::from_lookup(lookup, &origin.host, origin.port, Instant::now());
         Some(Event::H3(H3Event::Discovered { origin, rr }))
     }
     .boxed_local()
-}
-
-/// The resolver's background work, each future on a thread of its own: the
-/// transport's resolver is shared by every pool and outlives any one of
-/// them, so its tasks cannot live on a pool's thread.
-fn spawn_on_threads() -> Spawn {
-    Arc::new(crate::transport::spawn_thread)
 }
 
 /// A QUIC connection to `host`:`port` whose handshake completed by
@@ -297,8 +300,9 @@ fn spawn_on_threads() -> Spawn {
 /// addresses known and takes a late family's as its lookup answers, so one
 /// stalled lookup does not hold the other family back. `deadline` covers
 /// resolution and every attempt together.
-async fn connect<I: Io>(
+async fn connect<I: Datagram + Timer + Clone + 'static, R: Resolve>(
     io: &I,
+    resolver: &R,
     transport: &Transport,
     client: &H3Client,
     host: &str,
@@ -317,7 +321,7 @@ async fn connect<I: Io>(
         host,
         port,
         deadline,
-        happy_eyeballs::connect(&dialer, host, port),
+        happy_eyeballs::connect(&dialer, resolver, host, port),
     )
     .await
     .map_err(|error| Error::Transport(Box::new(error)))
@@ -332,7 +336,7 @@ struct QuicDialer<'a, I> {
     deadline: Instant,
 }
 
-impl<I: Io> Dialer for QuicDialer<'_, I> {
+impl<I: Datagram + Timer + Clone + 'static> Dialer for QuicDialer<'_, I> {
     type Stream = Established;
 
     async fn dial(&self, addr: SocketAddr) -> std::io::Result<Established> {
@@ -363,7 +367,7 @@ impl<I: Io> Dialer for QuicDialer<'_, I> {
 
 /// One QUIC handshake with `peer`, driven until it completes, fails or
 /// `deadline` passes.
-async fn attempt<I: Io>(
+async fn attempt<I: Datagram + Timer + Clone + 'static>(
     io: &I,
     transport: &Transport,
     client: &H3Client,
@@ -380,6 +384,7 @@ async fn attempt<I: Io>(
     );
     let socket = io
         .bind_udp(local)
+        .await
         .map_err(|error| Error::Transport(Box::new(error)))?;
     let (send, connection) = {
         let mut client = client.0.borrow_mut();
@@ -500,6 +505,9 @@ mod tests {
     use time::{Duration, OffsetDateTime};
 
     use std::sync::Mutex;
+
+    #[cfg(any(feature = "native-compio", feature = "native-tokio"))]
+    use http_kit_io::{FromStd, Listen};
 
     use super::*;
     use crate::Proxy;
@@ -660,7 +668,10 @@ mod tests {
     /// [`Recording`]. Returns the handshake's outcome and the OCSP responses the verifier
     /// was shown.
     #[cfg(any(feature = "native-compio", feature = "native-tokio"))]
-    async fn handshake<I: Io>(io: I, staple: Option<&[u8]>) -> (Result<(), Error>, Vec<Vec<u8>>) {
+    async fn handshake<I: FromStd + Timer + Clone + 'static>(
+        io: I,
+        staple: Option<&[u8]>,
+    ) -> (Result<(), Error>, Vec<Vec<u8>>) {
         let issued = issue("zenwave h3 ocsp test CA");
         let transport = Transport::builder()
             .proxy(Proxy::none())
@@ -697,6 +708,7 @@ mod tests {
         .expect("h3 client");
         let socket = io
             .bind_udp("127.0.0.1:0".parse().expect("address"))
+            .await
             .expect("UDP binds");
         let (send, connection) = client
             .connect(socket, io.clone(), "localhost", peer)
@@ -726,7 +738,7 @@ mod tests {
     /// verifier exactly, a revoked one fails the handshake as the same
     /// verifier fails a TLS one, and no stapled response arrives empty.
     #[cfg(any(feature = "native-compio", feature = "native-tokio"))]
-    async fn stapled_status_reaches_the_verifier<I: Io>(io: I) {
+    async fn stapled_status_reaches_the_verifier<I: FromStd + Timer + Clone + 'static>(io: I) {
         let staple = "ocsp response 你好 こんにちは 안녕".as_bytes();
         let (outcome, seen) = handshake(io.clone(), Some(staple)).await;
         assert!(outcome.is_ok(), "a non-revoked staple passes: {outcome:?}");
@@ -747,7 +759,7 @@ mod tests {
     /// lookup. The server starts answering `server_delay` after the dial
     /// begins, as a slow path would; the time the dial took is returned.
     #[cfg(any(feature = "native-compio", feature = "native-tokio"))]
-    async fn dial_with_stalled_aaaa<I: Io>(
+    async fn dial_with_stalled_aaaa<I: FromStd + Timer + Clone + 'static>(
         io: I,
         server_delay: std::time::Duration,
     ) -> std::time::Duration {
@@ -776,7 +788,7 @@ mod tests {
 
         // The A lookup answers with the server; the AAAA lookup is held for
         // as long as `stalled` lives.
-        let (resolution, stalled) = happy_eyeballs::Resolution::with_other_family_stalled(peer);
+        let (resolution, stalled) = happy_eyeballs::with_other_family_stalled(peer);
         let client = H3Client::default();
         let dialer = QuicDialer {
             io: &io,
@@ -809,7 +821,7 @@ mod tests {
 
     /// The scenario: a stalled AAAA lookup does not hold the dial back.
     #[cfg(any(feature = "native-compio", feature = "native-tokio"))]
-    async fn stalled_aaaa_does_not_hold_the_dial<I: Io>(io: I) {
+    async fn stalled_aaaa_does_not_hold_the_dial<I: FromStd + Timer + Clone + 'static>(io: I) {
         let took = dial_with_stalled_aaaa(io, std::time::Duration::ZERO).await;
         assert!(
             took < std::time::Duration::from_secs(2),
@@ -820,7 +832,9 @@ mod tests {
     /// The scenario: the one address's handshake takes longer than TCP's
     /// 2 s attempt bound and still completes inside the dial deadline.
     #[cfg(any(feature = "native-compio", feature = "native-tokio"))]
-    async fn slow_quic_handshake_has_the_dial_deadline<I: Io>(io: I) {
+    async fn slow_quic_handshake_has_the_dial_deadline<I: FromStd + Timer + Clone + 'static>(
+        io: I,
+    ) {
         let took = dial_with_stalled_aaaa(io, std::time::Duration::from_millis(2500)).await;
         assert!(
             took >= std::time::Duration::from_millis(2500),
@@ -911,16 +925,20 @@ mod tests {
     /// marker the verifier recognises: nothing here signs a real OCSP
     /// response.
     #[cfg(any(feature = "native-compio", feature = "native-tokio"))]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scenario, with its server and handshake helpers beside it"
+    )]
     async fn stapled_status_reaches_the_verifier_over_tls<I, E>(io: I, executor: &E)
     where
-        I: super::NativeIo,
+        I: super::NativeIo + Listen,
         E: executor_core::LocalExecutor,
     {
         use http_kit_io::Listener as _;
 
-        async fn serve<I: super::NativeIo>(
+        async fn serve<I: super::NativeIo + Listen>(
             io: I,
-            listener: I::TcpListener,
+            listener: I::Listener,
             acceptor: http_kit_tls::TlsAcceptor,
         ) {
             loop {
@@ -950,7 +968,7 @@ mod tests {
             staple: Option<&[u8]>,
         ) -> (Result<(), Error>, Vec<Vec<u8>>)
         where
-            I: super::NativeIo,
+            I: super::NativeIo + Listen,
             E: executor_core::LocalExecutor,
         {
             let issued = issue("zenwave tls ocsp test CA");
@@ -992,8 +1010,13 @@ mod tests {
                 })
                 .build()
                 .expect("transport builds");
-            let mut client =
-                crate::backend::NativeBackend::on_current_thread(transport, io.clone(), executor);
+            let resolver = crate::dns::System::new(&transport);
+            let mut client = crate::backend::NativeBackend::on_current_thread(
+                transport,
+                io.clone(),
+                resolver,
+                executor,
+            );
             let request = async {
                 use crate::Client as _;
                 client

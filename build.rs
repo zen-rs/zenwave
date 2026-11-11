@@ -86,6 +86,13 @@ fn main() {
     cfg_aliases! {
         // Anything that is not the browser/Workers Fetch backend.
         native: { not(target_arch = "wasm32") },
+        // The browser/Workers Fetch backend and its JS timers.
+        browser: { target_arch = "wasm32" },
+        // async-io's reactor, which drives the sockets and timers of every
+        // backend but the browser's.
+        reactor: { not(target_arch = "wasm32") },
+        // The `getaddrinfo` resolver and the `http-kit-io` it implements.
+        getaddrinfo: { all(not(target_arch = "wasm32"), feature = "getaddrinfo") },
         // The shared async-net TCP/TLS connector is needed by hyper, by native
         // websockets, and by the OneCRL refresher wherever OneCRL applies.
         connector: { all(not(target_arch = "wasm32"), any(

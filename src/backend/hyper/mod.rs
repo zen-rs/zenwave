@@ -30,6 +30,8 @@ use tracing::warn;
 use super::shared::replayable_request;
 use super::shared::{received, request_origin, shape_h1_request, take_request};
 #[cfg(http3)]
+use crate::dns::Getaddrinfo;
+#[cfg(http3)]
 use crate::transport::{
     Spawn,
     connect::proxied,
@@ -39,6 +41,7 @@ use crate::transport::{
 };
 use crate::{
     Client, Transport,
+    clock::{AsyncIoClock, Clocked},
     transport::{
         connect::{Protocol, Protocols, Target, Via, connect},
         hyper_io::HyperIo,
@@ -342,7 +345,7 @@ async fn quic_dial(
         host,
         h3_port,
         deadline,
-        happy_eyeballs::connect(&dialer, host, h3_port),
+        happy_eyeballs::connect(&dialer, &Getaddrinfo, host, h3_port),
     )
     .await
     .map_err(|error| crate::Error::Transport(Box::new(error)))
@@ -715,6 +718,14 @@ async fn drive(connection: impl Future<Output = Result<(), hyper::Error>>) {
 http_kit::impl_send_endpoint!(HyperBackend);
 
 impl Client for HyperBackend {}
+
+impl Clocked for HyperBackend {
+    type Clock = AsyncIoClock;
+
+    fn clock(&self) -> AsyncIoClock {
+        AsyncIoClock
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1429,8 +1440,7 @@ mod tests {
                 };
                 // The A lookup answers with the server; the AAAA lookup is
                 // held for as long as `stalled` lives.
-                let (resolution, stalled) =
-                    happy_eyeballs::Resolution::with_other_family_stalled(peer);
+                let (resolution, stalled) = happy_eyeballs::with_other_family_stalled(peer);
                 let started = Instant::now();
                 let mut connection = happy_eyeballs::within(
                     &dialer,

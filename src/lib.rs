@@ -76,8 +76,10 @@ compile_error!(
 );
 
 pub mod backend;
+pub use auth::{BasicAuth, BearerAuth};
 pub use cache::Cache;
 pub use client::Client;
+pub use cookie::CookieStore;
 pub use http_kit::*;
 #[cfg(default_backend)]
 pub use oauth2::OAuth2ClientCredentials;
@@ -95,6 +97,9 @@ pub mod oauth2;
 pub mod timeout;
 
 mod client;
+pub mod clock;
+#[cfg(any(getaddrinfo, https_rr))]
+pub mod dns;
 pub mod redirect;
 pub mod retry;
 #[cfg(target_arch = "wasm32")]

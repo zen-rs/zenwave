@@ -43,13 +43,14 @@ use futures_util::Stream;
 #[cfg(native_h3)]
 use http::uri::Scheme;
 use http_kit::{
-    Body, BodyError, BodyFrame, Endpoint, FrameSource, Method, PipeOffer, Request, Response,
+    Body, BodyError, BodyFrame, Deadlines, Endpoint, FrameSource, Method, PipeOffer, ReceiveError,
+    Request, Response,
 };
 
 use connect::H1Send;
-pub use connect::NativeIo;
-pub use pool::PoolHandle;
+pub use connect::{NativeIo, NativeResolve, QuicBind, UnixDial};
 use pool::{Command, Grant, Want};
+pub use pool::{PoolClock, PoolHandle, PoolSleep};
 #[cfg(feature = "native-compio")]
 pub use runtime::Compio;
 #[cfg(native_driver)]
@@ -61,6 +62,7 @@ pub use upgrade::{Switched, Upgrade};
 use super::shared::{received, replayable_request, request_origin, shape_h1_request, take_request};
 use crate::{
     Client, Error, Transport,
+    clock::Clocked,
     transport::route::{Origin, Via},
 };
 
@@ -92,19 +94,26 @@ impl fmt::Debug for NativeBackend {
 
 impl NativeBackend {
     /// A backend whose pool runs on the current thread: `io` is the
-    /// thread's `http-kit-io` implementation and `executor` the thread's
-    /// local executor, which runs the pool until every clone of the backend
-    /// is dropped.
+    /// thread's `http-kit-io` implementation, `resolver` resolves the names
+    /// it dials ([`Getaddrinfo`](crate::dns::Getaddrinfo) on a host with a
+    /// system resolver) and `executor` is the thread's local executor, which
+    /// runs the pool until every clone of the backend is dropped.
     ///
     /// Must be called on a thread where `io`'s runtime is running.
-    pub fn on_current_thread<I, E>(transport: Transport, io: I, executor: &E) -> Self
+    pub fn on_current_thread<I, R, E>(
+        transport: Transport,
+        io: I,
+        resolver: R,
+        executor: &E,
+    ) -> Self
     where
         I: NativeIo,
+        R: NativeResolve,
         E: LocalExecutor,
     {
         let (pool, receiver) = PoolHandle::channel();
         executor
-            .spawn_local(pool::run(io, transport.downgrade(), receiver))
+            .spawn_local(pool::run(io, resolver, transport.downgrade(), receiver))
             .detach();
         Self { transport, pool }
     }
@@ -193,6 +202,15 @@ impl NativeBackend {
             .flatten();
         let connect = request.method() == Method::CONNECT;
         shape_h1_request(&mut request, &via)?;
+        if let Some(timeout) = self.transport.read_timeout() {
+            // The transport's one read timeout, as the connection's two
+            // receive deadlines.
+            request.extensions_mut().insert(
+                Deadlines::default()
+                    .with_response_head(timeout)
+                    .with_body_idle(timeout),
+            );
+        }
         let sender = lease.send.as_ref().expect("a new lease holds its sender");
         let mut failure = match sender.requests.try_send(request).await {
             Ok(mut response) => {
@@ -322,6 +340,14 @@ http_kit::impl_send_endpoint!(NativeBackend);
 
 impl Client for NativeBackend {}
 
+impl Clocked for NativeBackend {
+    type Clock = PoolClock;
+
+    fn clock(&self) -> PoolClock {
+        PoolClock::new(self.pool.clone())
+    }
+}
+
 /// An HTTP/1.1 connection leased from the pool: back to the pool when its
 /// response body ends, discarded when it is dropped first.
 struct H1Lease {
@@ -413,16 +439,10 @@ fn poll_offering(
     }
 }
 
-/// Whether `error` is the HTTP/1.1 client's read timeout expiring during the
-/// body.
-fn is_body_timeout(error: &BodyError) -> bool {
-    let BodyError::Other(error) = error else {
-        return false;
-    };
-    matches!(
-        error.downcast_ref::<http_kit_h1::Error>(),
-        Some(http_kit_h1::Error::Timeout(http_kit_h1::Timeout::BodyRead))
-    )
+/// Whether `error` is the HTTP/1.1 client's body-idle deadline expiring
+/// during the body.
+const fn is_body_timeout(error: &BodyError) -> bool {
+    matches!(error, BodyError::Receive(ReceiveError::Stalled))
 }
 
 /// How a body read the read timeout cut short fails: an I/O timeout, as
@@ -472,7 +492,7 @@ impl FrameSource for KeepPool {
     reason = "the scenario runs on one runtime thread, as the pool's connections do"
 )]
 mod tests {
-    use http_kit_io::Listener as _;
+    use http_kit_io::{Listen, Listener as _};
 
     use super::*;
     use crate::Proxy;
@@ -482,7 +502,7 @@ mod tests {
 
     /// A sender whose connection takes no request: its driver is dropped
     /// before it ran, as when a connection stops while it sits idle.
-    async fn stopped<I: NativeIo>(io: &I) -> H1Send {
+    async fn stopped<I: NativeIo + Listen>(io: &I) -> H1Send {
         let listener = io
             .bind_tcp("127.0.0.1:0".parse().expect("loopback"))
             .expect("bind");
@@ -511,7 +531,7 @@ mod tests {
     /// A POST that a reused connection took none of comes back for another
     /// connection, body intact; on a fresh connection the same failure is
     /// the request's.
-    async fn unsent_requests_come_back<I: NativeIo>(io: I) {
+    async fn unsent_requests_come_back<I: NativeIo + Listen>(io: I) {
         // A pool that never runs: the leases' reports go nowhere.
         let (pool, _receiver) = PoolHandle::channel();
         let transport = Transport::builder()

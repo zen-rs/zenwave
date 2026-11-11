@@ -2,11 +2,11 @@
 //! race connection attempts so a broken IPv6 path costs milliseconds, not a
 //! timeout.
 //!
-//! The state machine and the resolution are runtime-independent: names go
-//! to `getaddrinfo` on threads of their own — except localhost names, which
-//! are the loopback addresses without a query (RFC 6761 §6.3), so a stalled
-//! system resolver cannot hold up a local connection — and the sockets and timers come
-//! from a [`Dialer`] — async-net for the hyper backend and websockets, an
+//! The state machine is runtime-independent: names go to a caller's
+//! [`Resolve`] — except localhost names, which are the loopback addresses
+//! without a query (RFC 6761 §6.3), so a stalled system resolver cannot hold
+//! up a local connection — and the sockets and timers come from a
+//! [`Dialer`] — async-net for the hyper backend and websockets, an
 //! `http-kit-io` implementation for the native backend.
 
 use std::{
@@ -14,18 +14,25 @@ use std::{
     future::Future,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    thread,
+    pin::pin,
     time::{Duration, Instant},
 };
 
-use dns_lookup::{AddrFamily, AddrInfoHints, SockType, getaddrinfo};
+#[cfg(all(
+    test,
+    any(
+        http3,
+        all(native_h3, any(feature = "native-compio", feature = "native-tokio"))
+    )
+))]
 use futures_channel::mpsc::{UnboundedReceiver, unbounded};
 use futures_util::{
     FutureExt,
     future::{Either, pending, select},
     pin_mut,
-    stream::{FuturesUnordered, StreamExt},
+    stream::{self, FuturesUnordered, Stream, StreamExt},
 };
+use http_kit_io::{Answer, Family, Resolve};
 
 /// Opens TCP connections and keeps the race's deadlines.
 pub trait Dialer {
@@ -76,19 +83,23 @@ const MIN_CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(100);
 const MAX_CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Resolve `host`:`port` to socket addresses in the order [`connect`] would
-/// attempt them — getaddrinfo's RFC 6724 ordering where the system reports
-/// it, otherwise the RFC 8305 interleave, once every lookup has finished:
-/// the hyper backend's QUIC dial and a SOCKS5 proxy that resolves nothing
-/// itself, which is handed the first.
-pub async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+/// Resolve `host`:`port` through `resolver` to socket addresses in the order
+/// [`connect`] would attempt them — the resolver's RFC 6724 ranking where it
+/// reports one, otherwise the RFC 8305 interleave, once every lookup has
+/// finished: the hyper backend's QUIC dial and a SOCKS5 proxy that resolves
+/// nothing itself, which is handed the first.
+pub async fn resolve<R: Resolve>(
+    resolver: &R,
+    host: &str,
+    port: u16,
+) -> io::Result<Vec<SocketAddr>> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
     let mut state = HappyEyeballsState::new();
-    let mut resolver = start_resolution(host, port);
-    while let Some(event) = resolver.next().await {
+    let mut answers = pin!(lookup(resolver, host, port));
+    while let Some(event) = answers.next().await {
         state.apply_resolution(event);
     }
     state.mark_resolution_stream_closed();
@@ -100,10 +111,15 @@ pub async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     Ok(ordered)
 }
 
-/// Connects to `host`:`port` through `dialer`, racing the resolved
-/// addresses as RFC 8305 describes. The dialer's streams are TCP or
+/// Connects to `host`:`port` through `dialer`, racing the addresses
+/// `resolver` finds as RFC 8305 describes. The dialer's streams are TCP or
 /// anything else one address connects to, QUIC included.
-pub async fn connect<D: Dialer>(dialer: &D, host: &str, port: u16) -> io::Result<D::Stream> {
+pub async fn connect<D: Dialer, R: Resolve>(
+    dialer: &D,
+    resolver: &R,
+    host: &str,
+    port: u16,
+) -> io::Result<D::Stream> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         let addr = SocketAddr::new(ip, port);
         return connect_with_timeout(dialer, addr)
@@ -111,7 +127,7 @@ pub async fn connect<D: Dialer>(dialer: &D, host: &str, port: u16) -> io::Result
             .map_err(|error| io::Error::new(error.kind(), format!("{addr}: {error}")));
     }
 
-    race(dialer, Resolution(start_resolution(host, port))).await
+    race(dialer, lookup(resolver, host, port)).await
 }
 
 /// `dial`'s outcome, or a [`io::ErrorKind::TimedOut`] error once `deadline`
@@ -137,10 +153,28 @@ pub async fn within<D: Dialer, T>(
     }
 }
 
-/// A name's lookups in flight: each family's answer and the system's
-/// sorted snapshot, as they arrive.
-pub struct Resolution(UnboundedReceiver<ResolutionEvent>);
+/// A name's lookup as the events the race consumes. A localhost name is
+/// answered here, with no query sent (RFC 6761 §6.3); any other goes to
+/// `resolver`, whose answers arrive as the resolver delivers them.
+pub fn lookup<'a, R: Resolve>(
+    resolver: &'a R,
+    host: &'a str,
+    port: u16,
+) -> impl Stream<Item = ResolutionEvent> + 'a {
+    if is_localhost(host) {
+        stream::iter(loopback_resolution(port)).left_stream()
+    } else {
+        resolver
+            .lookup(host)
+            .map(move |answer| ResolutionEvent::new(answer, port))
+            .right_stream()
+    }
+}
 
+/// `answer`'s family answered at once and the other family's lookup never
+/// does for as long as the returned [`Stall`] lives, as a system resolver
+/// holding one query for seconds behaves. No ranked answer arrives either:
+/// it waits on the same resolver.
 #[cfg(all(
     test,
     any(
@@ -148,28 +182,24 @@ pub struct Resolution(UnboundedReceiver<ResolutionEvent>);
         all(native_h3, any(feature = "native-compio", feature = "native-tokio"))
     )
 ))]
-impl Resolution {
-    /// `answer`'s family answered at once and the other family's lookup
-    /// never does for as long as the returned sender lives, as a system
-    /// resolver holding one query for seconds behaves. No sorted snapshot
-    /// arrives either: it waits on the same resolver.
-    pub(crate) fn with_other_family_stalled(answer: SocketAddr) -> (Self, Stall) {
-        let (sender, receiver) = unbounded();
-        let family = if answer.is_ipv6() {
-            AddressFamilyKind::Ipv6
-        } else {
-            AddressFamilyKind::Ipv4
-        };
-        sender
-            .unbounded_send(ResolutionEvent {
-                kind: ResolutionEventKind::Family {
-                    family,
-                    result: ResolutionResult::Addresses(vec![answer]),
-                },
-            })
-            .expect("the receiver is still held here");
-        (Self(receiver), Stall(sender))
-    }
+pub fn with_other_family_stalled(
+    answer: SocketAddr,
+) -> (UnboundedReceiver<ResolutionEvent>, Stall) {
+    let (sender, receiver) = unbounded();
+    let family = if answer.is_ipv6() {
+        AddressFamilyKind::Ipv6
+    } else {
+        AddressFamilyKind::Ipv4
+    };
+    sender
+        .unbounded_send(ResolutionEvent {
+            kind: ResolutionEventKind::Family {
+                family,
+                result: ResolutionResult::Addresses(vec![answer]),
+            },
+        })
+        .expect("the receiver is still held here");
+    (receiver, Stall(sender))
 }
 
 /// Holds a stalled lookup open: the lookup answers nothing until this is
@@ -185,10 +215,13 @@ pub struct Stall(#[expect(dead_code)] futures_channel::mpsc::UnboundedSender<Res
 
 /// Races the addresses `resolution` delivers, starting with those known
 /// and taking the rest as they arrive.
-pub async fn race<D: Dialer>(dialer: &D, resolution: Resolution) -> io::Result<D::Stream> {
+pub async fn race<D: Dialer>(
+    dialer: &D,
+    resolution: impl Stream<Item = ResolutionEvent>,
+) -> io::Result<D::Stream> {
     let mut state = HappyEyeballsState::new();
     let mut attempts = FuturesUnordered::new();
-    let mut resolver = resolution.0;
+    let mut resolver = pin!(resolution);
     let mut resolver_closed = false;
 
     loop {
@@ -253,18 +286,44 @@ enum AddressFamilyKind {
     Ipv4,
 }
 
+impl From<Family> for AddressFamilyKind {
+    fn from(family: Family) -> Self {
+        match family {
+            Family::Ipv6 => Self::Ipv6,
+            Family::Ipv4 => Self::Ipv4,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum ResolutionEventKind {
     Family {
         family: AddressFamilyKind,
         result: ResolutionResult,
     },
+    /// Every address of the name, ranked by the resolver (RFC 6724).
     SortedSnapshot(ResolutionResult),
 }
 
+/// One answer of a lookup, with the port its addresses are dialed on.
 #[derive(Debug)]
-struct ResolutionEvent {
+pub struct ResolutionEvent {
     kind: ResolutionEventKind,
+}
+
+impl ResolutionEvent {
+    fn new(answer: Answer, port: u16) -> Self {
+        let kind = match answer {
+            Answer::Family(family, result) => ResolutionEventKind::Family {
+                family: family.into(),
+                result: ResolutionResult::new(result, port),
+            },
+            Answer::Ranked(result) => {
+                ResolutionEventKind::SortedSnapshot(ResolutionResult::new(result, port))
+            }
+        };
+        Self { kind }
+    }
 }
 
 #[derive(Debug)]
@@ -272,6 +331,26 @@ enum ResolutionResult {
     Addresses(Vec<SocketAddr>),
     Empty,
     Failed(String),
+}
+
+impl ResolutionResult {
+    fn new(result: io::Result<Vec<IpAddr>>, port: u16) -> Self {
+        match result {
+            Ok(ips) => {
+                let addrs = dedup_socket_addrs(
+                    ips.into_iter()
+                        .map(|ip| SocketAddr::new(ip, port))
+                        .collect(),
+                );
+                if addrs.is_empty() {
+                    Self::Empty
+                } else {
+                    Self::Addresses(addrs)
+                }
+            }
+            Err(error) => Self::Failed(error.to_string()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -346,6 +425,8 @@ struct HappyEyeballsState {
     ipv6: FamilyResolution,
     ipv4: FamilyResolution,
     sorted_snapshot: Option<Vec<SocketAddr>>,
+    /// Why the ranked lookup failed, for a family no answer covered.
+    ranked_failure: Option<String>,
     first_positive_family: Option<AddressFamilyKind>,
     resolution_delay: ResolutionDelay,
     pending: VecDeque<SocketAddr>,
@@ -360,6 +441,7 @@ impl HappyEyeballsState {
             ipv6: FamilyResolution::Pending,
             ipv4: FamilyResolution::Pending,
             sorted_snapshot: None,
+            ranked_failure: None,
             first_positive_family: None,
             resolution_delay: ResolutionDelay::Idle,
             pending: VecDeque::new(),
@@ -409,9 +491,41 @@ impl HappyEyeballsState {
                 }
             }
             ResolutionEventKind::SortedSnapshot(result) => match result {
-                ResolutionResult::Addresses(addrs) => self.sorted_snapshot = Some(addrs),
+                ResolutionResult::Addresses(addrs) => {
+                    // A resolver that ranks without answering per family
+                    // (one query for every address) covers each family its
+                    // ranking names; a per-family answer, if one comes,
+                    // replaces what this derives.
+                    for family in [AddressFamilyKind::Ipv6, AddressFamilyKind::Ipv4] {
+                        let pending = match family {
+                            AddressFamilyKind::Ipv6 => &self.ipv6,
+                            AddressFamilyKind::Ipv4 => &self.ipv4,
+                        };
+                        if matches!(pending, FamilyResolution::Pending) {
+                            let covered: Vec<_> = addrs
+                                .iter()
+                                .copied()
+                                .filter(|addr| {
+                                    addr.is_ipv6() == (family == AddressFamilyKind::Ipv6)
+                                })
+                                .collect();
+                            let result = if covered.is_empty() {
+                                ResolutionResult::Empty
+                            } else {
+                                ResolutionResult::Addresses(covered)
+                            };
+                            self.apply_resolution(ResolutionEvent {
+                                kind: ResolutionEventKind::Family { family, result },
+                            });
+                        }
+                    }
+                    self.sorted_snapshot = Some(addrs);
+                }
                 ResolutionResult::Empty => self.sorted_snapshot = Some(Vec::new()),
-                ResolutionResult::Failed(_) => self.sorted_snapshot = None,
+                ResolutionResult::Failed(message) => {
+                    self.sorted_snapshot = None;
+                    self.ranked_failure = Some(message);
+                }
             },
         }
     }
@@ -527,15 +641,16 @@ impl HappyEyeballsState {
     }
 
     fn mark_resolution_stream_closed(&mut self) {
-        if matches!(self.ipv6, FamilyResolution::Pending) {
-            self.ipv6 = FamilyResolution::Failed(
-                "resolver stream closed before IPv6 result was delivered".to_string(),
-            );
-        }
-        if matches!(self.ipv4, FamilyResolution::Pending) {
-            self.ipv4 = FamilyResolution::Failed(
-                "resolver stream closed before IPv4 result was delivered".to_string(),
-            );
+        for (family, resolution) in [
+            (AddressFamilyKind::Ipv6, &mut self.ipv6),
+            (AddressFamilyKind::Ipv4, &mut self.ipv4),
+        ] {
+            if matches!(resolution, FamilyResolution::Pending) {
+                *resolution =
+                    FamilyResolution::Failed(self.ranked_failure.clone().unwrap_or_else(|| {
+                        format!("resolver stream closed before {family:?} result was delivered")
+                    }));
+            }
         }
     }
 
@@ -591,27 +706,6 @@ async fn connect_with_timeout<D: Dialer>(dialer: &D, addr: SocketAddr) -> io::Re
     }
 }
 
-fn start_resolution(host: &str, port: u16) -> UnboundedReceiver<ResolutionEvent> {
-    let (sender, receiver) = unbounded();
-    if is_localhost(host) {
-        for event in loopback_resolution(port) {
-            sender
-                .unbounded_send(event)
-                .expect("the receiver is still held here");
-        }
-        return receiver;
-    }
-    for query in [
-        ResolveQuery::Family(AddressFamilyKind::Ipv6),
-        ResolveQuery::Family(AddressFamilyKind::Ipv4),
-        ResolveQuery::SortedSnapshot,
-    ] {
-        spawn_blocking_resolution(host.to_string(), port, query, sender.clone());
-    }
-    drop(sender);
-    receiver
-}
-
 /// Whether `host` is a localhost name: `localhost` or a name under it, in
 /// any case, with or without the root label (RFC 6761 §6.3).
 fn is_localhost(host: &str) -> bool {
@@ -649,63 +743,6 @@ fn loopback_resolution(port: u16) -> [ResolutionEvent; 3] {
             ])),
         },
     ]
-}
-
-#[derive(Clone, Copy, Debug)]
-enum ResolveQuery {
-    Family(AddressFamilyKind),
-    SortedSnapshot,
-}
-
-fn spawn_blocking_resolution(
-    host: String,
-    port: u16,
-    query: ResolveQuery,
-    sender: futures_channel::mpsc::UnboundedSender<ResolutionEvent>,
-) {
-    thread::spawn(move || {
-        let result = match query {
-            ResolveQuery::Family(family) => resolve_family_blocking(&host, port, Some(family)),
-            ResolveQuery::SortedSnapshot => resolve_family_blocking(&host, port, None),
-        };
-        let kind = match query {
-            ResolveQuery::Family(family) => ResolutionEventKind::Family { family, result },
-            ResolveQuery::SortedSnapshot => ResolutionEventKind::SortedSnapshot(result),
-        };
-        let _ = sender.unbounded_send(ResolutionEvent { kind });
-    });
-}
-
-fn resolve_family_blocking(
-    host: &str,
-    port: u16,
-    family: Option<AddressFamilyKind>,
-) -> ResolutionResult {
-    let service = port.to_string();
-    let hints = AddrInfoHints {
-        address: family.map_or(0, |family| match family {
-            AddressFamilyKind::Ipv6 => AddrFamily::Inet6.into(),
-            AddressFamilyKind::Ipv4 => AddrFamily::Inet.into(),
-        }),
-        socktype: SockType::Stream.into(),
-        ..AddrInfoHints::default()
-    };
-
-    match getaddrinfo(Some(host), Some(service.as_str()), Some(hints)) {
-        Ok(iter) => match iter.collect::<io::Result<Vec<_>>>() {
-            Ok(entries) => {
-                let addrs =
-                    dedup_socket_addrs(entries.into_iter().map(|entry| entry.sockaddr).collect());
-                if addrs.is_empty() {
-                    ResolutionResult::Empty
-                } else {
-                    ResolutionResult::Addresses(addrs)
-                }
-            }
-            Err(error) => ResolutionResult::Failed(error.to_string()),
-        },
-        Err(error) => ResolutionResult::Failed(format!("{error:?}")),
-    }
 }
 
 fn dedup_socket_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
@@ -776,12 +813,53 @@ async fn timer_at<D: Dialer>(dialer: &D, deadline: Option<Instant>) {
 mod tests {
     use super::{
         AddressFamilyKind, HappyEyeballsState, ResolutionEvent, ResolutionEventKind,
-        ResolutionResult, interleave_address_families, is_localhost, resolve, start_resolution,
+        ResolutionResult, interleave_address_families, is_localhost, lookup, resolve,
     };
     #[cfg(connector)]
     use super::{AsyncNet, connect};
-    use futures_channel::mpsc::TryRecvError;
-    use std::{net::SocketAddr, time::Instant};
+    use futures_util::{StreamExt, stream};
+    use http_kit_io::{Answer, Resolve};
+    use std::{cell::Cell, net::SocketAddr, time::Instant};
+
+    /// A resolver that counts its queries and finds nothing.
+    #[derive(Default)]
+    struct Counting(Cell<usize>);
+
+    impl Resolve for Counting {
+        fn lookup(&self, _host: &str) -> impl futures_util::Stream<Item = Answer> {
+            self.0.set(self.0.get() + 1);
+            stream::empty()
+        }
+    }
+
+    /// A resolver that ranks every address of a name in one answer and
+    /// answers no family on its own, as a single-query resolver does.
+    struct RankedOnly(Vec<std::net::IpAddr>);
+
+    impl Resolve for RankedOnly {
+        fn lookup(&self, _host: &str) -> impl futures_util::Stream<Item = Answer> {
+            stream::once(std::future::ready(Answer::Ranked(Ok(self.0.clone()))))
+        }
+    }
+
+    #[test]
+    fn a_ranked_answer_stands_in_for_the_per_family_answers() {
+        let ranked: Vec<std::net::IpAddr> = vec![
+            "203.0.113.10".parse().expect("valid IPv4"),
+            "2001:db8::1".parse().expect("valid IPv6"),
+        ];
+        let addrs =
+            futures_executor::block_on(resolve(&RankedOnly(ranked.clone()), "example.test", 443))
+                .expect("resolves");
+        assert_eq!(
+            addrs,
+            ranked
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, 443))
+                .collect::<Vec<_>>(),
+            "the resolver's own ranking is kept"
+        );
+    }
 
     #[test]
     fn localhost_names_are_recognised() {
@@ -812,20 +890,15 @@ mod tests {
             "127.0.0.1:8443".parse().expect("valid IPv4"),
         ];
         for host in ["localhost", "zenwave-test.localhost."] {
-            // Every answer is in, and the stream closed, before anything ran:
-            // no resolver thread holds a sender.
-            let mut events = start_resolution(host, 8443);
-            let mut answers = 0;
-            loop {
-                match events.try_recv() {
-                    Ok(_) => answers += 1,
-                    Err(TryRecvError::Closed) => break,
-                    Err(TryRecvError::Empty) => panic!("{host} is waiting on a lookup"),
-                }
-            }
+            // Every answer is in, and the stream closed, without the
+            // resolver being asked.
+            let resolver = Counting::default();
+            let answers = futures_executor::block_on(lookup(&resolver, host, 8443).count());
             assert_eq!(answers, 3, "{host}: both families and the sorted snapshot");
-            let addrs = futures_executor::block_on(resolve(host, 8443)).expect("resolves");
+            let addrs =
+                futures_executor::block_on(resolve(&resolver, host, 8443)).expect("resolves");
             assert_eq!(addrs, loopback, "{host}");
+            assert_eq!(resolver.0.get(), 0, "{host} is never looked up");
         }
     }
 
@@ -942,7 +1015,7 @@ mod tests {
     #[cfg(connector)]
     #[test]
     fn literal_ip_connect_does_not_report_opposite_family_resolution() {
-        let error = smol::block_on(connect(&AsyncNet, "127.0.0.1", 9))
+        let error = smol::block_on(connect(&AsyncNet, &Counting::default(), "127.0.0.1", 9))
             .expect_err("discard port should not accept connections in tests");
         let message = error.to_string();
         assert!(

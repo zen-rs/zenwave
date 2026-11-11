@@ -5,6 +5,10 @@ use std::{future::Future, io, thread};
 
 use super::{NativeIo, PoolHandle, pool};
 use crate::Transport;
+#[cfg(not(native_h3))]
+use crate::dns::Getaddrinfo;
+#[cfg(native_h3)]
+use crate::dns::System;
 
 /// A runtime the native backend can start a driver thread on.
 pub trait Driver: NativeIo + Default + Send + 'static {
@@ -31,12 +35,18 @@ pub type DefaultDriver = Tokio;
 fn start<D: Driver>(transport: &Transport, name: &'static str) -> PoolHandle {
     let (handle, receiver) = PoolHandle::channel();
     let weak = transport.downgrade();
+    // The system resolver: `getaddrinfo`, and with HTTP/3 the transport's own
+    // resolver for HTTPS records.
+    #[cfg(native_h3)]
+    let resolver = System::new(transport);
+    #[cfg(not(native_h3))]
+    let resolver = Getaddrinfo;
     thread::Builder::new()
         .name(name.to_owned())
         .spawn(move || {
-            D::block_on(pool::run(D::default(), weak, receiver)).unwrap_or_else(|error| {
-                panic!("zenwave: cannot start the {name} runtime: {error}")
-            });
+            D::block_on(pool::run(D::default(), resolver, weak, receiver)).unwrap_or_else(
+                |error| panic!("zenwave: cannot start the {name} runtime: {error}"),
+            );
         })
         .unwrap_or_else(|error| panic!("zenwave: cannot spawn the native pool thread: {error}"));
     handle

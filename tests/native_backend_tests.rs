@@ -24,7 +24,7 @@ use std::{
 use executor_core::{LocalExecutor, Task as _};
 use futures_util::{future::select, pin_mut};
 use http_kit::{Body, Request, Response};
-use http_kit_io::{BufResult, Listener as _, Read, Split as _, Write};
+use http_kit_io::{BufResult, FromStd, Listener as _, Read, Split as _, Write};
 use http_kit_tls::TlsAcceptor;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -38,6 +38,26 @@ use zenwave::{
     Client as _, Proxy, ResponseExt as _, Transport,
     backend::{NativeBackend, NativeIo},
 };
+
+/// What the scenarios need of an `http-kit-io` implementation: the native
+/// backend's own bounds, and sockets to serve on.
+trait TestIo: NativeIo + FromStd {}
+
+impl<I: NativeIo + FromStd> TestIo for I {}
+
+/// A backend on the current thread over `io`, resolving through the system's
+/// resolver.
+fn backend<I: TestIo, E: LocalExecutor>(
+    transport: Transport,
+    io: I,
+    executor: &E,
+) -> NativeBackend {
+    #[cfg(feature = "native-http3")]
+    let resolver = zenwave::dns::System::new(&transport);
+    #[cfg(not(feature = "native-http3"))]
+    let resolver = zenwave::dns::Getaddrinfo;
+    NativeBackend::on_current_thread(transport, io, resolver, executor)
+}
 
 /// A request body in Chinese, Japanese and Korean, echoed back by every
 /// server below.
@@ -172,10 +192,10 @@ fn trailers_response(protocol: &'static str) -> Response {
 
 /// Serves HTTP/1.1 on `listener` as `options` says, one local task per
 /// connection; runs until dropped.
-async fn serve_h1<I: NativeIo, E: LocalExecutor>(
+async fn serve_h1<I: TestIo, E: LocalExecutor>(
     io: I,
     executor: &E,
-    listener: I::TcpListener,
+    listener: I::Listener,
     options: H1Options,
 ) {
     let mut accepted = 0_usize;
@@ -218,10 +238,10 @@ async fn serve_h1<I: NativeIo, E: LocalExecutor>(
 /// An HTTPS proxy: TLS with `tls` on every connection, then one `CONNECT`
 /// to a loopback port, recorded in `connects`, and the bytes relayed both
 /// ways. Runs until dropped.
-async fn serve_tls_proxy<I: NativeIo, E: LocalExecutor>(
+async fn serve_tls_proxy<I: TestIo, E: LocalExecutor>(
     io: I,
     executor: &E,
-    listener: I::TcpListener,
+    listener: I::Listener,
     tls: TlsAcceptor,
     connects: Rc<RefCell<Vec<String>>>,
 ) {
@@ -306,7 +326,7 @@ fn loopback() -> SocketAddr {
 
 /// Plaintext HTTP/1.1: a GET and a POST with a CJK body reuse one
 /// connection from the thread's pool.
-async fn plaintext<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+async fn plaintext<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
     let listener = io.bind_tcp(loopback()).expect("bind");
     let port = listener.local_addr().expect("local address").port();
     let server = serve_h1(io.clone(), executor, listener, H1Options::default());
@@ -314,7 +334,7 @@ async fn plaintext<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
         .proxy(Proxy::none())
         .build()
         .expect("transport builds");
-    let mut client = NativeBackend::on_current_thread(transport, io, executor);
+    let mut client = backend(transport, io, executor);
     against(server, async {
         for _ in 0..2 {
             let response = client
@@ -364,23 +384,19 @@ async fn read_len(read: &mut impl Read, len: usize) -> Vec<u8> {
 /// A request that asks to switch protocols gets the `101`, then the
 /// switched stream: first the bytes the server wrote right behind its head,
 /// then a ping out and a pong back on the same connection.
-async fn upgrade<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+async fn upgrade<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
     switch(io, executor, None).await;
 }
 
 /// The switched stream belongs to its owner: a pong that takes three times
 /// the transport's read timeout still arrives on it.
-async fn upgrade_outlives_read_timeout<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+async fn upgrade_outlives_read_timeout<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
     switch(io, executor, Some(Duration::from_millis(200))).await;
 }
 
 /// The upgrade scenario, on a transport with `read_timeout`; the server
 /// holds its pong back for three times that long.
-async fn switch<I: NativeIo, E: LocalExecutor>(
-    io: I,
-    executor: &E,
-    read_timeout: Option<Duration>,
-) {
+async fn switch<I: TestIo, E: LocalExecutor>(io: I, executor: &E, read_timeout: Option<Duration>) {
     use futures_util::{AsyncReadExt as _, AsyncWriteExt as _};
     use zenwave::backend::Upgrade;
 
@@ -417,7 +433,7 @@ async fn switch<I: NativeIo, E: LocalExecutor>(
         transport = transport.read_timeout(read_timeout);
     }
     let transport = transport.build().expect("transport builds");
-    let mut client = NativeBackend::on_current_thread(transport, io, executor);
+    let mut client = backend(transport, io, executor);
     against(server, async {
         let mut response = client
             .get(format!("http://127.0.0.1:{port}/echo"))
@@ -450,7 +466,7 @@ async fn switch<I: NativeIo, E: LocalExecutor>(
 /// A server that closes every connection after its response: the pool
 /// never hands a closed connection out again, so each POST, a request no
 /// client may send twice once written, goes out on a new one and succeeds.
-async fn closing<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+async fn closing<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
     let listener = io.bind_tcp(loopback()).expect("bind");
     let port = listener.local_addr().expect("local address").port();
     let server = serve_h1(
@@ -466,7 +482,7 @@ async fn closing<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
         .proxy(Proxy::none())
         .build()
         .expect("transport builds");
-    let mut client = NativeBackend::on_current_thread(transport, io, executor);
+    let mut client = backend(transport, io, executor);
     against(server, async {
         for round in 0..10 {
             let response = client
@@ -486,7 +502,7 @@ async fn closing<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
 
 /// HTTP/1.1 over `http-kit-tls`, verified against the test CA by the
 /// platform verifier.
-async fn tls<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+async fn tls<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
     let pki = Pki::new();
     let listener = io.bind_tcp(loopback()).expect("bind");
     let port = listener.local_addr().expect("local address").port();
@@ -499,7 +515,7 @@ async fn tls<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
             ..H1Options::default()
         },
     );
-    let mut client = NativeBackend::on_current_thread(pki.transport(), io.clone(), executor);
+    let mut client = backend(pki.transport(), io.clone(), executor);
     against(server, async {
         let response = client
             // `/安全`, percent-encoded as a URI path carries it.
@@ -529,7 +545,7 @@ async fn tls<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
             ..H1Options::default()
         },
     );
-    let mut client = NativeBackend::on_current_thread(pki.transport(), io, executor);
+    let mut client = backend(pki.transport(), io, executor);
     against(server, async {
         let error = client
             .get(format!("https://localhost:{port}/"))
@@ -544,7 +560,7 @@ async fn tls<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
 /// An https origin through an HTTPS proxy: the origin's TLS session runs
 /// inside the proxy's, both verified against the test CA, and the tunnel
 /// is pooled like any connection.
-async fn https_proxy<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+async fn https_proxy<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
     let pki = Pki::new();
     let listener = io.bind_tcp(loopback()).expect("bind");
     let port = listener.local_addr().expect("local address").port();
@@ -573,7 +589,7 @@ async fn https_proxy<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
     let rules = Proxy::builder()
         .https(format!("https://localhost:{proxy_port}"))
         .build();
-    let mut client = NativeBackend::on_current_thread(pki.transport_through(rules), io, executor);
+    let mut client = backend(pki.transport_through(rules), io, executor);
     against(server, async {
         for _ in 0..2 {
             let response = client
@@ -619,10 +635,10 @@ type Script = Vec<(Duration, Vec<u8>)>;
 
 /// Plays `script` on every connection `listener` accepts, inside TLS with
 /// `tls` when given; runs until dropped.
-async fn serve_script<I: NativeIo, E: LocalExecutor>(
+async fn serve_script<I: TestIo, E: LocalExecutor>(
     io: I,
     executor: &E,
-    listener: I::TcpListener,
+    listener: I::Listener,
     tls: Option<TlsAcceptor>,
     script: Script,
 ) {
@@ -661,7 +677,7 @@ async fn play<I: NativeIo, S: http_kit_io::Split>(io: &I, stream: S, script: Scr
 /// A server that accepts TCP and never answers the TLS handshake: the
 /// connect timeout fails the request with `Error::Timeout`, about when it
 /// runs out.
-async fn stalled_connect<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+async fn stalled_connect<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
     let listener = io.bind_tcp(loopback()).expect("bind");
     let port = listener.local_addr().expect("local address").port();
     // The one dial is accepted and held open, unanswered.
@@ -670,7 +686,7 @@ async fn stalled_connect<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
         futures_util::future::pending::<()>().await;
     };
     let timeout = Duration::from_millis(300);
-    let mut client = NativeBackend::on_current_thread(bounded(Some(timeout), None), io, executor);
+    let mut client = backend(bounded(Some(timeout), None), io, executor);
     against(server, async {
         let started = Instant::now();
         let error = client
@@ -690,7 +706,7 @@ async fn stalled_connect<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
 
 /// A server that reads the request and never answers: the read timeout
 /// fails the request with `Error::Timeout`, in plaintext or over TLS.
-async fn stalled_head_on<I: NativeIo, E: LocalExecutor>(io: I, executor: &E, pki: Option<&Pki>) {
+async fn stalled_head_on<I: TestIo, E: LocalExecutor>(io: I, executor: &E, pki: Option<&Pki>) {
     let listener = io.bind_tcp(loopback()).expect("bind");
     let port = listener.local_addr().expect("local address").port();
     let server = serve_script(
@@ -712,7 +728,7 @@ async fn stalled_head_on<I: NativeIo, E: LocalExecutor>(io: I, executor: &E, pki
         format!("http://127.0.0.1:{port}/")
     };
     let transport = transport.build().expect("transport builds");
-    let mut client = NativeBackend::on_current_thread(transport, io, executor);
+    let mut client = backend(transport, io, executor);
     against(server, async {
         let started = Instant::now();
         let error = client
@@ -730,18 +746,18 @@ async fn stalled_head_on<I: NativeIo, E: LocalExecutor>(io: I, executor: &E, pki
     .await;
 }
 
-async fn stalled_head<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+async fn stalled_head<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
     stalled_head_on(io, executor, None).await;
 }
 
-async fn stalled_head_tls<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+async fn stalled_head_tls<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
     stalled_head_on(io, executor, Some(&Pki::new())).await;
 }
 
 /// A server that sends the head and half the body, then stalls: the
 /// response arrives, and reading its body fails with an I/O timeout that
 /// carries `Error::Timeout`.
-async fn stalled_body<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+async fn stalled_body<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
     let listener = io.bind_tcp(loopback()).expect("bind");
     let port = listener.local_addr().expect("local address").port();
     let half = GREETING.as_bytes();
@@ -756,8 +772,7 @@ async fn stalled_body<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
         None,
         vec![(Duration::ZERO, [head.as_bytes(), half].concat())],
     );
-    let mut client =
-        NativeBackend::on_current_thread(bounded(None, Some(READ_TIMEOUT)), io, executor);
+    let mut client = backend(bounded(None, Some(READ_TIMEOUT)), io, executor);
     against(server, async {
         let response = client
             .get(format!("http://127.0.0.1:{port}/"))
@@ -787,7 +802,7 @@ async fn stalled_body<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
 /// A body that arrives in eight parts a third of the read timeout apart,
 /// taking well over the read timeout in all: every part restarts the wait,
 /// so the whole body arrives.
-async fn slow_body<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+async fn slow_body<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
     let listener = io.bind_tcp(loopback()).expect("bind");
     let port = listener.local_addr().expect("local address").port();
     let body = GREETING.repeat(8).into_bytes();
@@ -798,8 +813,7 @@ async fn slow_body<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
             .map(|part| (READ_TIMEOUT / 3, part.to_vec())),
     );
     let server = serve_script(io.clone(), executor, listener, None, script);
-    let mut client =
-        NativeBackend::on_current_thread(bounded(None, Some(READ_TIMEOUT)), io, executor);
+    let mut client = backend(bounded(None, Some(READ_TIMEOUT)), io, executor);
     against(server, async {
         let started = Instant::now();
         let response = client
@@ -819,7 +833,7 @@ async fn slow_body<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
 
 /// A pooled connection is not waiting for anything: one left idle for
 /// three times the read timeout still carries the next request.
-async fn idle_outlives_read_timeout<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+async fn idle_outlives_read_timeout<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
     let listener = io.bind_tcp(loopback()).expect("bind");
     let port = listener.local_addr().expect("local address").port();
     let accepted = Rc::new(Cell::new(0));
@@ -832,8 +846,7 @@ async fn idle_outlives_read_timeout<I: NativeIo, E: LocalExecutor>(io: I, execut
             ..H1Options::default()
         },
     );
-    let mut client =
-        NativeBackend::on_current_thread(bounded(None, Some(READ_TIMEOUT)), io.clone(), executor);
+    let mut client = backend(bounded(None, Some(READ_TIMEOUT)), io.clone(), executor);
     against(server, async {
         for round in 0..2 {
             if round > 0 {
@@ -859,7 +872,7 @@ async fn idle_outlives_read_timeout<I: NativeIo, E: LocalExecutor>(io: I, execut
 /// bytes of a run still in the kernel; one polled without an offer is plain
 /// data on the same pooled connection, which the first body's end released.
 #[cfg(target_os = "linux")]
-async fn pipe_body<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+async fn pipe_body<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
     use futures_util::future::poll_fn;
     use http_kit::{BodyFrame, PipeOffer};
 
@@ -886,7 +899,7 @@ async fn pipe_body<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
         }
         futures_util::future::pending::<()>().await;
     };
-    let mut client = NativeBackend::on_current_thread(
+    let mut client = backend(
         Transport::builder()
             .proxy(Proxy::none())
             .build()
@@ -935,7 +948,7 @@ async fn pipe_body<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
 /// server wrote behind its `101` head go to the tunnel's other end first,
 /// then each direction is forwarded by the kernel until both end.
 #[cfg(target_os = "linux")]
-async fn splice_upgrade<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+async fn splice_upgrade<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
     use http_kit::utils::Bytes;
     use http_kit_io::splice::SpliceDuplex;
     use zenwave::backend::Upgrade;
@@ -973,7 +986,7 @@ async fn splice_upgrade<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
         assert_eq!(read_len(&mut read, PONG.len()).await, PONG.as_bytes());
         write.shutdown().await.expect("the far end ends its side");
     };
-    let mut client = NativeBackend::on_current_thread(
+    let mut client = backend(
         Transport::builder()
             .proxy(Proxy::none())
             .build()
@@ -1242,13 +1255,16 @@ mod h3 {
         time::Instant,
     };
 
-    use http_kit_io::Io;
+    use http_kit_io::Datagram;
 
     use super::*;
 
     /// Serves HTTP/3 with `pki`'s leaf on a dual-stack UDP socket —
     /// `localhost` may resolve to `::1` first — and returns its port.
-    fn bind_h3<I: Io>(io: &I, pki: &Pki) -> (http_kit_h3::Server<I::UdpSocket, I>, u16) {
+    fn bind_h3<I: TestIo>(
+        io: &I,
+        pki: &Pki,
+    ) -> (http_kit_h3::Server<<I as Datagram>::UdpSocket, I>, u16) {
         let socket = socket2::Socket::new(
             socket2::Domain::IPV6,
             socket2::Type::DGRAM,
@@ -1275,7 +1291,7 @@ mod h3 {
 
     /// A TLS HTTP/1.1 server signed by `pki` advertising an HTTP/3 server
     /// signed by `h3_pki`, both running until dropped, and the TCP port.
-    fn advertised<'a, I: NativeIo, E: LocalExecutor>(
+    fn advertised<'a, I: TestIo, E: LocalExecutor>(
         io: &I,
         executor: &'a E,
         pki: &Pki,
@@ -1329,7 +1345,7 @@ mod h3 {
     /// `Alt-Svc` names a UDP port that swallows every datagram. The request
     /// that races the QUIC dial finds TCP first, and no request waits for
     /// the QUIC connect timeout: QUIC only ever runs beside TCP.
-    pub async fn black_hole<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    pub async fn black_hole<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
         let pki = Pki::new();
         let hole = UdpSocket::bind("[::]:0").expect("UDP binds");
         let hole_port = hole.local_addr().expect("local address").port();
@@ -1345,7 +1361,7 @@ mod h3 {
                 ..H1Options::default()
             },
         );
-        let mut client = NativeBackend::on_current_thread(pki.transport(), io.clone(), executor);
+        let mut client = backend(pki.transport(), io.clone(), executor);
         against(server, async {
             let uri = format!("https://localhost:{port}/fallback");
             let started = Instant::now();
@@ -1369,10 +1385,10 @@ mod h3 {
     /// The TLS server advertises the h3 one through `Alt-Svc`; requests
     /// move to HTTP/3 once the pool's QUIC dial completes its handshake,
     /// a POST with a CJK body among them.
-    pub async fn upgrade<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    pub async fn upgrade<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
         let pki = Pki::new();
         let (server, port) = advertised(&io, executor, &pki, &pki, None);
-        let mut client = NativeBackend::on_current_thread(pki.transport(), io.clone(), executor);
+        let mut client = backend(pki.transport(), io.clone(), executor);
         against(server, async {
             let uri = format!("https://localhost:{port}/upgrade");
             let mut protocol = String::new();
@@ -1402,12 +1418,12 @@ mod h3 {
 
     /// A response over HTTP/3 delivers its trailers after the body, the
     /// CJK body intact.
-    pub async fn trailers<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    pub async fn trailers<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
         use futures_util::StreamExt as _;
 
         let pki = Pki::new();
         let (server, port) = advertised(&io, executor, &pki, &pki, None);
-        let mut client = NativeBackend::on_current_thread(pki.transport(), io.clone(), executor);
+        let mut client = backend(pki.transport(), io.clone(), executor);
         against(server, async {
             let uri = format!("https://localhost:{port}/upgrade");
             let mut protocol = String::new();
@@ -1447,11 +1463,11 @@ mod h3 {
     /// Once h3 is advertised, a request with no connection to reuse races
     /// a QUIC dial against a TCP dial whose server stalls: the QUIC
     /// handshake completes first and carries the request.
-    pub async fn race<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    pub async fn race<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
         const STALL: Duration = Duration::from_secs(3);
         let pki = Pki::new();
         let (server, port) = advertised(&io, executor, &pki, &pki, Some(STALL));
-        let mut client = NativeBackend::on_current_thread(pki.transport(), io.clone(), executor);
+        let mut client = backend(pki.transport(), io.clone(), executor);
         against(server, async {
             let uri = format!("https://localhost:{port}/race");
             assert_eq!(get(&mut client, &uri, false).await, "h1");
@@ -1469,11 +1485,11 @@ mod h3 {
     /// The advertised HTTP/3 server presents a chain no configured root
     /// signed: the transport's verifier refuses it, QUIC backs off, and
     /// every request stays on TCP, the one that raced QUIC included.
-    pub async fn untrusted<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    pub async fn untrusted<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
         let pki = Pki::new();
         let stranger = Pki::new();
         let (server, port) = advertised(&io, executor, &pki, &stranger, None);
-        let mut client = NativeBackend::on_current_thread(pki.transport(), io.clone(), executor);
+        let mut client = backend(pki.transport(), io.clone(), executor);
         against(server, async {
             let uri = format!("https://localhost:{port}/untrusted");
             assert_eq!(get(&mut client, &uri, false).await, "h1");

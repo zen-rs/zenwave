@@ -87,7 +87,10 @@ pub(crate) mod quic;
 // Which legs a connection takes through the proxy rules, for every connector.
 #[cfg(dialer)]
 pub(crate) mod route;
+// Generic over the resolver, whose lookups need not be `Send`: an
+// `http-kit-io` one's are not.
 #[cfg(dialer)]
+#[expect(clippy::future_not_send)]
 pub(crate) mod socks5;
 #[cfg(connector)]
 pub(crate) mod stream;

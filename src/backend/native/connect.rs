@@ -3,14 +3,7 @@
 //! with every leg on owned-buffer streams and TLS through `http-kit-tls`,
 //! the origin's session inside the proxy's when the proxy is HTTPS.
 
-use std::{
-    future::Future,
-    io,
-    net::SocketAddr,
-    pin::pin,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{future::Future, io, net::SocketAddr, pin::pin, sync::Arc, time::Instant};
 
 use futures_util::{
     FutureExt,
@@ -20,8 +13,8 @@ use http::{HeaderValue, Method, header, uri::Scheme};
 use http_kit::{Body, Request};
 use http_kit_h1::{ClientConfig, ClientOutcome, RequestTarget, SendRequest, handshake_stream};
 use http_kit_io::{
-    BufResult, IntoInner, Io, IoBuf, Read, SendFile, SpliceRead, SpliceWrite, Split, TcpOptions,
-    Write,
+    BufResult, Dial, IntoInner, IoBuf, Read, ReadOwned, Resolve, SendFile, SpliceRead, SpliceWrite,
+    Split, TcpOptions, Timer, Write,
 };
 use http_kit_tls::{TlsConnector, Transport as TlsTransport, rustls::pki_types::ServerName};
 use tracing::debug;
@@ -37,40 +30,76 @@ use crate::{
     },
 };
 
-/// An `http-kit-io` implementation whose stream sockets `http-kit-tls` can
-/// run over: every implementation `http-kit-io` ships is one.
-#[cfg(unix)]
+/// What the native backend asks of an `http-kit-io` implementation.
+///
+/// It dials TCP (and, where the platform has them, Unix-domain) connections
+/// that `http-kit-tls` can run over, keeps time, and, under `native-http3`,
+/// binds datagram sockets.
+///
+/// It is zenwave's name for that set of capabilities and nothing more:
+/// every type that offers them is one.
 pub trait NativeIo:
-    Io<
-        TcpStream: TlsTransport + Split<ReadHalf: SpliceRead, WriteHalf: SpliceWrite>,
-        UnixStream: TlsTransport + Split<ReadHalf: SpliceRead, WriteHalf: SpliceWrite>,
-    >
+    Dial<Connection: TlsTransport> + Timer + Clone + 'static + UnixDial + QuicBind
 {
 }
 
-#[cfg(unix)]
-impl<
-    I: Io<
-            TcpStream: TlsTransport + Split<ReadHalf: SpliceRead, WriteHalf: SpliceWrite>,
-            UnixStream: TlsTransport + Split<ReadHalf: SpliceRead, WriteHalf: SpliceWrite>,
-        >,
-> NativeIo for I
-{
-}
-
-/// An `http-kit-io` implementation whose stream sockets `http-kit-tls` can
-/// run over: every implementation `http-kit-io` ships is one.
-#[cfg(not(unix))]
-pub trait NativeIo:
-    Io<TcpStream: TlsTransport + Split<ReadHalf: SpliceRead, WriteHalf: SpliceWrite>>
-{
-}
-
-#[cfg(not(unix))]
-impl<I: Io<TcpStream: TlsTransport + Split<ReadHalf: SpliceRead, WriteHalf: SpliceWrite>>> NativeIo
+impl<I: Dial<Connection: TlsTransport> + Timer + Clone + 'static + UnixDial + QuicBind> NativeIo
     for I
 {
 }
+
+/// What the native backend asks of a resolver: [`Resolve`] for the addresses
+/// it dials and, with `native-http3`, [`ResolveHttps`](crate::dns::ResolveHttps)
+/// for HTTP/3 discovery.
+///
+/// Like [`NativeIo`], zenwave's name for that set and nothing more.
+#[cfg(native_h3)]
+pub trait NativeResolve: crate::dns::ResolveHttps + 'static {}
+
+#[cfg(native_h3)]
+impl<R: crate::dns::ResolveHttps + 'static> NativeResolve for R {}
+
+/// What the native backend asks of a resolver: [`Resolve`] for the addresses
+/// it dials and, with `native-http3`, `ResolveHttps` for HTTP/3 discovery.
+///
+/// Like [`NativeIo`], zenwave's name for that set and nothing more.
+#[cfg(not(native_h3))]
+pub trait NativeResolve: Resolve + 'static {}
+
+#[cfg(not(native_h3))]
+impl<R: Resolve + 'static> NativeResolve for R {}
+
+/// [`http_kit_io::DialUnix`] where the platform has Unix-domain sockets, and
+/// no requirement elsewhere.
+#[cfg(unix)]
+pub trait UnixDial: http_kit_io::DialUnix<UnixConnection: TlsTransport> {}
+
+#[cfg(unix)]
+impl<I: http_kit_io::DialUnix<UnixConnection: TlsTransport>> UnixDial for I {}
+
+/// [`http_kit_io::DialUnix`] where the platform has Unix-domain sockets, and
+/// no requirement elsewhere.
+#[cfg(not(unix))]
+pub trait UnixDial {}
+
+#[cfg(not(unix))]
+impl<I> UnixDial for I {}
+
+/// [`http_kit_io::Datagram`] with `native-http3`, which dials QUIC over UDP,
+/// and no requirement without it.
+#[cfg(native_h3)]
+pub trait QuicBind: http_kit_io::Datagram {}
+
+#[cfg(native_h3)]
+impl<I: http_kit_io::Datagram> QuicBind for I {}
+
+/// [`http_kit_io::Datagram`] with `native-http3`, which dials QUIC over UDP,
+/// and no requirement without it.
+#[cfg(not(native_h3))]
+pub trait QuicBind {}
+
+#[cfg(not(native_h3))]
+impl<I> QuicBind for I {}
 
 /// A fresh HTTP/1.1 connection: its handle, how requests on it are shaped,
 /// and the future that drives its socket.
@@ -135,8 +164,9 @@ impl H1Send {
 ///
 /// Every leg's failure; [`Error::Timeout`] when the connect timeout passed
 /// first.
-pub async fn dial<I: NativeIo>(
+pub async fn dial<I: NativeIo, R: Resolve>(
     io: &I,
+    resolver: &R,
     transport: &Transport,
     tls: &TlsConnector,
     origin: &Origin,
@@ -145,11 +175,11 @@ pub async fn dial<I: NativeIo>(
         .connect_timeout()
         .and_then(|timeout| Instant::now().checked_add(timeout))
     else {
-        return dial_route(io, transport, tls, origin).await;
+        return dial_route(io, resolver, transport, tls, origin).await;
     };
     // Dropping the dial at the deadline closes whatever sockets it opened.
     match select(
-        pin!(dial_route(io, transport, tls, origin)),
+        pin!(dial_route(io, resolver, transport, tls, origin)),
         pin!(io.sleep_until(deadline)),
     )
     .await
@@ -163,18 +193,15 @@ pub async fn dial<I: NativeIo>(
 }
 
 /// [`dial`], unbounded.
-async fn dial_route<I: NativeIo>(
+async fn dial_route<I: NativeIo, R: Resolve>(
     io: &I,
+    resolver: &R,
     transport: &Transport,
     tls: &TlsConnector,
     origin: &Origin,
 ) -> Result<Dialed, Error> {
     let secure = origin.scheme == Scheme::HTTPS;
-    let last = LastLeg {
-        io,
-        tls,
-        read_timeout: transport.read_timeout(),
-    };
+    let last = LastLeg { io, tls };
 
     #[cfg(unix_socket)]
     if let Some(path) = transport.unix_socket() {
@@ -196,14 +223,14 @@ async fn dial_route<I: NativeIo>(
     };
     match route(transport.proxy(), target)? {
         Route::Direct => {
-            let tcp = tcp(io, &origin.host, origin.port).await?;
+            let tcp = tcp(io, resolver, &origin.host, origin.port).await?;
             last.finish(&origin.host, secure, tcp, Via::Direct).await
         }
         Route::Forward {
             proxy,
             authorization,
         } => {
-            let tcp = tcp(io, &proxy.host, proxy.port).await?;
+            let tcp = tcp(io, resolver, &proxy.host, proxy.port).await?;
             last.finish(
                 &proxy.host,
                 proxy.tls,
@@ -217,7 +244,7 @@ async fn dial_route<I: NativeIo>(
             authority,
             authorization,
         } => {
-            let tcp = tcp(io, &proxy.host, proxy.port).await?;
+            let tcp = tcp(io, resolver, &proxy.host, proxy.port).await?;
             if proxy.tls {
                 // The proxy's session carries the tunnel, and the origin's
                 // runs inside it.
@@ -240,9 +267,10 @@ async fn dial_route<I: NativeIo>(
             credentials,
             resolve_remotely,
         } => {
-            let tcp = tcp(io, &host, port).await?;
+            let tcp = tcp(io, resolver, &host, port).await?;
             let OwnedBytes(tcp) = socks5::connect(
                 OwnedBytes(tcp),
+                resolver,
                 &origin.host,
                 origin.port,
                 credentials
@@ -257,14 +285,13 @@ async fn dial_route<I: NativeIo>(
 }
 
 /// What the last leg of every route needs: TLS to the host that leg
-/// reaches, and the read timeout the connection's reads run under.
+/// reaches.
 struct LastLeg<'a, I> {
     io: &'a I,
     tls: &'a TlsConnector,
-    read_timeout: Option<Duration>,
 }
 
-impl<I: Io> LastLeg<'_, I> {
+impl<I: Timer + Clone + 'static> LastLeg<'_, I> {
     /// Wraps `stream` in TLS for `host` when `secure`, then starts
     /// HTTP/1.1 on it.
     async fn finish<S>(
@@ -275,14 +302,13 @@ impl<I: Io> LastLeg<'_, I> {
         via: Via,
     ) -> Result<Dialed, Error>
     where
-        S: TlsTransport + Split<ReadHalf: SpliceRead, WriteHalf: SpliceWrite>,
+        S: TlsTransport + Split<ReadHalf: ReadOwned + SpliceRead, WriteHalf: SpliceWrite>,
     {
         let mut config = ClientConfig::default();
         config.request_target = match via {
             Via::Direct => RequestTarget::Origin,
             Via::HttpProxy { .. } => RequestTarget::Absolute,
         };
-        config.read_timeout = self.read_timeout;
         let io = self.io.clone();
         if !secure {
             return Ok(start(stream, io, config, via));
@@ -322,7 +348,7 @@ fn server_name(host: &str) -> Result<ServerName<'static>, Error> {
 fn start<S, T>(stream: S, timer: T, config: ClientConfig, via: Via) -> Dialed
 where
     S: Split + 'static,
-    S::ReadHalf: Read + SpliceRead + 'static,
+    S::ReadHalf: ReadOwned + SpliceRead + 'static,
     S::WriteHalf: Write + SendFile + SpliceWrite + 'static,
     T: http_kit_io::Timer + 'static,
 {
@@ -366,9 +392,9 @@ async fn tunnel<I, S>(
     authorization: Option<HeaderValue>,
 ) -> Result<Rejoined<S::ReadHalf, S::WriteHalf>, Error>
 where
-    I: Io,
+    I: Timer + Clone,
     S: Split + 'static,
-    S::ReadHalf: SpliceRead,
+    S::ReadHalf: ReadOwned + SpliceRead,
     S::WriteHalf: SendFile + SpliceWrite,
 {
     let (send, connection) = handshake_stream(stream, io.clone(), ClientConfig::default());
@@ -437,8 +463,13 @@ impl<R: Read + 'static, W: Write + 'static> Split for Rejoined<R, W> {
 }
 
 /// TCP to `host`:`port`, raced over its addresses (RFC 8305).
-async fn tcp<I: Io>(io: &I, host: &str, port: u16) -> Result<I::TcpStream, Error> {
-    happy_eyeballs::connect(&IoDialer(io), host, port)
+async fn tcp<I: Dial + Timer, R: Resolve>(
+    io: &I,
+    resolver: &R,
+    host: &str,
+    port: u16,
+) -> Result<I::Connection, Error> {
+    happy_eyeballs::connect(&IoDialer(io), resolver, host, port)
         .await
         .map_err(|error| Error::Transport(Box::new(error)))
 }
@@ -448,10 +479,10 @@ async fn tcp<I: Io>(io: &I, host: &str, port: u16) -> Result<I::TcpStream, Error
 /// head or a TLS record goes out at once instead of waiting on Nagle.
 struct IoDialer<'a, I>(&'a I);
 
-impl<I: Io> Dialer for IoDialer<'_, I> {
-    type Stream = I::TcpStream;
+impl<I: Dial + Timer> Dialer for IoDialer<'_, I> {
+    type Stream = I::Connection;
 
-    async fn dial(&self, addr: SocketAddr) -> io::Result<I::TcpStream> {
+    async fn dial(&self, addr: SocketAddr) -> io::Result<I::Connection> {
         let stream = self.0.connect(addr).await?;
         stream.set_nodelay(true)?;
         Ok(stream)
@@ -504,7 +535,7 @@ mod tests {
 
     use futures_util::future::{Either, select};
     use http_kit::Response;
-    use http_kit_io::Listener as _;
+    use http_kit_io::{Listen, Listener as _};
     use http_kit_tls::{Mode, TlsAcceptor};
     use rcgen::{
         BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -516,7 +547,7 @@ mod tests {
     use time::{Duration as TimeDelta, OffsetDateTime};
 
     use super::*;
-    use crate::{Proxy, backend::shared::request_origin};
+    use crate::{Proxy, backend::shared::request_origin, dns::Getaddrinfo};
 
     /// A greeting in Chinese, Japanese and Korean.
     const GREETING: &str = "你好，世界。こんにちは、世界。안녕하세요, 세계.";
@@ -561,7 +592,7 @@ mod tests {
     }
 
     /// Echoes the request body, over one TLS connection.
-    async fn serve_once<I: NativeIo>(io: I, listener: I::TcpListener, tls: TlsAcceptor) {
+    async fn serve_once<I: NativeIo + Listen>(io: I, listener: I::Listener, tls: TlsAcceptor) {
         let (stream, _) = listener.accept().await.expect("accept");
         let stream = tls.accept(stream, &io).await.expect("TLS handshake");
         let service = |request: Request| async move {
@@ -580,7 +611,7 @@ mod tests {
 
     /// A native-backend dial to an HTTPS origin, through the connector the
     /// pool builds, settles on kernel TLS and carries a request.
-    async fn https_runs_over_kernel_tls<I: NativeIo>(io: I) {
+    async fn https_runs_over_kernel_tls<I: NativeIo + Listen>(io: I) {
         let (transport, acceptor) = pki();
         let listener = io
             .bind_tcp("127.0.0.1:0".parse().expect("loopback"))
@@ -596,7 +627,7 @@ mod tests {
 
         let server = serve_once(io.clone(), listener, acceptor);
         let client = async {
-            let dialed = dial(&io, &transport, &tls, &origin)
+            let dialed = dial(&io, &Getaddrinfo, &transport, &tls, &origin)
                 .await
                 .expect("the dial succeeds");
             assert_eq!(
@@ -644,7 +675,7 @@ mod tests {
 
     /// Answers one TLS connection's request with a `101` and, in the same
     /// write, a greeting, then holds the connection open.
-    async fn serve_switch<I: NativeIo>(io: I, listener: I::TcpListener, tls: TlsAcceptor) {
+    async fn serve_switch<I: NativeIo + Listen>(io: I, listener: I::Listener, tls: TlsAcceptor) {
         let (stream, _) = listener.accept().await.expect("accept");
         let stream = tls.accept(stream, &io).await.expect("TLS handshake");
         let (mut read, mut write) = stream.split();
@@ -669,7 +700,7 @@ mod tests {
     /// records are the kernel's (`kernel`), and is given back by
     /// `into_splice`, still carrying the bytes behind the head, when rustls
     /// holds them in user space.
-    async fn switched_over_tls<I: NativeIo>(io: I, kernel: bool) {
+    async fn switched_over_tls<I: NativeIo + Listen>(io: I, kernel: bool) {
         use futures_util::AsyncReadExt as _;
 
         let (transport, acceptor) = pki();
@@ -691,7 +722,7 @@ mod tests {
 
         let server = serve_switch(io.clone(), listener, acceptor);
         let client = async {
-            let dialed = dial(&io, &transport, &tls, &origin)
+            let dialed = dial(&io, &Getaddrinfo, &transport, &tls, &origin)
                 .await
                 .expect("the dial succeeds");
             let expected = if kernel { Mode::Kernel } else { Mode::User };

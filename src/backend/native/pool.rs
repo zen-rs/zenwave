@@ -18,17 +18,27 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    time::Instant,
+    future::Future,
+    pin::Pin,
+    rc::Rc,
+    task::{Context, Poll},
+    time::{Duration, Instant},
 };
 
 use futures_channel::{mpsc, oneshot};
-use futures_util::{FutureExt, StreamExt, future::LocalBoxFuture, stream::FuturesUnordered};
+use futures_util::{
+    FutureExt, StreamExt,
+    future::{Either, LocalBoxFuture, select},
+    pin_mut,
+    stream::FuturesUnordered,
+};
 use http_kit_tls::TlsConnector;
 use tracing::debug;
 
-use super::connect::{self, Dialed, H1Send, NativeIo};
+use super::connect::{self, Dialed, H1Send, NativeIo, NativeResolve};
 use crate::{
     Error,
+    clock::Clock,
     transport::{
         WeakTransport,
         route::{IDLE_TIMEOUT, MAX_H1_PER_ORIGIN, Origin, Via},
@@ -95,12 +105,59 @@ pub enum Command {
     /// A response for `origin` carried these `Alt-Svc` fields, joined.
     #[cfg(native_h3)]
     AltSvc { origin: Origin, value: String },
+    /// Answer on `reply` once `duration` has passed on the pool's timer.
+    Sleep {
+        duration: Duration,
+        reply: oneshot::Sender<()>,
+    },
 }
 
 /// The `Send` side of a pool: requests reach the pool's thread through it.
 /// The pool runs while any handle exists.
 #[derive(Clone, Debug)]
 pub struct PoolHandle(mpsc::UnboundedSender<Command>);
+
+/// The clock of a native backend: sleeps run on its pool's timer.
+///
+/// That is the `http_kit_io::Timer` the connect and read deadlines use. The
+/// pool answers over a channel, so the sleep future is `Send` whatever the
+/// timer's is.
+///
+/// A sleep whose pool has stopped completes at once; the request it guards
+/// fails on the stopped pool anyway.
+#[derive(Clone, Debug)]
+pub struct PoolClock(PoolHandle);
+
+impl PoolClock {
+    /// The clock of the pool `handle` reaches.
+    pub(super) const fn new(handle: PoolHandle) -> Self {
+        Self(handle)
+    }
+}
+
+impl Clock for PoolClock {
+    type Sleep = PoolSleep;
+
+    fn sleep(&self, duration: Duration) -> PoolSleep {
+        let (reply, answered) = oneshot::channel();
+        self.0.send(Command::Sleep { duration, reply });
+        PoolSleep(answered)
+    }
+}
+
+/// A sleep running on a native pool's timer; completes when the pool answers
+/// or has stopped.
+#[derive(Debug)]
+pub struct PoolSleep(oneshot::Receiver<()>);
+
+impl Future for PoolSleep {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // `Err` is a pool that stopped before answering.
+        Pin::new(&mut self.0).poll(cx).map(drop)
+    }
+}
 
 /// The pool's end of its channel, handed to [`run`] on the pool's thread.
 #[derive(Debug)]
@@ -266,8 +323,10 @@ impl Entry {
 }
 
 /// The pool's state: everything its task owns.
-pub struct Pool<I> {
+pub struct Pool<I, R> {
     pub io: I,
+    /// The resolver every dial task shares, on the pool's thread.
+    pub resolver: Rc<R>,
     pub transport: WeakTransport,
     tls: Option<TlsConnector>,
     pub origins: HashMap<Origin, Entry>,
@@ -278,9 +337,15 @@ pub struct Pool<I> {
 
 /// Runs a pool over `io` until every [`PoolHandle`] is dropped. Connections
 /// still open then close with it.
-pub async fn run<I: NativeIo>(io: I, transport: WeakTransport, receiver: PoolReceiver) {
+pub async fn run<I: NativeIo, R: NativeResolve>(
+    io: I,
+    resolver: R,
+    transport: WeakTransport,
+    receiver: PoolReceiver,
+) {
     let mut pool = Pool {
         io,
+        resolver: Rc::new(resolver),
         transport,
         tls: None,
         origins: HashMap::new(),
@@ -304,7 +369,7 @@ pub async fn run<I: NativeIo>(io: I, transport: WeakTransport, receiver: PoolRec
     }
 }
 
-impl<I: NativeIo> Pool<I> {
+impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
     fn command(&mut self, command: Command) {
         match command {
             Command::Checkout {
@@ -322,7 +387,39 @@ impl<I: NativeIo> Pool<I> {
             }
             #[cfg(native_h3)]
             Command::AltSvc { origin, value } => self.alt_svc(&origin, &value),
+            Command::Sleep { duration, reply } => self.sleep(duration, reply),
         }
+    }
+
+    /// Sleeps `duration` on the pool's timer, the one connection deadlines
+    /// run on, and answers `reply`. A request that no longer waits for the
+    /// answer (`reply` canceled) ends the sleep early.
+    fn sleep(&self, duration: Duration, mut reply: oneshot::Sender<()>) {
+        let io = self.io.clone();
+        // A duration too long to be an `Instant` never elapses, as for
+        // `async_io::Timer`.
+        let deadline = Instant::now().checked_add(duration);
+        self.tasks.push(
+            async move {
+                {
+                    let elapsed = async {
+                        match deadline {
+                            Some(deadline) => io.sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    let canceled = reply.cancellation();
+                    pin_mut!(elapsed, canceled);
+                    if let Either::Right(_) = select(elapsed, canceled).await {
+                        return None;
+                    }
+                }
+                // The sleep's future was dropped meanwhile: nobody to tell.
+                let _ = reply.send(());
+                None
+            }
+            .boxed_local(),
+        );
     }
 
     fn event(&mut self, event: Event) {
@@ -460,9 +557,10 @@ impl<I: NativeIo> Pool<I> {
             },
         };
         let io = self.io.clone();
+        let resolver = Rc::clone(&self.resolver);
         self.tasks.push(
             async move {
-                let result = connect::dial(&io, &transport, &tls, &origin).await;
+                let result = connect::dial(&io, &*resolver, &transport, &tls, &origin).await;
                 Some(Event::H1Dialed { origin, result })
             }
             .boxed_local(),

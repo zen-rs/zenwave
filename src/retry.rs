@@ -3,9 +3,10 @@
 use core::{future::Future, time::Duration};
 use http_kit::{Endpoint, Request, Response, SendEndpoint};
 
-use crate::client::Client;
-#[cfg(target_arch = "wasm32")]
-use crate::single_threaded::SingleThreaded;
+use crate::{
+    client::Client,
+    clock::{Clock, Clocked},
+};
 
 /// Middleware that retries failed requests.
 ///
@@ -13,7 +14,8 @@ use crate::single_threaded::SingleThreaded;
 /// error — a transport failure, a timeout or an I/O error, classified by
 /// [`crate::Error::is_transient`]. Any other error (a malformed request, a
 /// refused credential, an HTTP error status) cannot succeed on a second
-/// attempt and is returned after the first one.
+/// attempt and is returned after the first one. The backoff between attempts
+/// sleeps on the middleware's [`Clock`].
 ///
 /// Every attempt sends the original request. A backend takes the request out
 /// of the `&mut Request` it is handed, so a copy is taken before each attempt
@@ -21,25 +23,27 @@ use crate::single_threaded::SingleThreaded;
 /// (a reader or a stream) cannot be copied and is attempted once: its error is
 /// returned as is.
 #[derive(Debug, Clone)]
-pub struct Retry<C>
+pub struct Retry<C, K>
 where
     C: Client,
     C::Error: Into<crate::Error>,
 {
     client: C,
+    clock: K,
     max_retries: usize,
     min_delay: Duration,
     max_delay: Duration,
 }
 
-impl<C: Client> Retry<C>
+impl<C: Client, K: Clock> Retry<C, K>
 where
     C::Error: Into<crate::Error>,
 {
-    /// Create a new `Retry` middleware.
-    pub const fn new(client: C, max_retries: usize) -> Self {
+    /// Create a new `Retry` middleware whose backoff sleeps on `clock`.
+    pub const fn new(client: C, clock: K, max_retries: usize) -> Self {
         Self {
             client,
+            clock,
             max_retries,
             min_delay: Duration::from_millis(100),
             max_delay: Duration::from_secs(5),
@@ -61,9 +65,20 @@ where
     }
 }
 
-impl<C: Client> Client for Retry<C> where C::Error: Into<crate::Error> {}
+impl<C: Client, K: Clock> Client for Retry<C, K> where C::Error: Into<crate::Error> {}
 
-impl<C: Client> SendEndpoint for Retry<C>
+impl<C: Clocked, K: Clock> Clocked for Retry<C, K>
+where
+    C::Error: Into<crate::Error>,
+{
+    type Clock = C::Clock;
+
+    fn clock(&self) -> C::Clock {
+        self.client.clock()
+    }
+}
+
+impl<C: Client, K: Clock> SendEndpoint for Retry<C, K>
 where
     C::Error: Into<crate::Error>,
 {
@@ -75,7 +90,7 @@ where
     }
 }
 
-impl<C: Client> Endpoint for Retry<C>
+impl<C: Client, K: Clock> Endpoint for Retry<C, K>
 where
     C::Error: Into<crate::Error>,
 {
@@ -105,14 +120,7 @@ where
                     let delay =
                         (self.min_delay * 2u32.pow((attempts - 1) as u32)).min(self.max_delay);
 
-                    #[cfg(not(target_arch = "wasm32"))]
-                    async_io::Timer::after(delay).await;
-
-                    #[cfg(target_arch = "wasm32")]
-                    SingleThreaded(gloo_timers::future::TimeoutFuture::new(
-                        delay.as_millis() as u32
-                    ))
-                    .await;
+                    self.clock.sleep(delay).await;
 
                     *request = replay;
                 }

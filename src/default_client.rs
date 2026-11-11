@@ -4,7 +4,7 @@
 
 use crate::{
     Client, Endpoint, Error, Method, Request, Response, Transport, Uri, backend::DefaultBackend,
-    redirect,
+    clock::Clocked, redirect,
 };
 
 /// The default Zenwave client.
@@ -59,6 +59,14 @@ impl Endpoint for DefaultClient {
 http_kit::impl_send_endpoint!(DefaultClient);
 
 impl Client for DefaultClient {}
+
+impl Clocked for DefaultClient {
+    type Clock = <DefaultBackend as Clocked>::Clock;
+
+    fn clock(&self) -> Self::Clock {
+        self.inner.clock()
+    }
+}
 
 /// The default client over the system transport: the operating system's
 /// proxy settings and root certificates, redirects followed.

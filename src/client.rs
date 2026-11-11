@@ -24,6 +24,7 @@ pub use download::{DownloadError, DownloadOptions, DownloadReport};
 use crate::{
     auth::{BasicAuth, BearerAuth},
     cache::Cache,
+    clock::Clocked,
     cookie::CookieStore,
     redirect::FollowRedirect,
     retry::Retry,
@@ -521,7 +522,7 @@ mod tests {
 /// [`SendMiddleware`].
 pub trait Client: SendEndpoint + Sized {
     /// Add middleware to the client.
-    fn with(self, middleware: impl SendMiddleware) -> impl Client {
+    fn with<M: SendMiddleware>(self, middleware: M) -> WithMiddleware<Self, M> {
         WithMiddleware::new(self, middleware)
     }
 
@@ -535,11 +536,16 @@ pub trait Client: SendEndpoint + Sized {
     /// Only errors [`crate::Error::is_transient`] classifies as transient —
     /// transport failures, timeouts and I/O errors — are retried; any other
     /// error returns after the first attempt.
-    fn retry(self, max_retries: usize) -> Retry<Self>
+    ///
+    /// The backoff sleeps on the client's own [`Clock`](crate::clock::Clock);
+    /// a different clock goes to [`Retry::new`].
+    fn retry(self, max_retries: usize) -> Retry<Self, Self::Clock>
     where
+        Self: Clocked,
         Self::Error: Into<crate::Error>,
     {
-        Retry::new(self, max_retries)
+        let clock = self.clock();
+        Retry::new(self, clock, max_retries)
     }
 
     /// Turn a 4xx or 5xx response into [`crate::Error::Http`].
@@ -553,28 +559,35 @@ pub trait Client: SendEndpoint + Sized {
     }
 
     /// Enable HTTP caching middleware.
-    fn enable_cache(self) -> impl Client {
+    fn enable_cache(self) -> WithMiddleware<Self, Cache> {
         WithMiddleware::new(self, Cache::new())
     }
 
     /// Enable cookie management.
-    fn enable_cookie(self) -> impl Client {
+    fn enable_cookie(self) -> WithMiddleware<Self, CookieStore> {
         WithMiddleware::new(self, CookieStore::default())
     }
 
     /// Enable cookie management with persistent backing storage (native targets only).
     #[cfg(not(target_arch = "wasm32"))]
-    fn enable_persistent_cookie(self) -> impl Client {
+    fn enable_persistent_cookie(self) -> WithMiddleware<Self, CookieStore> {
         WithMiddleware::new(self, CookieStore::persistent_default())
     }
 
     /// Enforce a timeout for individual requests issued by this client.
-    fn timeout(self, duration: Duration) -> impl Client {
-        WithMiddleware::new(self, Timeout::new(duration))
+    ///
+    /// The timer runs on the client's own [`Clock`](crate::clock::Clock); a
+    /// different clock goes to [`Timeout::new`].
+    fn timeout(self, duration: Duration) -> WithMiddleware<Self, Timeout<Self::Clock>>
+    where
+        Self: Clocked,
+    {
+        let clock = self.clock();
+        WithMiddleware::new(self, Timeout::new(clock, duration))
     }
 
     /// Add Bearer Token Authentication middleware.
-    fn bearer_auth(self, token: impl Into<String>) -> impl Client {
+    fn bearer_auth(self, token: impl Into<String>) -> WithMiddleware<Self, BearerAuth> {
         WithMiddleware::new(self, BearerAuth::new(token))
     }
 
@@ -583,7 +596,7 @@ pub trait Client: SendEndpoint + Sized {
         self,
         username: impl Into<String>,
         password: Option<impl Into<String>>,
-    ) -> impl Client {
+    ) -> WithMiddleware<Self, BasicAuth> {
         WithMiddleware::new(self, BasicAuth::new(username, password))
     }
 
