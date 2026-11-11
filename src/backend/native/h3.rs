@@ -372,6 +372,11 @@ impl<I: Io> Dialer for QuicDialer<'_, I> {
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> {
         self.io.sleep_until(deadline)
     }
+
+    /// A QUIC handshake has the whole dial deadline, not TCP's bound.
+    fn attempt_timeout(&self) -> std::time::Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
 }
 
 /// One QUIC handshake with `peer`, driven until it completes, fails or
@@ -757,9 +762,13 @@ mod tests {
     /// A QUIC dial to a name whose AAAA lookup never answers connects over
     /// the IPv4 address that did, once the resolution delay passes, far
     /// inside the dial's deadline: the dial does not wait on the stalled
-    /// lookup.
+    /// lookup. The server starts answering `server_delay` after the dial
+    /// begins, as a slow path would; the time the dial took is returned.
     #[cfg(any(feature = "native-compio", feature = "native-tokio"))]
-    async fn stalled_aaaa_does_not_hold_the_dial<I: Io>(io: I) {
+    async fn dial_with_stalled_aaaa<I: Io>(
+        io: I,
+        server_delay: std::time::Duration,
+    ) -> std::time::Duration {
         let issued = issue("zenwave h3 stalled lookup CA");
         let transport = Transport::builder()
             .proxy(Proxy::none())
@@ -779,6 +788,7 @@ mod tests {
             http_kit::Response::new(http_kit::Body::from_bytes("你好 こんにちは 안녕"))
         };
         let serving = async {
+            io.sleep(server_delay).await;
             server.serve(&service).await.expect("h3 server runs");
         };
 
@@ -811,12 +821,52 @@ mod tests {
             "the dial connects over IPv4 while AAAA is stalled: {:?}",
             established.err()
         );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "connected in {:?}, well inside the 5 s deadline",
-            started.elapsed()
-        );
         drop(stalled);
+        started.elapsed()
+    }
+
+    /// The scenario: a stalled AAAA lookup does not hold the dial back.
+    #[cfg(any(feature = "native-compio", feature = "native-tokio"))]
+    async fn stalled_aaaa_does_not_hold_the_dial<I: Io>(io: I) {
+        let took = dial_with_stalled_aaaa(io, std::time::Duration::ZERO).await;
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "connected in {took:?}, well inside the 5 s deadline",
+        );
+    }
+
+    /// The scenario: the one address's handshake takes longer than TCP's
+    /// 2 s attempt bound and still completes inside the dial deadline.
+    #[cfg(any(feature = "native-compio", feature = "native-tokio"))]
+    async fn slow_quic_handshake_has_the_dial_deadline<I: Io>(io: I) {
+        let took = dial_with_stalled_aaaa(io, std::time::Duration::from_millis(2500)).await;
+        assert!(
+            took >= std::time::Duration::from_millis(2500),
+            "the handshake waited on the delayed server: {took:?}",
+        );
+    }
+
+    #[cfg(feature = "native-compio")]
+    #[test]
+    fn h3_slow_handshake_succeeds_inside_the_deadline_on_compio() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime");
+        runtime.block_on(slow_quic_handshake_has_the_dial_deadline(
+            http_kit_io::compio::Compio,
+        ));
+    }
+
+    #[cfg(feature = "native-tokio")]
+    #[test]
+    fn h3_slow_handshake_succeeds_inside_the_deadline_on_tokio() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(
+            &runtime,
+            slow_quic_handshake_has_the_dial_deadline(http_kit_io::tokio::Tokio),
+        );
     }
 
     #[cfg(feature = "native-compio")]

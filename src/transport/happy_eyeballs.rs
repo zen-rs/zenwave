@@ -38,6 +38,13 @@ pub trait Dialer {
 
     /// Completes at `deadline`.
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()>;
+
+    /// How long one attempt, started now, may take before it counts as
+    /// failed. A TCP handshake gets [`CONNECT_TIMEOUT`]; a dialer whose
+    /// handshake is slower by nature bounds it by its own deadline.
+    fn attempt_timeout(&self) -> Duration {
+        CONNECT_TIMEOUT
+    }
 }
 
 /// The async-io/async-net dialer the hyper backend and websockets use.
@@ -540,7 +547,9 @@ async fn connect_attempt<D: Dialer>(dialer: &D, addr: SocketAddr) -> AttemptOutc
 async fn connect_with_timeout<D: Dialer>(dialer: &D, addr: SocketAddr) -> io::Result<D::Stream> {
     let connect = dialer.dial(addr);
     let timeout = async {
-        dialer.sleep_until(Instant::now() + CONNECT_TIMEOUT).await;
+        dialer
+            .sleep_until(Instant::now() + dialer.attempt_timeout())
+            .await;
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!("timed out connecting to {addr}"),
