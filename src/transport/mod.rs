@@ -363,6 +363,26 @@ pub struct TransportBuilder {
     /// DNS server instead of the system's.
     #[cfg(all(https_rr, not(target_os = "android")))]
     dns: Option<dns::Config>,
+    /// Wraps the TLS verifier — tests observe what a handshake presents.
+    #[cfg(all(test, tls_rustls))]
+    verifier_wrap: Option<tls::VerifierWrap>,
+}
+
+#[cfg(all(test, tls_rustls))]
+impl TransportBuilder {
+    /// Runs every handshake's verifier through `wrap`, which receives the
+    /// transport's own verifier.
+    #[allow(dead_code)] // only the native backend's tests, with a runtime, use it
+    pub(crate) fn wrap_verifier(
+        mut self,
+        wrap: impl FnOnce(
+            Arc<dyn rustls::client::danger::ServerCertVerifier>,
+        ) -> Arc<dyn rustls::client::danger::ServerCertVerifier>
+        + 'static,
+    ) -> Self {
+        self.verifier_wrap = Some(Box::new(wrap));
+        self
+    }
 }
 
 impl fmt::Debug for TransportBuilder {
@@ -543,6 +563,8 @@ impl TransportBuilder {
                 &self.extra_roots,
                 #[cfg(onecrl)]
                 refresh.as_ref().map(|(_, additions)| Arc::clone(additions)),
+                #[cfg(all(test, tls_rustls))]
+                self.verifier_wrap,
             )?;
             #[cfg(feature = "curl-backend")]
             let ca_bundle = if self.extra_roots.is_empty() {

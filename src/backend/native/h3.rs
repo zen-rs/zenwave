@@ -489,6 +489,11 @@ mod tests {
             expect(dead_code)
         )]
         leaf_key_pem: String,
+        #[cfg_attr(
+            not(any(feature = "native-compio", feature = "native-tokio")),
+            expect(dead_code)
+        )]
+        leaf_key_der: Vec<u8>,
     }
 
     /// The DER of a CA named `ca_name` and the DER of a leaf it signed for
@@ -525,6 +530,7 @@ mod tests {
             leaf_der: leaf.der().to_vec(),
             leaf_pem: leaf.pem(),
             leaf_key_pem: leaf_key.serialize_pem(),
+            leaf_key_der: leaf_key.serialize_der(),
         }
     }
 
@@ -569,7 +575,7 @@ mod tests {
     #[derive(Debug)]
     struct Recording {
         inner: Arc<dyn ServerCertVerifier>,
-        seen: Mutex<Vec<Vec<u8>>>,
+        seen: Arc<Mutex<Vec<Vec<u8>>>>,
     }
 
     impl ServerCertVerifier for Recording {
@@ -634,7 +640,7 @@ mod tests {
             .expect("transport builds");
         let recording = Arc::new(Recording {
             inner: Arc::clone(transport.tls().verifier()),
-            seen: Mutex::default(),
+            seen: Arc::default(),
         });
 
         let mut identity = http_kit_h3::Identity::from_pem(issued.leaf_pem, issued.leaf_key_pem);
@@ -718,7 +724,7 @@ mod tests {
             .expect("transport builds");
         let recording = Recording {
             inner: Arc::clone(transport.tls().verifier()),
-            seen: Mutex::default(),
+            seen: Arc::default(),
         };
         assert_eq!(
             verify(
@@ -732,6 +738,153 @@ mod tests {
         assert_eq!(
             verify(&recording, &[issued.leaf_der], "localhost", b""),
             Ok(())
+        );
+    }
+
+    /// The TLS side of [`stapled_status_reaches_the_verifier`]: the same
+    /// [`Recording`] verifier, wrapped around the transport's own, judges a
+    /// TCP+TLS handshake with a rustls server stapling the same bytes. It
+    /// shows the verifier exactly the staple, as over HTTP/3, and fails the
+    /// handshake on the revoked one. The revoked status is [`REVOKED`], a
+    /// marker the verifier recognises: nothing here signs a real OCSP
+    /// response.
+    #[cfg(any(feature = "native-compio", feature = "native-tokio"))]
+    async fn stapled_status_reaches_the_verifier_over_tls<I, E>(io: I, executor: &E)
+    where
+        I: super::NativeIo,
+        E: executor_core::LocalExecutor,
+    {
+        use http_kit_io::Listener as _;
+
+        async fn serve<I: super::NativeIo>(
+            io: I,
+            listener: I::TcpListener,
+            acceptor: http_kit_tls::TlsAcceptor,
+        ) {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                // A refused handshake ends in the client's alert: the
+                // server only needs to carry on.
+                let Ok(stream) = acceptor.accept(stream, &io).await else {
+                    continue;
+                };
+                let service = |_request: http_kit::Request| async {
+                    http_kit::Response::new(http_kit::Body::from_bytes("你好 こんにちは 안녕"))
+                };
+                let connection = http_kit_h1::ServerConnection::from_stream(
+                    stream,
+                    io.clone(),
+                    http_kit_h1::ServerConfig::default(),
+                );
+                connection.serve(&service).await.ok();
+            }
+        }
+
+        // One handshake against a server stapling `staple`: its outcome and
+        // what the verifier was shown.
+        async fn handshake<I, E>(
+            io: &I,
+            executor: &E,
+            staple: Option<&[u8]>,
+        ) -> (Result<(), Error>, Vec<Vec<u8>>)
+        where
+            I: super::NativeIo,
+            E: executor_core::LocalExecutor,
+        {
+            let issued = issue("zenwave tls ocsp test CA");
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let builder = rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("default versions")
+                .with_no_client_auth();
+            let chain = vec![CertificateDer::from(issued.leaf_der.clone())];
+            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(issued.leaf_key_der.clone()),
+            );
+            let mut config = match staple {
+                Some(staple) => builder.with_single_cert_with_ocsp(chain, key, staple.to_vec()),
+                None => builder.with_single_cert(chain, key),
+            }
+            .expect("server certificate");
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let listener = io
+                .bind_tcp("127.0.0.1:0".parse().expect("loopback"))
+                .expect("bind");
+            let port = listener.local_addr().expect("local address").port();
+            let server = serve(
+                io.clone(),
+                listener,
+                http_kit_tls::TlsAcceptor::new(Arc::new(config)),
+            );
+
+            let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+            let recorded = Arc::clone(&seen);
+            let transport = Transport::builder()
+                .proxy(Proxy::none())
+                .extra_root_certificate_der(issued.ca_der)
+                .wrap_verifier(move |inner| {
+                    Arc::new(Recording {
+                        inner,
+                        seen: recorded,
+                    })
+                })
+                .build()
+                .expect("transport builds");
+            let mut client =
+                crate::backend::NativeBackend::on_current_thread(transport, io.clone(), executor);
+            let request = async {
+                use crate::Client as _;
+                client
+                    .get(format!("https://localhost:{port}/ocsp"))
+                    .expect("request builds")
+                    .await
+                    .map(drop)
+            };
+            let deadline = io.sleep(std::time::Duration::from_secs(10));
+            pin_mut!(server, request, deadline);
+            let outcome = match select(request, select(server, deadline)).await {
+                Either::Left((outcome, _)) => outcome,
+                Either::Right(_) => panic!("the TLS handshake neither completed nor failed"),
+            };
+            let seen = seen.lock().expect("not poisoned").clone();
+            (outcome, seen)
+        }
+
+        let staple = "ocsp response 你好 こんにちは 안녕".as_bytes();
+        let (outcome, seen) = handshake(&io, executor, Some(staple)).await;
+        assert!(outcome.is_ok(), "a non-revoked staple passes: {outcome:?}");
+        assert_eq!(seen, vec![staple.to_vec()]);
+
+        let (outcome, seen) = handshake(&io, executor, Some(REVOKED)).await;
+        assert!(outcome.is_err(), "a revoked staple fails the handshake");
+        assert_eq!(seen, vec![REVOKED.to_vec()]);
+
+        let (outcome, seen) = handshake(&io, executor, None).await;
+        assert!(outcome.is_ok(), "no staple passes: {outcome:?}");
+        assert_eq!(seen, vec![Vec::<u8>::new()]);
+    }
+
+    #[cfg(feature = "native-compio")]
+    #[test]
+    fn tls_stapled_ocsp_reaches_the_verifier_on_compio() {
+        let runtime = compio::runtime::Runtime::new().expect("compio runtime");
+        runtime.block_on(stapled_status_reaches_the_verifier_over_tls(
+            http_kit_io::compio::Compio,
+            &runtime,
+        ));
+    }
+
+    #[cfg(feature = "native-tokio")]
+    #[test]
+    fn tls_stapled_ocsp_reaches_the_verifier_on_tokio() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(
+            &runtime,
+            stapled_status_reaches_the_verifier_over_tls(http_kit_io::tokio::Tokio, &local),
         );
     }
 

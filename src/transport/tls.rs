@@ -116,10 +116,20 @@ mod engine {
         http2_or_http1: futures_rustls::TlsConnector,
     }
 
+    /// Wraps the verifier a connector would run, so a test can observe or
+    /// decide what every TLS and QUIC handshake of a transport is shown.
+    #[cfg(test)]
+    pub type VerifierWrap = Box<
+        dyn FnOnce(
+            Arc<dyn rustls::client::danger::ServerCertVerifier>,
+        ) -> Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    >;
+
     impl TlsConnector {
         pub fn new(
             extra_roots: &[CertificateDer<'static>],
             #[cfg(onecrl)] additions: Option<Arc<ArcSwap<Additions>>>,
+            #[cfg(test)] wrap: Option<VerifierWrap>,
         ) -> Result<Self, Error> {
             let provider = Arc::new(ring::default_provider());
             let verifier = verifier(
@@ -128,6 +138,11 @@ mod engine {
                 #[cfg(onecrl)]
                 additions,
             )?;
+            #[cfg(test)]
+            let verifier = match wrap {
+                Some(wrap) => wrap(verifier),
+                None => verifier,
+            };
             #[cfg(native_h3)]
             let shared = Arc::clone(&verifier);
             let base = ClientConfig::builder_with_provider(provider)
@@ -288,6 +303,8 @@ mod engine {
 }
 
 pub use engine::TlsConnector;
+#[cfg(all(test, tls_rustls))]
+pub use engine::VerifierWrap;
 #[cfg(connector)]
 pub use engine::{TlsStream, negotiated_alpn};
 
