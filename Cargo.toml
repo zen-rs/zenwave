@@ -1,6 +1,6 @@
 [package]
 name = "zenwave"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 authors = ["Lexo Liu<me@lexo.cool>"]
 repository = "https://github.com/zen-rs/zenwave"
@@ -34,9 +34,7 @@ include = [
 ]
 
 [dependencies]
-# The http-kit crates come from `main`: the capability traits of `http-kit-io`
-# and the request deadlines are not released yet.
-http-kit = { git = "https://github.com/zen-rs/http-kit", branch = "main" }
+http-kit = "0.8.0"
 serde ={ version = "1.0.229", default-features = false, features = ["derive"]}
 serde_json = "1.0.154"
 base64 = "0.23.1"
@@ -235,9 +233,9 @@ async-tungstenite = { version = "0.35.0", default-features = false, features = [
 async-trait = "0.1.92"
 executor-core = { version = "0.7.2" }
 # The native backend: owned-buffer sockets, HTTP/1.1 and TLS on them.
-http-kit-io = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
-http-kit-h1 = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
-http-kit-tls = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
+http-kit-io = { version = "0.6.1", optional = true }
+http-kit-h1 = { version = "0.6.0", optional = true }
+http-kit-tls = { version = "0.4.0", optional = true }
 futures-rustls = { version = "0.26.0", optional = true, default-features = false, features = ["ring", "tls12"] }
 rustls = { version = "0.23.46", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
@@ -265,7 +263,7 @@ blocking = { version = "1.7.0", optional = true }
 curl = { version = "0.4.51", optional = true }
 dns-lookup = { version = "4.0.2", optional = true }
 # HTTP/3 for the native backend: quiche.
-http-kit-h3 = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
+http-kit-h3 = { version = "0.6.0", optional = true }
 compio = { version = "0.19.2", default-features = false, features = ["runtime"], optional = true }
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time"], optional = true }
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
@@ -283,7 +281,6 @@ h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
 # Nonblocking socket work in `transport::dns::runtime` and `transport::quic`.
 socket2 = "0.6.5"
-bytes = { version = "1.12.1", optional = true }
 
 # The OneCRL baseline applies where `rustls` chains are checked by webpki:
 # every native target (WASI included, over its compiled-in roots) but Apple and
