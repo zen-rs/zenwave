@@ -89,12 +89,12 @@ mod engine {
         let mut store = rustls::RootCertStore::empty();
         store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         for root in extra_roots {
-            store.add(root.clone()).map_err(Error::tls)?;
+            store.add(root.clone()).map_err(Error::trust_store)?;
         }
         let verifier =
             rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(store), provider)
                 .build()
-                .map_err(Error::tls)?;
+                .map_err(|error| Error::trust_store(Cause::Detail(error.to_string())))?;
         #[cfg(onecrl)]
         let verifier = onecrl_wrap(verifier, additions);
         Ok(verifier)
