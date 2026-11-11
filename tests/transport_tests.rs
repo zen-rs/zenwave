@@ -5,14 +5,44 @@
 
 mod common;
 
-use zenwave::{Error, Transport};
+#[cfg(tls_native)]
+use zenwave::Cause;
+use zenwave::{ConfigError, ConnectFailure, Error, TlsFailure, Transport};
+
+/// Whether `error` is a connect failure whose TLS handshake rejected the
+/// server's certificate.
+///
+/// rustls (every backend but hyper with `native-tls` and no `rustls`, the
+/// `tls_native` cfg) classifies it as [`TlsFailure::Certificate`].
+/// `native-tls` reports no typed verification outcome, so its failure is
+/// [`TlsFailure::Unclassified`] with the platform error as a
+/// [`Cause::NativeTls`].
+fn is_untrusted_certificate(error: &Error) -> bool {
+    let Error::Connect(connect) = error else {
+        return false;
+    };
+    let ConnectFailure::Tls(tls) = &connect.failure else {
+        return false;
+    };
+    #[cfg(tls_native)]
+    {
+        tls.failure == TlsFailure::Unclassified && matches!(tls.cause, Cause::NativeTls(_))
+    }
+    #[cfg(not(tls_native))]
+    {
+        tls.failure == TlsFailure::Certificate
+    }
+}
 
 #[test]
 fn pem_without_a_certificate_is_rejected() {
     let error = Transport::builder()
         .extra_root_certificates_pem(b"-----BEGIN NOTHING-----\nAAAA\n-----END NOTHING-----\n")
         .expect_err("PEM without a CERTIFICATE block must be refused");
-    assert!(matches!(error, Error::Tls(_)), "{error:?}");
+    assert!(
+        matches!(error, Error::Config(ConfigError::TrustStore(_))),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -22,7 +52,10 @@ fn garbage_pem_is_rejected() {
             b"-----BEGIN CERTIFICATE-----\n@@@\n-----END CERTIFICATE-----\n",
         )
         .expect_err("malformed PEM must be refused");
-    assert!(matches!(error, Error::Tls(_)), "{error:?}");
+    assert!(
+        matches!(error, Error::Config(ConfigError::TrustStore(_))),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -33,9 +66,9 @@ fn system_transport_is_shared() {
 }
 
 mod http {
-    use zenwave::{Client, Error, ResponseExt as _, Transport, backend::DefaultBackend};
+    use zenwave::{Client, ResponseExt as _, Transport, backend::DefaultBackend};
 
-    use crate::common::tls::tls_fixture;
+    use crate::{common::tls::tls_fixture, is_untrusted_certificate};
 
     #[test_executors::async_test]
     async fn system_roots_reject_a_locally_issued_certificate() {
@@ -46,7 +79,7 @@ mod http {
             .expect("valid request")
             .await
             .expect_err("a certificate from an unknown CA must be rejected");
-        assert!(matches!(error, Error::Tls(_)), "{error:?}");
+        assert!(is_untrusted_certificate(&error), "{error:?}");
     }
 
     #[test_executors::async_test]
@@ -72,11 +105,11 @@ mod http {
 #[cfg(feature = "ws")]
 mod websocket {
     use zenwave::{
-        Error, Transport,
+        Transport,
         websocket::{self, WebSocketConfig, WebSocketError, WebSocketMessage},
     };
 
-    use crate::common::tls::tls_fixture;
+    use crate::{common::tls::tls_fixture, is_untrusted_certificate};
 
     #[test_executors::async_test]
     async fn system_roots_reject_a_locally_issued_certificate() {
@@ -85,7 +118,7 @@ mod websocket {
             .await
             .expect_err("a certificate from an unknown CA must be rejected");
         assert!(
-            matches!(error, WebSocketError::Transport(ref inner) if matches!(**inner, Error::Tls(_))),
+            matches!(error, WebSocketError::Transport(ref inner) if is_untrusted_certificate(inner)),
             "{error:?}"
         );
     }

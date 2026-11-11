@@ -42,6 +42,8 @@ use std::{future::Future, pin::Pin};
 #[cfg(native)]
 use rustls_pki_types::{CertificateDer, pem::PemObject};
 
+#[cfg(native)]
+use crate::Cause;
 use crate::Error;
 
 // RFC 7838 Alt-Svc parsing, for HTTP/3 discovery.
@@ -308,7 +310,7 @@ impl Transport {
         spawn: Spawn,
         host: &str,
         port: u16,
-    ) -> Result<Option<dns::HttpsRecord>, Error> {
+    ) -> Result<Option<dns::HttpsRecord>, crate::ResolveError> {
         dns::https_record(&self.inner, spawn, host, port).await
     }
 }
@@ -421,15 +423,19 @@ impl TransportBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when the input is not PEM or holds no certificate.
+    /// Returns [`ConfigError::TrustStore`](crate::ConfigError::TrustStore)
+    /// when the input is not PEM or holds no certificate.
     #[cfg(native)]
     pub fn extra_root_certificates_pem(mut self, pem: &[u8]) -> Result<Self, Error> {
         let before = self.extra_roots.len();
         for certificate in CertificateDer::pem_slice_iter(pem) {
-            self.extra_roots.push(certificate.map_err(Error::tls)?);
+            self.extra_roots
+                .push(certificate.map_err(|error| Error::trust_store(Cause::Pem(error)))?);
         }
         if self.extra_roots.len() == before {
-            return Err(Error::tls("PEM input holds no CERTIFICATE block"));
+            return Err(Error::trust_store(Cause::Detail(
+                "PEM input holds no CERTIFICATE block".to_owned(),
+            )));
         }
         Ok(self)
     }
@@ -462,7 +468,8 @@ impl TransportBuilder {
     /// TCP connect (every address happy eyeballs races), a proxy's TLS
     /// handshake and `CONNECT` tunnel or SOCKS5 handshake, and the origin's
     /// TLS handshake, together; for HTTP/3, the QUIC handshake. An attempt
-    /// that takes longer fails with [`Error::Timeout`].
+    /// that takes longer fails with [`Error::Timeout`] holding
+    /// [`TimedOut::Connect`](crate::TimedOut::Connect) and the phase it was in.
     ///
     /// Off unless set. Applied by the native backend
     /// ([`NativeBackend`](crate::backend::NativeBackend)); a caller that
@@ -486,10 +493,10 @@ impl TransportBuilder {
     /// timed.
     ///
     /// A wait that runs out closes the connection and fails the request
-    /// with [`Error::Timeout`], never retried since the server may have the
-    /// request; during the body, the body's read fails with
-    /// an [`std::io::Error`] of kind [`TimedOut`](std::io::ErrorKind::TimedOut)
-    /// whose inner error is [`Error::Timeout`]. An idle pooled connection
+    /// with [`Error::Timeout`] holding [`TimedOut::ResponseHead`](crate::TimedOut::ResponseHead),
+    /// never retried since the server may have the request; during the body,
+    /// the body's read fails with [`TimedOut::BodyIdle`](crate::TimedOut::BodyIdle)
+    /// once it reaches a [`crate::Error`]. An idle pooled connection
     /// is not waiting and is never timed, and a stream a `101` handed over
     /// ([`Switched`](crate::backend::Switched)) belongs to its owner and is
     /// not timed either.
@@ -546,10 +553,11 @@ impl TransportBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Tls`] when a certificate cannot be parsed or the
-    /// platform trust store cannot be initialised. With OneCRL refresh
-    /// enabled it also fails with [`Error::Io`] when the platform has no
-    /// cache directory for the persisted additions.
+    /// Returns [`Error::Config`] when a certificate cannot be parsed, the
+    /// platform trust store cannot be initialised or the TLS engine cannot
+    /// be configured. With OneCRL refresh enabled it also fails with
+    /// [`ConfigError::OneCrl`](crate::ConfigError::OneCrl) when the platform
+    /// has no cache directory for the persisted additions.
     #[cfg(native)]
     pub fn build(self) -> Result<Transport, Error> {
         {

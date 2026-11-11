@@ -16,7 +16,7 @@ use std::future::Future;
 use std::time::Duration;
 
 #[cfg(native_h3)]
-use crate::Error;
+use crate::ResolveError;
 
 // The resolver machinery, compiled only where something calls it.
 #[cfg(https_lookup)]
@@ -58,7 +58,7 @@ pub trait ResolveHttps: http_kit_io::Resolve {
         &self,
         host: &str,
         port: u16,
-    ) -> impl Future<Output = Result<Option<HttpsRecord>, Error>>;
+    ) -> impl Future<Output = Result<Option<HttpsRecord>, ResolveError>>;
 }
 
 /// The system resolver: `getaddrinfo` for addresses and the transport's own
@@ -100,11 +100,15 @@ impl http_kit_io::Resolve for System {
 
 #[cfg(all(native_h3, getaddrinfo))]
 impl ResolveHttps for System {
-    async fn https_record(&self, host: &str, port: u16) -> Result<Option<HttpsRecord>, Error> {
+    async fn https_record(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<Option<HttpsRecord>, ResolveError> {
         let transport = self.transport.upgrade().ok_or_else(|| {
-            Error::Transport(Box::new(std::io::Error::other(
-                "the transport the system resolver was built for has been dropped",
-            )))
+            ResolveError::Lookup(crate::Cause::Detail(
+                "the transport the system resolver was built for has been dropped".to_owned(),
+            ))
         })?;
         // The resolver's background work, each future on a thread of its
         // own: the transport's resolver is shared by every pool and outlives

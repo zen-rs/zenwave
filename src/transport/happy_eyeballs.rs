@@ -34,6 +34,61 @@ use futures_util::{
 };
 use http_kit_io::{Answer, Family, Resolve};
 
+use crate::{Attempt, ConnectFailure, Error, Hop, ResolveError, TcpFailure};
+#[cfg(any(http3, native_h3))]
+use crate::{Cause, ConnectPhase, TimedOut};
+
+/// Why a dial gave no connection.
+#[derive(Debug, thiserror::Error)]
+pub enum DialError {
+    /// The name gave no address.
+    #[error(transparent)]
+    Resolve(ResolveError),
+    /// Every address was tried and every attempt failed.
+    #[error(transparent)]
+    Attempts(TcpFailure),
+    /// The dial's deadline passed.
+    #[cfg(any(http3, native_h3))]
+    #[error("the dial did not finish before its deadline")]
+    Expired,
+}
+
+impl DialError {
+    /// The failure to reach `host`:`port`, the `hop` of the route, that this
+    /// dial's failure is.
+    pub fn into_error(self, hop: Hop, host: &str, port: u16) -> Error {
+        match self {
+            Self::Resolve(error) => Error::connect(hop, host, port, ConnectFailure::Resolve(error)),
+            Self::Attempts(failure) => {
+                Error::connect(hop, host, port, ConnectFailure::Tcp(failure))
+            }
+            #[cfg(any(http3, native_h3))]
+            Self::Expired => Error::Timeout(TimedOut::Connect {
+                during: ConnectPhase::Quic,
+            }),
+        }
+    }
+}
+
+#[cfg(any(http3, native_h3))]
+impl DialError {
+    /// [`into_error`](Self::into_error) for a QUIC dial of the origin
+    /// `host`:`port`: the attempts' failure is the QUIC handshake's, the
+    /// last attempt's error as its cause.
+    pub fn into_quic_error(self, host: &str, port: u16) -> Error {
+        match self {
+            Self::Attempts(failure) => {
+                let cause = failure.attempts.into_iter().next_back().map_or_else(
+                    || Cause::Detail("no QUIC attempt was made".to_owned()),
+                    |attempt| Cause::Io(std::sync::Arc::new(attempt.error)),
+                );
+                Error::connect(Hop::Origin, host, port, ConnectFailure::Quic(cause))
+            }
+            other => other.into_error(Hop::Origin, host, port),
+        }
+    }
+}
+
 /// Opens TCP connections and keeps the race's deadlines.
 pub trait Dialer {
     /// A connected stream.
@@ -47,11 +102,10 @@ pub trait Dialer {
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()>;
 
     /// How long one attempt, started now, may take before it counts as
-    /// failed. A TCP handshake gets [`CONNECT_TIMEOUT`]; a dialer whose
-    /// handshake is slower by nature bounds it by its own deadline.
-    fn attempt_timeout(&self) -> Duration {
-        CONNECT_TIMEOUT
-    }
+    /// failed, or `None` when nothing but the caller's own connect timeout
+    /// bounds it: a TCP handshake ends when the OS says so. A dialer whose
+    /// attempts share a deadline returns what is left of it.
+    fn attempt_timeout(&self) -> Option<Duration>;
 }
 
 /// The async-io/async-net dialer the hyper backend and websockets use.
@@ -72,6 +126,10 @@ impl Dialer for AsyncNet {
     async fn sleep_until(&self, deadline: Instant) {
         async_io::Timer::at(deadline).await;
     }
+
+    fn attempt_timeout(&self) -> Option<Duration> {
+        None
+    }
 }
 
 // RFC 8305 defaults: Resolution Delay = 50ms, First Address Family Count = 1,
@@ -81,7 +139,6 @@ const FIRST_ADDRESS_FAMILY_COUNT: usize = 1;
 const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 const MIN_CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(100);
 const MAX_CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_secs(2);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Resolve `host`:`port` through `resolver` to socket addresses in the order
 /// [`connect`] would attempt them — the resolver's RFC 6724 ranking where it
@@ -92,7 +149,7 @@ pub async fn resolve<R: Resolve>(
     resolver: &R,
     host: &str,
     port: u16,
-) -> io::Result<Vec<SocketAddr>> {
+) -> Result<Vec<SocketAddr>, ResolveError> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
@@ -106,7 +163,7 @@ pub async fn resolve<R: Resolve>(
 
     let ordered = state.ordered_candidates();
     if ordered.is_empty() {
-        return Err(state.into_connect_error());
+        return Err(state.into_resolve_error());
     }
     Ok(ordered)
 }
@@ -119,37 +176,32 @@ pub async fn connect<D: Dialer, R: Resolve>(
     resolver: &R,
     host: &str,
     port: u16,
-) -> io::Result<D::Stream> {
+) -> Result<D::Stream, DialError> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         let addr = SocketAddr::new(ip, port);
-        return connect_with_timeout(dialer, addr)
-            .await
-            .map_err(|error| io::Error::new(error.kind(), format!("{addr}: {error}")));
+        return connect_with_timeout(dialer, addr).await.map_err(|error| {
+            DialError::Attempts(TcpFailure::new(vec![Attempt::new(Some(addr), error)]))
+        });
     }
 
     race(dialer, lookup(resolver, host, port)).await
 }
 
-/// `dial`'s outcome, or a [`io::ErrorKind::TimedOut`] error once `deadline`
-/// passes on `dialer`'s clock. A dial whose attempts are bounded by the
-/// rest of one deadline (see [`Dialer::attempt_timeout`]) is also bounded
-/// as a whole by it, resolution included.
+/// `dial`'s outcome, or [`DialError::Expired`] once `deadline` passes on
+/// `dialer`'s clock. A dial whose attempts are bounded by the rest of one
+/// deadline (see [`Dialer::attempt_timeout`]) is also bounded as a whole by
+/// it, resolution included.
 #[cfg(any(http3, native_h3))]
 pub async fn within<D: Dialer, T>(
     dialer: &D,
-    host: &str,
-    port: u16,
     deadline: Instant,
-    dial: impl Future<Output = io::Result<T>>,
-) -> io::Result<T> {
+    dial: impl Future<Output = Result<T, DialError>>,
+) -> Result<T, DialError> {
     let expire = dialer.sleep_until(deadline);
     pin_mut!(dial, expire);
     match select(dial, expire).await {
         Either::Left((result, _)) => result,
-        Either::Right(((), _)) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("connect to {host}:{port} timed out"),
-        )),
+        Either::Right(((), _)) => Err(DialError::Expired),
     }
 }
 
@@ -218,7 +270,7 @@ pub struct Stall(#[expect(dead_code)] futures_channel::mpsc::UnboundedSender<Res
 pub async fn race<D: Dialer>(
     dialer: &D,
     resolution: impl Stream<Item = ResolutionEvent>,
-) -> io::Result<D::Stream> {
+) -> Result<D::Stream, DialError> {
     let mut state = HappyEyeballsState::new();
     let mut attempts = FuturesUnordered::new();
     let mut resolver = pin!(resolution);
@@ -233,7 +285,7 @@ pub async fn race<D: Dialer>(
         }
 
         if state.is_terminal(attempts.is_empty()) {
-            return Err(state.into_connect_error());
+            return Err(state.into_dial_error());
         }
 
         let resolver_event = async {
@@ -263,7 +315,7 @@ pub async fn race<D: Dialer>(
             outcome = attempt_result => {
                 match outcome.result {
                     Ok(stream) => return Ok(stream),
-                    Err(error) => state.record_attempt_failure(outcome.addr, &error),
+                    Err(error) => state.record_attempt_failure(outcome.addr, error),
                 }
             }
             message = resolver_event.fuse() => {
@@ -330,7 +382,7 @@ impl ResolutionEvent {
 enum ResolutionResult {
     Addresses(Vec<SocketAddr>),
     Empty,
-    Failed(String),
+    Failed(io::Error),
 }
 
 impl ResolutionResult {
@@ -348,7 +400,7 @@ impl ResolutionResult {
                     Self::Addresses(addrs)
                 }
             }
-            Err(error) => Self::Failed(error.to_string()),
+            Err(error) => Self::Failed(error),
         }
     }
 }
@@ -358,7 +410,7 @@ enum FamilyResolution {
     Pending,
     Ready(Vec<SocketAddr>),
     Empty,
-    Failed(String),
+    Failed(io::Error),
 }
 
 impl FamilyResolution {
@@ -376,14 +428,12 @@ impl FamilyResolution {
     const fn is_positive(&self) -> bool {
         matches!(self, Self::Ready(addrs) if !addrs.is_empty())
     }
+}
 
-    fn failure_message(&self, family: AddressFamilyKind) -> Option<String> {
-        match self {
-            Self::Failed(message) => Some(format!("{family:?} resolution failed: {message}")),
-            Self::Empty => Some(format!("{family:?} resolution returned no addresses")),
-            Self::Pending | Self::Ready(_) => None,
-        }
-    }
+/// A copy of `error` for a second family the same answer covers: its kind
+/// and text, since an `io::Error` cannot be cloned.
+fn duplicate(error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), error.to_string())
 }
 
 struct AttemptOutcome<S> {
@@ -426,13 +476,13 @@ struct HappyEyeballsState {
     ipv4: FamilyResolution,
     sorted_snapshot: Option<Vec<SocketAddr>>,
     /// Why the ranked lookup failed, for a family no answer covered.
-    ranked_failure: Option<String>,
+    ranked_failure: Option<io::Error>,
     first_positive_family: Option<AddressFamilyKind>,
     resolution_delay: ResolutionDelay,
     pending: VecDeque<SocketAddr>,
     attempted: HashSet<SocketAddr>,
     last_attempt_started_at: Option<Instant>,
-    attempt_failures: Vec<String>,
+    attempt_failures: Vec<Attempt>,
 }
 
 impl HappyEyeballsState {
@@ -457,7 +507,7 @@ impl HappyEyeballsState {
                 let resolution = match result {
                     ResolutionResult::Addresses(addrs) => FamilyResolution::Ready(addrs),
                     ResolutionResult::Empty => FamilyResolution::Empty,
-                    ResolutionResult::Failed(message) => FamilyResolution::Failed(message),
+                    ResolutionResult::Failed(error) => FamilyResolution::Failed(error),
                 };
                 match family {
                     AddressFamilyKind::Ipv6 => {
@@ -522,9 +572,9 @@ impl HappyEyeballsState {
                     self.sorted_snapshot = Some(addrs);
                 }
                 ResolutionResult::Empty => self.sorted_snapshot = Some(Vec::new()),
-                ResolutionResult::Failed(message) => {
+                ResolutionResult::Failed(error) => {
                     self.sorted_snapshot = None;
-                    self.ranked_failure = Some(message);
+                    self.ranked_failure = Some(error);
                 }
             },
         }
@@ -589,8 +639,6 @@ impl HappyEyeballsState {
         let addr = self.pending.pop_front()?;
         self.attempted.insert(addr);
         self.last_attempt_started_at = Some(now);
-        self.attempt_failures
-            .retain(|failure| !failure.starts_with(&format!("{addr}:")));
         Some(addr)
     }
 
@@ -636,8 +684,8 @@ impl HappyEyeballsState {
         self.resolution_delay = ResolutionDelay::Passed;
     }
 
-    fn record_attempt_failure(&mut self, addr: SocketAddr, error: &io::Error) {
-        self.attempt_failures.push(format!("{addr}: {error}"));
+    fn record_attempt_failure(&mut self, addr: SocketAddr, error: io::Error) {
+        self.attempt_failures.push(Attempt::new(Some(addr), error));
     }
 
     fn mark_resolution_stream_closed(&mut self) {
@@ -646,10 +694,23 @@ impl HappyEyeballsState {
             (AddressFamilyKind::Ipv4, &mut self.ipv4),
         ] {
             if matches!(resolution, FamilyResolution::Pending) {
-                *resolution =
-                    FamilyResolution::Failed(self.ranked_failure.clone().unwrap_or_else(|| {
-                        format!("resolver stream closed before {family:?} result was delivered")
-                    }));
+                // A ranked answer that found no address at all covers both
+                // families: the name has none.
+                if self.sorted_snapshot.as_ref().is_some_and(Vec::is_empty) {
+                    *resolution = FamilyResolution::Empty;
+                    continue;
+                }
+                *resolution = FamilyResolution::Failed(self.ranked_failure.as_ref().map_or_else(
+                    || {
+                        io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "resolver stream closed before {family:?} result was delivered"
+                            ),
+                        )
+                    },
+                    duplicate,
+                ));
             }
         }
     }
@@ -662,20 +723,37 @@ impl HappyEyeballsState {
         no_attempts_running && self.pending.is_empty() && self.resolution_complete()
     }
 
-    fn into_connect_error(self) -> io::Error {
-        let mut diagnostics = Vec::new();
-        if let Some(message) = self.ipv6.failure_message(AddressFamilyKind::Ipv6) {
-            diagnostics.push(message);
+    /// Why the race ended with no connection: the attempts that failed, or,
+    /// when none was ever made, why the name gave no address.
+    fn into_dial_error(self) -> DialError {
+        if self.attempt_failures.is_empty() {
+            DialError::Resolve(self.into_resolve_error())
+        } else {
+            DialError::Attempts(TcpFailure::new(self.attempt_failures))
         }
-        if let Some(message) = self.ipv4.failure_message(AddressFamilyKind::Ipv4) {
-            diagnostics.push(message);
-        }
-        diagnostics.extend(self.attempt_failures);
+    }
 
-        io::Error::other(format!(
-            "RFC 8305 connection setup failed: {}",
-            diagnostics.join("; ")
-        ))
+    /// Why the name gave no address: [`ResolveError::NoAddress`] when every
+    /// family answered that the name has none (an empty answer, or one that
+    /// says the name does not exist), else the answers that failed.
+    fn into_resolve_error(self) -> ResolveError {
+        let mut failures: Vec<io::Error> = [self.ipv6, self.ipv4]
+            .into_iter()
+            .filter_map(|family| match family {
+                FamilyResolution::Failed(error) if error.kind() != io::ErrorKind::NotFound => {
+                    Some(error)
+                }
+                _ => None,
+            })
+            .collect();
+        if failures.is_empty() {
+            return ResolveError::NoAddress;
+        }
+        let first = failures.remove(0);
+        ResolveError::Failed {
+            first,
+            rest: failures,
+        }
     }
 }
 
@@ -688,10 +766,11 @@ async fn connect_attempt<D: Dialer>(dialer: &D, addr: SocketAddr) -> AttemptOutc
 
 async fn connect_with_timeout<D: Dialer>(dialer: &D, addr: SocketAddr) -> io::Result<D::Stream> {
     let connect = dialer.dial(addr);
+    let Some(bound) = dialer.attempt_timeout() else {
+        return connect.await;
+    };
     let timeout = async {
-        dialer
-            .sleep_until(Instant::now() + dialer.attempt_timeout())
-            .await;
+        dialer.sleep_until(Instant::now() + bound).await;
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!("timed out connecting to {addr}"),
@@ -816,10 +895,60 @@ mod tests {
         ResolutionResult, interleave_address_families, is_localhost, lookup, resolve,
     };
     #[cfg(connector)]
-    use super::{AsyncNet, connect};
+    use super::{AsyncNet, DialError, connect};
     use futures_util::{StreamExt, stream};
     use http_kit_io::{Answer, Resolve};
-    use std::{cell::Cell, net::SocketAddr, time::Instant};
+    use std::{cell::Cell, io, net::SocketAddr, time::Duration, time::Instant};
+
+    use super::{Dialer, connect_with_timeout};
+
+    /// A dialer on a clock that is past every deadline: a bound it is asked
+    /// to wait for has already expired. Its dial pends once, as a handshake
+    /// that is not instant does, and then connects.
+    struct ExpiredClock(Option<Duration>);
+
+    impl Dialer for ExpiredClock {
+        type Stream = ();
+
+        async fn dial(&self, _addr: SocketAddr) -> io::Result<()> {
+            let mut pended = false;
+            std::future::poll_fn(|cx| {
+                if pended {
+                    std::task::Poll::Ready(())
+                } else {
+                    pended = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            Ok(())
+        }
+
+        async fn sleep_until(&self, _deadline: Instant) {}
+
+        fn attempt_timeout(&self) -> Option<Duration> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn an_attempt_with_no_bound_is_never_cut_off() {
+        let addr = "127.0.0.1:9".parse().expect("valid address");
+        futures_executor::block_on(connect_with_timeout(&ExpiredClock(None), addr))
+            .expect("with no bound the attempt runs until the dial answers");
+    }
+
+    #[test]
+    fn an_attempt_past_its_bound_is_a_timeout() {
+        let addr = "127.0.0.1:9".parse().expect("valid address");
+        let error = futures_executor::block_on(connect_with_timeout(
+            &ExpiredClock(Some(Duration::from_secs(2))),
+            addr,
+        ))
+        .expect_err("the bound passed before the dial answered");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
 
     /// A resolver that counts its queries and finds nothing.
     #[derive(Default)]
@@ -1015,16 +1144,58 @@ mod tests {
     #[cfg(connector)]
     #[test]
     fn literal_ip_connect_does_not_report_opposite_family_resolution() {
-        let error = smol::block_on(connect(&AsyncNet, &Counting::default(), "127.0.0.1", 9))
+        let resolver = Counting::default();
+        let error = smol::block_on(connect(&AsyncNet, &resolver, "127.0.0.1", 9))
             .expect_err("discard port should not accept connections in tests");
-        let message = error.to_string();
-        assert!(
-            !message.contains("Ipv6 resolution"),
-            "literal IPv4 must not run DNS or report IPv6 resolution: {message}",
+        let DialError::Attempts(failure) = error else {
+            panic!("a literal IP is attempted, never resolved: {error:?}");
+        };
+        let [attempt] = failure.attempts.as_slice() else {
+            panic!("one address, one attempt: {:?}", failure.attempts);
+        };
+        assert_eq!(
+            attempt.addr,
+            Some("127.0.0.1:9".parse().expect("valid socket address")),
+            "the attempt names the socket address it tried",
         );
-        assert!(
-            message.contains("127.0.0.1:9"),
-            "literal IP connection error should name the attempted socket address: {message}",
-        );
+        assert_eq!(resolver.0.get(), 0, "a literal IP is never looked up");
+    }
+
+    /// A name that does not exist, an empty answer and a resolver that
+    /// failed are told apart, with no text to match.
+    #[test]
+    fn resolution_failures_are_typed() {
+        use std::io;
+
+        use crate::ResolveError;
+
+        /// Answers every family with `answer`.
+        struct Answering(fn() -> Answer);
+
+        impl Resolve for Answering {
+            fn lookup(&self, _host: &str) -> impl futures_util::Stream<Item = Answer> {
+                stream::once(std::future::ready((self.0)()))
+            }
+        }
+
+        let missing = Answering(|| Answer::Ranked(Err(io::Error::from(io::ErrorKind::NotFound))));
+        assert!(matches!(
+            futures_executor::block_on(resolve(&missing, "example.test", 443)),
+            Err(ResolveError::NoAddress)
+        ));
+
+        let empty = Answering(|| Answer::Ranked(Ok(Vec::new())));
+        assert!(matches!(
+            futures_executor::block_on(resolve(&empty, "example.test", 443)),
+            Err(ResolveError::NoAddress)
+        ));
+
+        let failed = Answering(|| Answer::Ranked(Err(io::Error::other("the resolver is down"))));
+        let Err(ResolveError::Failed { first, .. }) =
+            futures_executor::block_on(resolve(&failed, "example.test", 443))
+        else {
+            panic!("a resolver that failed is not a name without an address");
+        };
+        assert_eq!(first.to_string(), "the resolver is down");
     }
 }

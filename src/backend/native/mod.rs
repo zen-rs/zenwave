@@ -40,11 +40,10 @@ use std::{
 
 use executor_core::{LocalExecutor, Task as _};
 use futures_util::Stream;
-#[cfg(native_h3)]
 use http::uri::Scheme;
 use http_kit::{
-    Body, BodyError, BodyFrame, Deadlines, Endpoint, FrameSource, Method, PipeOffer, ReceiveError,
-    Request, Response,
+    Body, BodyError, BodyFrame, Deadlines, Endpoint, FrameSource, Method, PipeOffer, Request,
+    Response,
 };
 
 use connect::H1Send;
@@ -61,7 +60,7 @@ pub use upgrade::{Switched, Upgrade};
 
 use super::shared::{received, replayable_request, request_origin, shape_h1_request, take_request};
 use crate::{
-    Client, Error, Transport,
+    Cause, Client, Error, ExchangeFailure, TimedOut, Transport,
     clock::Clocked,
     transport::route::{Origin, Via},
 };
@@ -230,9 +229,9 @@ impl NativeBackend {
             Err(failure) => failure,
         };
         if matches!(failure.error(), http_kit_h1::Error::Timeout(_)) {
-            // The read timeout closed the connection: no retry, since the
-            // server may have the request.
-            return Err(Error::Timeout);
+            // The response-head deadline closed the connection: no retry,
+            // since the server may have the request.
+            return Err(Error::Timeout(TimedOut::ResponseHead));
         }
         if reused {
             if let Some(unsent) = failure.take_request() {
@@ -257,7 +256,10 @@ impl NativeBackend {
                 return Ok(Err(replay));
             }
         }
-        Err(Error::Transport(Box::new(failure.into_error())))
+        Err(h1_error(
+            failure.into_error(),
+            origin.scheme == Scheme::HTTPS,
+        ))
     }
 
     /// Sends `request` on the origin's HTTP/3 connection, whose handshake
@@ -271,6 +273,54 @@ impl NativeBackend {
         let response = send.send(request).await.map_err(h3::h3_error)?;
         Ok(response.map(|body| keep_pool(body, &self.pool)))
     }
+}
+
+/// How an HTTP/1.1 client failure reads to a request: the exchange failure it
+/// is, the engine's error kept as the cause. `tls` says the connection
+/// carries TLS, where invalid data from the socket is the TLS layer's.
+fn h1_error(error: http_kit_h1::Error, tls: bool) -> Error {
+    use std::io::ErrorKind;
+
+    use http_kit_h1::{Error as H1, ParseError};
+
+    let failure = match &error {
+        H1::Timeout(_) => return Error::Timeout(TimedOut::ResponseHead),
+        H1::ConnectionClosed => ExchangeFailure::Terminated,
+        H1::Parse(ParseError::Incomplete) => ExchangeFailure::Incomplete,
+        H1::Parse(ParseError::HeadTooLarge { limit }) => {
+            ExchangeFailure::HeadTooLarge { limit: *limit }
+        }
+        H1::Parse(ParseError::TooManyHeaders { limit }) => {
+            ExchangeFailure::TooManyFields { limit: *limit }
+        }
+        H1::Parse(ParseError::UnsupportedTransferCoding | ParseError::ChunkedNotFinal) => {
+            ExchangeFailure::TransferCoding
+        }
+        H1::Parse(_) | H1::UnrequestedUpgrade | H1::InformationalResponse(_) => {
+            ExchangeFailure::Protocol
+        }
+        H1::OutgoingContentLength
+        | H1::OutgoingTransferEncoding
+        | H1::UnknownLengthHttp10
+        | H1::UnsupportedVersion(_)
+        | H1::MissingHost
+        | H1::AbsoluteTargetIncomplete
+        | H1::TrailersNotChunked => ExchangeFailure::InvalidRequest,
+        H1::Body(_) => ExchangeFailure::RequestBody,
+        H1::ContentLengthMismatch { declared } => ExchangeFailure::RequestBodyLength {
+            declared: *declared,
+        },
+        H1::Io(io) => match io.kind() {
+            ErrorKind::InvalidData if tls => ExchangeFailure::Tls,
+            ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof => ExchangeFailure::Terminated,
+            _ => ExchangeFailure::Io,
+        },
+        _ => ExchangeFailure::Io,
+    };
+    Error::exchange(failure, Cause::H1(error))
 }
 
 /// Whether `method` is idempotent (RFC 9110 §9.2.2): one a client may send
@@ -381,8 +431,8 @@ impl Drop for H1Lease {
 
 /// An HTTP/1.1 response body that returns its connection's lease when it
 /// ends. Dropped unfinished, the lease is discarded: the connection still
-/// holds the rest of the body. A read the read timeout cut short fails as
-/// [`timed_out`].
+/// holds the rest of the body. A body failure passes through as the
+/// connection reported it.
 ///
 /// The consumer's [`PipeOffer`] passes through to the connection's body, so
 /// a consumer that can splice receives the body as `BodyFrame::Pipe` frames.
@@ -414,9 +464,6 @@ impl FrameSource for LeaseReturn {
                 }
                 Poll::Ready(None)
             }
-            Poll::Ready(Some(Err(error))) if is_body_timeout(&error) => {
-                Poll::Ready(Some(Err(timed_out())))
-            }
             poll => poll,
         }
     }
@@ -424,21 +471,6 @@ impl FrameSource for LeaseReturn {
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
-}
-
-/// Whether `error` is the HTTP/1.1 client's body-idle deadline expiring
-/// during the body.
-const fn is_body_timeout(error: &BodyError) -> bool {
-    matches!(error, BodyError::Receive(ReceiveError::Stalled))
-}
-
-/// How a body read the read timeout cut short fails: an I/O timeout, as
-/// every reader of bytes recognises one, carrying [`Error::Timeout`].
-fn timed_out() -> BodyError {
-    BodyError::Io(std::io::Error::new(
-        std::io::ErrorKind::TimedOut,
-        Error::Timeout,
-    ))
 }
 
 /// An HTTP/3 response body that keeps the pool, and with it the

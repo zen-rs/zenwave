@@ -12,7 +12,7 @@ use http::uri::Scheme;
 use http::{HeaderValue, Uri};
 
 use super::{Proxy, proxy::Intercept};
-use crate::{Error, error::ProxyErrorKind};
+use crate::{ConfigError, Error};
 
 /// The HTTP versions a TLS connection may offer the server through ALPN.
 #[derive(Clone, Copy, Debug)]
@@ -137,7 +137,7 @@ pub fn route(proxy: &Proxy, target: Target<'_>) -> Result<Route, Error> {
     let scheme = proxy_uri.scheme_str().unwrap_or("http");
     let host = proxy_uri
         .host()
-        .ok_or(ProxyErrorKind::MissingHost)?
+        .ok_or(Error::Config(ConfigError::ProxyHost))?
         .to_owned();
     match scheme {
         "http" | "https" => {
@@ -167,7 +167,7 @@ pub fn route(proxy: &Proxy, target: Target<'_>) -> Result<Route, Error> {
             credentials: credentials(&intercept),
             resolve_remotely: scheme == "socks5h",
         }),
-        other => Err(ProxyErrorKind::UnsupportedScheme(other.to_owned()).into()),
+        other => Err(Error::Config(ConfigError::ProxyScheme(other.to_owned()))),
     }
 }
 

@@ -31,7 +31,7 @@ use http_kit_io::splice::SpliceDuplex;
 use http_kit_io::{Read, SpliceRead, SpliceWrite, Write, poll::CopyingPoll};
 
 use super::connect::Rejoined;
-use crate::Error;
+use crate::{Cause, Error, ExchangeFailure};
 
 /// Where a claim's stream is sent: made by the claiming future, on the
 /// connection's thread, and answered by the driver on that same thread.
@@ -157,10 +157,13 @@ impl Future for Switching {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let received = ready!(Pin::new(&mut self.received).poll(cx));
         Poll::Ready(received.map_err(|_| {
-            Error::Transport(Box::new(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "the connection ended before handing over its switched stream",
-            )))
+            Error::exchange(
+                ExchangeFailure::Terminated,
+                Cause::Io(Arc::new(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "the connection ended before handing over its switched stream",
+                ))),
+            )
         }))
     }
 }

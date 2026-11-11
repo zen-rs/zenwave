@@ -40,7 +40,7 @@ use super::{
     pool::{Command, Event, Pool},
 };
 use crate::{
-    Error, Transport,
+    Cause, ConnectFailure, ConnectPhase, Error, ExchangeFailure, Hop, TimedOut, Transport,
     dns::ResolveHttps,
     transport::{
         discovery::{H3Knowledge, HttpsRr},
@@ -318,13 +318,11 @@ async fn connect<I: Datagram + Timer + Clone + 'static, R: Resolve>(
     };
     happy_eyeballs::within(
         &dialer,
-        host,
-        port,
         deadline,
         happy_eyeballs::connect(&dialer, resolver, host, port),
     )
     .await
-    .map_err(|error| Error::Transport(Box::new(error)))
+    .map_err(|error| error.into_quic_error(host, port))
 }
 
 /// The happy eyeballs dialer for QUIC: an address is one handshake.
@@ -359,9 +357,9 @@ impl<I: Datagram + Timer + Clone + 'static> Dialer for QuicDialer<'_, I> {
         self.io.sleep_until(deadline)
     }
 
-    /// A QUIC handshake has the whole dial deadline, not TCP's bound.
-    fn attempt_timeout(&self) -> std::time::Duration {
-        self.deadline.saturating_duration_since(Instant::now())
+    /// A QUIC handshake has the whole dial deadline.
+    fn attempt_timeout(&self) -> Option<std::time::Duration> {
+        Some(self.deadline.saturating_duration_since(Instant::now()))
     }
 }
 
@@ -382,19 +380,24 @@ async fn attempt<I: Datagram + Timer + Clone + 'static>(
         },
         0,
     );
+    // A failure of this handshake is the QUIC leg's of the connect to `host`.
+    let fail = |error: http_kit_h3::Error| quic_error(host, peer.port(), error);
     let socket = io
         .bind_udp(local)
         .await
-        .map_err(|error| Error::Transport(Box::new(error)))?;
+        .map_err(|error| quic_error(host, peer.port(), error.into()))?;
     let (send, connection) = {
         let mut client = client.0.borrow_mut();
         let client = match &mut *client {
             Some(client) => client,
-            empty => empty.insert(Client::new(&client_config(transport)).map_err(h3_error)?),
+            empty => empty.insert(
+                Client::new(&client_config(transport))
+                    .map_err(|error| Error::tls_config(Cause::H3(error)))?,
+            ),
         };
         client
             .connect(socket, io.clone(), host, peer)
-            .map_err(h3_error)?
+            .map_err(fail)?
     };
     let mut run = connection.run().boxed_local();
     let handshake = {
@@ -402,14 +405,13 @@ async fn attempt<I: Datagram + Timer + Clone + 'static>(
         let expire = io.sleep_until(deadline);
         pin_mut!(ready, expire);
         match select(select(ready, &mut run), expire).await {
-            Either::Left((Either::Left((ready, _)), _)) => ready.map_err(h3_error),
-            Either::Left((Either::Right((ended, _)), _)) => Err(h3_error(
+            Either::Left((Either::Left((ready, _)), _)) => ready.map_err(fail),
+            Either::Left((Either::Right((ended, _)), _)) => Err(fail(
                 ended.err().unwrap_or(http_kit_h3::Error::ConnectionClosed),
             )),
-            Either::Right(((), _)) => Err(Error::Transport(Box::new(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("QUIC handshake with {host} at {peer} timed out"),
-            )))),
+            Either::Right(((), _)) => Err(Error::Timeout(TimedOut::Connect {
+                during: ConnectPhase::Quic,
+            })),
         }
     };
     handshake.map(|()| (send, run))
@@ -482,8 +484,58 @@ const fn rejection(error: &rustls::Error) -> Rejection {
     }
 }
 
+/// The first byte of a QUIC transport error code that carries a TLS alert:
+/// `CRYPTO_ERROR` is `0x0100` plus the alert's description (RFC 9001 §4.8).
+const CRYPTO_ERROR: std::ops::RangeInclusive<u64> = 0x100..=0x1ff;
+
+/// A failure of the QUIC handshake with the origin `host`:`port`.
+fn quic_error(host: &str, port: u16, error: http_kit_h3::Error) -> Error {
+    let cause = match error {
+        http_kit_h3::Error::Io(error) => Cause::Io(error),
+        error => Cause::H3(error),
+    };
+    Error::connect(Hop::Origin, host, port, ConnectFailure::Quic(cause))
+}
+
+/// How a failure of an HTTP/3 exchange reads to a request.
 pub(super) fn h3_error(error: http_kit_h3::Error) -> Error {
-    Error::Transport(Box::new(error))
+    use std::io::ErrorKind;
+
+    use http_kit_h3::{Error as H3, Timeout};
+
+    let failure = match &error {
+        H3::Timeout(Timeout::ResponseHead) => return Error::Timeout(TimedOut::ResponseHead),
+        H3::Timeout(Timeout::BodyIdle) => return Error::Timeout(TimedOut::BodyIdle),
+        // The peer's or our own TLS alert, closing the connection.
+        H3::PeerClosed {
+            application: false,
+            code,
+        }
+        | H3::LocallyClosed {
+            application: false,
+            code,
+        } if CRYPTO_ERROR.contains(code) => ExchangeFailure::Tls,
+        H3::ConnectionClosed | H3::StreamReset(_) | H3::RequestRejected | H3::PeerClosed { .. } => {
+            ExchangeFailure::Terminated
+        }
+        H3::LocallyClosed { .. } | H3::Malformed(_) => ExchangeFailure::Protocol,
+        H3::Body(_) => ExchangeFailure::RequestBody,
+        H3::ContentLengthMismatch { declared } => ExchangeFailure::RequestBodyLength {
+            declared: *declared,
+        },
+        H3::MissingAuthority | H3::InformationalResponse(_) | H3::UnsupportedFrame => {
+            ExchangeFailure::InvalidRequest
+        }
+        H3::Io(io) => match io.kind() {
+            ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof => ExchangeFailure::Terminated,
+            _ => ExchangeFailure::Io,
+        },
+        _ => ExchangeFailure::Io,
+    };
+    Error::exchange(failure, Cause::H3(error))
 }
 
 /// Tells the pool about the `Alt-Svc` fields on `headers`, when there are
@@ -800,8 +852,6 @@ mod tests {
         let started = Instant::now();
         let dial = happy_eyeballs::within(
             &dialer,
-            "localhost",
-            peer.port(),
             dialer.deadline,
             happy_eyeballs::race(&dialer, resolution),
         );

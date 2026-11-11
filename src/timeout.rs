@@ -46,7 +46,7 @@ impl HttpError for TimeoutError {
 // Convert TimeoutError to unified zenwave::Error
 impl From<TimeoutError> for crate::Error {
     fn from(_: TimeoutError) -> Self {
-        Self::Timeout
+        Self::Timeout(crate::TimedOut::Request)
     }
 }
 

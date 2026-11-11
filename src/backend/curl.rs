@@ -1,19 +1,18 @@
 #[cfg(unix_socket)]
 use std::path::{Path, PathBuf};
-use std::{mem::replace, str};
+use std::{io, mem::replace, str, time::Duration};
 
-use anyhow::{Context, anyhow};
 use blocking::unblock;
 use curl::easy::{Easy2, Handler, List, ProxyType, ReadError, SslOpt, WriteError};
 use http::{
     HeaderMap, Method,
     header::{HeaderName, HeaderValue},
 };
-use http_kit::{Body, Endpoint, HttpError, Request, Response, StatusCode};
-use thiserror::Error;
+use http_kit::{Body, Endpoint, Request, Response, StatusCode};
 
 use crate::{
-    Client, Transport,
+    Attempt, Cause, Client, ConfigError, ConnectFailure, ConnectPhase, Error, ExchangeFailure, Hop,
+    ResolveError, TcpFailure, TimedOut, TlsError, TlsFailure, Transport,
     clock::{AsyncIoClock, Clocked},
     transport::proxy::{self, Intercept},
 };
@@ -22,49 +21,6 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct CurlBackend {
     transport: Transport,
-}
-
-#[derive(Debug, Error)]
-pub enum CurlError {
-    #[error("bad request: {0}")]
-    BadRequest(#[source] anyhow::Error),
-    #[error("bad gateway: {0}")]
-    BadGateway(#[source] anyhow::Error),
-    #[error("TLS failure: {0}")]
-    Tls(#[source] curl::Error),
-}
-
-impl HttpError for CurlError {
-    fn status(&self) -> StatusCode {
-        match self {
-            Self::BadRequest(_) => StatusCode::BAD_REQUEST,
-            Self::BadGateway(_) | Self::Tls(_) => StatusCode::BAD_GATEWAY,
-        }
-    }
-}
-
-impl CurlError {
-    fn bad_request(error: impl Into<anyhow::Error>) -> Self {
-        Self::BadRequest(error.into())
-    }
-
-    fn bad_gateway(error: impl Into<anyhow::Error>) -> Self {
-        Self::BadGateway(error.into())
-    }
-}
-
-// Convert CurlError to unified zenwave::Error
-impl From<CurlError> for crate::Error {
-    fn from(err: CurlError) -> Self {
-        match err {
-            CurlError::BadRequest(e) => Self::InvalidRequest(e.to_string()),
-            CurlError::BadGateway(e) => {
-                let io_err = std::io::Error::other(e);
-                Self::Transport(Box::new(io_err))
-            }
-            CurlError::Tls(e) => Self::tls(e),
-        }
-    }
 }
 
 impl CurlBackend {
@@ -106,29 +62,31 @@ impl Endpoint for CurlBackend {
         // cookie jar) finds them again once `respond` returns.
         std::mem::swap(dummy_request.extensions_mut(), request.extensions_mut());
         let request = replace(request, dummy_request);
-        execute(request, &self.transport).await.map_err(Into::into)
+        execute(request, &self.transport).await
     }
 }
 
-async fn execute(request: Request, transport: &Transport) -> Result<Response, CurlError> {
+async fn execute(request: Request, transport: &Transport) -> Result<Response, Error> {
     let (parts, body) = request.into_parts();
     let mut headers = Vec::with_capacity(parts.headers.len());
     for (name, value) in &parts.headers {
-        let value_str = value.to_str().map_err(CurlError::bad_request)?;
+        let value_str = value
+            .to_str()
+            .map_err(|error| Error::InvalidRequest(error.to_string()))?;
         headers.push((name.as_str().to_string(), value_str.to_string()));
     }
 
     let body_bytes = body
         .into_bytes()
         .await
-        .map_err(CurlError::bad_request)?
+        .map_err(|error| Error::InvalidRequest(error.to_string()))?
         .to_vec();
 
     let matched_proxy = || {
         transport
             .proxy()
             .intercept(&parts.uri)
-            .map(|intercept| resolve_proxy(&intercept).map_err(CurlError::bad_request))
+            .map(|intercept| resolve_proxy(&intercept))
             .transpose()
     };
     // No proxy can reach a local socket: a transport carrying one skips the
@@ -144,9 +102,13 @@ async fn execute(request: Request, transport: &Transport) -> Result<Response, Cu
     #[cfg(not(unix_socket))]
     let proxy = matched_proxy()?;
 
+    let https = parts.uri.scheme_str() == Some("https");
     let prepared = PreparedRequest {
         method: parts.method.as_str().to_owned(),
         url: parts.uri.to_string(),
+        host: parts.uri.host().unwrap_or_default().to_owned(),
+        port: parts.uri.port_u16().unwrap_or(if https { 443 } else { 80 }),
+        https,
         headers,
         body: body_bytes,
         proxy,
@@ -160,23 +122,24 @@ async fn execute(request: Request, transport: &Transport) -> Result<Response, Cu
     Ok(response)
 }
 
-fn perform(request: PreparedRequest) -> Result<Response, CurlError> {
-    let handler = CurlHandler::new(request.body);
+fn perform(mut request: PreparedRequest) -> Result<Response, Error> {
+    let handler = CurlHandler::new(std::mem::take(&mut request.body));
     let upload_len = handler.request_body_len();
 
+    // An option libcurl refuses is a request it cannot be given.
+    let refused = |error: curl::Error| Error::InvalidRequest(error.to_string());
+
     let mut easy = Easy2::new(handler);
-    easy.url(&request.url).map_err(map_curl_error)?;
-    easy.custom_request(&request.method)
-        .map_err(map_curl_error)?;
+    easy.url(&request.url).map_err(refused)?;
+    easy.custom_request(&request.method).map_err(refused)?;
     #[cfg(unix_socket)]
     if let Some(path) = &request.unix_socket {
-        easy.unix_socket_path(Some(path)).map_err(map_curl_error)?;
+        easy.unix_socket_path(Some(path)).map_err(refused)?;
     }
 
     if upload_len > 0 {
-        easy.upload(true).map_err(map_curl_error)?;
-        easy.in_filesize(upload_len as u64)
-            .map_err(map_curl_error)?;
+        easy.upload(true).map_err(refused)?;
+        easy.in_filesize(upload_len as u64).map_err(refused)?;
     }
 
     let header_list = if request.headers.is_empty() {
@@ -184,35 +147,38 @@ fn perform(request: PreparedRequest) -> Result<Response, CurlError> {
     } else {
         let mut list = List::new();
         for (name, value) in &request.headers {
-            list.append(&format!("{name}: {value}"))
-                .map_err(map_curl_error)?;
+            list.append(&format!("{name}: {value}")).map_err(refused)?;
         }
-        Some(easy.http_headers(list).map_err(map_curl_error)?)
+        Some(easy.http_headers(list).map_err(refused)?)
     };
 
     // The matcher is the only source of proxy rules: an empty CURLOPT_PROXY
     // stops libcurl from consulting `http_proxy` and friends on its own.
     match &request.proxy {
-        Some(proxy) => apply_proxy(&mut easy, proxy).map_err(map_curl_error)?,
-        None => easy.proxy("").map_err(map_curl_error)?,
+        Some(proxy) => apply_proxy(&mut easy, proxy)
+            .map_err(|error| Error::Config(ConfigError::Tls(Cause::Curl(error))))?,
+        None => easy.proxy("").map_err(refused)?,
     }
     if let Some(bundle) = &request.ca_bundle {
-        easy.ssl_cainfo_blob(bundle).map_err(map_curl_error)?;
+        easy.ssl_cainfo_blob(bundle)
+            .map_err(|error| Error::trust_store(Cause::Curl(error)))?;
     }
     // Revocation is checked when the information is reachable and skipped
     // when it is not (no distribution point, offline responder), which is how
     // the platform verifiers behind the rustls and native-tls engines behave.
     // Only Schannel interprets this flag; the other TLS libraries ignore it.
     easy.ssl_options(SslOpt::new().revoke_best_effort(true))
-        .map_err(map_curl_error)?;
+        .map_err(|error| Error::tls_config(Cause::Curl(error)))?;
 
-    easy.perform().map_err(map_curl_error)?;
+    if let Err(error) = easy.perform() {
+        return Err(classify(&easy, &request, error));
+    }
 
     // Keep the header list alive until this point.
     let _ = header_list;
 
     let handler = easy.get_mut();
-    let response = handler.take_response().map_err(CurlError::bad_gateway)?;
+    let response = handler.take_response()?;
 
     let SessionResponse {
         status,
@@ -226,32 +192,112 @@ fn perform(request: PreparedRequest) -> Result<Response, CurlError> {
     Ok(http_response)
 }
 
-/// Sort a libcurl failure into zenwave's error taxonomy: handshake and
-/// certificate problems are TLS errors, everything else is transport.
-fn map_curl_error(error: curl::Error) -> CurlError {
-    let is_tls = error.is_ssl_connect_error()
-        || error.is_peer_failed_verification()
+/// Sort a failed `perform` into zenwave's error taxonomy. libcurl reports
+/// one code for the whole transfer, so the phase it failed in comes from its
+/// timings: each of name lookup, TCP connect and TLS handshake stays at zero
+/// until it completes.
+fn classify(easy: &Easy2<CurlHandler>, request: &PreparedRequest, error: curl::Error) -> Error {
+    let origin = |failure| Error::connect(Hop::Origin, &request.host, request.port, failure);
+    // libcurl does not say which hop refused: with a proxy configured, a
+    // connect failure is the proxy's.
+    let (hop, host, port) = request.proxy.as_ref().map_or(
+        (Hop::Origin, request.host.as_str(), request.port),
+        |proxy| (Hop::Proxy, proxy.host.as_str(), proxy.port),
+    );
+    let connect = |hop, host: &str, port, failure| Error::connect(hop, host, port, failure);
+    let reached = |timing: Result<Duration, curl::Error>| timing.is_ok_and(|time| !time.is_zero());
+    let tls = |failure| {
+        origin(ConnectFailure::Tls(TlsError::new(
+            failure,
+            Cause::Curl(error.clone()),
+        )))
+    };
+
+    if error.is_couldnt_resolve_host() {
+        return origin(ConnectFailure::Resolve(ResolveError::Lookup(Cause::Curl(
+            error,
+        ))));
+    }
+    if error.is_couldnt_resolve_proxy() {
+        let (host, port) = request
+            .proxy
+            .as_ref()
+            .map_or((request.host.as_str(), request.port), |proxy| {
+                (proxy.host.as_str(), proxy.port)
+            });
+        return connect(
+            Hop::Proxy,
+            host,
+            port,
+            ConnectFailure::Resolve(ResolveError::Lookup(Cause::Curl(error))),
+        );
+    }
+    if error.is_couldnt_connect() {
+        return connect(
+            hop,
+            host,
+            port,
+            ConnectFailure::Tcp(TcpFailure::new(vec![Attempt::new(
+                None,
+                io::Error::other(error),
+            )])),
+        );
+    }
+    if error.is_operation_timedout() {
+        return Error::Timeout(if !reached(easy.namelookup_time()) {
+            TimedOut::Connect {
+                during: ConnectPhase::Resolve,
+            }
+        } else if !reached(easy.connect_time()) {
+            TimedOut::Connect {
+                during: ConnectPhase::Tcp,
+            }
+        } else if request.https && !reached(easy.appconnect_time()) {
+            TimedOut::Connect {
+                during: ConnectPhase::Tls,
+            }
+        } else {
+            TimedOut::ResponseHead
+        });
+    }
+    if error.is_peer_failed_verification() || error.is_ssl_cacert() || error.is_ssl_issuer_error() {
+        return tls(TlsFailure::Certificate);
+    }
+    if error.is_ssl_connect_error()
         || error.is_ssl_certproblem()
         || error.is_ssl_cipher()
-        || error.is_ssl_cacert()
-        || error.is_ssl_cacert_badfile()
-        || error.is_ssl_crl_badfile()
-        || error.is_ssl_issuer_error()
         || error.is_use_ssl_failed()
-        || error.is_ssl_engine_notfound()
-        || error.is_ssl_engine_setfailed()
-        || error.is_ssl_engine_initfailed();
-    if is_tls {
-        CurlError::Tls(error)
-    } else {
-        CurlError::bad_gateway(error)
+    {
+        return tls(TlsFailure::Protocol);
     }
+    if error.is_ssl_cacert_badfile() || error.is_ssl_crl_badfile() {
+        return Error::trust_store(Cause::Curl(error));
+    }
+    if error.is_ssl_engine_notfound()
+        || error.is_ssl_engine_setfailed()
+        || error.is_ssl_engine_initfailed()
+    {
+        return Error::tls_config(Cause::Curl(error));
+    }
+    let failure = if error.is_got_nothing() || error.is_recv_error() || error.is_send_error() {
+        ExchangeFailure::Terminated
+    } else if error.is_partial_file() {
+        ExchangeFailure::Incomplete
+    } else {
+        ExchangeFailure::Io
+    };
+    Error::exchange(failure, Cause::Curl(error))
 }
 
 #[derive(Debug)]
 struct PreparedRequest {
     method: String,
     url: String,
+    /// The URL's host and port, and whether it is `https`: where a failure
+    /// to connect is reported.
+    host: String,
+    port: u16,
+    https: bool,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     proxy: Option<ResolvedProxy>,
@@ -262,6 +308,9 @@ struct PreparedRequest {
 #[derive(Debug)]
 struct ResolvedProxy {
     endpoint: String,
+    /// The proxy's host and port, for the errors that name it.
+    host: String,
+    port: u16,
     kind: ProxyType,
     credentials: Option<(String, String)>,
 }
@@ -282,7 +331,7 @@ fn apply_proxy(
     Ok(())
 }
 
-fn resolve_proxy(intercept: &Intercept) -> anyhow::Result<ResolvedProxy> {
+fn resolve_proxy(intercept: &Intercept) -> Result<ResolvedProxy, Error> {
     let scheme = intercept
         .uri()
         .scheme_str()
@@ -291,22 +340,24 @@ fn resolve_proxy(intercept: &Intercept) -> anyhow::Result<ResolvedProxy> {
     let authority = intercept
         .uri()
         .authority()
-        .context("proxy URI missing authority")?
-        .as_str();
-    let endpoint = format!("{scheme}://{authority}");
+        .ok_or(Error::Config(ConfigError::ProxyHost))?;
+    let endpoint = format!("{scheme}://{}", authority.as_str());
 
-    let kind = match scheme.as_str() {
-        "http" | "https" => ProxyType::Http,
-        "socks4" => ProxyType::Socks4,
-        "socks4a" => ProxyType::Socks4a,
-        "socks5" => ProxyType::Socks5,
-        "socks5h" => ProxyType::Socks5Hostname,
-        other => return Err(anyhow!("unsupported proxy scheme `{other}`")),
+    let (kind, default_port) = match scheme.as_str() {
+        "http" => (ProxyType::Http, 80),
+        "https" => (ProxyType::Http, 443),
+        "socks4" => (ProxyType::Socks4, 1080),
+        "socks4a" => (ProxyType::Socks4a, 1080),
+        "socks5" => (ProxyType::Socks5, 1080),
+        "socks5h" => (ProxyType::Socks5Hostname, 1080),
+        other => return Err(Error::Config(ConfigError::ProxyScheme(other.to_owned()))),
     };
     let credentials = proxy::credentials(intercept);
 
     Ok(ResolvedProxy {
         endpoint,
+        host: authority.host().to_owned(),
+        port: authority.port_u16().unwrap_or(default_port),
         kind,
         credentials,
     })
@@ -337,10 +388,13 @@ impl CurlHandler {
         self.request_body.as_ref().map_or(0, Vec::len)
     }
 
-    fn take_response(&mut self) -> anyhow::Result<SessionResponse> {
-        let status = self
-            .status
-            .ok_or_else(|| anyhow!("curl response missing HTTP status line"))?;
+    fn take_response(&mut self) -> Result<SessionResponse, Error> {
+        let status = self.status.ok_or_else(|| {
+            Error::exchange(
+                ExchangeFailure::Protocol,
+                Cause::Detail("curl response missing HTTP status line".to_owned()),
+            )
+        })?;
         Ok(SessionResponse {
             status,
             headers: std::mem::take(&mut self.headers),

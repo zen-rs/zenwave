@@ -240,7 +240,7 @@ hostname); an `https` proxy is refused as `UnsupportedScheme`; destinations
 written as a loopback or local IP literal are never proxied. Plaintext requests
 carry `Proxy-Authorization` up front, `CONNECT` tunnels answer the proxy's
 challenge from the delegate, and a refused challenge fails at once with
-`ProxyErrorKind::TunnelRejected`.
+`ConnectFailure::Tunnel(TunnelError::Rejected(status))`.
 
 ## Backends and feature flags
 

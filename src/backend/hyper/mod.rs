@@ -17,9 +17,9 @@ use futures_util::{
     future::{Either, select},
     pin_mut,
 };
-use http::{StatusCode, uri::Scheme};
+use http::uri::Scheme;
 use http_body_util::BodyExt as _;
-use http_kit::{Endpoint, HttpError, Request, Response};
+use http_kit::{Endpoint, Request, Response};
 use hyper::{body::Incoming, client::conn::TrySendError, http};
 use rt::Spawner;
 #[cfg(http3)]
@@ -40,7 +40,7 @@ use crate::transport::{
     quic,
 };
 use crate::{
-    Client, Transport,
+    Cause, Client, ExchangeFailure, Transport,
     clock::{AsyncIoClock, Clocked},
     transport::{
         connect::{Protocol, Protocols, Target, Via, connect},
@@ -130,7 +130,7 @@ impl HyperBackend {
                 let (sender, driver) = hyper::client::conn::http1::Builder::new()
                     .handshake(HyperIo(connection.stream))
                     .await
-                    .map_err(HyperError::Connection)?;
+                    .map_err(hyper_error)?;
                 // The driver runs once for the connection's life, not per
                 // request.
                 self.spawner.spawn(drive(driver));
@@ -149,11 +149,11 @@ impl HyperBackend {
                 let (mut sender, driver) = builder
                     .handshake(HyperIo(connection.stream))
                     .await
-                    .map_err(HyperError::Connection)?;
+                    .map_err(hyper_error)?;
                 self.spawner.spawn(drive(driver));
                 // Ready before pooling: the handle is shared as soon as it
                 // is stored.
-                sender.ready().await.map_err(HyperError::Connection)?;
+                sender.ready().await.map_err(hyper_error)?;
                 Ok(Dialed::H2 { sender })
             }
         }
@@ -173,7 +173,7 @@ impl HyperBackend {
                     .await
                     .send(request)
                     .await
-                    .map_err(|error| HyperError::Connection(error.into_error()))?;
+                    .map_err(|error| hyper_error(error.into_error()))?;
                 Ok((into_body(response), Some(lease)))
             }
             #[cfg(feature = "http2")]
@@ -182,7 +182,7 @@ impl HyperBackend {
                 let response = sender
                     .try_send_request(request)
                     .await
-                    .map_err(|error| HyperError::Connection(error.into_error()))?;
+                    .map_err(|error| hyper_error(error.into_error()))?;
                 Ok((into_body(response), None))
             }
         }
@@ -289,19 +289,23 @@ impl Default for HyperBackend {
     }
 }
 
-#[derive(Debug)]
-pub enum HyperError {
-    Connection(hyper::Error),
-    #[cfg(http3)]
-    Http3(Box<dyn core::error::Error + Send + Sync>),
-}
-
-impl HyperError {
-    /// Wrap a QUIC or h3 protocol error.
-    #[cfg(http3)]
-    pub(crate) fn http3(error: impl Into<Box<dyn core::error::Error + Send + Sync>>) -> Self {
-        Self::Http3(error.into())
-    }
+/// How a hyper failure on an established connection reads to a request: the
+/// exchange failure it is, hyper's own error kept as the cause.
+fn hyper_error(error: hyper::Error) -> crate::Error {
+    let failure = if error.is_incomplete_message() {
+        ExchangeFailure::Incomplete
+    } else if error.is_closed() || error.is_canceled() {
+        ExchangeFailure::Terminated
+    } else if error.is_parse() || error.is_parse_status() {
+        ExchangeFailure::Protocol
+    } else if error.is_body_write_aborted() {
+        ExchangeFailure::RequestBody
+    } else if error.is_user() {
+        ExchangeFailure::InvalidRequest
+    } else {
+        ExchangeFailure::Io
+    };
+    crate::Error::exchange(failure, Cause::Hyper(error))
 }
 
 /// A freshly connected connection after its hyper handshake.
@@ -342,13 +346,11 @@ async fn quic_dial(
     };
     happy_eyeballs::within(
         &dialer,
-        host,
-        h3_port,
         deadline,
         happy_eyeballs::connect(&dialer, &Getaddrinfo, host, h3_port),
     )
     .await
-    .map_err(|error| crate::Error::Transport(Box::new(error)))
+    .map_err(|error| error.into_quic_error(host, h3_port))
 }
 
 /// The happy eyeballs dialer for QUIC: an address is one handshake.
@@ -384,38 +386,9 @@ impl happy_eyeballs::Dialer for QuicDialer<'_> {
         async_io::Timer::at(deadline).await;
     }
 
-    /// A QUIC handshake has the whole dial deadline, not TCP's bound.
-    fn attempt_timeout(&self) -> Duration {
-        self.deadline.saturating_duration_since(Instant::now())
-    }
-}
-
-impl core::fmt::Display for HyperError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Connection(err) => write!(f, "connection error: {err}"),
-            #[cfg(http3)]
-            Self::Http3(err) => write!(f, "http/3 error: {err}"),
-        }
-    }
-}
-
-impl core::error::Error for HyperError {}
-
-impl HttpError for HyperError {
-    fn status(&self) -> StatusCode {
-        StatusCode::INTERNAL_SERVER_ERROR
-    }
-}
-
-// Convert HyperError to unified zenwave::Error
-impl From<HyperError> for crate::Error {
-    fn from(err: HyperError) -> Self {
-        match err {
-            HyperError::Connection(e) => Self::Transport(Box::new(e)),
-            #[cfg(http3)]
-            HyperError::Http3(e) => Self::Transport(e),
-        }
+    /// A QUIC handshake has the whole dial deadline.
+    fn attempt_timeout(&self) -> Option<Duration> {
+        Some(self.deadline.saturating_duration_since(Instant::now()))
     }
 }
 
@@ -637,7 +610,7 @@ impl Unsent for TrySendError<http::Request<http_kit::Body>> {
     }
 
     fn into_error(self) -> crate::Error {
-        HyperError::Connection(self.into_error()).into()
+        hyper_error(self.into_error())
     }
 }
 
@@ -1444,8 +1417,6 @@ mod tests {
                 let started = Instant::now();
                 let mut connection = happy_eyeballs::within(
                     &dialer,
-                    "localhost",
-                    peer.port(),
                     deadline,
                     happy_eyeballs::race(&dialer, resolution),
                 )

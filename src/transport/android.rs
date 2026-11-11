@@ -16,7 +16,7 @@ use std::path::Path;
 use rustls::RootCertStore;
 use rustls_pki_types::{CertificateDer, pem::PemObject};
 
-use crate::Error;
+use crate::{Cause, Error};
 
 /// Where Android keeps the system trust anchors, one PEM file per anchor
 /// (each followed by a textual dump the PEM parser skips).
@@ -58,10 +58,10 @@ pub fn system_roots() -> Result<RootCertStore, Error> {
         }
     }
     if store.is_empty() {
-        return Err(Error::tls(format!(
+        return Err(Error::trust_store(Cause::Detail(format!(
             "no system trust anchors could be read from {}",
             ANCHOR_DIRECTORIES.join(" or ")
-        )));
+        ))));
     }
     tracing::debug!(
         anchors = store.len(),

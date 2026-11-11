@@ -35,7 +35,8 @@ use rustls::{
 };
 use time::{Duration as TimeDelta, OffsetDateTime};
 use zenwave::{
-    Client as _, Proxy, ResponseExt as _, Transport,
+    Client as _, ConnectFailure, ConnectPhase, Error, ExchangeFailure, Hop, Proxy, ResolveError,
+    ResponseExt as _, TimedOut, TlsFailure, Transport,
     backend::{NativeBackend, NativeIo},
 };
 
@@ -48,6 +49,11 @@ trait TestIo: NativeIo + FromStd + Listen<Listener: Listener<Stream: http_kit_tl
 impl<I> TestIo for I where
     I: NativeIo + FromStd + Listen<Listener: Listener<Stream: http_kit_tls::Transport>>
 {
+}
+
+/// How a runtime's sockets report a connection the peer refused.
+trait Refusal {
+    fn is_refusal(error: &std::io::Error) -> bool;
 }
 
 /// A backend on the current thread over `io`, resolving through the system's
@@ -680,8 +686,8 @@ async fn play<I: NativeIo, S: http_kit_io::Split>(io: &I, stream: S, script: Scr
 }
 
 /// A server that accepts TCP and never answers the TLS handshake: the
-/// connect timeout fails the request with `Error::Timeout`, about when it
-/// runs out.
+/// connect timeout fails the request with `TimedOut::Connect` in the TLS
+/// phase, about when it runs out.
 async fn stalled_connect<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
     let listener = io.bind_tcp(loopback()).expect("bind");
     let port = listener.local_addr().expect("local address").port();
@@ -700,7 +706,15 @@ async fn stalled_connect<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
             .await
             .expect_err("a handshake the server never answers fails");
         let elapsed = started.elapsed();
-        assert!(error.is_timeout(), "a timeout, got {error:?}");
+        assert!(
+            matches!(
+                error,
+                Error::Timeout(TimedOut::Connect {
+                    during: ConnectPhase::Tls
+                })
+            ),
+            "a connect timeout in the TLS phase, got {error:?}"
+        );
         assert!(
             elapsed >= timeout && elapsed < timeout * 10,
             "the connect timeout bounds the dial: {elapsed:?}"
@@ -710,7 +724,8 @@ async fn stalled_connect<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
 }
 
 /// A server that reads the request and never answers: the read timeout
-/// fails the request with `Error::Timeout`, in plaintext or over TLS.
+/// fails the request with `TimedOut::ResponseHead`, in plaintext or over
+/// TLS.
 async fn stalled_head_on<I: TestIo, E: LocalExecutor>(io: I, executor: &E, pki: Option<&Pki>) {
     let listener = io.bind_tcp(loopback()).expect("bind");
     let port = listener.local_addr().expect("local address").port();
@@ -742,7 +757,10 @@ async fn stalled_head_on<I: TestIo, E: LocalExecutor>(io: I, executor: &E, pki: 
             .await
             .expect_err("a head that never comes fails");
         let elapsed = started.elapsed();
-        assert!(error.is_timeout(), "a timeout, got {error:?}");
+        assert!(
+            matches!(error, Error::Timeout(TimedOut::ResponseHead)),
+            "a response-head timeout, got {error:?}"
+        );
         assert!(
             elapsed >= READ_TIMEOUT && elapsed < READ_TIMEOUT * 10,
             "the read timeout bounds the wait for the head: {elapsed:?}"
@@ -760,8 +778,8 @@ async fn stalled_head_tls<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
 }
 
 /// A server that sends the head and half the body, then stalls: the
-/// response arrives, and reading its body fails with an I/O timeout that
-/// carries `Error::Timeout`.
+/// response arrives, and reading its body fails as a stalled receive, which
+/// is `TimedOut::BodyIdle` as a zenwave error.
 async fn stalled_body<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
     let listener = io.bind_tcp(loopback()).expect("bind");
     let port = listener.local_addr().expect("local address").port();
@@ -789,16 +807,16 @@ async fn stalled_body<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
             .into_bytes()
             .await
             .expect_err("a body that stalls halfway fails");
-        let http_kit::BodyError::Io(io_error) = &error else {
-            panic!("an I/O error, got {error:?}");
-        };
-        assert_eq!(io_error.kind(), std::io::ErrorKind::TimedOut);
         assert!(
-            io_error
-                .get_ref()
-                .and_then(|inner| inner.downcast_ref::<zenwave::Error>())
-                .is_some_and(zenwave::Error::is_timeout),
-            "the I/O error carries zenwave's timeout: {io_error:?}"
+            matches!(
+                error,
+                http_kit::BodyError::Receive(http_kit::ReceiveError::Stalled)
+            ),
+            "a stalled receive, got {error:?}"
+        );
+        assert!(
+            matches!(Error::from(error), Error::Timeout(TimedOut::BodyIdle)),
+            "a body-idle timeout"
         );
     })
     .await;
@@ -832,6 +850,278 @@ async fn slow_body<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
             started.elapsed() > READ_TIMEOUT * 2,
             "the body took longer than the read timeout in all"
         );
+    })
+    .await;
+}
+
+/// A resolver that finds no address for any name: every lookup answers
+/// that the name does not exist.
+#[derive(Clone, Copy)]
+struct Unresolvable;
+
+impl http_kit_io::Resolve for Unresolvable {
+    fn lookup(&self, _host: &str) -> impl futures_util::Stream<Item = http_kit_io::Answer> {
+        futures_util::stream::iter([http_kit_io::Answer::Ranked(Err(
+            std::io::ErrorKind::NotFound.into(),
+        ))])
+    }
+}
+
+#[cfg(feature = "native-http3")]
+impl zenwave::dns::ResolveHttps for Unresolvable {
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait's method is async and this resolver has nothing to await"
+    )]
+    async fn https_record(
+        &self,
+        _host: &str,
+        _port: u16,
+    ) -> Result<Option<zenwave::dns::HttpsRecord>, ResolveError> {
+        Ok(None)
+    }
+}
+
+/// A name the resolver does not know fails the request as a connect failure
+/// on the origin, with [`ResolveError::NoAddress`].
+async fn unresolved_name<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
+    let mut client =
+        NativeBackend::on_current_thread(bounded(None, None), io, Unresolvable, executor);
+    let error = client
+        .get("http://no-such-host.example:8080/")
+        .expect("request builds")
+        .await
+        .expect_err("a name with no address fails");
+    let Error::Connect(connect) = &error else {
+        panic!("a connect failure, got {error:?}");
+    };
+    assert_eq!(connect.hop, Hop::Origin);
+    assert_eq!(connect.host, "no-such-host.example");
+    assert_eq!(connect.port, 8080);
+    assert!(
+        matches!(
+            connect.failure,
+            ConnectFailure::Resolve(ResolveError::NoAddress)
+        ),
+        "no address, got {:?}",
+        connect.failure
+    );
+}
+
+/// Nothing listens on the port: the one address's attempt is refused, and
+/// the failure names the address and keeps the OS's error kind.
+async fn refused_connection<I: TestIo + Refusal, E: LocalExecutor>(io: I, executor: &E) {
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    drop(listener);
+    let mut client = backend(bounded(None, None), io, executor);
+    let error = client
+        .get(format!("http://127.0.0.1:{port}/"))
+        .expect("request builds")
+        .await
+        .expect_err("a closed port refuses");
+    let Error::Connect(connect) = &error else {
+        panic!("a connect failure, got {error:?}");
+    };
+    let ConnectFailure::Tcp(tcp) = &connect.failure else {
+        panic!("a TCP failure, got {:?}", connect.failure);
+    };
+    let [attempt] = tcp.attempts.as_slice() else {
+        panic!("one attempt, got {tcp:?}");
+    };
+    assert_eq!(attempt.addr, Some(SocketAddr::from(([127, 0, 0, 1], port))));
+    assert!(
+        I::is_refusal(&attempt.error),
+        "a refusal, got {:?}",
+        attempt.error
+    );
+    assert!(error.is_transient(), "a refusal is worth retrying");
+}
+
+/// Accepts TLS connections and ignores how each handshake ends; runs until
+/// dropped.
+async fn serve_handshakes<I: TestIo, E: LocalExecutor>(
+    io: I,
+    executor: &E,
+    listener: I::Listener,
+    tls: TlsAcceptor,
+) {
+    loop {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let io = io.clone();
+        let tls = tls.clone();
+        let handshake = async move {
+            // The client ends these: with an alert, or by hanging up.
+            let accepted = tls.accept(stream, &io).await;
+            drop(accepted);
+        };
+        executor.spawn_local(handshake).detach();
+    }
+}
+
+/// How the client's handshake with a server ends, as the request's error.
+async fn handshake_failure<I: TestIo, E: LocalExecutor>(
+    io: I,
+    executor: &E,
+    transport: Transport,
+    acceptor: TlsAcceptor,
+) -> (Error, Hop) {
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let server = serve_handshakes(io.clone(), executor, listener, acceptor);
+    let mut client = backend(transport, io, executor);
+    let error = against(server, async {
+        client
+            .get(format!("https://localhost:{port}/"))
+            .expect("request builds")
+            .await
+            .expect_err("the handshake fails")
+    })
+    .await;
+    let Error::Connect(connect) = &error else {
+        panic!("a connect failure, got {error:?}");
+    };
+    let hop = connect.hop;
+    (error, hop)
+}
+
+/// A certificate the system's roots do not vouch for fails the handshake as
+/// [`TlsFailure::Certificate`], with no request sent and no retry worth
+/// making.
+async fn untrusted_certificate<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
+    let pki = Pki::new();
+    let (error, hop) =
+        handshake_failure(io, executor, bounded(None, None), pki.tls_acceptor()).await;
+    assert_eq!(hop, Hop::Origin);
+    let Error::Connect(connect) = &error else {
+        unreachable!("checked by handshake_failure");
+    };
+    assert!(
+        matches!(
+            &connect.failure,
+            ConnectFailure::Tls(tls) if tls.failure == TlsFailure::Certificate
+        ),
+        "an untrusted certificate, got {:?}",
+        connect.failure
+    );
+    assert!(!error.is_transient(), "retrying cannot make the CA trusted");
+}
+
+/// A server that answers the `ClientHello` with a fatal `handshake_failure`
+/// alert (RFC 8446 §6.2, description 40) ends the handshake as
+/// [`TlsFailure::AlertReceived`] with that description.
+async fn received_alert<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
+    const HANDSHAKE_FAILURE: u8 = 40;
+    /// A TLS record (RFC 8446 §5.1: type 21, the legacy version 1.2, a
+    /// length of 2) holding a fatal alert.
+    const ALERT_RECORD: [u8; 7] = [21, 3, 3, 0, 2, 2, HANDSHAKE_FAILURE];
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let server = async {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let connection = async move {
+                let (mut read, mut write) = stream.split();
+                // The ClientHello is one flight.
+                let BufResult(hello, _) = read.read(Vec::with_capacity(4096)).await;
+                hello.expect("the ClientHello reads");
+                write
+                    .write_all(ALERT_RECORD.to_vec())
+                    .await
+                    .0
+                    .expect("the alert writes");
+                write.shutdown().await.ok();
+            };
+            executor.spawn_local(connection).detach();
+        }
+    };
+    let mut client = backend(Pki::new().transport(), io, executor);
+    let error = against(server, async {
+        client
+            .get(format!("https://localhost:{port}/"))
+            .expect("request builds")
+            .await
+            .expect_err("the handshake fails")
+    })
+    .await;
+    let Error::Connect(connect) = &error else {
+        panic!("a connect failure, got {error:?}");
+    };
+    assert!(
+        matches!(
+            &connect.failure,
+            ConnectFailure::Tls(tls)
+                if tls.failure == TlsFailure::AlertReceived { alert: HANDSHAKE_FAILURE }
+        ),
+        "a received alert, got {:?}",
+        connect.failure
+    );
+    assert!(!error.is_transient(), "the server refused the handshake");
+}
+
+/// A server that writes `bytes` after reading a request head, then closes.
+async fn serve_truncated<I: TestIo, E: LocalExecutor>(
+    executor: &E,
+    listener: I::Listener,
+    bytes: Vec<u8>,
+) {
+    loop {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let bytes = bytes.clone();
+        let connection = async move {
+            let (mut read, mut write) = stream.split();
+            read_head(&mut read).await;
+            write
+                .write_all(bytes)
+                .await
+                .0
+                .expect("the scripted bytes write");
+            write.shutdown().await.ok();
+        };
+        executor.spawn_local(connection).detach();
+    }
+}
+
+/// A server that announces twice the body it sends and closes: the response
+/// arrives, and reading its body fails as an incomplete receive, which is an
+/// [`ExchangeFailure::Incomplete`] exchange failure as a zenwave error.
+async fn early_end<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let half = GREETING.as_bytes();
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n",
+        half.len() * 2
+    );
+    let server = serve_truncated::<I, E>(executor, listener, [head.as_bytes(), half].concat());
+    let mut client = backend(bounded(None, None), io, executor);
+    against(server, async {
+        let response = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .expect("request builds")
+            .await
+            .expect("the head arrives");
+        let error = response
+            .into_body()
+            .into_bytes()
+            .await
+            .expect_err("a body that ends halfway fails");
+        assert!(
+            matches!(
+                error,
+                http_kit::BodyError::Receive(http_kit::ReceiveError::Incomplete)
+            ),
+            "an incomplete receive, got {error:?}"
+        );
+        let error = Error::from(error);
+        assert!(
+            matches!(
+                &error,
+                Error::Exchange(exchange) if exchange.failure == ExchangeFailure::Incomplete
+            ),
+            "an incomplete exchange, got {error:?}"
+        );
+        assert!(error.is_transient());
     })
     .await;
 }
@@ -1030,6 +1320,24 @@ async fn splice_upgrade<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
 mod compio_runtime {
     use http_kit_io::compio::Compio;
 
+    /// `ERROR_CONNECTION_REFUSED` in `winerror.h`.
+    const ERROR_CONNECTION_REFUSED: i32 = 1225;
+
+    impl super::Refusal for Compio {
+        /// On Windows compio turns a failed completion's status into a Win32
+        /// code through `RtlNtStatusToDosError` (compio-driver
+        /// `src/sys/driver/iocp/cp/mod.rs`), so a refused connect arrives as
+        /// `ERROR_CONNECTION_REFUSED`, which std maps to no `ErrorKind`; a
+        /// Winsock call would have reported `WSAECONNREFUSED`.
+        fn is_refusal(error: &std::io::Error) -> bool {
+            if cfg!(windows) {
+                error.raw_os_error() == Some(ERROR_CONNECTION_REFUSED)
+            } else {
+                error.kind() == std::io::ErrorKind::ConnectionRefused
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_response_body_arrives_as_pipe_frames() {
@@ -1045,6 +1353,31 @@ mod compio_runtime {
     fn run(test: impl AsyncFnOnce(Compio, &compio::runtime::Runtime)) {
         let runtime = compio::runtime::Runtime::new().expect("compio runtime");
         runtime.block_on(test(Compio::default(), &runtime));
+    }
+
+    #[test]
+    fn an_unknown_name_is_a_resolve_failure() {
+        run(super::unresolved_name);
+    }
+
+    #[test]
+    fn a_closed_port_is_a_tcp_failure() {
+        run(super::refused_connection);
+    }
+
+    #[test]
+    fn an_untrusted_certificate_is_a_tls_certificate_failure() {
+        run(super::untrusted_certificate);
+    }
+
+    #[test]
+    fn a_fatal_alert_is_a_received_alert() {
+        run(super::received_alert);
+    }
+
+    #[test]
+    fn a_body_that_ends_early_is_an_incomplete_exchange() {
+        run(super::early_end);
     }
 
     #[test]
@@ -1142,6 +1475,12 @@ mod compio_runtime {
 mod tokio_runtime {
     use http_kit_io::tokio::Tokio;
 
+    impl super::Refusal for Tokio {
+        fn is_refusal(error: &std::io::Error) -> bool {
+            error.kind() == std::io::ErrorKind::ConnectionRefused
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_response_body_arrives_as_pipe_frames() {
@@ -1161,6 +1500,31 @@ mod tokio_runtime {
             .expect("tokio runtime");
         let local = tokio::task::LocalSet::new();
         local.block_on(&runtime, test(Tokio, &local));
+    }
+
+    #[test]
+    fn an_unknown_name_is_a_resolve_failure() {
+        run(super::unresolved_name);
+    }
+
+    #[test]
+    fn a_closed_port_is_a_tcp_failure() {
+        run(super::refused_connection);
+    }
+
+    #[test]
+    fn an_untrusted_certificate_is_a_tls_certificate_failure() {
+        run(super::untrusted_certificate);
+    }
+
+    #[test]
+    fn a_fatal_alert_is_a_received_alert() {
+        run(super::received_alert);
+    }
+
+    #[test]
+    fn a_body_that_ends_early_is_an_incomplete_exchange() {
+        run(super::early_end);
     }
 
     #[test]

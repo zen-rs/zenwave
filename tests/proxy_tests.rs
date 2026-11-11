@@ -144,8 +144,14 @@ async fn rejected_tunnel_is_an_error() {
     #[cfg(any(default_hyper, default_native, default_apple))]
     assert!(
         matches!(
-            error,
-            zenwave::Error::Proxy(zenwave::error::ProxyErrorKind::TunnelRejected(status)) if status.as_u16() == 407
+            &error,
+            zenwave::Error::Connect(connect)
+                if connect.hop == zenwave::Hop::Proxy
+                    && matches!(
+                        &connect.failure,
+                        zenwave::ConnectFailure::Tunnel(zenwave::TunnelError::Rejected(status))
+                            if status.as_u16() == 407
+                    )
         ),
         "{error:?}"
     );
@@ -218,7 +224,7 @@ async fn socks4_is_refused() {
     assert!(
         matches!(
             error,
-            zenwave::Error::Proxy(zenwave::error::ProxyErrorKind::UnsupportedScheme(ref scheme)) if scheme == "socks4"
+            zenwave::Error::Config(zenwave::ConfigError::ProxyScheme(ref scheme)) if scheme == "socks4"
         ),
         "{error:?}"
     );
