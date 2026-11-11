@@ -72,7 +72,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          targets: wasm32-unknown-unknown,wasm32-wasip2
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
@@ -81,6 +81,18 @@ jobs:
       # The desktop clippy lanes never compile the wasm32-only code. The
       # examples block on async-io and are native-only, so they stay out.
       - run: cargo clippy --target wasm32-unknown-unknown --lib --tests -- -D warnings
+      # The native backend over a WASI host's sockets. ring compiles C for
+      # wasm32, which takes the image's LLVM: its clang, and its archiver,
+      # because GNU ar writes an index wasm-ld cannot read.
+      - name: Point ring's C build at LLVM for wasm32-wasip2
+        run: |
+          llvm="$(ls -d /usr/lib/llvm-* | sort -V | tail -n 1)/bin"
+          {
+            echo "CC_wasm32_wasip2=$llvm/clang"
+            echo "AR_wasm32_wasip2=$llvm/llvm-ar"
+            echo "RANLIB_wasm32_wasip2=$llvm/llvm-ranlib"
+          } >> "$GITHUB_ENV"
+      - run: cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend --lib --test wasi_native_backend -- -D warnings
 
   mobile:
     # Cross-compilation for the mobile targets, tests included. The suites run
