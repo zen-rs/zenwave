@@ -5,16 +5,33 @@
 
 mod common;
 
+#[cfg(tls_native)]
+use zenwave::Cause;
 use zenwave::{ConfigError, ConnectFailure, Error, TlsFailure, Transport};
 
 /// Whether `error` is a connect failure whose TLS handshake rejected the
 /// server's certificate.
+///
+/// rustls (every backend but hyper with `native-tls` and no `rustls`, the
+/// `tls_native` cfg) classifies it as [`TlsFailure::Certificate`].
+/// `native-tls` reports no typed verification outcome, so its failure is
+/// [`TlsFailure::Unclassified`] with the platform error as a
+/// [`Cause::NativeTls`].
 fn is_untrusted_certificate(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::Connect(connect)
-            if matches!(&connect.failure, ConnectFailure::Tls(tls) if tls.failure == TlsFailure::Certificate)
-    )
+    let Error::Connect(connect) = error else {
+        return false;
+    };
+    let ConnectFailure::Tls(tls) = &connect.failure else {
+        return false;
+    };
+    #[cfg(tls_native)]
+    {
+        tls.failure == TlsFailure::Unclassified && matches!(tls.cause, Cause::NativeTls(_))
+    }
+    #[cfg(not(tls_native))]
+    {
+        tls.failure == TlsFailure::Certificate
+    }
 }
 
 #[test]

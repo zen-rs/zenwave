@@ -401,7 +401,9 @@ pub enum TlsFailure {
     #[error("TLS protocol failure")]
     Protocol,
     /// The engine reports no classification (`native-tls`, libcurl's and
-    /// `URLSession`'s TLS).
+    /// `URLSession`'s TLS): `native-tls` reports no typed verification
+    /// outcome, so its failures are unclassified and the cause carries the
+    /// platform error.
     #[error("TLS failure")]
     Unclassified,
 }
@@ -759,7 +761,12 @@ pub enum WebSocketErrorKind {
 impl Error {
     /// A TLS configuration failure: the engine could not be built from the
     /// transport's settings.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(
+        tls_engine,
+        http3,
+        native_h3,
+        all(not(target_arch = "wasm32"), feature = "curl-backend")
+    ))]
     pub(crate) fn tls_config(cause: impl Into<Cause>) -> Self {
         Self::Config(ConfigError::Tls(cause.into()))
     }
