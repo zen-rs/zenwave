@@ -924,7 +924,8 @@ async fn pipe_body<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
         let mut received = Vec::new();
         let mut pipes = 0_usize;
         while let Some(frame) =
-            poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame_offering(cx, &mut offer)).await
+            poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame_offering(cx, Some(&mut offer)))
+                .await
         {
             match frame.expect("the frame reads") {
                 BodyFrame::Data(data) => received.extend_from_slice(&data),

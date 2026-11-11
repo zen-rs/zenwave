@@ -407,7 +407,7 @@ impl FrameSource for LeaseReturn {
         offer: Option<&mut PipeOffer>,
     ) -> Poll<Option<Result<BodyFrame, BodyError>>> {
         let Self { inner, lease } = self.get_mut();
-        match poll_offering(inner, cx, offer) {
+        match Pin::new(inner).poll_frame_offering(cx, offer) {
             Poll::Ready(None) => {
                 if let Some(lease) = lease.take() {
                     lease.release();
@@ -423,19 +423,6 @@ impl FrameSource for LeaseReturn {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
-    }
-}
-
-/// Polls `body` for its next frame, with the consumer's `offer` when it made
-/// one.
-fn poll_offering(
-    body: &mut Body,
-    cx: &mut Context<'_>,
-    offer: Option<&mut PipeOffer>,
-) -> Poll<Option<Result<BodyFrame, BodyError>>> {
-    match offer {
-        Some(offer) => Pin::new(body).poll_frame_offering(cx, offer),
-        None => Pin::new(body).poll_next(cx),
     }
 }
 
@@ -478,7 +465,7 @@ impl FrameSource for KeepPool {
         cx: &mut Context<'_>,
         offer: Option<&mut PipeOffer>,
     ) -> Poll<Option<Result<BodyFrame, BodyError>>> {
-        poll_offering(&mut self.get_mut().inner, cx, offer)
+        Pin::new(&mut self.get_mut().inner).poll_frame_offering(cx, offer)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
