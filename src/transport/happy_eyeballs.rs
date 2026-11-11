@@ -102,11 +102,10 @@ pub trait Dialer {
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()>;
 
     /// How long one attempt, started now, may take before it counts as
-    /// failed. A TCP handshake gets [`CONNECT_TIMEOUT`]; a dialer whose
-    /// handshake is slower by nature bounds it by its own deadline.
-    fn attempt_timeout(&self) -> Duration {
-        CONNECT_TIMEOUT
-    }
+    /// failed, or `None` when nothing but the caller's own connect timeout
+    /// bounds it: a TCP handshake ends when the OS says so. A dialer whose
+    /// attempts share a deadline returns what is left of it.
+    fn attempt_timeout(&self) -> Option<Duration>;
 }
 
 /// The async-io/async-net dialer the hyper backend and websockets use.
@@ -127,6 +126,10 @@ impl Dialer for AsyncNet {
     async fn sleep_until(&self, deadline: Instant) {
         async_io::Timer::at(deadline).await;
     }
+
+    fn attempt_timeout(&self) -> Option<Duration> {
+        None
+    }
 }
 
 // RFC 8305 defaults: Resolution Delay = 50ms, First Address Family Count = 1,
@@ -136,7 +139,6 @@ const FIRST_ADDRESS_FAMILY_COUNT: usize = 1;
 const CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 const MIN_CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_millis(100);
 const MAX_CONNECTION_ATTEMPT_DELAY: Duration = Duration::from_secs(2);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Resolve `host`:`port` through `resolver` to socket addresses in the order
 /// [`connect`] would attempt them — the resolver's RFC 6724 ranking where it
@@ -764,10 +766,11 @@ async fn connect_attempt<D: Dialer>(dialer: &D, addr: SocketAddr) -> AttemptOutc
 
 async fn connect_with_timeout<D: Dialer>(dialer: &D, addr: SocketAddr) -> io::Result<D::Stream> {
     let connect = dialer.dial(addr);
+    let Some(bound) = dialer.attempt_timeout() else {
+        return connect.await;
+    };
     let timeout = async {
-        dialer
-            .sleep_until(Instant::now() + dialer.attempt_timeout())
-            .await;
+        dialer.sleep_until(Instant::now() + bound).await;
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!("timed out connecting to {addr}"),
@@ -895,7 +898,57 @@ mod tests {
     use super::{AsyncNet, DialError, connect};
     use futures_util::{StreamExt, stream};
     use http_kit_io::{Answer, Resolve};
-    use std::{cell::Cell, net::SocketAddr, time::Instant};
+    use std::{cell::Cell, io, net::SocketAddr, time::Duration, time::Instant};
+
+    use super::{Dialer, connect_with_timeout};
+
+    /// A dialer on a clock that is past every deadline: a bound it is asked
+    /// to wait for has already expired. Its dial pends once, as a handshake
+    /// that is not instant does, and then connects.
+    struct ExpiredClock(Option<Duration>);
+
+    impl Dialer for ExpiredClock {
+        type Stream = ();
+
+        async fn dial(&self, _addr: SocketAddr) -> io::Result<()> {
+            let mut pended = false;
+            std::future::poll_fn(|cx| {
+                if pended {
+                    std::task::Poll::Ready(())
+                } else {
+                    pended = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            Ok(())
+        }
+
+        async fn sleep_until(&self, _deadline: Instant) {}
+
+        fn attempt_timeout(&self) -> Option<Duration> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn an_attempt_with_no_bound_is_never_cut_off() {
+        let addr = "127.0.0.1:9".parse().expect("valid address");
+        futures_executor::block_on(connect_with_timeout(&ExpiredClock(None), addr))
+            .expect("with no bound the attempt runs until the dial answers");
+    }
+
+    #[test]
+    fn an_attempt_past_its_bound_is_a_timeout() {
+        let addr = "127.0.0.1:9".parse().expect("valid address");
+        let error = futures_executor::block_on(connect_with_timeout(
+            &ExpiredClock(Some(Duration::from_secs(2))),
+            addr,
+        ))
+        .expect_err("the bound passed before the dial answered");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
 
     /// A resolver that counts its queries and finds nothing.
     #[derive(Default)]

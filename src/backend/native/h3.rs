@@ -357,9 +357,9 @@ impl<I: Datagram + Timer + Clone + 'static> Dialer for QuicDialer<'_, I> {
         self.io.sleep_until(deadline)
     }
 
-    /// A QUIC handshake has the whole dial deadline, not TCP's bound.
-    fn attempt_timeout(&self) -> std::time::Duration {
-        self.deadline.saturating_duration_since(Instant::now())
+    /// A QUIC handshake has the whole dial deadline.
+    fn attempt_timeout(&self) -> Option<std::time::Duration> {
+        Some(self.deadline.saturating_duration_since(Instant::now()))
     }
 }
 

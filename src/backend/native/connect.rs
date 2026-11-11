@@ -570,6 +570,12 @@ impl<I: Dial + Timer> Dialer for IoDialer<'_, I> {
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> {
         self.io.sleep_until(deadline)
     }
+
+    /// The transport's connect timeout bounds the whole dial (`dial`), every
+    /// attempt included; nothing else bounds a TCP attempt.
+    fn attempt_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 /// The SOCKS5 handshake over an owned-buffer stream.

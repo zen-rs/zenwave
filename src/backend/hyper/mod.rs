@@ -386,9 +386,9 @@ impl happy_eyeballs::Dialer for QuicDialer<'_> {
         async_io::Timer::at(deadline).await;
     }
 
-    /// A QUIC handshake has the whole dial deadline, not TCP's bound.
-    fn attempt_timeout(&self) -> Duration {
-        self.deadline.saturating_duration_since(Instant::now())
+    /// A QUIC handshake has the whole dial deadline.
+    fn attempt_timeout(&self) -> Option<Duration> {
+        Some(self.deadline.saturating_duration_since(Instant::now()))
     }
 }
 
