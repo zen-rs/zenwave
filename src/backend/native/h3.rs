@@ -479,7 +479,15 @@ mod tests {
     struct Issued {
         ca_der: Vec<u8>,
         leaf_der: Vec<u8>,
+        #[cfg_attr(
+            not(any(feature = "native-compio", feature = "native-tokio")),
+            expect(dead_code)
+        )]
         leaf_pem: String,
+        #[cfg_attr(
+            not(any(feature = "native-compio", feature = "native-tokio")),
+            expect(dead_code)
+        )]
         leaf_key_pem: String,
     }
 
@@ -616,6 +624,7 @@ mod tests {
     /// (nothing when `None`), judged by the transport's verifier behind a
     /// [`Recording`]. Returns the handshake's outcome and the OCSP responses the verifier
     /// was shown.
+    #[cfg(any(feature = "native-compio", feature = "native-tokio"))]
     async fn handshake<I: Io>(io: I, staple: Option<&[u8]>) -> (Result<(), Error>, Vec<Vec<u8>>) {
         let issued = issue("zenwave h3 ocsp test CA");
         let transport = Transport::builder()
@@ -681,6 +690,7 @@ mod tests {
     /// The scenario: the OCSP response a server staples reaches the
     /// verifier exactly, a revoked one fails the handshake as the same
     /// verifier fails a TLS one, and no stapled response arrives empty.
+    #[cfg(any(feature = "native-compio", feature = "native-tokio"))]
     async fn stapled_status_reaches_the_verifier<I: Io>(io: I) {
         let staple = "ocsp response 你好 こんにちは 안녕".as_bytes();
         let (outcome, seen) = handshake(io.clone(), Some(staple)).await;
