@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/zen-rs/zenwave/compare/v0.11.0...v0.12.0) - 2026-11-11
+
+### Added
+
+- *(deps)* [**breaking**] build on the released http-kit 0.8
+- [**breaking**] the native backend takes its sockets, resolver and clock from the caller
+
+### Fixed
+
+- *(deps)* require http-kit-io 0.6.1, which returns file slots without spawning at teardown
+- follow http-kit's compio driver value and bound TLS-accepting test helpers
+- compile the HTTPS-record lookup only where something calls it
+
+### Other
+
+- *(native)* pass the offer as an option
+
 ## [0.11.0](https://github.com/zen-rs/zenwave/compare/v0.10.2...v0.11.0) - 2026-11-11
 
 ### Added
