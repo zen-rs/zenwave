@@ -99,6 +99,7 @@ pub mod error;
 #[cfg(default_backend)]
 pub mod oauth2;
 pub mod timeout;
+mod timeouts;
 
 mod client;
 pub mod clock;
@@ -128,6 +129,7 @@ pub mod websocket;
 pub use ext::ResponseExt;
 pub use status::ErrorForStatus;
 pub use timeout::Timeout;
+pub use timeouts::Timeouts;
 
 #[cfg(default_backend)]
 mod default_client;

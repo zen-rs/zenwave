@@ -164,29 +164,32 @@ impl H1Send {
 /// Connects to `origin` the way the transport's rules say — its unix domain
 /// socket when it has one, else TCP through whatever proxy the rules pick —
 /// and runs the HTTP/1.1 handshake over the result, within the transport's
-/// connect timeout.
+/// `deadline`, when there is one: the latest bound among the requests the
+/// dial serves, so it only stops a dial no request still waits for.
 ///
 /// # Errors
 ///
-/// Every leg's failure; [`TimedOut::Connect`] when the connect timeout
-/// passed first, with the phase the dial was in.
+/// Every leg's failure; [`TimedOut::Connect`] when `deadline` passed first,
+/// with the phase the dial was in.
+///
+/// `phase` follows the dial, so the pool can report where a request that
+/// gave up waiting for it found it.
 pub async fn dial<I: NativeIo, R: Resolve>(
     io: &I,
     resolver: &R,
     transport: &Transport,
     tls: &TlsConnector,
     origin: &Origin,
+    deadline: Option<Instant>,
+    phase: &Cell<ConnectPhase>,
 ) -> Result<Dialed, Error> {
-    let phase = Cell::new(ConnectPhase::Resolve);
-    let Some(deadline) = transport
-        .connect_timeout()
-        .and_then(|timeout| Instant::now().checked_add(timeout))
-    else {
-        return dial_route(io, resolver, transport, tls, origin, &phase).await;
+    phase.set(ConnectPhase::Resolve);
+    let Some(deadline) = deadline else {
+        return dial_route(io, resolver, transport, tls, origin, phase).await;
     };
     // Dropping the dial at the deadline closes whatever sockets it opened.
     match select(
-        pin!(dial_route(io, resolver, transport, tls, origin, &phase)),
+        pin!(dial_route(io, resolver, transport, tls, origin, phase)),
         pin!(io.sleep_until(deadline)),
     )
     .await
@@ -720,9 +723,17 @@ mod tests {
 
         let server = serve_once(io.clone(), listener, acceptor);
         let client = async {
-            let dialed = dial(&io, &Getaddrinfo, &transport, &tls, &origin)
-                .await
-                .expect("the dial succeeds");
+            let dialed = dial(
+                &io,
+                &Getaddrinfo,
+                &transport,
+                &tls,
+                &origin,
+                None,
+                &Cell::new(ConnectPhase::Resolve),
+            )
+            .await
+            .expect("the dial succeeds");
             assert_eq!(
                 dialed.tls_mode,
                 Some(Mode::Kernel),
@@ -822,9 +833,17 @@ mod tests {
 
         let server = serve_switch(io.clone(), listener, acceptor);
         let client = async {
-            let dialed = dial(&io, &Getaddrinfo, &transport, &tls, &origin)
-                .await
-                .expect("the dial succeeds");
+            let dialed = dial(
+                &io,
+                &Getaddrinfo,
+                &transport,
+                &tls,
+                &origin,
+                None,
+                &Cell::new(ConnectPhase::Resolve),
+            )
+            .await
+            .expect("the dial succeeds");
             let expected = if kernel { Mode::Kernel } else { Mode::User };
             assert_eq!(
                 dialed.tls_mode,

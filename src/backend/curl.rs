@@ -52,6 +52,7 @@ impl Clocked for CurlBackend {
 impl Endpoint for CurlBackend {
     type Error = crate::Error;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+        crate::timeouts::refuse(request)?;
         let mut dummy_request = http::Request::builder()
             .method(Method::GET)
             .uri("/")

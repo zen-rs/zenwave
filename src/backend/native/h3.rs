@@ -154,22 +154,24 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
     /// Without one, starts the HTTPS record lookup and the QUIC dial when
     /// they are due; the request then waits in the HTTP/1.1 queue, where a
     /// dial that completes in time finds it.
-    pub(super) fn h3_checkout(&mut self, origin: &Origin) -> Option<SendRequest> {
+    pub(super) fn h3_checkout(
+        &mut self,
+        origin: &Origin,
+        deadline: Option<Instant>,
+    ) -> Option<SendRequest> {
         let now = Instant::now();
         // Without the transport no dial can start; HTTP/1.1 reports why.
         let transport = self.transport.upgrade()?;
+        let bound = self.h3_bound(origin, deadline);
         let slot = &mut self.entry(origin).h3;
         if let Some(send) = slot.lease(now) {
             return Some(send);
         }
         let discover = slot.knowledge.begin_discovery(now);
         let dial = slot.knowledge.candidate(now).filter(|_| !slot.dialing);
-        // The race's own deadline, or the transport's connect timeout when
-        // that is shorter.
+        // The race's own deadline, or the latest bound among the requests
+        // the dial serves when that is sooner.
         let race = slot.knowledge.connect_timeout();
-        let timeout = transport
-            .connect_timeout()
-            .map_or(race, |bound| bound.min(race));
         if dial.is_some() {
             slot.dialing = true;
             slot.generation += 1;
@@ -186,7 +188,8 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
             let origin = origin.clone();
             self.tasks.push(
                 async move {
-                    let deadline = Instant::now() + timeout;
+                    let race_end = Instant::now() + race;
+                    let deadline = bound.map_or(race_end, |bound| bound.min(race_end));
                     let result = connect(
                         &io,
                         &*resolver,
