@@ -338,6 +338,12 @@ required-features = ["hyper-backend", "ws"]
 [package.metadata.cargo-machete]
 ignored = ["webpki-roots", "webpki-root-certs"]
 
+# http-kit's main builds on compio from this branch; compio from crates.io
+# (here and through executor-core) would be a second runtime, and a socket
+# made by one panics outside the other.
+[patch.crates-io]
+compio = { git = "https://github.com/lexoliu/compio", branch = "skyzen" }
+
 [lints]
 rust.missing_docs = "warn"
 rust.missing_debug_implementations = "warn"
