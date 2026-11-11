@@ -784,8 +784,20 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
     /// the next dial.
     fn dial_failed(&mut self, origin: &Origin, error: Error) {
         let entry = self.entry(origin);
-        if matches!(error, Error::Timeout(TimedOut::Connect { .. })) {
+        if let Error::Timeout(TimedOut::Connect { during }) = error {
+            // The dial's deadline is the latest of its waiters', so they have
+            // all expired; whichever of the two events the pool sees first,
+            // they fail with the phase the dial reached. A waiter whose
+            // deadline is still ahead stays queued for the next dial.
             debug!(host = %origin.host, %error, "a dial stopped at its deadline");
+            let now = Instant::now();
+            for waiter in std::mem::take(&mut entry.waiters) {
+                if waiter.expired(now) {
+                    waiter.fail(Error::Timeout(TimedOut::Connect { during }));
+                } else {
+                    entry.waiters.push_back(waiter);
+                }
+            }
             return;
         }
         entry.waiters.retain(|waiter| !waiter.gone());
