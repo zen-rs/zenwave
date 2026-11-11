@@ -59,7 +59,12 @@ pub struct Dialed {
     pub via: Via,
     pub driver: LocalBoxFuture<'static, ()>,
     /// Where the origin's TLS records are encrypted, for a TLS connection.
-    #[cfg(all(test, target_os = "linux", feature = "native-kernel-tls"))]
+    #[cfg(all(
+        test,
+        target_os = "linux",
+        feature = "native-kernel-tls",
+        native_driver
+    ))]
     pub tls_mode: Option<http_kit_tls::Mode>,
 }
 
@@ -264,10 +269,20 @@ impl<I: Io> LastLeg<'_, I> {
             .connect(server_name(host)?, stream, self.io)
             .await
             .map_err(Error::tls)?;
-        #[cfg(all(test, target_os = "linux", feature = "native-kernel-tls"))]
+        #[cfg(all(
+            test,
+            target_os = "linux",
+            feature = "native-kernel-tls",
+            native_driver
+        ))]
         let tls_mode = Some(stream.mode());
         let dialed = start(stream, io, config, via);
-        #[cfg(all(test, target_os = "linux", feature = "native-kernel-tls"))]
+        #[cfg(all(
+            test,
+            target_os = "linux",
+            feature = "native-kernel-tls",
+            native_driver
+        ))]
         let dialed = Dialed { tls_mode, ..dialed };
         Ok(dialed)
     }
@@ -309,7 +324,12 @@ where
         send: H1Send { requests, upgrade },
         via,
         driver,
-        #[cfg(all(test, target_os = "linux", feature = "native-kernel-tls"))]
+        #[cfg(all(
+            test,
+            target_os = "linux",
+            feature = "native-kernel-tls",
+            native_driver
+        ))]
         tls_mode: None,
     }
 }
@@ -562,7 +582,9 @@ mod tests {
             );
             let mut request = Request::new(Body::from_bytes(GREETING.as_bytes().to_vec()));
             *request.method_mut() = Method::POST;
-            *request.uri_mut() = "/echo".parse().expect("path");
+            *request.uri_mut() = format!("https://localhost:{port}/echo")
+                .parse()
+                .expect("request URI");
             let Dialed { send, driver, .. } = dialed;
             let exchange = async {
                 let response = send.requests.send(request).await.expect("request sends");
