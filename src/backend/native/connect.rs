@@ -20,7 +20,8 @@ use http::{HeaderValue, Method, header, uri::Scheme};
 use http_kit::{Body, Request};
 use http_kit_h1::{ClientConfig, ClientOutcome, RequestTarget, SendRequest, handshake_stream};
 use http_kit_io::{
-    BufResult, IntoInner, Io, IoBuf, Read, SendFile, Split, TcpOptions, Write, poll::CopyingPoll,
+    BufResult, IntoInner, Io, IoBuf, Read, SendFile, SpliceRead, SpliceWrite, Split, TcpOptions,
+    Write,
 };
 use http_kit_tls::{TlsConnector, Transport as TlsTransport, rustls::pki_types::ServerName};
 use tracing::debug;
@@ -39,18 +40,37 @@ use crate::{
 /// An `http-kit-io` implementation whose stream sockets `http-kit-tls` can
 /// run over: every implementation `http-kit-io` ships is one.
 #[cfg(unix)]
-pub trait NativeIo: Io<TcpStream: TlsTransport, UnixStream: TlsTransport> {}
+pub trait NativeIo:
+    Io<
+        TcpStream: TlsTransport + Split<ReadHalf: SpliceRead, WriteHalf: SpliceWrite>,
+        UnixStream: TlsTransport + Split<ReadHalf: SpliceRead, WriteHalf: SpliceWrite>,
+    >
+{
+}
 
 #[cfg(unix)]
-impl<I: Io<TcpStream: TlsTransport, UnixStream: TlsTransport>> NativeIo for I {}
+impl<
+    I: Io<
+            TcpStream: TlsTransport + Split<ReadHalf: SpliceRead, WriteHalf: SpliceWrite>,
+            UnixStream: TlsTransport + Split<ReadHalf: SpliceRead, WriteHalf: SpliceWrite>,
+        >,
+> NativeIo for I
+{
+}
 
 /// An `http-kit-io` implementation whose stream sockets `http-kit-tls` can
 /// run over: every implementation `http-kit-io` ships is one.
 #[cfg(not(unix))]
-pub trait NativeIo: Io<TcpStream: TlsTransport> {}
+pub trait NativeIo:
+    Io<TcpStream: TlsTransport + Split<ReadHalf: SpliceRead, WriteHalf: SpliceWrite>>
+{
+}
 
 #[cfg(not(unix))]
-impl<I: Io<TcpStream: TlsTransport>> NativeIo for I {}
+impl<I: Io<TcpStream: TlsTransport + Split<ReadHalf: SpliceRead, WriteHalf: SpliceWrite>>> NativeIo
+    for I
+{
+}
 
 /// A fresh HTTP/1.1 connection: its handle, how requests on it are shaped,
 /// and the future that drives its socket.
@@ -247,13 +267,16 @@ struct LastLeg<'a, I> {
 impl<I: Io> LastLeg<'_, I> {
     /// Wraps `stream` in TLS for `host` when `secure`, then starts
     /// HTTP/1.1 on it.
-    async fn finish<S: TlsTransport>(
+    async fn finish<S>(
         &self,
         host: &str,
         secure: bool,
         stream: S,
         via: Via,
-    ) -> Result<Dialed, Error> {
+    ) -> Result<Dialed, Error>
+    where
+        S: TlsTransport + Split<ReadHalf: SpliceRead, WriteHalf: SpliceWrite>,
+    {
         let mut config = ClientConfig::default();
         config.request_target = match via {
             Via::Direct => RequestTarget::Origin,
@@ -299,8 +322,8 @@ fn server_name(host: &str) -> Result<ServerName<'static>, Error> {
 fn start<S, T>(stream: S, timer: T, config: ClientConfig, via: Via) -> Dialed
 where
     S: Split + 'static,
-    S::ReadHalf: Read + 'static,
-    S::WriteHalf: Write + SendFile + 'static,
+    S::ReadHalf: Read + SpliceRead + 'static,
+    S::WriteHalf: Write + SendFile + SpliceWrite + 'static,
     T: http_kit_io::Timer + 'static,
 {
     let (requests, connection) = handshake_stream(stream, timer, config);
@@ -313,7 +336,7 @@ where
                     read: upgraded.read,
                     write: upgraded.write,
                 };
-                let switched = Switched::new(upgraded.read_buf, CopyingPoll::new(rejoined));
+                let switched = Switched::new(upgraded.read_buf, rejoined);
                 claims.hand_over(switched).await;
             }
             Err(error) => debug!(%error, "HTTP/1.1 connection ended with an error"),
@@ -345,7 +368,8 @@ async fn tunnel<I, S>(
 where
     I: Io,
     S: Split + 'static,
-    S::WriteHalf: SendFile,
+    S::ReadHalf: SpliceRead,
+    S::WriteHalf: SendFile + SpliceWrite,
 {
     let (send, connection) = handshake_stream(stream, io.clone(), ClientConfig::default());
     let mut request = Request::new(Body::empty());
@@ -399,8 +423,8 @@ where
 
 /// A connection's halves after an HTTP/1.1 switch, as one stream again.
 pub struct Rejoined<R, W> {
-    read: R,
-    write: W,
+    pub(super) read: R,
+    pub(super) write: W,
 }
 
 impl<R: Read + 'static, W: Write + 'static> Split for Rejoined<R, W> {
@@ -616,5 +640,141 @@ mod tests {
             .build()
             .expect("tokio runtime")
             .block_on(https_runs_over_kernel_tls(super::super::Tokio));
+    }
+
+    /// Answers one TLS connection's request with a `101` and, in the same
+    /// write, a greeting, then holds the connection open.
+    async fn serve_switch<I: NativeIo>(io: I, listener: I::TcpListener, tls: TlsAcceptor) {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let stream = tls.accept(stream, &io).await.expect("TLS handshake");
+        let (mut read, mut write) = stream.split();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let BufResult(filled, chunk) = read.read(Vec::with_capacity(1024)).await;
+            assert!(
+                filled.expect("the head reads") > 0,
+                "the client closed early"
+            );
+            head.extend_from_slice(&chunk);
+        }
+        let mut answer =
+            b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: echo\r\n\r\n"
+                .to_vec();
+        answer.extend_from_slice(GREETING.as_bytes());
+        write.write_all(answer).await.0.expect("the 101 writes");
+        futures_util::future::pending::<()>().await;
+    }
+
+    /// The stream a `101` switched over a TLS connection splices when its
+    /// records are the kernel's (`kernel`), and is given back by
+    /// `into_splice`, still carrying the bytes behind the head, when rustls
+    /// holds them in user space.
+    async fn switched_over_tls<I: NativeIo>(io: I, kernel: bool) {
+        use futures_util::AsyncReadExt as _;
+
+        let (transport, acceptor) = pki();
+        let listener = io
+            .bind_tcp("127.0.0.1:0".parse().expect("loopback"))
+            .expect("bind");
+        let port = listener.local_addr().expect("local address").port();
+        let tls = if kernel {
+            connector(transport.tls().http1_config().clone()).expect("the kernel probes")
+        } else {
+            TlsConnector::new(transport.tls().http1_config().clone())
+        };
+        let origin = request_origin(
+            &format!("https://localhost:{port}/")
+                .parse()
+                .expect("origin URI"),
+        )
+        .expect("origin");
+
+        let server = serve_switch(io.clone(), listener, acceptor);
+        let client = async {
+            let dialed = dial(&io, &transport, &tls, &origin)
+                .await
+                .expect("the dial succeeds");
+            let expected = if kernel { Mode::Kernel } else { Mode::User };
+            assert_eq!(
+                dialed.tls_mode,
+                Some(expected),
+                "is the kernel's `tls` module loaded?"
+            );
+            let mut request = Request::new(Body::empty());
+            *request.uri_mut() = format!("https://localhost:{port}/echo")
+                .parse()
+                .expect("request URI");
+            request
+                .headers_mut()
+                .insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+            request
+                .headers_mut()
+                .insert(header::UPGRADE, HeaderValue::from_static("echo"));
+            let Dialed { send, driver, .. } = dialed;
+            let exchange = async {
+                let response = send.requests.send(request).await.expect("request sends");
+                assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+                let switched = send
+                    .upgrade
+                    .clone()
+                    .switched()
+                    .await
+                    .expect("the stream is handed over");
+                assert_eq!(switched.can_splice(), kernel);
+                match switched.into_splice() {
+                    Ok(_end) => assert!(kernel, "a user-space TLS session cannot splice"),
+                    Err(mut switched) => {
+                        assert!(!kernel, "a kernel TLS socket splices");
+                        let mut greeting = vec![0; GREETING.len()];
+                        switched
+                            .read_exact(&mut greeting)
+                            .await
+                            .expect("the stream still reads");
+                        assert_eq!(greeting, GREETING.as_bytes());
+                    }
+                }
+            };
+            futures_util::join!(driver, exchange);
+        };
+        match select(pin!(client), pin!(server)).await {
+            Either::Left(((), _)) => {}
+            Either::Right(((), _)) => panic!("the server ended before the client"),
+        }
+    }
+
+    #[cfg(feature = "native-compio")]
+    #[test]
+    fn a_kernel_tls_switch_splices_on_compio() {
+        compio::runtime::Runtime::new()
+            .expect("compio runtime")
+            .block_on(switched_over_tls(super::super::Compio, true));
+    }
+
+    #[cfg(feature = "native-compio")]
+    #[test]
+    fn a_user_space_tls_switch_does_not_splice_on_compio() {
+        compio::runtime::Runtime::new()
+            .expect("compio runtime")
+            .block_on(switched_over_tls(super::super::Compio, false));
+    }
+
+    #[cfg(feature = "native-tokio")]
+    #[test]
+    fn a_kernel_tls_switch_splices_on_tokio() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(switched_over_tls(super::super::Tokio, true));
+    }
+
+    #[cfg(feature = "native-tokio")]
+    #[test]
+    fn a_user_space_tls_switch_does_not_splice_on_tokio() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(switched_over_tls(super::super::Tokio, false));
     }
 }

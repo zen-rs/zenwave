@@ -42,7 +42,9 @@ use executor_core::{LocalExecutor, Task as _};
 use futures_util::Stream;
 #[cfg(native_h3)]
 use http::uri::Scheme;
-use http_kit::{Body, BodyError, BodyFrame, Endpoint, Method, Request, Response};
+use http_kit::{
+    Body, BodyError, BodyFrame, Endpoint, FrameSource, Method, PipeOffer, Request, Response,
+};
 
 use connect::H1Send;
 pub use connect::NativeIo;
@@ -204,7 +206,7 @@ impl NativeBackend {
                     return Ok(Ok(response));
                 }
                 return Ok(Ok(
-                    response.map(|body| Body::from_frames(LeaseReturn::new(body, lease)))
+                    response.map(|body| Body::from_source(LeaseReturn::new(body, lease)))
                 ));
             }
             Err(failure) => failure,
@@ -355,13 +357,16 @@ impl Drop for H1Lease {
 /// ends. Dropped unfinished, the lease is discarded: the connection still
 /// holds the rest of the body. A read the read timeout cut short fails as
 /// [`timed_out`].
-struct LeaseReturn<S> {
-    inner: S,
+///
+/// The consumer's [`PipeOffer`] passes through to the connection's body, so
+/// a consumer that can splice receives the body as `BodyFrame::Pipe` frames.
+struct LeaseReturn {
+    inner: Body,
     lease: Option<H1Lease>,
 }
 
-impl<S> LeaseReturn<S> {
-    const fn new(inner: S, lease: H1Lease) -> Self {
+impl LeaseReturn {
+    const fn new(inner: Body, lease: H1Lease) -> Self {
         Self {
             inner,
             lease: Some(lease),
@@ -369,15 +374,14 @@ impl<S> LeaseReturn<S> {
     }
 }
 
-impl<S> Stream for LeaseReturn<S>
-where
-    S: Stream<Item = Result<BodyFrame, BodyError>> + Unpin,
-{
-    type Item = S::Item;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+impl FrameSource for LeaseReturn {
+    fn poll_next_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        offer: Option<&mut PipeOffer>,
+    ) -> Poll<Option<Result<BodyFrame, BodyError>>> {
         let Self { inner, lease } = self.get_mut();
-        match Pin::new(inner).poll_next(cx) {
+        match poll_offering(inner, cx, offer) {
             Poll::Ready(None) => {
                 if let Some(lease) = lease.take() {
                     lease.release();
@@ -389,6 +393,23 @@ where
             }
             poll => poll,
         }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+/// Polls `body` for its next frame, with the consumer's `offer` when it made
+/// one.
+fn poll_offering(
+    body: &mut Body,
+    cx: &mut Context<'_>,
+    offer: Option<&mut PipeOffer>,
+) -> Poll<Option<Result<BodyFrame, BodyError>>> {
+    match offer {
+        Some(offer) => Pin::new(body).poll_frame_offering(cx, offer),
+        None => Pin::new(body).poll_next(cx),
     }
 }
 
@@ -417,24 +438,31 @@ fn timed_out() -> BodyError {
 /// connection's driver, running until the body is done.
 #[cfg(native_h3)]
 fn keep_pool(body: Body, pool: &PoolHandle) -> Body {
-    Body::from_frames(KeepPool {
+    Body::from_source(KeepPool {
         inner: body,
         _pool: pool.clone(),
     })
 }
 
+/// The consumer's [`PipeOffer`] passes through to the connection's body.
 #[cfg(native_h3)]
-struct KeepPool<S> {
-    inner: S,
+struct KeepPool {
+    inner: Body,
     _pool: PoolHandle,
 }
 
 #[cfg(native_h3)]
-impl<S: Stream + Unpin> Stream for KeepPool<S> {
-    type Item = S::Item;
+impl FrameSource for KeepPool {
+    fn poll_next_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        offer: Option<&mut PipeOffer>,
+    ) -> Poll<Option<Result<BodyFrame, BodyError>>> {
+        poll_offering(&mut self.get_mut().inner, cx, offer)
+    }
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.get_mut().inner).poll_next(cx)
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
     }
 }
 
