@@ -405,7 +405,8 @@ async fn upgrade_outlives_read_timeout<I: TestIo, E: LocalExecutor>(io: I, execu
     switch(io, executor, Some(Duration::from_millis(200))).await;
 }
 
-/// The upgrade scenario, on a transport with `read_timeout`; the server
+/// The upgrade scenario, on a transport whose read defaults are
+/// `read_timeout`; the server
 /// holds its pong back for three times that long.
 async fn switch<I: TestIo, E: LocalExecutor>(io: I, executor: &E, read_timeout: Option<Duration>) {
     use futures_util::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -441,7 +442,9 @@ async fn switch<I: TestIo, E: LocalExecutor>(io: I, executor: &E, read_timeout: 
     };
     let mut transport = Transport::builder().proxy(Proxy::none());
     if let Some(read_timeout) = read_timeout {
-        transport = transport.read_timeout(read_timeout);
+        transport = transport
+            .response_head_timeout(read_timeout)
+            .body_idle_timeout(read_timeout);
     }
     let transport = transport.build().expect("transport builds");
     let mut client = backend(transport, io, executor);
@@ -627,14 +630,15 @@ async fn https_proxy<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
 /// The read timeout the timeout scenarios run under.
 const READ_TIMEOUT: Duration = Duration::from_millis(300);
 
-/// A transport with no proxy, bounded as given.
+/// A transport with no proxy, bounded as given: the connect timeout, and
+/// `read` as both the response-head and the body-idle default.
 fn bounded(connect: Option<Duration>, read: Option<Duration>) -> Transport {
     let mut builder = Transport::builder().proxy(Proxy::none());
     if let Some(connect) = connect {
         builder = builder.connect_timeout(connect);
     }
     if let Some(read) = read {
-        builder = builder.read_timeout(read);
+        builder = builder.response_head_timeout(read).body_idle_timeout(read);
     }
     builder.build().expect("transport builds")
 }
@@ -723,6 +727,238 @@ async fn stalled_connect<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
     .await;
 }
 
+/// Accepts TCP connections and holds each one, never answering a TLS
+/// handshake: every dial stalls in the TLS phase.
+async fn hold_connections<L: Listener<Stream: 'static>, E: LocalExecutor>(
+    listener: L,
+    executor: &E,
+) {
+    loop {
+        let (held, _) = listener.accept().await.expect("accept");
+        executor
+            .spawn_local(async move {
+                let _held = held;
+                futures_util::future::pending::<()>().await;
+            })
+            .detach();
+    }
+}
+
+/// Two requests with different connect timeouts, on one backend over a
+/// server that never answers a handshake: each fails at its own bound, and
+/// names the phase its connection was in.
+async fn connect_timeouts_differ_per_request<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let short = Duration::from_millis(200);
+    let long = Duration::from_millis(600);
+    // The transport has no connect timeout: only the requests' own bound.
+    let first = backend(bounded(None, None), io, executor);
+    let second = first.clone();
+    let attempt = |mut client: NativeBackend, timeout: Duration| async move {
+        let started = Instant::now();
+        let error = client
+            .get(format!("https://127.0.0.1:{port}/"))
+            .expect("request builds")
+            .connect_timeout(timeout)
+            .await
+            .expect_err("a handshake the server never answers fails");
+        (error, started.elapsed())
+    };
+    let ((short_error, short_elapsed), (long_error, long_elapsed)) = against(
+        hold_connections(listener, executor),
+        futures_util::future::join(attempt(first, short), attempt(second, long)),
+    )
+    .await;
+    for (error, elapsed, bound) in [
+        (&short_error, short_elapsed, short),
+        (&long_error, long_elapsed, long),
+    ] {
+        assert!(
+            matches!(
+                error,
+                Error::Timeout(TimedOut::Connect {
+                    during: ConnectPhase::Tls
+                })
+            ),
+            "a connect timeout in the TLS phase, got {error:?}"
+        );
+        assert!(
+            elapsed >= bound,
+            "the request waited its own bound of {bound:?}: {elapsed:?}"
+        );
+    }
+    assert!(
+        short_elapsed < long_elapsed,
+        "the short bound ended its request first: {short_elapsed:?} against {long_elapsed:?}"
+    );
+}
+
+/// How long [`serve_delayed`] takes to answer.
+const ANSWER_DELAY: Duration = Duration::from_millis(600);
+
+/// Answers every request `ANSWER_DELAY` after it arrives, pushing the number
+/// of the connection that carried it onto `served_on`.
+async fn serve_delayed<I: TestIo, E: LocalExecutor>(
+    io: I,
+    executor: &E,
+    listener: I::Listener,
+    served_on: Rc<RefCell<Vec<usize>>>,
+) {
+    let mut accepted = 0_usize;
+    loop {
+        let (stream, _) = listener.accept().await.expect("accept");
+        accepted += 1;
+        let connection = accepted;
+        let io = io.clone();
+        let served_on = Rc::clone(&served_on);
+        let serving = async move {
+            let service = {
+                let io = io.clone();
+                move |_request: Request| {
+                    let io = io.clone();
+                    let served_on = Rc::clone(&served_on);
+                    async move {
+                        served_on.borrow_mut().push(connection);
+                        io.sleep(ANSWER_DELAY).await;
+                        Response::new(Body::from_bytes(&b"answered"[..]))
+                    }
+                }
+            };
+            // The client closing the connection under a request ends it
+            // with an error, which is the scenario.
+            let _ = http_kit_h1::ServerConnection::from_stream(
+                stream,
+                io,
+                http_kit_h1::ServerConfig::default(),
+            )
+            .serve(&service)
+            .await;
+        };
+        executor.spawn_local(serving).detach();
+    }
+}
+
+/// A request's response-head timeout overrides the transport's default, and
+/// requests with different bounds share one pooled connection: one that
+/// allows the server's whole delay is answered, the next, on the same
+/// connection, falls to the default, and the one after that, on a fresh
+/// connection (the expired deadline closed the first), fails at its own.
+async fn response_head_timeouts_differ_per_request<I: TestIo, E: LocalExecutor>(
+    io: I,
+    executor: &E,
+) {
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let served_on = Rc::new(RefCell::new(Vec::new()));
+    let server = serve_delayed(io.clone(), executor, listener, Rc::clone(&served_on));
+    let default = ANSWER_DELAY / 4;
+    let own = ANSWER_DELAY / 2;
+    let transport = Transport::builder()
+        .proxy(Proxy::none())
+        .response_head_timeout(default)
+        .build()
+        .expect("transport builds");
+    let mut client = backend(transport, io, executor);
+    let url = format!("http://127.0.0.1:{port}/");
+    against(server, async {
+        let response = client
+            .get(&url)
+            .expect("request builds")
+            .response_head_timeout(ANSWER_DELAY * 5)
+            .await
+            .expect("a bound that allows the delay is answered");
+        assert_eq!(
+            &*response.into_string().await.expect("body reads"),
+            "answered"
+        );
+
+        for (bound, overridden) in [(default, false), (own, true)] {
+            let started = Instant::now();
+            let request = client.get(&url).expect("request builds");
+            let error = if overridden {
+                request.response_head_timeout(own).await
+            } else {
+                request.await
+            }
+            .expect_err("a bound shorter than the delay fails");
+            let elapsed = started.elapsed();
+            assert!(
+                matches!(error, Error::Timeout(TimedOut::ResponseHead)),
+                "a response-head timeout, got {error:?}"
+            );
+            assert!(
+                elapsed >= bound && elapsed < ANSWER_DELAY,
+                "the request failed at its own bound of {bound:?}: {elapsed:?}"
+            );
+        }
+    })
+    .await;
+    assert_eq!(
+        *served_on.borrow(),
+        [1, 1, 2],
+        "the first two requests shared a connection, the expiry closed it"
+    );
+}
+
+/// A request's body-idle timeout bounds its own body: one that stalls past
+/// it fails, while the default (none) lets another request's slow body
+/// through on the same backend.
+async fn body_idle_timeouts_differ_per_request<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let half = GREETING.as_bytes();
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n",
+        half.len() * 2
+    );
+    let stall = READ_TIMEOUT;
+    let server = serve_script(
+        io.clone(),
+        executor,
+        listener,
+        None,
+        vec![
+            (Duration::ZERO, [head.as_bytes(), half].concat()),
+            (stall * 2, half.to_vec()),
+        ],
+    );
+    let mut client = backend(bounded(None, None), io, executor);
+    against(server, async {
+        let impatient = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .expect("request builds")
+            .body_idle_timeout(stall)
+            .await
+            .expect("the head arrives");
+        let error = impatient
+            .into_body()
+            .into_bytes()
+            .await
+            .expect_err("a body that stalls past its bound fails");
+        assert!(
+            matches!(Error::from(error), Error::Timeout(TimedOut::BodyIdle)),
+            "a body-idle timeout"
+        );
+
+        // The stall closed that connection, so this request dials a fresh
+        // one whose script stalls just as long.
+        let patient = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .expect("request builds")
+            .body_idle_timeout(stall * 10)
+            .await
+            .expect("the head arrives");
+        let body = patient
+            .into_body()
+            .into_bytes()
+            .await
+            .expect("a patient body ends");
+        assert_eq!(body.len(), half.len() * 2);
+    })
+    .await;
+}
+
 /// A server that reads the request and never answers: the read timeout
 /// fails the request with `TimedOut::ResponseHead`, in plaintext or over
 /// TLS.
@@ -738,7 +974,7 @@ async fn stalled_head_on<I: TestIo, E: LocalExecutor>(io: I, executor: &E, pki: 
     );
     let mut transport = Transport::builder()
         .proxy(Proxy::none())
-        .read_timeout(READ_TIMEOUT);
+        .response_head_timeout(READ_TIMEOUT);
     if let Some(pki) = pki {
         transport = transport.extra_root_certificate_der(pki.ca_der.to_vec());
     }
@@ -1386,32 +1622,47 @@ mod compio_runtime {
     }
 
     #[test]
-    fn read_timeout_bounds_a_stalled_head() {
+    fn connect_timeouts_differ_per_request() {
+        run(super::connect_timeouts_differ_per_request);
+    }
+
+    #[test]
+    fn response_head_timeouts_differ_per_request() {
+        run(super::response_head_timeouts_differ_per_request);
+    }
+
+    #[test]
+    fn body_idle_timeouts_differ_per_request() {
+        run(super::body_idle_timeouts_differ_per_request);
+    }
+
+    #[test]
+    fn read_defaults_bounds_a_stalled_head() {
         run(super::stalled_head);
     }
 
     #[test]
-    fn read_timeout_bounds_a_stalled_head_over_tls() {
+    fn read_defaults_bounds_a_stalled_head_over_tls() {
         run(super::stalled_head_tls);
     }
 
     #[test]
-    fn read_timeout_bounds_a_stalled_body() {
+    fn read_defaults_bounds_a_stalled_body() {
         run(super::stalled_body);
     }
 
     #[test]
-    fn read_timeout_lets_a_slow_body_through() {
+    fn read_defaults_lets_a_slow_body_through() {
         run(super::slow_body);
     }
 
     #[test]
-    fn read_timeout_spares_idle_connections() {
+    fn read_defaults_spares_idle_connections() {
         run(super::idle_outlives_read_timeout);
     }
 
     #[test]
-    fn read_timeout_spares_the_switched_stream() {
+    fn read_defaults_spares_the_switched_stream() {
         run(super::upgrade_outlives_read_timeout);
     }
 
@@ -1533,32 +1784,47 @@ mod tokio_runtime {
     }
 
     #[test]
-    fn read_timeout_bounds_a_stalled_head() {
+    fn connect_timeouts_differ_per_request() {
+        run(super::connect_timeouts_differ_per_request);
+    }
+
+    #[test]
+    fn response_head_timeouts_differ_per_request() {
+        run(super::response_head_timeouts_differ_per_request);
+    }
+
+    #[test]
+    fn body_idle_timeouts_differ_per_request() {
+        run(super::body_idle_timeouts_differ_per_request);
+    }
+
+    #[test]
+    fn read_defaults_bounds_a_stalled_head() {
         run(super::stalled_head);
     }
 
     #[test]
-    fn read_timeout_bounds_a_stalled_head_over_tls() {
+    fn read_defaults_bounds_a_stalled_head_over_tls() {
         run(super::stalled_head_tls);
     }
 
     #[test]
-    fn read_timeout_bounds_a_stalled_body() {
+    fn read_defaults_bounds_a_stalled_body() {
         run(super::stalled_body);
     }
 
     #[test]
-    fn read_timeout_lets_a_slow_body_through() {
+    fn read_defaults_lets_a_slow_body_through() {
         run(super::slow_body);
     }
 
     #[test]
-    fn read_timeout_spares_idle_connections() {
+    fn read_defaults_spares_idle_connections() {
         run(super::idle_outlives_read_timeout);
     }
 
     #[test]
-    fn read_timeout_spares_the_switched_stream() {
+    fn read_defaults_spares_the_switched_stream() {
         run(super::upgrade_outlives_read_timeout);
     }
 

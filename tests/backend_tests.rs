@@ -108,3 +108,32 @@ mod web_backend_tests {
         assert!(format!("{backend:?}").starts_with("WebBackend"));
     }
 }
+
+/// A backend that applies no per-request timeouts refuses a request that
+/// carries them, before any I/O.
+#[test_executors::async_test]
+#[cfg(default_hyper)]
+async fn test_hyper_backend_refuses_per_request_timeouts() {
+    let mut backend = HyperBackend::default();
+    let mut request = http::Request::builder()
+        .method(Method::GET)
+        .uri("http://127.0.0.1:9/")
+        .body(http_kit::Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(zenwave::Timeouts::default().with_connect(std::time::Duration::from_secs(1)));
+    let error = backend
+        .respond(&mut request)
+        .await
+        .expect_err("the request is refused");
+    assert!(
+        matches!(
+            error,
+            zenwave::Error::Config(zenwave::ConfigError::Unsupported {
+                what: "per-request timeouts"
+            })
+        ),
+        "an unsupported-config error, got {error:?}"
+    );
+}

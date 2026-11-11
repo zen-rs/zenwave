@@ -149,6 +149,7 @@ impl Default for AppleBackend {
 impl Endpoint for AppleBackend {
     type Error = crate::Error;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+        crate::timeouts::refuse(request)?;
         if self.transport.unix_socket().is_some() {
             return Err(Error::Config(ConfigError::Unsupported {
                 what: "unix domain sockets",

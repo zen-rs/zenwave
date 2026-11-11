@@ -17,6 +17,7 @@
 //! request that a QUIC connection served meanwhile leaves it to the next.
 
 use std::{
+    cell::Cell,
     collections::{HashMap, VecDeque},
     future::Future,
     pin::Pin,
@@ -37,7 +38,7 @@ use tracing::debug;
 
 use super::connect::{self, Dialed, H1Send, NativeIo, NativeResolve};
 use crate::{
-    Error,
+    ConnectPhase, Error, TimedOut,
     clock::Clock,
     transport::{
         WeakTransport,
@@ -91,6 +92,8 @@ pub enum Command {
     Checkout {
         origin: Origin,
         want: Want,
+        /// When the request stops waiting for a connection, if it does.
+        deadline: Option<Instant>,
         reply: oneshot::Sender<Result<Grant, Error>>,
     },
     /// A leased HTTP/1.1 connection whose response body ended.
@@ -170,16 +173,25 @@ impl PoolHandle {
         (Self(sender), PoolReceiver(receiver))
     }
 
-    /// A connection for `origin`, dialed if none is free.
+    /// A connection for `origin`, dialed if none is free, waited for at most
+    /// `connect` (counted from this call; `None`, or a duration too long to
+    /// be an `Instant`, waits as long as the dials take).
     ///
     /// # Errors
     ///
-    /// The dial failed, or the pool is gone.
-    pub async fn checkout(&self, origin: Origin, want: Want) -> Result<Grant, Error> {
+    /// The dial failed, `connect` passed first ([`TimedOut::Connect`] with
+    /// the phase the origin's connection was in), or the pool is gone.
+    pub async fn checkout(
+        &self,
+        origin: Origin,
+        want: Want,
+        connect: Option<Duration>,
+    ) -> Result<Grant, Error> {
         let (reply, granted) = oneshot::channel();
         self.send(Command::Checkout {
             origin,
             want,
+            deadline: connect.and_then(|connect| Instant::now().checked_add(connect)),
             reply,
         });
         granted.await.map_err(|_| gone())?
@@ -197,19 +209,44 @@ const fn gone() -> Error {
     Error::Stopped
 }
 
+/// How far along a connection's setup `phase` is: the later the phase, the
+/// closer the connection is to ready.
+const fn phase_rank(phase: ConnectPhase) -> u8 {
+    match phase {
+        ConnectPhase::Queued => 0,
+        ConnectPhase::Resolve => 1,
+        ConnectPhase::Tcp => 2,
+        ConnectPhase::Proxy => 3,
+        ConnectPhase::Tls => 4,
+        ConnectPhase::Quic => 5,
+    }
+}
+
 /// Something a pool task finished.
 pub enum Event {
     /// An HTTP/1.1 dial for `origin` ended.
     H1Dialed {
         origin: Origin,
+        /// The phase the dial was in, which the origin stops reporting.
+        phase: Rc<Cell<ConnectPhase>>,
         result: Result<Dialed, Error>,
     },
+    /// A request's connect timeout passed while it waited at `origin`.
+    CheckoutExpired { origin: Origin, waiter: WaiterId },
     #[cfg(native_h3)]
     H3(h3::H3Event),
 }
 
+/// Names a waiter among its origin's, so its expiry finds it again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaiterId(u64);
+
 /// A request waiting for a connection.
 struct Waiter {
+    id: WaiterId,
+    /// Dropped with the waiter, which ends the task counting down its
+    /// connect timeout.
+    _expiry: Option<oneshot::Sender<()>>,
     reply: oneshot::Sender<Result<Grant, Error>>,
     fresh: bool,
     /// The request may take an HTTP/3 connection whose dial completes
@@ -285,6 +322,8 @@ pub struct Entry {
     leased: usize,
     /// HTTP/1.1 dials in flight.
     dialing: usize,
+    /// The phase of each HTTP/1.1 dial in flight.
+    dial_phases: Vec<Rc<Cell<ConnectPhase>>>,
     waiters: VecDeque<Waiter>,
     #[cfg(native_h3)]
     pub h3: H3Slot,
@@ -296,6 +335,7 @@ impl Entry {
             idle: Vec::new(),
             leased: 0,
             dialing: 0,
+            dial_phases: Vec::new(),
             waiters: VecDeque::new(),
             #[cfg(native_h3)]
             h3: H3Slot::new(origin.port),
@@ -328,6 +368,8 @@ pub struct Pool<I, R> {
     pub transport: WeakTransport,
     tls: Option<TlsConnector>,
     pub origins: HashMap<Origin, Entry>,
+    /// The id the next waiter takes.
+    next_waiter: u64,
     pub tasks: FuturesUnordered<LocalBoxFuture<'static, Option<Event>>>,
     #[cfg(native_h3)]
     pub h3: h3::H3Client,
@@ -347,6 +389,7 @@ pub async fn run<I: NativeIo, R: NativeResolve>(
         transport,
         tls: None,
         origins: HashMap::new(),
+        next_waiter: 0,
         tasks: FuturesUnordered::new(),
         #[cfg(native_h3)]
         h3: h3::H3Client::default(),
@@ -373,8 +416,9 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
             Command::Checkout {
                 origin,
                 want,
+                deadline,
                 reply,
-            } => self.checkout(&origin, want, reply),
+            } => self.checkout(&origin, want, deadline, reply),
             Command::Release { origin, send, via } => {
                 self.entry(&origin).leased -= 1;
                 self.offer(&origin, send, via, true);
@@ -422,7 +466,12 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
 
     fn event(&mut self, event: Event) {
         match event {
-            Event::H1Dialed { origin, result } => self.h1_dialed(&origin, result),
+            Event::H1Dialed {
+                origin,
+                phase,
+                result,
+            } => self.h1_dialed(&origin, &phase, result),
+            Event::CheckoutExpired { origin, waiter } => self.checkout_expired(&origin, waiter),
             #[cfg(native_h3)]
             Event::H3(event) => self.h3_event(event),
         }
@@ -445,6 +494,7 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
         &mut self,
         origin: &Origin,
         want: Want,
+        deadline: Option<Instant>,
         reply: oneshot::Sender<Result<Grant, Error>>,
     ) {
         if reply.is_canceled() {
@@ -459,7 +509,12 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
             }
             return;
         }
+        let id = WaiterId(self.next_waiter);
+        self.next_waiter += 1;
+        let expiry = deadline.map(|deadline| self.expire_at(origin, id, deadline));
         self.entry(origin).waiters.push_back(Waiter {
+            id,
+            _expiry: expiry,
             reply,
             fresh: want.fresh,
             #[cfg(native_h3)]
@@ -467,6 +522,48 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
             #[cfg(native_h3)]
             tcp_error: None,
         });
+        self.serve_waiters(origin);
+    }
+
+    /// Starts the countdown to `deadline` for waiter `id` at `origin`, on the
+    /// pool's timer. The sender it returns ends the countdown when the
+    /// waiter holding it goes away, served or not.
+    fn expire_at(&self, origin: &Origin, id: WaiterId, deadline: Instant) -> oneshot::Sender<()> {
+        let io = self.io.clone();
+        let origin = origin.clone();
+        let (expiry, mut ended) = oneshot::channel::<()>();
+        self.tasks.push(
+            async move {
+                let elapsed = io.sleep_until(deadline);
+                pin_mut!(elapsed);
+                match select(elapsed, &mut ended).await {
+                    Either::Left(_) => Some(Event::CheckoutExpired { origin, waiter: id }),
+                    Either::Right(_) => None,
+                }
+            }
+            .boxed_local(),
+        );
+        expiry
+    }
+
+    /// A request's connect timeout passed: unless it was served meanwhile,
+    /// it fails with the phase the origin's connection was in.
+    fn checkout_expired(&mut self, origin: &Origin, id: WaiterId) {
+        let Some(entry) = self.origins.get_mut(origin) else {
+            return;
+        };
+        let Some(at) = entry.waiters.iter().position(|waiter| waiter.id == id) else {
+            return;
+        };
+        let waiter = entry.waiters.remove(at).expect("the position is in range");
+        let dials = entry.dial_phases.iter().map(|phase| phase.get());
+        #[cfg(native_h3)]
+        let dials = dials.chain((waiter.h3 && entry.h3.dialing()).then_some(ConnectPhase::Quic));
+        let during = dials
+            .max_by_key(|phase| phase_rank(*phase))
+            .unwrap_or(ConnectPhase::Queued);
+        debug!(host = %origin.host, %during, "a request's connect timeout passed while it waited");
+        waiter.fail(Error::Timeout(TimedOut::Connect { during }));
         self.serve_waiters(origin);
     }
 
@@ -524,11 +621,14 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
 
     /// Starts an HTTP/1.1 dial for `origin`.
     fn dial_h1(&mut self, origin: Origin) {
+        let phase = Rc::new(Cell::new(ConnectPhase::Resolve));
+        self.entry(&origin).dial_phases.push(Rc::clone(&phase));
         let Some(transport) = self.transport.upgrade() else {
             self.tasks.push(
                 async move {
                     Some(Event::H1Dialed {
                         origin,
+                        phase,
                         result: Err(gone()),
                     })
                 }
@@ -545,6 +645,7 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
                         async move {
                             Some(Event::H1Dialed {
                                 origin,
+                                phase,
                                 result: Err(error),
                             })
                         }
@@ -558,15 +659,29 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
         let resolver = Rc::clone(&self.resolver);
         self.tasks.push(
             async move {
-                let result = connect::dial(&io, &*resolver, &transport, &tls, &origin).await;
-                Some(Event::H1Dialed { origin, result })
+                let result =
+                    connect::dial(&io, &*resolver, &transport, &tls, &origin, &phase).await;
+                Some(Event::H1Dialed {
+                    origin,
+                    phase,
+                    result,
+                })
             }
             .boxed_local(),
         );
     }
 
-    fn h1_dialed(&mut self, origin: &Origin, result: Result<Dialed, Error>) {
-        self.entry(origin).dialing -= 1;
+    fn h1_dialed(
+        &mut self,
+        origin: &Origin,
+        phase: &Rc<Cell<ConnectPhase>>,
+        result: Result<Dialed, Error>,
+    ) {
+        let entry = self.entry(origin);
+        entry.dialing -= 1;
+        entry
+            .dial_phases
+            .retain(|running| !Rc::ptr_eq(running, phase));
         match result {
             Ok(Dialed {
                 send, via, driver, ..

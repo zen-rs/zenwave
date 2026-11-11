@@ -30,6 +30,7 @@ use crate::{
     retry::Retry,
     status::ErrorForStatus,
     timeout::Timeout,
+    timeouts::Timeouts,
 };
 
 /// Builder for HTTP requests using a Client.
@@ -98,6 +99,35 @@ impl<T: Client> RequestBuilder<'_, T> {
         self.request
             .headers_mut()
             .insert(http_kit::header::AUTHORIZATION, auth_value.parse().unwrap());
+        self
+    }
+
+    /// Bound this request's wait for a connection by `timeout`, over the
+    /// transport's default ([`Timeouts::connect`]).
+    #[must_use]
+    pub fn connect_timeout(self, timeout: Duration) -> Self {
+        self.timeouts(|timeouts| timeouts.with_connect(timeout))
+    }
+
+    /// Bound the wait for this request's response head by `timeout`, over the
+    /// transport's default ([`Deadlines::response_head`](http_kit::Deadlines::response_head)).
+    #[must_use]
+    pub fn response_head_timeout(self, timeout: Duration) -> Self {
+        self.timeouts(|timeouts| timeouts.with_response_head(timeout))
+    }
+
+    /// Bound each wait for more of this request's response body by
+    /// `timeout`, over the transport's default
+    /// ([`Deadlines::body_idle`](http_kit::Deadlines::body_idle)).
+    #[must_use]
+    pub fn body_idle_timeout(self, timeout: Duration) -> Self {
+        self.timeouts(|timeouts| timeouts.with_body_idle(timeout))
+    }
+
+    fn timeouts(mut self, set: impl FnOnce(Timeouts) -> Timeouts) -> Self {
+        let extensions = self.request.extensions_mut();
+        let timeouts = extensions.remove::<Timeouts>().unwrap_or_default();
+        extensions.insert(set(timeouts));
         self
     }
 

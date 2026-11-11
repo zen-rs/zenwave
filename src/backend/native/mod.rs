@@ -60,7 +60,7 @@ pub use upgrade::{Switched, Upgrade};
 
 use super::shared::{received, replayable_request, request_origin, shape_h1_request, take_request};
 use crate::{
-    Cause, Client, Error, ExchangeFailure, TimedOut, Transport,
+    Cause, Client, Error, ExchangeFailure, TimedOut, Timeouts, Transport,
     clock::Clocked,
     transport::route::{Origin, Via},
 };
@@ -189,6 +189,7 @@ impl NativeBackend {
         send: H1Send,
         via: Via,
         reused: bool,
+        deadlines: Deadlines,
     ) -> Result<Result<Response, http::Request<Body>>, Error> {
         let lease = H1Lease {
             send: Some(send),
@@ -201,15 +202,7 @@ impl NativeBackend {
             .flatten();
         let connect = request.method() == Method::CONNECT;
         shape_h1_request(&mut request, &via)?;
-        if let Some(timeout) = self.transport.read_timeout() {
-            // The transport's one read timeout, as the connection's two
-            // receive deadlines.
-            request.extensions_mut().insert(
-                Deadlines::default()
-                    .with_response_head(timeout)
-                    .with_body_idle(timeout),
-            );
-        }
+        request.extensions_mut().insert(deadlines);
         let sender = lease.send.as_ref().expect("a new lease holds its sender");
         let mut failure = match sender.requests.try_send(request).await {
             Ok(mut response) => {
@@ -267,9 +260,11 @@ impl NativeBackend {
     #[cfg(native_h3)]
     async fn send_h3(
         &self,
-        request: http::Request<Body>,
+        mut request: http::Request<Body>,
         send: http_kit_h3::SendRequest,
+        deadlines: Deadlines,
     ) -> Result<Response, Error> {
+        request.extensions_mut().insert(deadlines);
         let response = send.send(request).await.map_err(h3::h3_error)?;
         Ok(response.map(|body| keep_pool(body, &self.pool)))
     }
@@ -348,6 +343,16 @@ impl Endpoint for NativeBackend {
         // whichever connection serves the retry.
         let uri = request.uri().clone();
         let origin = request_origin(&uri)?;
+        // The request's own timeouts over the transport's defaults. They stay
+        // on the slot with the rest of the extensions; the connection takes
+        // the exchange's deadlines with each send, so a request handed back
+        // for a fresh dial keeps them.
+        let timeouts = slot
+            .extensions()
+            .get::<Timeouts>()
+            .copied()
+            .unwrap_or_default()
+            .or(self.transport.timeouts());
         let mut fresh = false;
         #[cfg(native_h3)]
         let h3 = self.h3_use(&origin)?;
@@ -357,16 +362,22 @@ impl Endpoint for NativeBackend {
                 #[cfg(native_h3)]
                 h3,
             };
-            let sent = match self.pool.checkout(origin.clone(), want).await? {
+            let granted = self
+                .pool
+                .checkout(origin.clone(), want, timeouts.connect)
+                .await?;
+            let sent = match granted {
                 Grant::H1 { send, via, reused } => {
-                    let sent = self.send_h1(&origin, request, send, via, reused).await?;
+                    let sent = self
+                        .send_h1(&origin, request, send, via, reused, timeouts.exchange)
+                        .await?;
                     if sent.is_err() {
                         fresh = true;
                     }
                     sent
                 }
                 #[cfg(native_h3)]
-                Grant::H3(send) => Ok(self.send_h3(request, send).await?),
+                Grant::H3(send) => Ok(self.send_h3(request, send, timeouts.exchange).await?),
             };
             match sent {
                 Ok(response) => {
@@ -561,7 +572,14 @@ mod tests {
         let origin = request_origin(&post().uri().clone()).expect("origin");
 
         let sent = backend
-            .send_h1(&origin, post(), stopped(&io).await, Via::Direct, true)
+            .send_h1(
+                &origin,
+                post(),
+                stopped(&io).await,
+                Via::Direct,
+                true,
+                Deadlines::default(),
+            )
             .await;
         let Ok(Err(returned)) = sent else {
             panic!("the unsent POST must come back, got {sent:?}");
@@ -571,7 +589,14 @@ mod tests {
         assert_eq!(body.as_ref(), ORDER.as_bytes());
 
         let sent = backend
-            .send_h1(&origin, post(), stopped(&io).await, Via::Direct, false)
+            .send_h1(
+                &origin,
+                post(),
+                stopped(&io).await,
+                Via::Direct,
+                false,
+                Deadlines::default(),
+            )
             .await;
         assert!(
             sent.is_err(),
