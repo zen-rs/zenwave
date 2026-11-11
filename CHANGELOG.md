@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(native)* race QUIC dials over the streaming resolution
 - *(native)* gate the h3 OCSP test helpers on a runtime
 - *(native)* pass the stapled OCSP response to the HTTP/3 verifier
 - *(transport)* answer localhost without the system resolver and honour the resolution delay
