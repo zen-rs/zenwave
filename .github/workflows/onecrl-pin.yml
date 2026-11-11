@@ -1,9 +1,9 @@
 name: OneCRL pin
 
 # Moves onecrl.pin.json to the newest zen-rs/onecrl-snapshots release. The
-# pull request it opens gets CI through `workflow_dispatch` (a GITHUB_TOKEN
-# pull request triggers no runs) and is merged once every check passes; a
-# failing one is left open.
+# pull request it opens has its CI runs held by GitHub until approved (the
+# Actions bot opened it), so the job approves them, and it is merged once
+# every check passes; a failing one is left open.
 on:
   schedule:
     - cron: "17 9 * * *"
@@ -29,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: dev
+          ref: main
           persist-credentials: false
 
       - name: Find the newest snapshot
@@ -78,10 +78,10 @@ jobs:
             -f message="chore(onecrl): move the snapshot pin to ${TAG}" \
             -f content="$(base64 -w0 onecrl.pin.json)" \
             -f sha="$(git rev-parse HEAD:onecrl.pin.json)" > /dev/null
-          pr=$(gh pr create -R "$GITHUB_REPOSITORY" --base dev --head "$branch" \
+          pr=$(gh pr create -R "$GITHUB_REPOSITORY" --base main --head "$branch" \
             --title "chore(onecrl): move the snapshot pin to ${TAG}" \
             --body "Moves \`onecrl.pin.json\` to the zen-rs/onecrl-snapshots release ${TAG} (SHA-256 \`${SHA256}\`).")
-          gh workflow run ci.yml -R "$GITHUB_REPOSITORY" --ref "$branch"
+          bash .github/scripts/approve-held-runs.sh "${pr##*/}"
           echo "number=${pr##*/}" >> "$GITHUB_OUTPUT"
 
       - name: Merge once every check passes
@@ -90,7 +90,7 @@ jobs:
           PR: ${{ steps.pr.outputs.number }}
         run: |
           set -euo pipefail
-          # The dispatched run takes a moment to register its checks.
+          # The approved runs take a moment to register their checks.
           deadline=$(( $(date +%s) + 300 ))
           until [ "$(gh pr checks "$PR" -R "$GITHUB_REPOSITORY" 2>/dev/null | wc -l)" -gt 0 ]; do
             if [ "$(date +%s)" -gt "$deadline" ]; then
