@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/zen-rs/zenwave/compare/v0.10.2...v0.11.0) - 2026-11-11
+
+### Added
+
+- *(native)* [**breaking**] pipe-aware bodies and a spliceable Switched
+- *(native)* kernel TLS on Linux behind native-kernel-tls
+
+### Other
+
+- *(native)* give the kernel TLS request its host, gate the mode on a driver
+- approve bot pull requests' held CI instead of dispatching it
+- restore the job lines the tier removal joined
+- release from main and retire dev
+
 ## [0.10.2](https://github.com/zen-rs/zenwave/compare/v0.10.1...v0.10.2) - 2026-11-11
 
 ### Fixed
