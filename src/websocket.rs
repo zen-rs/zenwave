@@ -120,7 +120,7 @@ where
     serde_json::to_string(value).map_err(WebSocketError::FailToEncodePayload)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(reactor)]
 mod native {
     use async_lock::Mutex;
     use async_tungstenite::{
@@ -447,7 +447,7 @@ mod native {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(browser)]
 mod wasm {
     use std::{cell::RefCell, fmt, future::Future, io, rc::Rc, sync::Arc};
 
@@ -900,8 +900,8 @@ mod wasm {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(reactor)]
 pub use native::{WebSocket, WebSocketReceiver, WebSocketSender, connect, connect_with};
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(browser)]
 pub use wasm::{WebSocket, WebSocketReceiver, WebSocketSender, connect, connect_with};

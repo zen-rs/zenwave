@@ -21,7 +21,7 @@ mod engine {
     use rustls::pki_types::ServerName;
     use rustls::{ClientConfig, crypto::ring};
     use rustls_pki_types::CertificateDer;
-    #[cfg(not(android_verifier))]
+    #[cfg(not(any(android_verifier, wasi_verifier)))]
     use rustls_platform_verifier::Verifier;
 
     #[cfg(onecrl)]
@@ -33,7 +33,7 @@ mod engine {
     pub type TlsStream<S> = futures_rustls::client::TlsStream<S>;
 
     /// The platform verifier, extended with `extra_roots`.
-    #[cfg(not(android_verifier))]
+    #[cfg(not(any(android_verifier, wasi_verifier)))]
     fn verifier(
         extra_roots: &[CertificateDer<'static>],
         provider: Arc<rustls::crypto::CryptoProvider>,
@@ -60,6 +60,28 @@ mod engine {
         #[cfg(onecrl)] additions: Option<Arc<ArcSwap<Additions>>>,
     ) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, Error> {
         let mut store = super::super::android::system_roots()?;
+        for root in extra_roots {
+            store.add(root.clone()).map_err(Error::tls)?;
+        }
+        let verifier =
+            rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(store), provider)
+                .build()
+                .map_err(Error::tls)?;
+        #[cfg(onecrl)]
+        let verifier = onecrl_wrap(verifier, additions);
+        Ok(verifier)
+    }
+
+    /// Mozilla's roots, compiled in by `webpki-roots`, plus `extra_roots`,
+    /// verified by webpki: a WASI host has no platform trust store.
+    #[cfg(wasi_verifier)]
+    fn verifier(
+        extra_roots: &[CertificateDer<'static>],
+        provider: Arc<rustls::crypto::CryptoProvider>,
+        #[cfg(onecrl)] additions: Option<Arc<ArcSwap<Additions>>>,
+    ) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, Error> {
+        let mut store = rustls::RootCertStore::empty();
+        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         for root in extra_roots {
             store.add(root.clone()).map_err(Error::tls)?;
         }

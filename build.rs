@@ -84,32 +84,35 @@ mod pinned {
 
 fn main() {
     cfg_aliases! {
-        // Anything that is not the browser/Workers Fetch backend.
-        native: { not(target_arch = "wasm32") },
-        // The browser/Workers Fetch backend and its JS timers.
-        browser: { target_arch = "wasm32" },
+        // Everything that is not the browser/Workers Fetch backend: every
+        // non-wasm32 target and WASI, whose host supplies sockets.
+        native: { any(not(target_arch = "wasm32"), target_os = "wasi") },
+        // The browser/Workers Fetch backend and its JS timers: wasm32 without
+        // a WASI host.
+        browser: { all(target_arch = "wasm32", not(target_os = "wasi")) },
         // async-io's reactor, which drives the sockets and timers of every
-        // backend but the browser's.
-        reactor: { not(target_arch = "wasm32") },
+        // backend but the browser's and WASI's, whose hosts have no OS reactor.
+        reactor: { all(native, not(target_os = "wasi")) },
         // The `getaddrinfo` resolver and the `http-kit-io` it implements.
-        getaddrinfo: { all(not(target_arch = "wasm32"), feature = "getaddrinfo") },
+        getaddrinfo: { all(reactor, feature = "getaddrinfo") },
         // The shared async-net TCP/TLS connector is needed by hyper, by native
         // websockets, and by the OneCRL refresher wherever OneCRL applies.
-        connector: { all(not(target_arch = "wasm32"), any(
+        connector: { all(reactor, any(
             feature = "hyper-backend",
             feature = "ws",
             all(feature = "native-backend", feature = "onecrl", not(target_vendor = "apple"), not(windows))
         )) },
         // What every connector shares: the proxy route, happy eyeballs,
         // SOCKS5 and the TLS verifier configuration.
-        dialer: { any(connector, all(not(target_arch = "wasm32"), feature = "native-backend")) },
+        dialer: { any(connector, all(native, feature = "native-backend")) },
         // The backend on http-kit-io's owned-buffer sockets; `native_driver`
-        // when it also carries a runtime of its own for callers on none.
-        native_backend: { all(not(target_arch = "wasm32"), feature = "native-backend") },
-        native_driver: { all(native_backend, any(feature = "native-compio", feature = "native-tokio")) },
-        native_h3: { all(native_backend, feature = "native-http3") },
+        // when it also carries a runtime of its own for callers on none (the
+        // driver runtimes need an OS reactor).
+        native_backend: { all(native, feature = "native-backend") },
+        native_driver: { all(native_backend, reactor, any(feature = "native-compio", feature = "native-tokio")) },
+        native_h3: { all(native_backend, reactor, feature = "native-http3") },
         // A backend that pools connections per origin: hyper's and the native one.
-        pooled: { all(not(target_arch = "wasm32"), any(feature = "hyper-backend", feature = "native-backend")) },
+        pooled: { all(native, any(all(reactor, feature = "hyper-backend"), feature = "native-backend")) },
         // TLS engine compiled into that connector (and the native backend); an
         // engine feature enabled next to curl or URLSession alone has nothing
         // to serve. Features are additive, so `rustls` wins when both engines
@@ -119,6 +122,9 @@ fn main() {
         tls_engine: { any(tls_rustls, tls_native) },
         // rustls-platform-verifier needs a JVM handle on Android.
         android_verifier: { all(target_os = "android", tls_rustls) },
+        // WASI has no platform trust store to verify against: Mozilla's roots
+        // are compiled in (`webpki-roots`).
+        wasi_verifier: { all(target_os = "wasi", tls_rustls) },
         // QUIC transport and the h3 connection type exist only where the
         // shared connector, the hyper backend and the rustls engine do.
         http3: { all(connector, feature = "hyper-backend", feature = "http3") },
@@ -129,31 +135,36 @@ fn main() {
         // the hyper h3 path, or the `System` resolver. A native h3 host with
         // a resolver of its own never reaches it.
         https_lookup: { any(http3, all(native_h3, getaddrinfo)) },
-        // Unix domain sockets: every `unix` target has AF_UNIX, but wasm32-wasi
-        // is `unix` without being `native` — the connector does not exist there.
+        // Unix domain sockets: every `unix` target has AF_UNIX. `wasm32-wasip2`
+        // does not set `unix`, so WASI never has them.
         unix_socket: { all(unix, native) },
         // The OneCRL baseline, enforced where the rustls engine verifies chains
         // with webpki: rustls-platform-verifier's disk-root verifier (every
-        // `unix` but Apple and Android) and the Android disk-root verifier.
-        // Apple and Windows verify through the OS trust service, which ships
-        // its own distrust.
+        // `unix` but Apple and Android), the Android disk-root verifier and
+        // WASI's compiled-in roots. Apple and Windows verify through the OS
+        // trust service, which ships its own distrust.
         onecrl: { all(tls_rustls, feature = "onecrl", not(target_vendor = "apple"), not(windows)) },
+        // The refresher fetches additions through the async-net connector from
+        // a thread of its own; WASI has neither, so its table is the compiled
+        // one for the life of the binary.
+        onecrl_refresh: { all(onecrl, reactor) },
         // Which backend `DefaultBackend` resolves to: hyper wins, then the
         // native backend with a runtime, then URLSession, then libcurl.
         apple_backend: { all(target_vendor = "apple", feature = "apple-backend") },
-        default_hyper: { all(not(target_arch = "wasm32"), feature = "hyper-backend") },
+        default_hyper: { all(reactor, feature = "hyper-backend") },
         default_native: { all(native_driver, not(feature = "hyper-backend")) },
         default_apple: { all(target_vendor = "apple", feature = "apple-backend", not(feature = "hyper-backend"), not(default_native)) },
         default_curl: { all(
-            not(target_arch = "wasm32"),
+            reactor,
             feature = "curl-backend",
             not(feature = "hyper-backend"),
             not(default_native),
             not(all(target_vendor = "apple", feature = "apple-backend"))
         ) },
         // Whether there is a `DefaultBackend` at all: `native-backend` without
-        // a driver runtime has none, and neither has `zenwave::client()`.
-        default_backend: { any(target_arch = "wasm32", default_hyper, default_native, default_apple, default_curl) },
+        // a driver runtime has none, and neither has `zenwave::client()`. A
+        // WASI host has none either: its caller supplies the sockets.
+        default_backend: { any(browser, default_hyper, default_native, default_apple, default_curl) },
     }
 
     // The pins and their packaged assets are inputs to the compiled tables.
@@ -211,7 +222,8 @@ mod onecrl {
         let connector = feature("HYPER_BACKEND") || feature("WS") || feature("NATIVE_BACKEND");
         let tls_rustls = connector && feature("RUSTLS");
         let applies = tls_rustls
-            && env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("wasm32")
+            && (env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("wasm32")
+                || env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("wasi"))
             && env::var("CARGO_CFG_TARGET_VENDOR").as_deref() != Ok("apple")
             && env::var_os("CARGO_CFG_WINDOWS").is_none();
         if !applies {

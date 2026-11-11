@@ -9,7 +9,7 @@ use http_kit::header::HeaderValue;
 use http_kit::middleware::MiddlewareError;
 use url::Url;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(native)]
 use {
     async_fs,
     async_lock::Mutex as AsyncMutex,
@@ -25,7 +25,7 @@ use {
 #[derive(Debug)]
 pub struct CookieStore {
     store: Store,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(native)]
     persistence: Option<Persistence>,
 }
 
@@ -33,7 +33,7 @@ impl Default for CookieStore {
     fn default() -> Self {
         Self {
             store: new_store(),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(native)]
             persistence: None,
         }
     }
@@ -148,14 +148,14 @@ impl From<CookieError> for crate::Error {
 
 impl CookieStore {
     /// Enable persistent storage using the default path for the current crate.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(native)]
     #[must_use]
     pub fn persistent_default() -> Self {
         default_cookie_path().map_or_else(Self::default, Self::persistent_with_path)
     }
 
     /// Enable persistent storage using the provided path.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(native)]
     pub fn persistent_with_path(path: impl Into<PathBuf>) -> Self {
         Self {
             store: new_store(),
@@ -163,7 +163,7 @@ impl CookieStore {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(native)]
     async fn prepare(&mut self) -> Result<(), CookieError> {
         if let Some(path) = self
             .persistence
@@ -183,7 +183,7 @@ impl CookieStore {
         Ok(())
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(native)]
     async fn finalize(&self, updated: bool) -> Result<(), CookieError> {
         if updated && let Some(persistence) = &self.persistence {
             self.persist_to_path(&persistence.path).await?;
@@ -191,7 +191,7 @@ impl CookieStore {
         Ok(())
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(native)]
     async fn load_from_disk(&mut self, path: &Path) -> Result<(), CookieError> {
         let lock = file_mutex(path).await;
         let _guard = lock.lock().await;
@@ -217,7 +217,7 @@ impl CookieStore {
         Ok(())
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(native)]
     async fn persist_to_path(&self, path: &Path) -> Result<(), CookieError> {
         let lock = file_mutex(path).await;
         let _guard = lock.lock().await;
@@ -255,9 +255,9 @@ impl Middleware for CookieStore {
         request: &mut Request,
         mut next: E,
     ) -> Result<Response, http_kit::middleware::MiddlewareError<E::Error, Self::Error>> {
-        // Persistence exists only on native targets; on wasm32 there is
+        // Persistence exists only on native targets; in the browser there is
         // nothing to prepare or finalize.
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(native)]
         self.prepare().await.map_err(MiddlewareError::Middleware)?;
 
         let request_url = Url::parse(&request.uri().to_string()).ok();
@@ -290,14 +290,14 @@ impl Middleware for CookieStore {
                     jar.changed |=
                         store_response_cookies(&mut self.store, response.headers(), &url);
                 }
-                #[cfg(not(target_arch = "wasm32"))]
+                #[cfg(native)]
                 self.finalize(jar.changed)
                     .await
                     .map_err(MiddlewareError::Middleware)?;
                 Ok(response)
             }
             Err(err) => {
-                #[cfg(not(target_arch = "wasm32"))]
+                #[cfg(native)]
                 if let Err(persist) = self.finalize(jar.changed).await {
                     tracing::warn!(error = %persist, "failed to persist cookies after endpoint error");
                 }
@@ -307,14 +307,14 @@ impl Middleware for CookieStore {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(native)]
 #[derive(Debug)]
 struct Persistence {
     path: PathBuf,
     initialized: bool,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(native)]
 impl Persistence {
     #[allow(clippy::missing_const_for_fn)]
     fn new(path: PathBuf) -> Self {
@@ -325,18 +325,18 @@ impl Persistence {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(native)]
 fn default_cookie_path() -> Option<PathBuf> {
     let dir = dirs::data_local_dir()?;
     let crate_name = env!("CARGO_PKG_NAME");
     Some(dir.join(format!("zenwave_cookie_store_{crate_name}.json")))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(native)]
 static COOKIE_FILE_LOCKS: LazyLock<AsyncMutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>> =
     LazyLock::new(|| AsyncMutex::new(HashMap::new()));
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(native)]
 async fn file_mutex(path: &Path) -> Arc<AsyncMutex<()>> {
     let mut map = COOKIE_FILE_LOCKS.lock().await;
     map.entry(path.to_path_buf())
@@ -344,7 +344,7 @@ async fn file_mutex(path: &Path) -> Arc<AsyncMutex<()>> {
         .clone()
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, reactor))]
 mod tests {
     use std::convert::Infallible;
 

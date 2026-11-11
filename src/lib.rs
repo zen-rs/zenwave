@@ -27,6 +27,10 @@
 //! powered by the browser's Fetch API. No configuration is needed or available.
 //! **Note:** Explicitly selecting a backend on wasm32 will result in a compile error.
 //!
+//! ## WASI (`wasm32-wasip2`)
+//! Only `native-backend` exists: `NativeBackend::on_current_thread` over the
+//! host's `http-kit-io` sockets, resolver and clock. See [`backend`].
+//!
 //! ## Native Platforms
 //! On native platforms, Zenwave supports multiple HTTP client backends and,
 //! for hyper and websockets, two TLS engines.
@@ -67,7 +71,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 #[cfg(all(
-    not(target_arch = "wasm32"),
+    native,
     any(feature = "hyper-backend", feature = "ws"),
     not(any(feature = "rustls", feature = "native-tls"))
 ))]
@@ -84,7 +88,7 @@ pub use http_kit::*;
 #[cfg(default_backend)]
 pub use oauth2::OAuth2ClientCredentials;
 pub mod transport;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(native)]
 pub use transport::{Proxy, ProxyBuilder};
 pub use transport::{Transport, TransportBuilder};
 
@@ -102,7 +106,7 @@ pub mod clock;
 pub mod dns;
 pub mod redirect;
 pub mod retry;
-#[cfg(target_arch = "wasm32")]
+#[cfg(browser)]
 mod single_threaded;
 pub mod status;
 
