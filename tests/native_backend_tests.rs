@@ -51,6 +51,11 @@ impl<I> TestIo for I where
 {
 }
 
+/// How a runtime's sockets report a connection the peer refused.
+trait Refusal {
+    fn is_refusal(error: &std::io::Error) -> bool;
+}
+
 /// A backend on the current thread over `io`, resolving through the system's
 /// resolver.
 fn backend<I: TestIo, E: LocalExecutor>(
@@ -905,7 +910,7 @@ async fn unresolved_name<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
 
 /// Nothing listens on the port: the one address's attempt is refused, and
 /// the failure names the address and keeps the OS's error kind.
-async fn refused_connection<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
+async fn refused_connection<I: TestIo + Refusal, E: LocalExecutor>(io: I, executor: &E) {
     let listener = io.bind_tcp(loopback()).expect("bind");
     let port = listener.local_addr().expect("local address").port();
     drop(listener);
@@ -925,7 +930,11 @@ async fn refused_connection<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
         panic!("one attempt, got {tcp:?}");
     };
     assert_eq!(attempt.addr, Some(SocketAddr::from(([127, 0, 0, 1], port))));
-    assert_eq!(attempt.error.kind(), std::io::ErrorKind::ConnectionRefused);
+    assert!(
+        I::is_refusal(&attempt.error),
+        "a refusal, got {:?}",
+        attempt.error
+    );
     assert!(error.is_transient(), "a refusal is worth retrying");
 }
 
@@ -1311,6 +1320,24 @@ async fn splice_upgrade<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
 mod compio_runtime {
     use http_kit_io::compio::Compio;
 
+    /// `ERROR_CONNECTION_REFUSED` in `winerror.h`.
+    const ERROR_CONNECTION_REFUSED: i32 = 1225;
+
+    impl super::Refusal for Compio {
+        /// On Windows compio turns a failed completion's status into a Win32
+        /// code through `RtlNtStatusToDosError` (compio-driver
+        /// `src/sys/driver/iocp/cp/mod.rs`), so a refused connect arrives as
+        /// `ERROR_CONNECTION_REFUSED`, which std maps to no `ErrorKind`; a
+        /// Winsock call would have reported `WSAECONNREFUSED`.
+        fn is_refusal(error: &std::io::Error) -> bool {
+            if cfg!(windows) {
+                error.raw_os_error() == Some(ERROR_CONNECTION_REFUSED)
+            } else {
+                error.kind() == std::io::ErrorKind::ConnectionRefused
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_response_body_arrives_as_pipe_frames() {
@@ -1447,6 +1474,12 @@ mod compio_runtime {
 #[cfg(feature = "native-tokio")]
 mod tokio_runtime {
     use http_kit_io::tokio::Tokio;
+
+    impl super::Refusal for Tokio {
+        fn is_refusal(error: &std::io::Error) -> bool {
+            error.kind() == std::io::ErrorKind::ConnectionRefused
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
