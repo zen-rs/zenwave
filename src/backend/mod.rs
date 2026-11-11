@@ -76,7 +76,7 @@ pub use native::Driver;
 #[cfg(feature = "native-tokio")]
 pub use native::Tokio;
 #[cfg(native_backend)]
-pub use native::{NativeBackend, NativeIo, Switched, Upgrade};
+pub use native::{NativeBackend, NativeIo, NativeResolve, QuicBind, Switched, UnixDial, Upgrade};
 
 /// The default HTTP client backend: the native backend on its own driver
 /// runtime.

@@ -46,6 +46,7 @@ use security_framework::{certificate::SecCertificate, trust::SecTrust};
 
 use crate::{
     Client, Transport,
+    clock::{AsyncIoClock, Clocked},
     error::ProxyErrorKind,
     transport::proxy::{self, Intercept, Source},
 };
@@ -210,6 +211,14 @@ impl core::fmt::Debug for AppleBackend {
 http_kit::impl_send_endpoint!(AppleBackend);
 
 impl Client for AppleBackend {}
+
+impl Clocked for AppleBackend {
+    type Clock = AsyncIoClock;
+
+    fn clock(&self) -> AsyncIoClock {
+        AsyncIoClock
+    }
+}
 
 /// What a session is configured for.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -8,7 +8,7 @@ use std::{
 
 use http::StatusCode;
 use http_kit::{Body, Endpoint, HttpError, Request, Response};
-use zenwave::Client;
+use zenwave::{Client, clock::Clocked};
 
 #[derive(Default)]
 struct MockState {
@@ -100,6 +100,20 @@ impl Endpoint for MockClient {
 http_kit::impl_send_endpoint!(MockClient);
 
 impl Client for MockClient {}
+
+/// The clock a retry's backoff runs on: the platform's own.
+#[cfg(reactor)]
+type TestClock = zenwave::clock::AsyncIoClock;
+#[cfg(browser)]
+type TestClock = zenwave::clock::BrowserClock;
+
+impl Clocked for MockClient {
+    type Clock = TestClock;
+
+    fn clock(&self) -> TestClock {
+        TestClock::default()
+    }
+}
 
 fn ok_response() -> Response {
     http::Response::builder()
@@ -263,6 +277,15 @@ impl<C: Client> http_kit::SendEndpoint for CountAttempts<C> {
 
 #[cfg(all(not(target_arch = "wasm32"), default_backend))]
 impl<C: Client> Client for CountAttempts<C> {}
+
+#[cfg(all(not(target_arch = "wasm32"), default_backend))]
+impl<C: Clocked> Clocked for CountAttempts<C> {
+    type Clock = C::Clock;
+
+    fn clock(&self) -> C::Clock {
+        self.client.clock()
+    }
+}
 
 /// A server that accepts a connection and drops it on the floor stands in
 /// for a transient transport failure. A backend may itself redial a dropped

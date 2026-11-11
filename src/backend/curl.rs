@@ -14,6 +14,7 @@ use thiserror::Error;
 
 use crate::{
     Client, Transport,
+    clock::{AsyncIoClock, Clocked},
     transport::proxy::{self, Intercept},
 };
 
@@ -83,6 +84,14 @@ impl Default for CurlBackend {
 http_kit::impl_send_endpoint!(CurlBackend);
 
 impl Client for CurlBackend {}
+
+impl Clocked for CurlBackend {
+    type Clock = AsyncIoClock;
+
+    fn clock(&self) -> AsyncIoClock {
+        AsyncIoClock
+    }
+}
 
 impl Endpoint for CurlBackend {
     type Error = crate::Error;

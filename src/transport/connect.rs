@@ -19,7 +19,7 @@ use super::{
     stream::Stream,
     tunnel,
 };
-use crate::Error;
+use crate::{Error, dns::Getaddrinfo};
 
 /// The HTTP version a [`Connection`] negotiated, or will speak.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +116,7 @@ pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connec
             let tcp = tcp(&host, port).await?;
             let tcp = socks5::connect(
                 tcp,
+                &Getaddrinfo,
                 target.host,
                 target.port,
                 credentials
@@ -187,7 +188,7 @@ async fn finish(
 }
 
 async fn tcp(host: &str, port: u16) -> Result<TcpStream, Error> {
-    happy_eyeballs::connect(&happy_eyeballs::AsyncNet, host, port)
+    happy_eyeballs::connect(&happy_eyeballs::AsyncNet, &Getaddrinfo, host, port)
         .await
         .map_err(|error| Error::Transport(Box::new(error)))
 }

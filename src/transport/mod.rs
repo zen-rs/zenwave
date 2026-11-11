@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(any(onecrl, native_backend))]
 use std::time::Duration;
-#[cfg(any(all(connector, feature = "hyper-backend"), native_h3))]
+#[cfg(any(all(connector, feature = "hyper-backend"), https_lookup))]
 use std::{future::Future, pin::Pin};
 
 #[cfg(native)]
@@ -56,8 +56,9 @@ pub(crate) mod connect;
 // The per-origin HTTP/3 knowledge both h3 paths keep.
 #[cfg(https_rr)]
 pub(crate) mod discovery;
-// HTTPS records only feed HTTP/3 discovery, so the resolver exists only
-// where a backend can dial QUIC.
+// HTTPS records only feed HTTP/3 discovery, so the record type and the
+// resolver capability exist only where a backend can dial QUIC; the lookup
+// machinery behind them, only where something calls it.
 #[cfg(https_rr)]
 pub(crate) mod dns;
 // Generic over the dialer: its futures are `Send` exactly when the dialer's
@@ -87,7 +88,10 @@ pub(crate) mod quic;
 // Which legs a connection takes through the proxy rules, for every connector.
 #[cfg(dialer)]
 pub(crate) mod route;
+// Generic over the resolver, whose lookups need not be `Send`: an
+// `http-kit-io` one's are not.
 #[cfg(dialer)]
+#[expect(clippy::future_not_send)]
 pub(crate) mod socks5;
 #[cfg(connector)]
 pub(crate) mod stream;
@@ -102,13 +106,13 @@ pub use proxy::{Proxy, ProxyBuilder};
 /// Schedules the futures a DNS resolver or QUIC driver runs in the
 /// background. The backend supplies its own spawner so that work runs
 /// wherever connection drivers already run; `dns` and `quic` share it.
-#[cfg(https_rr)]
+#[cfg(https_lookup)]
 pub(crate) type Spawn = Arc<dyn Fn(Pin<Box<dyn Future<Output = ()> + Send>>) + Send + Sync>;
 
 /// Runs `future` to completion on a thread of its own, on async-io's
 /// reactor: the background work of a caller that has no executor of its
 /// own to hand it.
-#[cfg(any(all(connector, feature = "hyper-backend"), native_h3))]
+#[cfg(any(all(connector, feature = "hyper-backend"), all(native_h3, getaddrinfo)))]
 pub(crate) fn spawn_thread(future: Pin<Box<dyn Future<Output = ()> + Send>>) {
     std::thread::spawn(move || async_io::block_on(future));
 }
@@ -150,12 +154,12 @@ struct Inner {
     quic: once_cell::sync::OnceCell<quinn::Endpoint>,
     /// The resolver configuration read once at build; on Android the unit
     /// config — `DnsResolver` is configured by the OS.
-    #[cfg(https_rr)]
+    #[cfg(https_lookup)]
     dns: dns::Config,
     /// The hickory resolver over `dns`, built on first lookup so its runtime
     /// takes the caller's [`Spawn`]; kept for its pooled name-server
     /// connections and TTL response cache.
-    #[cfg(all(https_rr, not(target_os = "android")))]
+    #[cfg(all(https_lookup, not(target_os = "android")))]
     resolver: once_cell::sync::OnceCell<dns::HickoryResolver>,
     /// The native backend's pool on its own driver thread, one per runtime,
     /// started by the first `NativeBackend::new` over this transport.
@@ -298,7 +302,7 @@ impl Transport {
     /// The HTTPS (SVCB) record for `host`:`port`, resolved through the
     /// transport's DNS resolver. `spawn` schedules the futures the resolver
     /// drives in the background.
-    #[cfg(https_rr)]
+    #[cfg(https_lookup)]
     pub(crate) async fn https_record(
         &self,
         spawn: Spawn,
@@ -361,7 +365,7 @@ pub struct TransportBuilder {
     onecrl: onecrl::refresh::Refresh,
     /// Resolver configuration override — tests point it at an in-process
     /// DNS server instead of the system's.
-    #[cfg(all(https_rr, not(target_os = "android")))]
+    #[cfg(all(https_lookup, not(target_os = "android")))]
     dns: Option<dns::Config>,
     /// Wraps the TLS verifier — tests observe what a handshake presents.
     #[cfg(all(test, tls_rustls))]
@@ -530,7 +534,7 @@ impl TransportBuilder {
 
     /// Resolve through `config` instead of the system resolver
     /// configuration — a constructor for tests, not a runtime hook.
-    #[cfg(all(https_rr, not(target_os = "android")))]
+    #[cfg(all(https_lookup, not(target_os = "android")))]
     #[allow(dead_code)] // only the h3 discovery tests override the configuration
     #[must_use]
     pub(crate) fn dns_config(mut self, config: dns::Config) -> Self {
@@ -577,7 +581,7 @@ impl TransportBuilder {
             // binaries) still resolves names through `getaddrinfo`, so
             // `build` records the failure and `https_record` reports it
             // per lookup.
-            #[cfg(all(https_rr, not(target_os = "android")))]
+            #[cfg(all(https_lookup, not(target_os = "android")))]
             let dns = self.dns.unwrap_or_else(|| {
                 let config = dns::Config::system();
                 if let dns::Config::Unavailable(reason) = &config {
@@ -585,7 +589,7 @@ impl TransportBuilder {
                 }
                 config
             });
-            #[cfg(all(https_rr, target_os = "android"))]
+            #[cfg(all(https_lookup, target_os = "android"))]
             let dns = dns::Config;
             let transport = Transport {
                 inner: Arc::new(Inner {
@@ -605,9 +609,9 @@ impl TransportBuilder {
                     pool: pool::Pool::new(),
                     #[cfg(http3)]
                     quic: once_cell::sync::OnceCell::new(),
-                    #[cfg(https_rr)]
+                    #[cfg(https_lookup)]
                     dns,
-                    #[cfg(all(https_rr, not(target_os = "android")))]
+                    #[cfg(all(https_lookup, not(target_os = "android")))]
                     resolver: once_cell::sync::OnceCell::new(),
                     #[cfg(all(native_backend, feature = "native-compio"))]
                     native_compio: std::sync::OnceLock::new(),

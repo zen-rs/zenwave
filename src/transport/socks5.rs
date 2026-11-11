@@ -10,6 +10,8 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 
+use http_kit_io::Resolve;
+
 use super::happy_eyeballs;
 use crate::{Error, error::ProxyErrorKind};
 
@@ -49,9 +51,10 @@ const AUTH_VERSION: u8 = 0x01;
 /// Ask the SOCKS5 proxy on `stream` to connect to `host:port`.
 ///
 /// With `resolve_remotely` (`socks5h://`) the hostname is sent to the proxy;
-/// otherwise (`socks5://`) it is resolved here first, as curl does.
-pub async fn connect<S: Handshake>(
+/// otherwise (`socks5://`) `resolver` resolves it here first, as curl does.
+pub async fn connect<S: Handshake, R: Resolve>(
     mut stream: S,
+    resolver: &R,
     host: &str,
     port: u16,
     credentials: Option<(&str, &str)>,
@@ -60,7 +63,7 @@ pub async fn connect<S: Handshake>(
     negotiate_method(&mut stream, credentials).await?;
 
     let mut request = vec![VERSION, COMMAND_CONNECT, 0x00];
-    match destination(host, port, resolve_remotely).await? {
+    match destination(resolver, host, port, resolve_remotely).await? {
         Destination::Ip(SocketAddr::V4(addr)) => {
             request.push(ADDRESS_IPV4);
             request.extend_from_slice(&addr.ip().octets());
@@ -154,11 +157,12 @@ enum Destination<'a> {
     Domain(&'a str),
 }
 
-async fn destination(
-    host: &str,
+async fn destination<'a, R: Resolve>(
+    resolver: &R,
+    host: &'a str,
     port: u16,
     resolve_remotely: bool,
-) -> Result<Destination<'_>, Error> {
+) -> Result<Destination<'a>, Error> {
     if let Ok(ip) = host
         .trim_start_matches('[')
         .trim_end_matches(']')
@@ -169,10 +173,10 @@ async fn destination(
     if resolve_remotely {
         return Ok(Destination::Domain(host));
     }
-    let resolved = happy_eyeballs::resolve(host, port)
+    let addrs = happy_eyeballs::resolve(resolver, host, port)
         .await
         .map_err(|error| Error::Transport(Box::new(error)))?;
-    resolved
+    addrs
         .into_iter()
         .next()
         .map(Destination::Ip)

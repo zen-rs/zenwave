@@ -34,8 +34,10 @@ include = [
 ]
 
 [dependencies]
-http-kit = "0.7.0"
-serde = { version = "1.0.229", default-features = false, features = ["derive"]}
+# The http-kit crates come from `main`: the capability traits of `http-kit-io`
+# and the request deadlines are not released yet.
+http-kit = { git = "https://github.com/zen-rs/http-kit", branch = "main" }
+serde ={ version = "1.0.229", default-features = false, features = ["derive"]}
 serde_json = "1.0.154"
 base64 = "0.23.1"
 url = "2.5.8"
@@ -95,7 +97,11 @@ default = ["hyper-backend", "rustls", "ws", "http2", "http3", "onecrl", "public-
 # HTTP backends (native platforms only). At least one must be enabled.
 #
 # hyper over async-io/async-net. Needs a TLS engine (`rustls` or `native-tls`).
-hyper-backend = []
+hyper-backend = ["getaddrinfo"]
+# `getaddrinfo` as a resolver (`zenwave::dns::Getaddrinfo`), one thread per
+# query. Every backend that resolves names itself enables it; a native backend
+# over a resolver of the caller's own needs none of it.
+getaddrinfo = ["dep:dns-lookup", "dep:http-kit-io"]
 # HTTP/2 for the hyper backend, negotiated with the server through ALPN.
 # Off by default only in `default-features = false` builds.
 http2 = ["hyper/http2", "dep:h2"]
@@ -138,9 +144,9 @@ native-backend = [
     "http-kit-h1/pipe",
 ]
 # compio (io_uring, IOCP, polling) for the native backend.
-native-compio = ["native-backend", "http-kit-io/compio", "executor-core/compio", "dep:compio"]
+native-compio = ["native-backend", "getaddrinfo", "http-kit-io/compio", "executor-core/compio", "dep:compio"]
 # tokio's reactor for the native backend.
-native-tokio = ["native-backend", "http-kit-io/tokio", "executor-core/tokio", "dep:tokio"]
+native-tokio = ["native-backend", "getaddrinfo", "http-kit-io/tokio", "executor-core/tokio", "dep:tokio"]
 # HTTP/3 for the native backend through `http-kit-h3` (quiche; builds
 # BoringSSL with cmake). The server's chain goes to the same verifier as a TCP
 # connection's: the platform verifier with the transport's extra roots, and
@@ -158,7 +164,7 @@ hyper-rustls = ["hyper-backend", "rustls"]
 hyper-native-tls = ["hyper-backend", "native-tls"]
 
 # Websocket support (async-tungstenite on native, web-sys WebSocket on wasm).
-ws = ["dep:async-tungstenite"]
+ws = ["getaddrinfo", "dep:async-tungstenite"]
 
 # HTTP/3 over QUIC for the hyper backend. QUIC needs a QUIC-capable TLS
 # library, so it requires the `rustls` engine.
@@ -168,7 +174,7 @@ http3 = ["rustls", "dep:bytes", "dep:h3", "dep:h3-quinn", "dep:quinn"]
 # chains with webpki (`src/transport/onecrl.rs`). A pinned snapshot of the
 # list is compiled into the binary by `build.rs`; Apple and Windows builds
 # carry no table, since their OS trust service ships its own distrust.
-onecrl = ["rustls", "dep:webpki", "dep:ring", "dep:minreq", "dep:serde_json", "dep:base64", "dep:arc-swap", "dep:webpki-roots"]
+onecrl = ["rustls", "getaddrinfo", "dep:webpki", "dep:ring", "dep:minreq", "dep:serde_json", "dep:base64", "dep:arc-swap", "dep:webpki-roots"]
 
 # Reject cookie `Domain` attributes naming a public suffix (RFC 6265 §5.3) in
 # the cookie middleware: `build.rs` compiles the pinned, hash-verified Public
@@ -227,14 +233,14 @@ async-net = "2.0.0"
 async-trait = "0.1.92"
 blocking = { version = "1.7.0", optional = true }
 curl = { version = "0.4.51", optional = true }
-dns-lookup = "4.0.2"
+dns-lookup = { version = "4.0.2", optional = true }
 executor-core = { version = "0.7.2" }
 # The native backend: owned-buffer sockets, HTTP/1.1, TLS and HTTP/3 on them,
 # and the runtimes it can drive itself.
-http-kit-io = { version = "0.5.0", optional = true }
-http-kit-h1 = { version = "0.5.0", optional = true }
-http-kit-tls = { version = "0.3.0", optional = true }
-http-kit-h3 = { version = "0.5.0", optional = true }
+http-kit-io = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
+http-kit-h1 = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
+http-kit-tls = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
+http-kit-h3 = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
 compio = { version = "0.19.2", default-features = false, features = ["runtime"], optional = true }
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time"], optional = true }
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }

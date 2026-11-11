@@ -10,6 +10,7 @@ use http_kit::{
 };
 use url::Url;
 
+use crate::clock::Clocked;
 use crate::cookie::{RequestCookieJar, cookie_header, store_response_cookies};
 use crate::{Body, Request, Response, StatusCode, client::Client};
 
@@ -32,6 +33,14 @@ pub struct FollowRedirect<C: Client> {
 }
 
 impl<C: Client> Client for FollowRedirect<C> {}
+
+impl<C: Clocked> Clocked for FollowRedirect<C> {
+    type Clock = C::Clock;
+
+    fn clock(&self) -> C::Clock {
+        self.client.clock()
+    }
+}
 
 impl<C: Client> FollowRedirect<C> {
     /// Create a new `FollowRedirect` middleware wrapping the given client.

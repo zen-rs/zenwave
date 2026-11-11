@@ -7,7 +7,10 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::wasm_bindgen::{JsCast, JsValue};
 
 use crate::single_threaded::SingleThreaded;
-use crate::{Client, Transport};
+use crate::{
+    Client, Transport,
+    clock::{BrowserClock, Clocked},
+};
 /// HTTP client backend for browser environments using `fetch`.
 pub struct WebBackend {
     scope: SingleThreaded<FetchScope>,
@@ -294,3 +297,11 @@ fn transport_error(message: impl Into<String>) -> io::Error {
 http_kit::impl_send_endpoint!(WebBackend);
 
 impl Client for WebBackend {}
+
+impl Clocked for WebBackend {
+    type Clock = BrowserClock;
+
+    fn clock(&self) -> BrowserClock {
+        BrowserClock
+    }
+}

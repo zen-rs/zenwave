@@ -86,6 +86,13 @@ fn main() {
     cfg_aliases! {
         // Anything that is not the browser/Workers Fetch backend.
         native: { not(target_arch = "wasm32") },
+        // The browser/Workers Fetch backend and its JS timers.
+        browser: { target_arch = "wasm32" },
+        // async-io's reactor, which drives the sockets and timers of every
+        // backend but the browser's.
+        reactor: { not(target_arch = "wasm32") },
+        // The `getaddrinfo` resolver and the `http-kit-io` it implements.
+        getaddrinfo: { all(not(target_arch = "wasm32"), feature = "getaddrinfo") },
         // The shared async-net TCP/TLS connector is needed by hyper, by native
         // websockets, and by the OneCRL refresher wherever OneCRL applies.
         connector: { all(not(target_arch = "wasm32"), any(
@@ -117,6 +124,11 @@ fn main() {
         http3: { all(connector, feature = "hyper-backend", feature = "http3") },
         // HTTP/3 discovery (Alt-Svc, HTTPS records), shared by both h3 paths.
         https_rr: { any(http3, native_h3) },
+        // The HTTPS record lookup machinery (hickory or `DnsResolver`, the
+        // transport's resolver configuration): where something calls it —
+        // the hyper h3 path, or the `System` resolver. A native h3 host with
+        // a resolver of its own never reaches it.
+        https_lookup: { any(http3, all(native_h3, getaddrinfo)) },
         // Unix domain sockets: every `unix` target has AF_UNIX, but wasm32-wasi
         // is `unix` without being `native` — the connector does not exist there.
         unix_socket: { all(unix, native) },
