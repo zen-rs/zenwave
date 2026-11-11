@@ -727,6 +727,45 @@ async fn stalled_connect<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
     .await;
 }
 
+/// A request's connect timeout overrides the transport default in both
+/// directions: over a 150 ms default and a stalled handshake, a request
+/// bounded at 600 ms fails at about 600 ms, not when the default's dial
+/// would have.
+async fn request_connect_timeout_outlasts_the_default<I: TestIo, E: LocalExecutor>(
+    io: I,
+    executor: &E,
+) {
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let default = Duration::from_millis(150);
+    let timeout = Duration::from_millis(600);
+    let mut client = backend(bounded(Some(default), None), io, executor);
+    let (error, elapsed) = against(hold_connections(listener, executor), async {
+        let started = Instant::now();
+        let error = client
+            .get(format!("https://127.0.0.1:{port}/"))
+            .expect("request builds")
+            .connect_timeout(timeout)
+            .await
+            .expect_err("a handshake the server never answers fails");
+        (error, started.elapsed())
+    })
+    .await;
+    assert!(
+        matches!(
+            error,
+            Error::Timeout(TimedOut::Connect {
+                during: ConnectPhase::Tls
+            })
+        ),
+        "a connect timeout in the TLS phase, got {error:?}"
+    );
+    assert!(
+        elapsed >= timeout && elapsed < timeout * 3,
+        "the request's own bound of {timeout:?} applies, not the default's {default:?}: {elapsed:?}"
+    );
+}
+
 /// Accepts TCP connections and holds each one, never answering a TLS
 /// handshake: every dial stalls in the TLS phase.
 async fn hold_connections<L: Listener<Stream: 'static>, E: LocalExecutor>(
@@ -1627,6 +1666,11 @@ mod compio_runtime {
     }
 
     #[test]
+    fn request_connect_timeout_outlasts_the_default() {
+        run(super::request_connect_timeout_outlasts_the_default);
+    }
+
+    #[test]
     fn response_head_timeouts_differ_per_request() {
         run(super::response_head_timeouts_differ_per_request);
     }
@@ -1786,6 +1830,11 @@ mod tokio_runtime {
     #[test]
     fn connect_timeouts_differ_per_request() {
         run(super::connect_timeouts_differ_per_request);
+    }
+
+    #[test]
+    fn request_connect_timeout_outlasts_the_default() {
+        run(super::request_connect_timeout_outlasts_the_default);
     }
 
     #[test]

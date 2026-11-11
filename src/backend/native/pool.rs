@@ -244,6 +244,9 @@ pub struct WaiterId(u64);
 /// A request waiting for a connection.
 struct Waiter {
     id: WaiterId,
+    /// When the request's connect timeout passes; none when it has no bound.
+    /// Its own expiry task is the only thing that fails it for that.
+    deadline: Option<Instant>,
     /// Dropped with the waiter, which ends the task counting down its
     /// connect timeout.
     _expiry: Option<oneshot::Sender<()>>,
@@ -260,9 +263,25 @@ struct Waiter {
     tcp_error: Option<Error>,
 }
 
+/// The bound on a dial that serves requests with these deadlines: the
+/// latest of them, or none when any is unbounded (or when there are none).
+fn latest_deadline(deadlines: impl IntoIterator<Item = Option<Instant>>) -> Option<Instant> {
+    let mut latest = None;
+    for deadline in deadlines {
+        latest = latest.max(Some(deadline?));
+    }
+    latest
+}
+
 impl Waiter {
     fn gone(&self) -> bool {
         self.reply.is_canceled()
+    }
+
+    /// Whether the request's connect timeout has passed, so its expiry is
+    /// about to fail it and no dial is owed for it.
+    fn expired(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| deadline <= now)
     }
 
     /// Whether the request is owed an HTTP/1.1 dial: unless its own failed
@@ -503,7 +522,7 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
         #[cfg(native_h3)]
         let h3 = want.h3 == H3Use::Allowed;
         #[cfg(native_h3)]
-        if h3 && let Some(send) = self.h3_checkout(origin) {
+        if h3 && let Some(send) = self.h3_checkout(origin, deadline) {
             if reply.send(Ok(Grant::H3(send))).is_err() {
                 debug!("an HTTP/3 grant found its request gone");
             }
@@ -514,6 +533,7 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
         let expiry = deadline.map(|deadline| self.expire_at(origin, id, deadline));
         self.entry(origin).waiters.push_back(Waiter {
             id,
+            deadline,
             _expiry: expiry,
             reply,
             fresh: want.fresh,
@@ -523,6 +543,27 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
             tcp_error: None,
         });
         self.serve_waiters(origin);
+    }
+
+    /// The bound on a QUIC dial for `origin` started for a request with
+    /// `deadline`: the latest deadline among it and the waiters that may take
+    /// the connection, none when any has no bound.
+    #[cfg(native_h3)]
+    pub(super) fn h3_bound(
+        &mut self,
+        origin: &Origin,
+        deadline: Option<Instant>,
+    ) -> Option<Instant> {
+        let now = Instant::now();
+        latest_deadline(
+            std::iter::once(deadline).chain(
+                self.entry(origin)
+                    .waiters
+                    .iter()
+                    .filter(|waiter| waiter.h3 && !waiter.expired(now))
+                    .map(|waiter| waiter.deadline),
+            ),
+        )
     }
 
     /// Starts the countdown to `deadline` for waiter `id` at `origin`, on the
@@ -599,7 +640,7 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
         let owed = entry
             .waiters
             .iter()
-            .filter(|waiter| waiter.awaits_dial())
+            .filter(|waiter| waiter.awaits_dial() && !waiter.expired(now))
             .count()
             .saturating_sub(entry.dialing);
         let mut dials = 0;
@@ -614,13 +655,23 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
             entry.dialing += 1;
             dials += 1;
         }
+        // A dial outlasts no request it could still serve: it stops at the
+        // latest of their deadlines, and never when one has none.
+        let bound = latest_deadline(
+            entry
+                .waiters
+                .iter()
+                .filter(|waiter| waiter.awaits_dial() && !waiter.expired(now))
+                .map(|waiter| waiter.deadline),
+        );
         for _ in 0..dials {
-            self.dial_h1(origin.clone());
+            self.dial_h1(origin.clone(), bound);
         }
     }
 
-    /// Starts an HTTP/1.1 dial for `origin`.
-    fn dial_h1(&mut self, origin: Origin) {
+    /// Starts an HTTP/1.1 dial for `origin`, stopped at `bound` when there
+    /// is one.
+    fn dial_h1(&mut self, origin: Origin, bound: Option<Instant>) {
         let phase = Rc::new(Cell::new(ConnectPhase::Resolve));
         self.entry(&origin).dial_phases.push(Rc::clone(&phase));
         let Some(transport) = self.transport.upgrade() else {
@@ -660,7 +711,7 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
         self.tasks.push(
             async move {
                 let result =
-                    connect::dial(&io, &*resolver, &transport, &tls, &origin, &phase).await;
+                    connect::dial(&io, &*resolver, &transport, &tls, &origin, bound, &phase).await;
                 Some(Event::H1Dialed {
                     origin,
                     phase,
@@ -726,9 +777,17 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
     }
 
     /// A dial for `origin` failed: the first waiter still owed one gets the
-    /// error, unless a QUIC dial races for it, which it then waits on.
+    /// error, unless a QUIC dial races for it, which it then waits on. A
+    /// dial that timed out answers no one: it stopped at the latest deadline
+    /// of the waiters it was started for, which have expired through their
+    /// own tasks, and a waiter still within its deadline stays queued for
+    /// the next dial.
     fn dial_failed(&mut self, origin: &Origin, error: Error) {
         let entry = self.entry(origin);
+        if matches!(error, Error::Timeout(TimedOut::Connect { .. })) {
+            debug!(host = %origin.host, %error, "a dial stopped at its deadline");
+            return;
+        }
         entry.waiters.retain(|waiter| !waiter.gone());
         let Some(at) = entry.waiters.iter().position(Waiter::awaits_dial) else {
             debug!(host = %origin.host, %error, "a dial failed with no request waiting on it");

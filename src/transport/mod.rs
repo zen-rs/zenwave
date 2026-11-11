@@ -243,13 +243,6 @@ impl Transport {
         self.inner.timeouts
     }
 
-    /// How long one connection attempt may take, when bounded
-    /// ([`TransportBuilder::connect_timeout`]).
-    #[cfg(native_backend)]
-    pub(crate) fn connect_timeout(&self) -> Option<Duration> {
-        self.inner.timeouts.connect
-    }
-
     #[cfg(tls_engine)]
     pub(crate) fn tls(&self) -> &tls::TlsConnector {
         &self.inner.tls
@@ -467,7 +460,8 @@ impl TransportBuilder {
     /// HTTP/3, the QUIC handshake). A wait that runs out fails with
     /// [`Error::Timeout`] holding
     /// [`TimedOut::Connect`](crate::TimedOut::Connect) and the phase the
-    /// connection was in. The default also bounds each dial itself.
+    /// connection was in. A dial itself stops only once no request waiting
+    /// for it has time left.
     ///
     /// Off unless set. Applied by the native backend
     /// ([`NativeBackend`](crate::backend::NativeBackend)).

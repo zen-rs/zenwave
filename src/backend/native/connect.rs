@@ -164,12 +164,13 @@ impl H1Send {
 /// Connects to `origin` the way the transport's rules say — its unix domain
 /// socket when it has one, else TCP through whatever proxy the rules pick —
 /// and runs the HTTP/1.1 handshake over the result, within the transport's
-/// connect timeout.
+/// `deadline`, when there is one: the latest bound among the requests the
+/// dial serves, so it only stops a dial no request still waits for.
 ///
 /// # Errors
 ///
-/// Every leg's failure; [`TimedOut::Connect`] when the transport's connect
-/// timeout passed first, with the phase the dial was in.
+/// Every leg's failure; [`TimedOut::Connect`] when `deadline` passed first,
+/// with the phase the dial was in.
 ///
 /// `phase` follows the dial, so the pool can report where a request that
 /// gave up waiting for it found it.
@@ -179,13 +180,11 @@ pub async fn dial<I: NativeIo, R: Resolve>(
     transport: &Transport,
     tls: &TlsConnector,
     origin: &Origin,
+    deadline: Option<Instant>,
     phase: &Cell<ConnectPhase>,
 ) -> Result<Dialed, Error> {
     phase.set(ConnectPhase::Resolve);
-    let Some(deadline) = transport
-        .connect_timeout()
-        .and_then(|timeout| Instant::now().checked_add(timeout))
-    else {
+    let Some(deadline) = deadline else {
         return dial_route(io, resolver, transport, tls, origin, phase).await;
     };
     // Dropping the dial at the deadline closes whatever sockets it opened.
@@ -730,6 +729,7 @@ mod tests {
                 &transport,
                 &tls,
                 &origin,
+                None,
                 &Cell::new(ConnectPhase::Resolve),
             )
             .await
@@ -839,6 +839,7 @@ mod tests {
                 &transport,
                 &tls,
                 &origin,
+                None,
                 &Cell::new(ConnectPhase::Resolve),
             )
             .await
