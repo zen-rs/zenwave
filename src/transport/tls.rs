@@ -11,6 +11,8 @@ use super::route::Protocols;
 
 #[cfg(tls_rustls)]
 mod engine {
+    #[cfg(connector)]
+    use std::io;
     use std::sync::Arc;
 
     #[cfg(onecrl)]
@@ -27,7 +29,11 @@ mod engine {
     #[cfg(onecrl)]
     use super::super::onecrl::Additions;
     use super::Protocols;
+    #[cfg(any(connector, android_verifier))]
+    use crate::Cause;
     use crate::Error;
+    #[cfg(connector)]
+    use crate::{ConnectFailure, Hop, TlsError, TlsFailure};
 
     #[cfg(connector)]
     pub type TlsStream<S> = futures_rustls::client::TlsStream<S>;
@@ -44,7 +50,7 @@ mod engine {
         } else {
             Verifier::new_with_extra_roots(extra_roots.iter().cloned(), provider)
         }
-        .map_err(Error::tls)?;
+        .map_err(Error::trust_store)?;
         let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = Arc::new(verifier);
         #[cfg(onecrl)]
         let verifier = onecrl_wrap(verifier, additions);
@@ -61,12 +67,12 @@ mod engine {
     ) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, Error> {
         let mut store = super::super::android::system_roots()?;
         for root in extra_roots {
-            store.add(root.clone()).map_err(Error::tls)?;
+            store.add(root.clone()).map_err(Error::trust_store)?;
         }
         let verifier =
             rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(store), provider)
                 .build()
-                .map_err(Error::tls)?;
+                .map_err(|error| Error::trust_store(Cause::Detail(error.to_string())))?;
         #[cfg(onecrl)]
         let verifier = onecrl_wrap(verifier, additions);
         Ok(verifier)
@@ -147,7 +153,7 @@ mod engine {
             let shared = Arc::clone(&verifier);
             let base = ClientConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions()
-                .map_err(Error::tls)?
+                .map_err(Error::tls_config)?
                 .dangerous()
                 .with_custom_certificate_verifier(verifier)
                 .with_no_client_auth();
@@ -195,17 +201,27 @@ mod engine {
             &self.base
         }
 
+        /// The TLS handshake with `host`:`port`, the `hop` of the route, over
+        /// `stream`.
+        ///
+        /// # Errors
+        ///
+        /// `host` is no server name, or the handshake failed.
         #[cfg(connector)]
         pub async fn connect<S>(
             &self,
+            hop: Hop,
             host: &str,
+            port: u16,
             stream: S,
             protocols: Protocols,
         ) -> Result<TlsStream<S>, Error>
         where
             S: AsyncRead + AsyncWrite + Unpin,
         {
-            let server_name = ServerName::try_from(host.to_owned()).map_err(Error::tls)?;
+            let server_name = ServerName::try_from(host.to_owned()).map_err(|error| {
+                Error::InvalidUri(format!("{host}: not a TLS server name: {error}"))
+            })?;
             let connector = match protocols {
                 Protocols::Http1 => &self.http1,
                 Protocols::Http2OrHttp1 => &self.http2_or_http1,
@@ -213,7 +229,26 @@ mod engine {
             connector
                 .connect(server_name, stream)
                 .await
-                .map_err(Error::tls)
+                .map_err(|error| {
+                    Error::connect(hop, host, port, ConnectFailure::Tls(failure(error)))
+                })
+        }
+    }
+
+    /// How a handshake failed through `futures-rustls`.
+    ///
+    /// rustls's `io` adapters report a TLS failure as an
+    /// [`io::ErrorKind::InvalidData`] error whose payload is the
+    /// [`rustls::Error`] (the contract of `rustls::Connection`'s `io::Read`
+    /// and `io::Write`, which futures-rustls forwards), so the typed error
+    /// comes back out of the `io::Error` once, here. A transport failure or a
+    /// peer closing mid-handshake is no `rustls::Error`: it stays the
+    /// `io::Error`.
+    #[cfg(connector)]
+    fn failure(error: io::Error) -> TlsError {
+        match error.downcast::<rustls::Error>() {
+            Ok(error) => TlsError::new(TlsFailure::of_rustls(&error), Cause::Rustls(error)),
+            Err(error) => TlsError::new(TlsFailure::Protocol, Cause::from(error)),
         }
     }
 
@@ -237,7 +272,7 @@ mod engine {
         super::native_tls_stream::{self, TlsConnector as Connector},
         Protocols,
     };
-    use crate::Error;
+    use crate::{Cause, ConnectFailure, Error, ExchangeFailure, Hop, TlsError, TlsFailure};
 
     pub type TlsStream<S> = native_tls_stream::TlsStream<S>;
 
@@ -254,11 +289,12 @@ mod engine {
     ) -> Result<Connector, Error> {
         let mut builder = native_tls::TlsConnector::builder();
         for root in extra_roots {
-            let certificate = native_tls::Certificate::from_der(root).map_err(Error::tls)?;
+            let certificate =
+                native_tls::Certificate::from_der(root).map_err(Error::trust_store)?;
             builder.add_root_certificate(certificate);
         }
         builder.request_alpns(alpns);
-        Ok(Connector::new(builder.build().map_err(Error::tls)?))
+        Ok(Connector::new(builder.build().map_err(Error::tls_config)?))
     }
 
     /// The platform's native TLS library through `native-tls`.
@@ -276,9 +312,18 @@ mod engine {
             })
         }
 
+        /// The TLS handshake with `host`:`port`, the `hop` of the route, over
+        /// `stream`.
+        ///
+        /// # Errors
+        ///
+        /// The handshake failed. `native-tls` reports no classification, so
+        /// the failure is [`TlsFailure::Unclassified`].
         pub async fn connect<S>(
             &self,
+            hop: Hop,
             host: &str,
+            port: u16,
             stream: S,
             protocols: Protocols,
         ) -> Result<TlsStream<S>, Error>
@@ -289,7 +334,17 @@ mod engine {
                 Protocols::Http1 => &self.http1,
                 Protocols::Http2OrHttp1 => &self.http2_or_http1,
             };
-            connector.connect(host, stream).await.map_err(Error::tls)
+            connector.connect(host, stream).await.map_err(|error| {
+                Error::connect(
+                    hop,
+                    host,
+                    port,
+                    ConnectFailure::Tls(TlsError::new(
+                        TlsFailure::Unclassified,
+                        Cause::NativeTls(error),
+                    )),
+                )
+            })
         }
     }
 
@@ -298,7 +353,9 @@ mod engine {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        stream.negotiated_alpn().map_err(Error::tls)
+        stream
+            .negotiated_alpn()
+            .map_err(|error| Error::exchange(ExchangeFailure::Tls, Cause::NativeTls(error)))
     }
 }
 

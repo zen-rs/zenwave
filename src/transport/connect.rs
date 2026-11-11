@@ -19,7 +19,9 @@ use super::{
     stream::Stream,
     tunnel,
 };
-use crate::{Error, dns::Getaddrinfo};
+#[cfg(unix_socket)]
+use crate::ConnectFailure;
+use crate::{Error, Hop, dns::Getaddrinfo};
 
 /// The HTTP version a [`Connection`] negotiated, or will speak.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,7 +57,7 @@ pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connec
 
     match route(transport.proxy(), target)? {
         Route::Direct => {
-            let tcp = tcp(target.host, target.port).await?;
+            let tcp = tcp(Hop::Origin, target.host, target.port).await?;
             let stream = finish(transport, target, tcp).await?;
             connection(stream, Via::Direct, target)
         }
@@ -63,14 +65,14 @@ pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connec
             proxy,
             authorization,
         } => {
-            let tcp = tcp(&proxy.host, proxy.port).await?;
+            let tcp = tcp(Hop::Proxy, &proxy.host, proxy.port).await?;
             // Absolute-form requests to a forward proxy are HTTP/1.1, so the
             // TLS leg to the proxy offers no h2.
             let stream = if proxy.tls {
                 Stream::Tls(Box::new(
                     transport
                         .tls()
-                        .connect(&proxy.host, tcp, Protocols::Http1)
+                        .connect(Hop::Proxy, &proxy.host, proxy.port, tcp, Protocols::Http1)
                         .await?,
                 ))
             } else {
@@ -83,26 +85,34 @@ pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connec
             authority,
             authorization,
         } => {
-            let tcp = tcp(&proxy.host, proxy.port).await?;
+            let tcp = tcp(Hop::Proxy, &proxy.host, proxy.port).await?;
+            let via = (proxy.host.as_str(), proxy.port);
             let stream = if proxy.tls {
                 let to_proxy = transport
                     .tls()
-                    .connect(&proxy.host, tcp, Protocols::Http1)
+                    .connect(Hop::Proxy, via.0, via.1, tcp, Protocols::Http1)
                     .await?;
                 let tunneled =
-                    tunnel::connect(to_proxy, &authority, authorization.as_ref()).await?;
+                    tunnel::connect(to_proxy, via, &authority, authorization.as_ref()).await?;
                 if target.tls {
                     Stream::TlsOverTls(Box::new(
                         transport
                             .tls()
-                            .connect(target.host, tunneled, target.protocols)
+                            .connect(
+                                Hop::Origin,
+                                target.host,
+                                target.port,
+                                tunneled,
+                                target.protocols,
+                            )
                             .await?,
                     ))
                 } else {
                     Stream::Tls(Box::new(tunneled))
                 }
             } else {
-                let tunneled = tunnel::connect(tcp, &authority, authorization.as_ref()).await?;
+                let tunneled =
+                    tunnel::connect(tcp, via, &authority, authorization.as_ref()).await?;
                 finish(transport, target, tunneled).await?
             };
             connection(stream, Via::Direct, target)
@@ -113,7 +123,7 @@ pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connec
             credentials,
             resolve_remotely,
         } => {
-            let tcp = tcp(&host, port).await?;
+            let tcp = tcp(Hop::Proxy, &host, port).await?;
             let tcp = socks5::connect(
                 tcp,
                 &Getaddrinfo,
@@ -124,7 +134,8 @@ pub async fn connect(transport: &Transport, target: Target<'_>) -> Result<Connec
                     .map(|(user, password)| (user.as_str(), password.as_str())),
                 resolve_remotely,
             )
-            .await?;
+            .await
+            .map_err(|failure| failure.into_error((&host, port), target.host, target.port))?;
             let stream = finish(transport, target, tcp).await?;
             connection(stream, Via::Direct, target)
         }
@@ -153,14 +164,28 @@ async fn unix_connect(
     path: &Path,
     target: Target<'_>,
 ) -> Result<Connection, Error> {
-    let unix = UnixStream::connect(path)
-        .await
-        .map_err(|error| Error::Transport(Box::new(error)))?;
+    let unix = UnixStream::connect(path).await.map_err(|error| {
+        Error::connect(
+            Hop::Origin,
+            target.host,
+            target.port,
+            ConnectFailure::Unix {
+                path: path.to_path_buf(),
+                error,
+            },
+        )
+    })?;
     let stream = if target.tls {
         Stream::TlsOverUnix(Box::new(
             transport
                 .tls()
-                .connect(target.host, unix, target.protocols)
+                .connect(
+                    Hop::Origin,
+                    target.host,
+                    target.port,
+                    unix,
+                    target.protocols,
+                )
                 .await?,
         ))
     } else {
@@ -179,7 +204,7 @@ async fn finish(
         Ok(Stream::Tls(Box::new(
             transport
                 .tls()
-                .connect(target.host, tcp, target.protocols)
+                .connect(Hop::Origin, target.host, target.port, tcp, target.protocols)
                 .await?,
         )))
     } else {
@@ -187,8 +212,9 @@ async fn finish(
     }
 }
 
-async fn tcp(host: &str, port: u16) -> Result<TcpStream, Error> {
+/// TCP to `host`:`port`, the `hop` of the route, raced over its addresses.
+async fn tcp(hop: Hop, host: &str, port: u16) -> Result<TcpStream, Error> {
     happy_eyeballs::connect(&happy_eyeballs::AsyncNet, &Getaddrinfo, host, port)
         .await
-        .map_err(|error| Error::Transport(Box::new(error)))
+        .map_err(|error| error.into_error(hop, host, port))
 }

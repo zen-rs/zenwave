@@ -1,14 +1,13 @@
 use core::{fmt, future::Future};
 
-use http_kit::{BodyError, Endpoint, HttpError, StatusCode, utils::StreamExt};
-use std::error::Error as StdError;
+use http_kit::{BodyError, Endpoint, StatusCode, utils::StreamExt};
 use std::io;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::wasm_bindgen::{JsCast, JsValue};
 
 use crate::single_threaded::SingleThreaded;
 use crate::{
-    Client, Transport,
+    Cause, Client, Error, ExchangeFailure, Transport,
     clock::{BrowserClock, Clocked},
 };
 /// HTTP client backend for browser environments using `fetch`.
@@ -47,42 +46,6 @@ impl FetchScope {
         self.fetch
             .call1(&self.global, request)
             .map(web_sys::js_sys::Promise::from)
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum WebError {
-    #[error("{source}")]
-    Transport {
-        #[source]
-        source: Box<dyn StdError + Send + Sync>,
-        status: StatusCode,
-    },
-}
-
-impl WebError {
-    fn new(status: StatusCode, error: impl StdError + Send + Sync + 'static) -> Self {
-        Self::Transport {
-            source: Box::new(error),
-            status,
-        }
-    }
-}
-
-impl HttpError for WebError {
-    fn status(&self) -> StatusCode {
-        match self {
-            Self::Transport { status, .. } => *status,
-        }
-    }
-}
-
-// Convert WebError to unified zenwave::Error
-impl From<WebError> for crate::Error {
-    fn from(err: WebError) -> Self {
-        match err {
-            WebError::Transport { source, .. } => Self::Transport(source),
-        }
     }
 }
 
@@ -131,20 +94,20 @@ impl Endpoint for WebBackend {
         &mut self,
         request: &mut http_kit::Request,
     ) -> Result<http_kit::Response, Self::Error> {
-        fetch(&self.scope, request).await.map_err(Into::into)
+        fetch(&self.scope, request).await
     }
 }
 
 fn fetch(
     scope: &FetchScope,
     request: &mut http_kit::Request,
-) -> impl Future<Output = Result<http_kit::Response, WebError>> + Send {
+) -> impl Future<Output = Result<http_kit::Response, Error>> + Send {
     SingleThreaded(async move {
         let request_init = request_init(request).await?;
         let fetch_request = fetch_request(request, &request_init)?;
         let response = send(scope, &fetch_request).await?;
         let status = StatusCode::from_u16(response.status())
-            .map_err(|e| WebError::new(StatusCode::BAD_GATEWAY, e))?;
+            .map_err(|error| protocol(&error.to_string()))?;
         let headers = response_headers(&response)?;
         let body = response_body(&response);
 
@@ -163,7 +126,7 @@ fn fetch(
 /// a Cloudflare Worker never pulls a stream driven from Rust, so the request
 /// sat pending until the runtime cancelled the invocation. Buffering costs
 /// one copy of the body and works everywhere `fetch` does.
-async fn request_init(request: &mut http_kit::Request) -> Result<web_sys::RequestInit, WebError> {
+async fn request_init(request: &mut http_kit::Request) -> Result<web_sys::RequestInit, Error> {
     let request_init = web_sys::RequestInit::new();
     request_init.set_method(request.method().as_str());
     let headers = web_sys::Headers::new().unwrap();
@@ -172,7 +135,7 @@ async fn request_init(request: &mut http_kit::Request) -> Result<web_sys::Reques
     let bytes = body
         .into_bytes()
         .await
-        .map_err(|e| WebError::new(StatusCode::BAD_REQUEST, e))?;
+        .map_err(|error| Error::InvalidRequest(error.to_string()))?;
     if !bytes.is_empty() {
         let body_value: JsValue = js_sys::Uint8Array::from(bytes.as_ref()).into();
         request_init.set_body(&body_value);
@@ -181,7 +144,7 @@ async fn request_init(request: &mut http_kit::Request) -> Result<web_sys::Reques
     for (name, value) in request.headers() {
         let value = value
             .to_str()
-            .map_err(|e| WebError::new(StatusCode::BAD_REQUEST, e))?;
+            .map_err(|error| Error::InvalidRequest(error.to_string()))?;
         headers
             .set(name.as_str(), value)
             .map_err(|err| bad_request(&err))?;
@@ -193,7 +156,7 @@ async fn request_init(request: &mut http_kit::Request) -> Result<web_sys::Reques
 fn fetch_request(
     request: &http_kit::Request,
     request_init: &web_sys::RequestInit,
-) -> Result<web_sys::Request, WebError> {
+) -> Result<web_sys::Request, Error> {
     let uri = request.uri().to_string();
     web_sys::Request::new_with_str_and_init(uri.as_str(), request_init)
         .map_err(|err| bad_request(&err))
@@ -202,50 +165,38 @@ fn fetch_request(
 async fn send(
     scope: &FetchScope,
     fetch_request: &web_sys::Request,
-) -> Result<web_sys::Response, WebError> {
+) -> Result<web_sys::Response, Error> {
     let promise = scope
         .fetch_with_request(fetch_request)
         .map_err(|err| bad_gateway(&err))?;
     let response = SingleThreaded(JsFuture::from(promise))
         .await
         .map_err(|err| bad_gateway(&err))?;
-    response.dyn_into().map_err(|_| {
-        WebError::new(
-            StatusCode::BAD_GATEWAY,
-            transport_error("Failed to cast to Response"),
-        )
-    })
+    response
+        .dyn_into()
+        .map_err(|_| protocol("Failed to cast to Response"))
 }
 
-fn response_headers(response: &web_sys::Response) -> Result<http_kit::header::HeaderMap, WebError> {
+fn response_headers(response: &web_sys::Response) -> Result<http_kit::header::HeaderMap, Error> {
     let mut headers = http_kit::header::HeaderMap::new();
     for pair in response.headers().entries() {
-        let entry: js_sys::Array =
-            pair.map_err(|err| bad_gateway(&err))?
-                .dyn_into()
-                .map_err(|_| {
-                    WebError::new(
-                        StatusCode::BAD_GATEWAY,
-                        transport_error("Failed to cast header entry to Array"),
-                    )
-                })?;
-        let name = entry.get(0).as_string().ok_or_else(|| {
-            WebError::new(
-                StatusCode::BAD_GATEWAY,
-                transport_error("Failed to read header name"),
-            )
-        })?;
-        let value = entry.get(1).as_string().ok_or_else(|| {
-            WebError::new(
-                StatusCode::BAD_GATEWAY,
-                transport_error("Failed to read header value"),
-            )
-        })?;
+        let entry: js_sys::Array = pair
+            .map_err(|err| bad_gateway(&err))?
+            .dyn_into()
+            .map_err(|_| protocol("Failed to cast header entry to Array"))?;
+        let name = entry
+            .get(0)
+            .as_string()
+            .ok_or_else(|| protocol("Failed to read header name"))?;
+        let value = entry
+            .get(1)
+            .as_string()
+            .ok_or_else(|| protocol("Failed to read header value"))?;
         headers.insert(
             http_kit::header::HeaderName::from_bytes(name.as_bytes())
-                .map_err(|e| WebError::new(StatusCode::BAD_GATEWAY, e))?,
+                .map_err(|error| protocol(&error.to_string()))?,
             http_kit::header::HeaderValue::from_str(&value)
-                .map_err(|e| WebError::new(StatusCode::BAD_GATEWAY, e))?,
+                .map_err(|error| protocol(&error.to_string()))?,
         );
     }
     Ok(headers)
@@ -276,22 +227,20 @@ fn format_js_value(value: &JsValue) -> String {
     value.as_string().unwrap_or_else(|| format!("{value:?}"))
 }
 
-fn bad_request(err: &JsValue) -> WebError {
-    WebError::new(
-        StatusCode::BAD_REQUEST,
-        transport_error(format_js_value(err)),
-    )
+/// A request `fetch` refuses to be given.
+fn bad_request(err: &JsValue) -> Error {
+    Error::InvalidRequest(format_js_value(err))
 }
 
-fn bad_gateway(err: &JsValue) -> WebError {
-    WebError::new(
-        StatusCode::BAD_GATEWAY,
-        transport_error(format_js_value(err)),
-    )
+/// `fetch` rejected, or a JS call failed: the browser's own message is the
+/// cause.
+fn bad_gateway(err: &JsValue) -> Error {
+    Error::exchange(ExchangeFailure::Io, Cause::Js(format_js_value(err)))
 }
 
-fn transport_error(message: impl Into<String>) -> io::Error {
-    io::Error::other(message.into())
+/// The browser answered with something that is not a response.
+fn protocol(message: &str) -> Error {
+    Error::exchange(ExchangeFailure::Protocol, Cause::Detail(message.to_owned()))
 }
 
 http_kit::impl_send_endpoint!(WebBackend);

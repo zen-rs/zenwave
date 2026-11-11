@@ -29,7 +29,7 @@ use jni::{
 };
 use jni_min_helper::{DynamicProxy, JMethod};
 
-use crate::Error;
+use crate::{Cause, ResolveError};
 
 /// `android.net.DnsResolver.CLASS_IN`.
 const CLASS_IN: i32 = 1;
@@ -47,14 +47,17 @@ type RawAnswer = Result<Vec<u8>, String>;
 
 /// Query `domain` for HTTPS records through `DnsResolver`; NODATA and
 /// NXDOMAIN answers come back as an empty set.
-pub(super) async fn query_https(domain: String) -> Result<Vec<Record>, Error> {
+pub(super) async fn query_https(domain: String) -> Result<Vec<Record>, ResolveError> {
+    // `DnsResolver`'s failures have no error value of their own: JNI errors
+    // and the exception's text are kept as messages.
+    let failed = |message: String| ResolveError::Lookup(Cause::Detail(message));
     // The application registers the JVM through ndk-context.
     let vm = unsafe { JavaVM::from_raw(ndk_context::android_context().vm().cast()) };
     let (sender, receiver) = oneshot::channel::<RawAnswer>();
 
     let pending = vm
         .attach_current_thread(|env| raw_query(env, &domain, sender))
-        .map_err(|error| Error::Transport(Box::new(error)))?;
+        .map_err(|error| failed(error.to_string()))?;
     // Below API 29 there is no HTTPS-record resolver: a definitive empty
     // answer, not a failure.
     let Some(pending) = pending else {
@@ -75,18 +78,17 @@ pub(super) async fn query_https(domain: String) -> Result<Vec<Record>, Error> {
         Ok(bytes) => bytes,
         Err(message) => {
             let _ = released;
-            return Err(Error::Transport(Box::new(std::io::Error::other(message))));
+            return Err(failed(message));
         }
     };
-    released.map_err(|error| Error::Transport(Box::new(error)))?;
+    released.map_err(|error| failed(error.to_string()))?;
 
-    let message = Message::from_vec(&bytes).map_err(|error| Error::Transport(Box::new(error)))?;
+    let message =
+        Message::from_vec(&bytes).map_err(|error| ResolveError::Lookup(Cause::DnsProto(error)))?;
     match message.metadata.response_code {
         ResponseCode::NoError => Ok(message.answers),
         ResponseCode::NXDomain => Ok(Vec::new()),
-        code => Err(Error::Transport(Box::new(std::io::Error::other(format!(
-            "DNS response code {code:?}"
-        ))))),
+        code => Err(failed(format!("DNS response code {code:?}"))),
     }
 }
 

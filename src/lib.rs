@@ -106,8 +106,13 @@ pub mod retry;
 mod single_threaded;
 pub mod status;
 
-// Re-export the unified error type
-pub use error::Error;
+// Re-export the unified error type and the types its variants carry, so a
+// caller matches on them without reaching into `error`.
+pub use error::{
+    Attempt, Cause, ConfigError, ConnectError, ConnectFailure, ConnectPhase, Error, ExchangeError,
+    ExchangeFailure, Hop, ResolveError, SocksError, TcpFailure, TimedOut, TlsError, TlsFailure,
+    TunnelError,
+};
 
 mod ext;
 /// Multipart/form-data utilities.

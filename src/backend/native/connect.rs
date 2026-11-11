@@ -3,7 +3,7 @@
 //! with every leg on owned-buffer streams and TLS through `http-kit-tls`,
 //! the origin's session inside the proxy's when the proxy is HTTPS.
 
-use std::{future::Future, io, net::SocketAddr, pin::pin, sync::Arc, time::Instant};
+use std::{cell::Cell, future::Future, io, net::SocketAddr, pin::pin, sync::Arc, time::Instant};
 
 use futures_util::{
     FutureExt,
@@ -16,13 +16,17 @@ use http_kit_io::{
     BufResult, Dial, IntoInner, IoBuf, Read, ReadOwned, Resolve, SendFile, SpliceRead, SpliceWrite,
     Split, TcpOptions, Timer, Write,
 };
-use http_kit_tls::{TlsConnector, Transport as TlsTransport, rustls::pki_types::ServerName};
+use http_kit_tls::{
+    HandshakeError, TlsConnector, Transport as TlsTransport, rustls::pki_types::ServerName,
+};
 use tracing::debug;
 
 use super::upgrade::{self, Switched, Upgrade};
+#[cfg(all(feature = "native-kernel-tls", target_os = "linux"))]
+use crate::ConfigError;
 use crate::{
-    Error, Transport,
-    error::ProxyErrorKind,
+    Cause, ConnectFailure, ConnectPhase, Error, Hop, TimedOut, TlsError, TlsFailure, Transport,
+    TunnelError,
     transport::{
         happy_eyeballs::{self, Dialer},
         route::{Origin, Protocols, Route, Target, Via, route},
@@ -135,8 +139,10 @@ pub struct Dialed {
 pub fn connector(config: Arc<http_kit_tls::rustls::ClientConfig>) -> Result<TlsConnector, Error> {
     let connector = TlsConnector::new(config);
     #[cfg(all(feature = "native-kernel-tls", target_os = "linux"))]
-    let connector =
-        connector.with_kernel_tls(http_kit_tls::KernelTls::probe().map_err(Error::tls)?);
+    let connector = connector.with_kernel_tls(
+        http_kit_tls::KernelTls::probe()
+            .map_err(|error| Error::Config(ConfigError::KernelTls(error)))?,
+    );
     Ok(connector)
 }
 
@@ -162,8 +168,8 @@ impl H1Send {
 ///
 /// # Errors
 ///
-/// Every leg's failure; [`Error::Timeout`] when the connect timeout passed
-/// first.
+/// Every leg's failure; [`TimedOut::Connect`] when the connect timeout
+/// passed first, with the phase the dial was in.
 pub async fn dial<I: NativeIo, R: Resolve>(
     io: &I,
     resolver: &R,
@@ -171,47 +177,57 @@ pub async fn dial<I: NativeIo, R: Resolve>(
     tls: &TlsConnector,
     origin: &Origin,
 ) -> Result<Dialed, Error> {
+    let phase = Cell::new(ConnectPhase::Resolve);
     let Some(deadline) = transport
         .connect_timeout()
         .and_then(|timeout| Instant::now().checked_add(timeout))
     else {
-        return dial_route(io, resolver, transport, tls, origin).await;
+        return dial_route(io, resolver, transport, tls, origin, &phase).await;
     };
     // Dropping the dial at the deadline closes whatever sockets it opened.
     match select(
-        pin!(dial_route(io, resolver, transport, tls, origin)),
+        pin!(dial_route(io, resolver, transport, tls, origin, &phase)),
         pin!(io.sleep_until(deadline)),
     )
     .await
     {
         Either::Left((dialed, _)) => dialed,
         Either::Right(((), _)) => {
-            debug!(host = %origin.host, "connect timeout passed before the dial finished");
-            Err(Error::Timeout)
+            let during = phase.get();
+            debug!(host = %origin.host, %during, "connect timeout passed before the dial finished");
+            Err(Error::Timeout(TimedOut::Connect { during }))
         }
     }
 }
 
-/// [`dial`], unbounded.
+/// [`dial`], unbounded. `phase` follows the dial: where it was when a
+/// deadline passes.
 async fn dial_route<I: NativeIo, R: Resolve>(
     io: &I,
     resolver: &R,
     transport: &Transport,
     tls: &TlsConnector,
     origin: &Origin,
+    phase: &Cell<ConnectPhase>,
 ) -> Result<Dialed, Error> {
     let secure = origin.scheme == Scheme::HTTPS;
-    let last = LastLeg { io, tls };
+    let last = LastLeg { io, tls, phase };
 
     #[cfg(unix_socket)]
     if let Some(path) = transport.unix_socket() {
+        phase.set(ConnectPhase::Tcp);
         let unix = io.connect_unix(path).await.map_err(|error| {
-            Error::Transport(Box::new(io::Error::new(
-                error.kind(),
-                format!("unix domain socket {}: {error}", path.display()),
-            )))
+            Error::connect(
+                Hop::Origin,
+                &origin.host,
+                origin.port,
+                ConnectFailure::Unix {
+                    path: path.to_path_buf(),
+                    error,
+                },
+            )
         })?;
-        return last.finish(&origin.host, secure, unix, Via::Direct).await;
+        return last.finish_origin(origin, unix).await;
     }
 
     let target = Target {
@@ -223,16 +239,18 @@ async fn dial_route<I: NativeIo, R: Resolve>(
     };
     match route(transport.proxy(), target)? {
         Route::Direct => {
-            let tcp = tcp(io, resolver, &origin.host, origin.port).await?;
-            last.finish(&origin.host, secure, tcp, Via::Direct).await
+            let tcp = tcp(io, resolver, Hop::Origin, &origin.host, origin.port, phase).await?;
+            last.finish_origin(origin, tcp).await
         }
         Route::Forward {
             proxy,
             authorization,
         } => {
-            let tcp = tcp(io, resolver, &proxy.host, proxy.port).await?;
+            let tcp = tcp(io, resolver, Hop::Proxy, &proxy.host, proxy.port, phase).await?;
             last.finish(
+                Hop::Proxy,
                 &proxy.host,
+                proxy.port,
                 proxy.tls,
                 tcp,
                 Via::HttpProxy { authorization },
@@ -244,21 +262,23 @@ async fn dial_route<I: NativeIo, R: Resolve>(
             authority,
             authorization,
         } => {
-            let tcp = tcp(io, resolver, &proxy.host, proxy.port).await?;
+            let tcp = tcp(io, resolver, Hop::Proxy, &proxy.host, proxy.port, phase).await?;
+            let via = (proxy.host.as_str(), proxy.port);
             if proxy.tls {
                 // The proxy's session carries the tunnel, and the origin's
                 // runs inside it.
+                phase.set(ConnectPhase::Tls);
                 let secured = tls
-                    .connect(server_name(&proxy.host)?, tcp, io)
+                    .connect(server_name(via.0)?, tcp, io)
                     .await
-                    .map_err(Error::tls)?;
-                let tunneled = tunnel(io, secured, &authority, authorization).await?;
-                last.finish(&origin.host, secure, tunneled, Via::Direct)
-                    .await
+                    .map_err(|error| handshake_failure(Hop::Proxy, via.0, via.1, error))?;
+                phase.set(ConnectPhase::Proxy);
+                let tunneled = tunnel(io, secured, via, &authority, authorization).await?;
+                last.finish_origin(origin, tunneled).await
             } else {
-                let tunneled = tunnel(io, tcp, &authority, authorization).await?;
-                last.finish(&origin.host, secure, tunneled, Via::Direct)
-                    .await
+                phase.set(ConnectPhase::Proxy);
+                let tunneled = tunnel(io, tcp, via, &authority, authorization).await?;
+                last.finish_origin(origin, tunneled).await
             }
         }
         Route::Socks5 {
@@ -267,7 +287,8 @@ async fn dial_route<I: NativeIo, R: Resolve>(
             credentials,
             resolve_remotely,
         } => {
-            let tcp = tcp(io, resolver, &host, port).await?;
+            let tcp = tcp(io, resolver, Hop::Proxy, &host, port, phase).await?;
+            phase.set(ConnectPhase::Proxy);
             let OwnedBytes(tcp) = socks5::connect(
                 OwnedBytes(tcp),
                 resolver,
@@ -278,8 +299,9 @@ async fn dial_route<I: NativeIo, R: Resolve>(
                     .map(|(user, password)| (user.as_str(), password.as_str())),
                 resolve_remotely,
             )
-            .await?;
-            last.finish(&origin.host, secure, tcp, Via::Direct).await
+            .await
+            .map_err(|failure| failure.into_error((&host, port), &origin.host, origin.port))?;
+            last.finish_origin(origin, tcp).await
         }
     }
 }
@@ -289,14 +311,33 @@ async fn dial_route<I: NativeIo, R: Resolve>(
 struct LastLeg<'a, I> {
     io: &'a I,
     tls: &'a TlsConnector,
+    phase: &'a Cell<ConnectPhase>,
 }
 
 impl<I: Timer + Clone + 'static> LastLeg<'_, I> {
-    /// Wraps `stream` in TLS for `host` when `secure`, then starts
-    /// HTTP/1.1 on it.
+    /// [`finish`](Self::finish) for a `stream` that ends at `origin`.
+    async fn finish_origin<S>(&self, origin: &Origin, stream: S) -> Result<Dialed, Error>
+    where
+        S: TlsTransport + Split<ReadHalf: ReadOwned + SpliceRead, WriteHalf: SpliceWrite>,
+    {
+        self.finish(
+            Hop::Origin,
+            &origin.host,
+            origin.port,
+            origin.scheme == Scheme::HTTPS,
+            stream,
+            Via::Direct,
+        )
+        .await
+    }
+
+    /// Wraps `stream` in TLS for `host` (the `hop` of the route, at `port`)
+    /// when `secure`, then starts HTTP/1.1 on it.
     async fn finish<S>(
         &self,
+        hop: Hop,
         host: &str,
+        port: u16,
         secure: bool,
         stream: S,
         via: Via,
@@ -313,11 +354,12 @@ impl<I: Timer + Clone + 'static> LastLeg<'_, I> {
         if !secure {
             return Ok(start(stream, io, config, via));
         }
+        self.phase.set(ConnectPhase::Tls);
         let stream = self
             .tls
             .connect(server_name(host)?, stream, self.io)
             .await
-            .map_err(Error::tls)?;
+            .map_err(|error| handshake_failure(hop, host, port, error))?;
         #[cfg(all(
             test,
             target_os = "linux",
@@ -339,7 +381,35 @@ impl<I: Timer + Clone + 'static> LastLeg<'_, I> {
 
 /// `host` as the name a TLS handshake sends and verifies.
 fn server_name(host: &str) -> Result<ServerName<'static>, Error> {
-    ServerName::try_from(host.to_owned()).map_err(Error::tls)
+    ServerName::try_from(host.to_owned())
+        .map_err(|error| Error::InvalidUri(format!("{host}: {error}")))
+}
+
+/// A failed TLS handshake with `host`:`port`, the `hop` of the route, as the
+/// error a request reports.
+fn handshake_failure(hop: Hop, host: &str, port: u16, error: HandshakeError) -> Error {
+    // A kernel that cannot take TLS is the configuration's fault, not the
+    // peer's.
+    #[cfg(all(feature = "native-kernel-tls", target_os = "linux"))]
+    let error = match error {
+        HandshakeError::Kernel(error) => return Error::Config(ConfigError::KernelTls(error)),
+        other => other,
+    };
+    let failure = match &error {
+        HandshakeError::Tls(error) => TlsFailure::of_rustls(error),
+        HandshakeError::TimedOut(_) => {
+            return Error::Timeout(TimedOut::Connect {
+                during: ConnectPhase::Tls,
+            });
+        }
+        _ => TlsFailure::Protocol,
+    };
+    Error::connect(
+        hop,
+        host,
+        port,
+        ConnectFailure::Tls(TlsError::new(failure, Cause::Handshake(error))),
+    )
 }
 
 /// Runs the HTTP/1.1 client over `stream`; the driver logs how it ended, and
@@ -388,6 +458,7 @@ where
 async fn tunnel<I, S>(
     io: &I,
     stream: S,
+    proxy: (&str, u16),
     authority: &str,
     authorization: Option<HeaderValue>,
 ) -> Result<Rejoined<S::ReadHalf, S::WriteHalf>, Error>
@@ -397,6 +468,9 @@ where
     S::ReadHalf: ReadOwned + SpliceRead,
     S::WriteHalf: SendFile + SpliceWrite,
 {
+    let fail = |error: TunnelError| {
+        Error::connect(Hop::Proxy, proxy.0, proxy.1, ConnectFailure::Tunnel(error))
+    };
     let (send, connection) = handshake_stream(stream, io.clone(), ClientConfig::default());
     let mut request = Request::new(Body::empty());
     *request.method_mut() = Method::CONNECT;
@@ -418,32 +492,29 @@ where
     let exchange = async move { send.send(request).await.map(|response| response.status()) };
     let (outcome, status) = futures_util::join!(connection.run(), exchange);
     let status = status.map_err(|error| match error {
-        http_kit_h1::Error::ConnectionClosed => {
-            ProxyErrorKind::TunnelProtocol("proxy closed the connection before answering CONNECT")
-                .into()
-        }
-        error => Error::Transport(Box::new(error)),
+        http_kit_h1::Error::ConnectionClosed => fail(TunnelError::Protocol(
+            "proxy closed the connection before answering CONNECT",
+        )),
+        error => fail(TunnelError::Connection(Cause::H1(error))),
     })?;
     if !status.is_success() {
-        return Err(ProxyErrorKind::TunnelRejected(status).into());
+        return Err(fail(TunnelError::Rejected(status)));
     }
-    match outcome.map_err(|error| Error::Transport(Box::new(error)))? {
+    match outcome.map_err(|error| fail(TunnelError::Connection(Cause::H1(error))))? {
         ClientOutcome::Upgraded(upgraded) => {
             if !upgraded.read_buf.is_empty() {
-                return Err(ProxyErrorKind::TunnelProtocol(
+                return Err(fail(TunnelError::Protocol(
                     "proxy sent bytes into the tunnel before the client spoke",
-                )
-                .into());
+                )));
             }
             Ok(Rejoined {
                 read: upgraded.read,
                 write: upgraded.write,
             })
         }
-        ClientOutcome::Closed => Err(ProxyErrorKind::TunnelProtocol(
+        ClientOutcome::Closed => Err(fail(TunnelError::Protocol(
             "proxy answered CONNECT without switching to the tunnel",
-        )
-        .into()),
+        ))),
     }
 }
 
@@ -466,30 +537,38 @@ impl<R: Read + 'static, W: Write + 'static> Split for Rejoined<R, W> {
 async fn tcp<I: Dial + Timer, R: Resolve>(
     io: &I,
     resolver: &R,
+    hop: Hop,
     host: &str,
     port: u16,
+    phase: &Cell<ConnectPhase>,
 ) -> Result<I::Connection, Error> {
-    happy_eyeballs::connect(&IoDialer(io), resolver, host, port)
+    phase.set(ConnectPhase::Resolve);
+    happy_eyeballs::connect(&IoDialer { io, phase }, resolver, host, port)
         .await
-        .map_err(|error| Error::Transport(Box::new(error)))
+        .map_err(|error| error.into_error(hop, host, port))
 }
 
 /// Happy eyeballs over an `http-kit-io` implementation. Every connection
 /// it opens has `TCP_NODELAY` on, as the async-net dialer's do: a request
-/// head or a TLS record goes out at once instead of waiting on Nagle.
-struct IoDialer<'a, I>(&'a I);
+/// head or a TLS record goes out at once instead of waiting on Nagle. The
+/// first dial moves `phase` from resolving to connecting.
+struct IoDialer<'a, I> {
+    io: &'a I,
+    phase: &'a Cell<ConnectPhase>,
+}
 
 impl<I: Dial + Timer> Dialer for IoDialer<'_, I> {
     type Stream = I::Connection;
 
     async fn dial(&self, addr: SocketAddr) -> io::Result<I::Connection> {
-        let stream = self.0.connect(addr).await?;
+        self.phase.set(ConnectPhase::Tcp);
+        let stream = self.io.connect(addr).await?;
         stream.set_nodelay(true)?;
         Ok(stream)
     }
 
     fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> {
-        self.0.sleep_until(deadline)
+        self.io.sleep_until(deadline)
     }
 }
 

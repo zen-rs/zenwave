@@ -27,7 +27,7 @@ use runtime::AsyncIoRuntimeProvider;
 
 use super::HttpsRecord;
 use crate::{
-    Error,
+    Cause, ResolveError,
     transport::{Inner, Spawn},
 };
 
@@ -106,11 +106,11 @@ fn build_resolver(
     config: &ResolverConfig,
     options: &ResolverOpts,
     spawn: Spawn,
-) -> Result<HickoryResolver, Error> {
+) -> Result<HickoryResolver, ResolveError> {
     Resolver::builder_with_config(config.clone(), AsyncIoRuntimeProvider::new(spawn))
         .with_options(options.clone())
         .build()
-        .map_err(|error| Error::Transport(Box::new(error)))
+        .map_err(|error| ResolveError::Lookup(Cause::Hickory(error)))
 }
 
 /// The HTTPS default port queries `host` directly; every other port queries
@@ -133,7 +133,7 @@ pub(in crate::transport) async fn https_record(
     spawn: Spawn,
     host: &str,
     port: u16,
-) -> Result<Option<HttpsRecord>, Error> {
+) -> Result<Option<HttpsRecord>, ResolveError> {
     if host.parse::<IpAddr>().is_ok() {
         return Ok(None);
     }
@@ -154,9 +154,7 @@ pub(in crate::transport) async fn https_record(
             // The resolver only feeds h3 discovery; the caller (#69) decides
             // what a missing configuration means for the origin.
             Config::Unavailable(reason) => {
-                return Err(Error::Transport(Box::new(std::io::Error::other(
-                    reason.clone(),
-                ))));
+                return Err(ResolveError::Lookup(Cause::Detail(reason.clone())));
             }
         };
         resolve(host, port, |domain| lookup_https(resolver, domain)).await
@@ -167,24 +165,29 @@ pub(in crate::transport) async fn https_record(
 /// surface as `NoRecordsFound` — a definitive "there is no record", not a
 /// failure — and come back as an empty set.
 #[cfg(not(target_os = "android"))]
-async fn lookup_https(resolver: &HickoryResolver, domain: String) -> Result<Vec<Record>, Error> {
-    // A name that does not even parse is a caller error, not a transport
-    // failure.
+async fn lookup_https(
+    resolver: &HickoryResolver,
+    domain: String,
+) -> Result<Vec<Record>, ResolveError> {
     let name =
-        Name::from_str(&domain).map_err(|error| Error::InvalidUri(format!("{domain}: {error}")))?;
+        Name::from_str(&domain).map_err(|error| ResolveError::Lookup(Cause::DnsProto(error)))?;
     match resolver.lookup(name, RecordType::HTTPS).await {
         Ok(lookup) => Ok(lookup.answers().to_vec()),
         Err(error) if error.is_no_records_found() => Ok(Vec::new()),
-        Err(error) => Err(Error::Transport(Box::new(error))),
+        Err(error) => Err(ResolveError::Lookup(Cause::Hickory(error))),
     }
 }
 
 /// The shared resolution loop: `query` maps a domain to the HTTPS `RRSets`
 /// answered for it, and an `AliasMode` answer is re-queried once.
-async fn resolve<F, Fut>(host: &str, port: u16, query: F) -> Result<Option<HttpsRecord>, Error>
+async fn resolve<F, Fut>(
+    host: &str,
+    port: u16,
+    query: F,
+) -> Result<Option<HttpsRecord>, ResolveError>
 where
     F: Fn(String) -> Fut,
-    Fut: Future<Output = Result<Vec<Record>, Error>>,
+    Fut: Future<Output = Result<Vec<Record>, ResolveError>>,
 {
     let mut domain = query_domain(host, port);
     let mut hops = 0;
@@ -288,9 +291,13 @@ mod tests {
         Config, HTTPS_DEFAULT_PORT, HttpsRecord,
         test_support::{TTL, answer, https, name, queried_name, resolver_config, serve, spawn},
     };
-    use crate::{Error, transport::Transport};
+    use crate::{Cause, ResolveError, transport::Transport};
 
-    fn lookup(server: SocketAddr, host: &str, port: u16) -> Result<Option<HttpsRecord>, Error> {
+    fn lookup(
+        server: SocketAddr,
+        host: &str,
+        port: u16,
+    ) -> Result<Option<HttpsRecord>, ResolveError> {
         let (config, options) = resolver_config(server);
         let transport = Transport::builder()
             .dns_config(Config::new(config, options))
@@ -380,7 +387,10 @@ mod tests {
         let result =
             async_io::block_on(transport.https_record(spawn(), "example.test", HTTPS_DEFAULT_PORT));
 
-        assert!(matches!(result, Err(Error::Transport(_))));
+        assert!(matches!(
+            result,
+            Err(ResolveError::Lookup(Cause::Detail(_)))
+        ));
     }
 
     #[test]
@@ -389,7 +399,10 @@ mod tests {
 
         let result = lookup(server, "example.test", HTTPS_DEFAULT_PORT);
 
-        assert!(matches!(result, Err(Error::Transport(_))));
+        assert!(matches!(
+            result,
+            Err(ResolveError::Lookup(Cause::Hickory(_)))
+        ));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use rustls_pki_types::CertificateDer;
 
-use crate::Error;
+use crate::{Cause, Error};
 
 /// Encode the system roots and `extra_roots` as one PEM document.
 ///
@@ -18,9 +18,9 @@ pub fn platform_roots_with(extra_roots: &[CertificateDer<'static>]) -> Result<Ve
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("; ");
-        return Err(Error::tls(format!(
+        return Err(Error::trust_store(Cause::Detail(format!(
             "no platform root certificates could be loaded: {details}"
-        )));
+        ))));
     }
     for error in &loaded.errors {
         tracing::warn!(%error, "skipping an unreadable platform root certificate");

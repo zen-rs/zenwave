@@ -23,7 +23,7 @@ use async_io::Async;
 use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
 
 use super::Spawn;
-use crate::Error;
+use crate::{Cause, Error};
 
 /// `quinn::Runtime` over async-io: `async_io::Timer` for timers, an
 /// `Async<UdpSocket>` wrapper for datagrams, `spawn` for tasks.
@@ -190,20 +190,18 @@ pub fn endpoint(spawn: Spawn) -> Result<quinn::Endpoint, Error> {
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
     )
-    .map_err(|error| Error::Transport(Box::new(error)))?;
-    socket
-        .set_only_v6(false)
-        .map_err(|error| Error::Transport(Box::new(error)))?;
+    .map_err(Error::Io)?;
+    socket.set_only_v6(false).map_err(Error::Io)?;
     socket
         .bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0).into())
-        .map_err(|error| Error::Transport(Box::new(error)))?;
+        .map_err(Error::Io)?;
     quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         None,
         socket.into(),
         Arc::new(AsyncIoRuntime { spawn }),
     )
-    .map_err(|error| Error::Transport(Box::new(error)))
+    .map_err(Error::Io)
 }
 
 /// How long a QUIC connection may sit without packets before the endpoint
@@ -236,16 +234,16 @@ fn client_config_with_timeouts(
 ) -> Result<quinn::ClientConfig, Error> {
     let mut transport = quinn::TransportConfig::default();
     transport
-        .max_idle_timeout(Some(
-            max_idle_timeout
-                .try_into()
-                .map_err(|error| Error::Transport(Box::new(error)))?,
-        ))
+        .max_idle_timeout(Some(max_idle_timeout.try_into().map_err(
+            |error: quinn::VarIntBoundsExceeded| {
+                Error::tls_config(Cause::Detail(error.to_string()))
+            },
+        )?))
         .keep_alive_interval(keep_alive_interval);
     let mut config = base.clone();
     config.alpn_protocols = vec![b"h3".to_vec()];
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(config)
-        .map_err(|error| Error::Transport(Box::new(error)))?;
+        .map_err(|error| Error::tls_config(Cause::Detail(error.to_string())))?;
     let mut config = quinn::ClientConfig::new(Arc::new(quic));
     config.transport_config(Arc::new(transport));
     Ok(config)

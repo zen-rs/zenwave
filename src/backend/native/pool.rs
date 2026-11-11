@@ -193,10 +193,8 @@ impl PoolHandle {
     }
 }
 
-fn gone() -> Error {
-    Error::Transport(Box::new(std::io::Error::other(
-        "the native connection pool's thread has stopped",
-    )))
+const fn gone() -> Error {
+    Error::Stopped
 }
 
 /// Something a pool task finished.

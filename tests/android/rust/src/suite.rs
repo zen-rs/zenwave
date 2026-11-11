@@ -2,7 +2,9 @@
 //! and `tests/proxy_tests.rs` assert on every other platform.
 
 use base64::Engine as _;
-use zenwave::{Client, Error, Proxy, ResponseExt as _, Transport, backend::HyperBackend};
+use zenwave::{
+    Client, ConnectFailure, Error, Proxy, ResponseExt as _, Transport, backend::HyperBackend,
+};
 
 use crate::common::{FIXTURE_HOST, proxy::HttpProxy, tls::tls_fixture};
 
@@ -61,8 +63,8 @@ async fn system_roots_reject() -> Result<(), String> {
         .get(fixture.https_uri("/"))
         .map_err(|error| error.to_string())?;
     match request.await {
-        Err(Error::Tls(_)) => Ok(()),
-        other => Err(format!("expected Error::Tls, got {other:?}")),
+        Err(Error::Connect(connect)) if matches!(connect.failure, ConnectFailure::Tls(_)) => Ok(()),
+        other => Err(format!("expected a TLS connect failure, got {other:?}")),
     }
 }
 

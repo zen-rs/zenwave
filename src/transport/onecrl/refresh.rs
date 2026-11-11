@@ -29,7 +29,7 @@ use hyper::body::Bytes;
 
 use super::{Additions, baseline_timestamp, record};
 use crate::{
-    Error,
+    ConfigError, Error,
     transport::{
         Inner, Transport,
         connect::{self, Protocols, Target, Via},
@@ -63,9 +63,9 @@ impl Refresh {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] when refresh is enabled but no cache directory
-    /// exists for the additions file.
-    pub fn resolve(&self) -> Result<Option<Plan>, Error> {
+    /// Returns [`ConfigError::OneCrl`] when refresh is enabled but no cache
+    /// directory exists for the additions file.
+    pub fn resolve(&self) -> Result<Option<Plan>, ConfigError> {
         let Some(interval) = self.interval else {
             return Ok(None);
         };
@@ -109,17 +109,41 @@ struct Changeset {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Io`] when the thread cannot be spawned.
+/// Returns [`ConfigError::OneCrl`] when the thread cannot be spawned.
 pub fn spawn(
     inner: &Arc<Inner>,
     additions: Arc<ArcSwap<Additions>>,
     plan: Plan,
-) -> Result<(), Error> {
+) -> Result<(), ConfigError> {
     let inner = Arc::downgrade(inner);
     std::thread::Builder::new()
         .name("zenwave-onecrl".to_owned())
-        .spawn(move || async_io::block_on(run(inner, additions, plan)))?;
+        .spawn(move || async_io::block_on(run(inner, additions, plan)))
+        .map_err(ConfigError::OneCrl)?;
     Ok(())
+}
+
+/// Why a refresh round or a read of the additions cache failed: remote input
+/// or the machine, never a bug, so `run` warns and keeps the current
+/// additions.
+#[derive(Debug, thiserror::Error)]
+enum RefreshError {
+    /// The changeset endpoint could not be reached, or the request could not
+    /// be made.
+    #[error(transparent)]
+    Request(#[from] Error),
+    /// The endpoint's connection failed mid-exchange.
+    #[error("the changeset endpoint's connection failed: {0}")]
+    Connection(#[from] hyper::Error),
+    /// The changeset or the cache file is not JSON.
+    #[error("not JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    /// The cache file could not be read or written.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    /// The changeset is not what OneCRL serves.
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 /// Load the persisted additions, then run fetch-merge-persist rounds every
@@ -171,7 +195,7 @@ async fn round(
     plan: &Plan,
     additions: &Arc<ArcSwap<Additions>>,
     seen: &mut Vec<serde_json::Value>,
-) -> Result<(), Error> {
+) -> Result<(), RefreshError> {
     let changeset = fetch(transport, plan, since(additions)).await?;
     let current = additions.load_full();
     let mut next = (*current).clone();
@@ -217,7 +241,7 @@ fn since(additions: &ArcSwap<Additions>) -> u64 {
 /// its proxy rules and trust roots apply and OneCRL checks the connection
 /// too. Like `tunnel.rs`, the hyper connection is polled alongside the
 /// request so the response body can stream in.
-async fn fetch(transport: &Transport, plan: &Plan, since: u64) -> Result<Changeset, Error> {
+async fn fetch(transport: &Transport, plan: &Plan, since: u64) -> Result<Changeset, RefreshError> {
     let separator = if plan.endpoint.contains('?') {
         '&'
     } else {
@@ -249,8 +273,7 @@ async fn fetch(transport: &Transport, plan: &Plan, since: u64) -> Result<Changes
     .await?;
     let (mut sender, driver) =
         hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(HyperIo(connection.stream))
-            .await
-            .map_err(|error| Error::Transport(Box::new(error)))?;
+            .await?;
 
     let mut request = Request::get(
         uri.path_and_query()
@@ -271,18 +294,10 @@ async fn fetch(transport: &Transport, plan: &Plan, since: u64) -> Result<Changes
     }
 
     let exchange = async {
-        let response = sender
-            .send_request(request)
-            .await
-            .map_err(|error| Error::Transport(Box::new(error)))?;
+        let response = sender.send_request(request).await?;
         let status = response.status();
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|error| Error::Transport(Box::new(error)))?
-            .to_bytes();
-        Ok::<_, Error>((status, body))
+        let body = response.into_body().collect().await?.to_bytes();
+        Ok::<_, RefreshError>((status, body))
     }
     .fuse();
     pin_mut!(exchange);
@@ -292,7 +307,7 @@ async fn fetch(transport: &Transport, plan: &Plan, since: u64) -> Result<Changes
         Either::Left((result, _)) => result?,
         // The peer closed mid-exchange; buffered bytes may still complete it.
         Either::Right((driver_result, exchange)) => {
-            driver_result.map_err(|error| Error::Transport(Box::new(error)))?;
+            driver_result?;
             exchange.await?
         }
     };
@@ -302,8 +317,7 @@ async fn fetch(transport: &Transport, plan: &Plan, since: u64) -> Result<Changes
             "the changeset endpoint answered {status}"
         )));
     }
-    let value: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|error| Error::Transport(Box::new(error)))?;
+    let value: serde_json::Value = serde_json::from_slice(&body)?;
     let timestamp = value["timestamp"]
         .as_u64()
         .ok_or_else(|| unavailable("the changeset has no timestamp"))?;
@@ -320,14 +334,13 @@ async fn fetch(transport: &Transport, plan: &Plan, since: u64) -> Result<Changes
 ///
 /// Returns `Err` when the file cannot be read or does not hold the changeset
 /// shape — the caller warns and ignores it.
-fn load(dir: &Path) -> Result<Option<Changeset>, Error> {
+fn load(dir: &Path) -> Result<Option<Changeset>, RefreshError> {
     let body = match std::fs::read(dir.join(FILE_NAME)) {
         Ok(body) => body,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(Error::Io(error)),
+        Err(error) => return Err(error.into()),
     };
-    let value: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|error| Error::Transport(Box::new(error)))?;
+    let value: serde_json::Value = serde_json::from_slice(&body)?;
     let timestamp = value["timestamp"]
         .as_u64()
         .ok_or_else(|| unavailable("cached changes.json has no timestamp"))?;
@@ -340,34 +353,34 @@ fn load(dir: &Path) -> Result<Option<Changeset>, Error> {
 
 /// Atomically replace `dir/changes.json` with every addition seen: a temp
 /// file in the same directory, then a rename over the old one.
-fn persist(dir: &Path, timestamp: u64, records: &[serde_json::Value]) -> Result<(), Error> {
-    std::fs::create_dir_all(dir).map_err(Error::Io)?;
+fn persist(dir: &Path, timestamp: u64, records: &[serde_json::Value]) -> Result<(), RefreshError> {
+    std::fs::create_dir_all(dir)?;
     let body = serde_json::to_vec(&serde_json::json!({
         "timestamp": timestamp,
         "changes": records,
-    }))
-    .map_err(|error| Error::Transport(Box::new(error)))?;
+    }))?;
     let temporary = dir.join("changes.json.tmp");
-    std::fs::write(&temporary, body).map_err(Error::Io)?;
-    std::fs::rename(&temporary, dir.join(FILE_NAME)).map_err(Error::Io)?;
+    std::fs::write(&temporary, body)?;
+    std::fs::rename(&temporary, dir.join(FILE_NAME))?;
     Ok(())
 }
 
 /// A round failure: remote input or the network, never a bug — so `run`
 /// warns and retries next interval.
-fn unavailable(message: impl Into<String>) -> Error {
-    Error::Transport(Box::new(std::io::Error::other(message.into())))
+fn unavailable(message: impl Into<String>) -> RefreshError {
+    RefreshError::Unavailable(message.into())
 }
 
 /// The platform cache directory.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Io`] when the platform reports no cache directory.
+/// Returns [`ConfigError::OneCrl`] when the platform reports no cache
+/// directory.
 #[cfg(not(target_os = "android"))]
-fn cache_root() -> Result<PathBuf, Error> {
+fn cache_root() -> Result<PathBuf, ConfigError> {
     dirs::cache_dir().ok_or_else(|| {
-        Error::Io(std::io::Error::new(
+        ConfigError::OneCrl(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "no cache directory for the OneCRL additions",
         ))
@@ -382,7 +395,7 @@ fn cache_root() -> Result<PathBuf, Error> {
 ///
 /// Returns `Err` when the JVM call fails.
 #[cfg(target_os = "android")]
-fn cache_root() -> Result<PathBuf, Error> {
+fn cache_root() -> Result<PathBuf, ConfigError> {
     use jni::{
         JavaVM, jni_sig, jni_str,
         objects::{JObject, JString},
@@ -413,7 +426,7 @@ fn cache_root() -> Result<PathBuf, Error> {
             .l()?;
         Ok(PathBuf::from(JString::cast_local(env, path)?.to_string()))
     })
-    .map_err(|error| Error::Transport(Box::new(error)))
+    .map_err(|error| ConfigError::OneCrl(std::io::Error::other(error)))
 }
 
 #[cfg(test)]

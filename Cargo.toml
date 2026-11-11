@@ -46,7 +46,6 @@ futures-channel = "0.3.34"
 thiserror = "2.0.21"
 futures-io = "0.3.34"
 async-lock = "3.4.2"
-anyhow = "1.0.104"
 # Capped at the wasm-bindgen 0.2.120 generation: `tests/workerd` deploys through
 # the `skyzen` CLI, whose embedded bindings generator is wasm-bindgen 0.2.120
 # and refuses any other resolved version. js-sys/web-sys 0.3.98+ and

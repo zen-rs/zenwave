@@ -13,7 +13,7 @@ use tracing::debug;
 
 use super::alt_svc::{self, AltSvc};
 use super::dns::HttpsRecord;
-use crate::Error;
+use crate::ResolveError;
 
 /// How long a racing QUIC dial is given to finish before it loses; a detached
 /// loser also ends at this deadline.
@@ -56,7 +56,7 @@ impl HttpsRr {
     /// The answer a lookup for `host`:`port` produced; a failed lookup is
     /// logged and cached as a negative answer rather than failing anything.
     pub(crate) fn from_lookup(
-        lookup: Result<Option<HttpsRecord>, Error>,
+        lookup: Result<Option<HttpsRecord>, ResolveError>,
         host: &str,
         port: u16,
         now: Instant,

@@ -38,7 +38,10 @@ impl HttpError for MockError {}
 impl From<MockError> for zenwave::Error {
     fn from(err: MockError) -> Self {
         match err {
-            MockError::NetworkError => Self::Transport(Box::new(err)),
+            MockError::NetworkError => Self::Exchange(Box::new(zenwave::ExchangeError::new(
+                zenwave::ExchangeFailure::Terminated,
+                zenwave::Cause::Io(Arc::new(std::io::Error::other(err))),
+            ))),
             MockError::Permanent => Self::InvalidUri("permanent mock failure".to_owned()),
             MockError::Exhausted => Self::Other(Box::new(err)),
         }
@@ -169,7 +172,7 @@ async fn retry_middleware_gives_up_after_max_retries() {
         .unwrap();
 
     let result = client.respond(&mut request).await;
-    assert!(matches!(result, Err(zenwave::Error::Transport(_))));
+    assert!(matches!(result, Err(zenwave::Error::Exchange(_))));
 
     assert_eq!(state.lock().unwrap().attempts, 3); // Initial + 2 retries
 }
@@ -243,7 +246,7 @@ async fn retry_attempts_a_read_once_body_once() {
         )])))
         .unwrap();
     let result = client.respond(&mut request).await;
-    assert!(matches!(result, Err(zenwave::Error::Transport(_))));
+    assert!(matches!(result, Err(zenwave::Error::Exchange(_))));
     assert_eq!(state.lock().unwrap().attempts, 1);
 }
 

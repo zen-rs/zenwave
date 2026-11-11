@@ -24,7 +24,6 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-use anyhow::{Error, anyhow};
 use block::{Block, ConcreteBlock};
 use core_foundation::base::TCFType;
 use futures_channel::oneshot;
@@ -32,7 +31,7 @@ use http::{
     HeaderMap, Uri,
     header::{HeaderName, HeaderValue, PROXY_AUTHORIZATION},
 };
-use http_kit::{Body, Endpoint, HttpError, Request, Response, StatusCode};
+use http_kit::{Body, Endpoint, Request, Response, StatusCode};
 use objc::{
     class,
     declare::ClassDecl,
@@ -45,9 +44,9 @@ use rustls_pki_types::CertificateDer;
 use security_framework::{certificate::SecCertificate, trust::SecTrust};
 
 use crate::{
-    Client, Transport,
+    Attempt, Cause, Client, ConfigError, ConnectFailure, Error, ExchangeFailure, Hop, ResolveError,
+    TcpFailure, TimedOut, TlsError, TlsFailure, Transport, TunnelError,
     clock::{AsyncIoClock, Clocked},
-    error::ProxyErrorKind,
     transport::proxy::{self, Intercept, Source},
 };
 
@@ -60,49 +59,18 @@ pub struct AppleBackend {
     sessions: HashMap<SessionKey, Session>,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum AppleError {
-    #[error("bad request: {0}")]
-    BadRequest(#[source] anyhow::Error),
-    #[error("bad gateway: {0}")]
-    BadGateway(#[source] anyhow::Error),
-    #[error("TLS failure: {0}")]
-    Tls(#[source] anyhow::Error),
-    #[error(transparent)]
-    Proxy(#[from] ProxyErrorKind),
+/// A request `URLSession` cannot be given.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a `map_err` callback receives the error by value"
+)]
+fn invalid(error: impl ToString) -> Error {
+    Error::InvalidRequest(error.to_string())
 }
 
-impl AppleError {
-    fn bad_request(error: impl Into<anyhow::Error>) -> Self {
-        Self::BadRequest(error.into())
-    }
-
-    fn bad_gateway(error: impl Into<anyhow::Error>) -> Self {
-        Self::BadGateway(error.into())
-    }
-}
-
-impl HttpError for AppleError {
-    fn status(&self) -> StatusCode {
-        match self {
-            Self::BadRequest(_) | Self::Proxy(_) => StatusCode::BAD_REQUEST,
-            Self::BadGateway(_) | Self::Tls(_) => StatusCode::BAD_GATEWAY,
-        }
-    }
-}
-
-impl From<AppleError> for crate::Error {
-    fn from(err: AppleError) -> Self {
-        match err {
-            AppleError::BadRequest(e) => Self::InvalidRequest(e.to_string()),
-            AppleError::BadGateway(e) => {
-                let io_err = std::io::Error::other(e);
-                Self::Transport(Box::new(io_err))
-            }
-            AppleError::Tls(e) => Self::tls(e),
-            AppleError::Proxy(kind) => Self::Proxy(kind),
-        }
-    }
+/// A failure `URLSession` reports as a message and no `NSError`.
+fn failed(message: &str) -> Error {
+    Error::exchange(ExchangeFailure::Io, Cause::Detail(message.to_owned()))
 }
 
 /// A session plus the delegate state its tasks report through.
@@ -140,7 +108,7 @@ impl AppleBackend {
 
     /// The session whose proxy configuration matches `destination`, and the
     /// header the request itself must carry to get through.
-    fn route_for(&mut self, destination: &Uri) -> Result<Route, AppleError> {
+    fn route_for(&mut self, destination: &Uri) -> Result<Route, Error> {
         let rules = self.transport.proxy();
         let key = match rules.source() {
             Source::System => SessionKey::System,
@@ -182,10 +150,9 @@ impl Endpoint for AppleBackend {
     type Error = crate::Error;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         if self.transport.unix_socket().is_some() {
-            return Err(AppleError::BadRequest(anyhow!(
-                "URLSession cannot connect over unix domain sockets"
-            ))
-            .into());
+            return Err(Error::Config(ConfigError::Unsupported {
+                what: "unix domain sockets",
+            }));
         }
         let route = self.route_for(request.uri())?;
         if let Some(authorization) = route.proxy_authorization {
@@ -193,9 +160,7 @@ impl Endpoint for AppleBackend {
                 .headers_mut()
                 .insert(PROXY_AUTHORIZATION, authorization);
         }
-        send_with_url_session(route.session, request)
-            .await
-            .map_err(Into::into)
+        send_with_url_session(route.session, request).await
     }
 }
 
@@ -279,15 +244,18 @@ enum ProxyScheme {
 }
 
 impl ProxyEndpoint {
-    fn new(intercept: &Intercept) -> Result<Self, AppleError> {
+    fn new(intercept: &Intercept) -> Result<Self, Error> {
         let uri = intercept.uri();
         let scheme_name = uri.scheme_str().unwrap_or("http");
         let (scheme, default_port) = match scheme_name {
             "http" => (ProxyScheme::Http, 80),
             "socks5" | "socks5h" => (ProxyScheme::Socks, 1080),
-            other => return Err(ProxyErrorKind::UnsupportedScheme(other.to_owned()).into()),
+            other => return Err(Error::Config(ConfigError::ProxyScheme(other.to_owned()))),
         };
-        let host = uri.host().ok_or(ProxyErrorKind::MissingHost)?.to_owned();
+        let host = uri
+            .host()
+            .ok_or(Error::Config(ConfigError::ProxyHost))?
+            .to_owned();
         Ok(Self {
             scheme,
             host,
@@ -302,7 +270,7 @@ impl ProxyEndpoint {
     /// Keys are the string values of `kCFNetworkProxies*` from
     /// `CFProxySupport.h`; the HTTPS and SOCKS symbols are not exported on
     /// iOS although `CFNetwork` honours the keys there.
-    unsafe fn dictionary(&self) -> Result<*mut Object, AppleError> {
+    unsafe fn dictionary(&self) -> Result<*mut Object, Error> {
         let dictionary: *mut Object = msg_send![class!(NSMutableDictionary), new];
         let entries: &[(&str, &str, &str)] = match self.scheme {
             ProxyScheme::Http => &[
@@ -353,12 +321,12 @@ struct Session {
 }
 
 impl Session {
-    fn open(key: &SessionKey, extra_roots: &[CertificateDer<'static>]) -> Result<Self, AppleError> {
+    fn open(key: &SessionKey, extra_roots: &[CertificateDer<'static>]) -> Result<Self, Error> {
         let anchors = extra_roots
             .iter()
             .map(|der| SecCertificate::from_der(der))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| AppleError::Tls(error.into()))?;
+            .map_err(|error| Error::trust_store(Cause::Detail(error.to_string())))?;
         let state = Arc::new(DelegateState {
             proxy_credentials: key.proxy_credentials(),
             anchors,
@@ -437,27 +405,41 @@ struct SessionResponse {
     body: Vec<u8>,
 }
 
-type CompletionSender = Arc<Mutex<Option<oneshot::Sender<Result<SessionResponse, AppleError>>>>>;
+type CompletionSender = Arc<Mutex<Option<oneshot::Sender<Result<SessionResponse, Error>>>>>;
+
+/// The origin a request is for: where a failure to connect is reported.
+struct Origin {
+    host: String,
+    port: u16,
+}
+
+impl Origin {
+    fn of(uri: &Uri) -> Self {
+        let https = uri.scheme_str() == Some("https");
+        Self {
+            host: uri.host().unwrap_or_default().to_owned(),
+            port: uri.port_u16().unwrap_or(if https { 443 } else { 80 }),
+        }
+    }
+}
 
 async fn send_with_url_session(
     handle: SessionHandle,
     request: &mut Request,
-) -> Result<Response, AppleError> {
+) -> Result<Response, Error> {
     let method = request.method().as_str().to_owned();
     let uri = request.uri().to_string();
+    let origin = Origin::of(request.uri());
 
     let mut collected_headers = Vec::new();
     for (name, value) in request.headers() {
-        let value_str = value.to_str().map_err(AppleError::bad_request)?;
+        let value_str = value.to_str().map_err(invalid)?;
         collected_headers.push((name.as_str().to_string(), value_str.to_string()));
     }
 
     let body_bytes = {
         let body = replace(request.body_mut(), Body::empty());
-        body.into_bytes()
-            .await
-            .map_err(AppleError::bad_request)?
-            .to_vec()
+        body.into_bytes().await.map_err(invalid)?.to_vec()
     };
     let body = if body_bytes.is_empty() {
         None
@@ -475,11 +457,12 @@ async fn send_with_url_session(
         &collected_headers,
         body.as_deref(),
         sender,
+        origin,
     )?;
 
     let response = rx
         .await
-        .map_err(|_| AppleError::bad_gateway(anyhow!("URLSession task cancelled")))??;
+        .map_err(|_| failed("URLSession task cancelled"))??;
 
     let SessionResponse {
         status,
@@ -500,7 +483,8 @@ fn start_task(
     headers: &[(String, String)],
     body: Option<&[u8]>,
     sender: CompletionSender,
-) -> Result<(), AppleError> {
+    origin: Origin,
+) -> Result<(), Error> {
     autoreleasepool(|| unsafe {
         let session = handle.as_ptr();
         let request = build_request(method, url, headers, body)?;
@@ -516,7 +500,7 @@ fn start_task(
                     let id = *task_id
                         .get()
                         .expect("task identifier recorded before resume");
-                    let result = handle_completion(data, response, error, &state, id);
+                    let result = handle_completion(data, response, error, &state, id, &origin);
                     let tx = sender.lock().expect("mutex poisoned").take();
                     if let Some(tx) = tx {
                         let _ = tx.send(result);
@@ -529,9 +513,7 @@ fn start_task(
         let task: *mut Object =
             msg_send![session, dataTaskWithRequest: request completionHandler: &*completion];
         if task.is_null() {
-            return Err(AppleError::bad_gateway(anyhow!(
-                "Failed to create URLSession data task"
-            )));
+            return Err(failed("Failed to create URLSession data task"));
         }
         let id: usize = msg_send![task, taskIdentifier];
         task_id
@@ -548,13 +530,11 @@ unsafe fn build_request(
     url: &str,
     headers: &[(String, String)],
     body: Option<&[u8]>,
-) -> Result<*mut Object, AppleError> {
+) -> Result<*mut Object, Error> {
     let ns_url = str_to_nsurl(url)?;
     let request: *mut Object = msg_send![class!(NSMutableURLRequest), requestWithURL: ns_url];
     if request.is_null() {
-        return Err(AppleError::bad_gateway(anyhow!(
-            "Failed to create NSMutableURLRequest"
-        )));
+        return Err(failed("Failed to create NSMutableURLRequest"));
     }
 
     let method_string = str_to_nsstring(method)?;
@@ -583,20 +563,19 @@ fn handle_completion(
     error: *mut Object,
     state: &DelegateState,
     task_id: usize,
-) -> Result<SessionResponse, AppleError> {
+    origin: &Origin,
+) -> Result<SessionResponse, Error> {
     unsafe {
         if !error.is_null() {
-            return Err(classify_nserror(error, state, task_id));
+            return Err(classify_nserror(error, state, task_id, origin));
         }
 
         if response.is_null() {
-            return Err(AppleError::bad_gateway(anyhow!(
-                "URLSession returned an empty response"
-            )));
+            return Err(failed("URLSession returned an empty response"));
         }
 
-        let status = http_status(response)?
-            .ok_or_else(|| AppleError::bad_gateway(anyhow!("URLSession response is not HTTP")))?;
+        let status =
+            http_status(response)?.ok_or_else(|| failed("URLSession response is not HTTP"))?;
 
         let headers = headers_from_response(response);
 
@@ -615,7 +594,7 @@ fn handle_completion(
 }
 
 /// The status of an `NSURLResponse`, `None` when it is not an HTTP response.
-unsafe fn http_status(response: *mut Object) -> Result<Option<StatusCode>, AppleError> {
+unsafe fn http_status(response: *mut Object) -> Result<Option<StatusCode>, Error> {
     if response.is_null() {
         return Ok(None);
     }
@@ -624,66 +603,122 @@ unsafe fn http_status(response: *mut Object) -> Result<Option<StatusCode>, Apple
         return Ok(None);
     }
     let status_code: i64 = msg_send![response, statusCode];
-    let status = u16::try_from(status_code).map_err(|e| AppleError::bad_gateway(anyhow!(e)))?;
-    StatusCode::from_u16(status)
-        .map(Some)
-        .map_err(AppleError::bad_gateway)
+    let status = u16::try_from(status_code).map_err(|error| {
+        Error::exchange(ExchangeFailure::Protocol, Cause::Detail(error.to_string()))
+    })?;
+    StatusCode::from_u16(status).map(Some).map_err(|error| {
+        Error::exchange(ExchangeFailure::Protocol, Cause::Detail(error.to_string()))
+    })
 }
 
-/// `NSURLErrorDomain` codes for TLS handshake and certificate failures
-/// (`NSURLErrorSecureConnectionFailed` through `NSURLErrorClientCertificateRequired`).
-const NSURL_TLS_ERROR_CODES: std::ops::RangeInclusive<isize> = -1206..=-1200;
-/// `NSURLErrorCancelled`: what a task reports after the delegate cancelled
-/// its authentication challenge.
-const NSURL_ERROR_CANCELLED: isize = -999;
+/// `NSURLErrorDomain` codes (`NSURLError.h`) `URLSession` fails with.
+mod nsurl {
+    use std::ops::RangeInclusive;
 
-/// Sort an `NSError` into zenwave's taxonomy: a cancellation the delegate
-/// caused by refusing a proxy challenge is that proxy's rejection, certificate
-/// and handshake failures are TLS errors, everything else is transport.
+    /// `NSURLErrorCancelled`: what a task reports after the delegate
+    /// cancelled its authentication challenge.
+    pub const CANCELLED: isize = -999;
+    /// `NSURLErrorTimedOut`.
+    pub const TIMED_OUT: isize = -1001;
+    /// `NSURLErrorCannotFindHost`.
+    pub const CANNOT_FIND_HOST: isize = -1003;
+    /// `NSURLErrorCannotConnectToHost`.
+    pub const CANNOT_CONNECT_TO_HOST: isize = -1004;
+    /// `NSURLErrorNetworkConnectionLost`.
+    pub const NETWORK_CONNECTION_LOST: isize = -1005;
+    /// `NSURLErrorDNSLookupFailed`.
+    pub const DNS_LOOKUP_FAILED: isize = -1006;
+    /// `NSURLErrorNotConnectedToInternet`.
+    pub const NOT_CONNECTED_TO_INTERNET: isize = -1009;
+    /// `NSURLErrorServerCertificateHasBadDate` through
+    /// `NSURLErrorServerCertificateNotYetValid`: the server's certificate did
+    /// not verify.
+    pub const SERVER_CERTIFICATE: RangeInclusive<isize> = -1204..=-1201;
+    /// `NSURLErrorSecureConnectionFailed` through
+    /// `NSURLErrorClientCertificateRequired`: every TLS failure.
+    pub const TLS: RangeInclusive<isize> = -1206..=-1200;
+}
+
+/// Sort an `NSError` into zenwave's taxonomy, the `NSError` kept as the
+/// cause: a cancellation the delegate caused by refusing a proxy challenge
+/// is that proxy's rejection; the codes `URLSession` gives to name lookup,
+/// connect, handshake and certificate failures are those connect failures;
+/// anything else is an exchange failure.
+///
+/// `URLSession` reports no connect phase and no address, so a timeout is a
+/// [`TimedOut::ResponseHead`] (its request timeout is a bound on silence) and
+/// a refused connection holds one attempt without an address.
 unsafe fn classify_nserror(
     error: *mut Object,
     state: &DelegateState,
     task_id: usize,
-) -> AppleError {
+    origin: &Origin,
+) -> Error {
     let domain: *mut Object = msg_send![error, domain];
     let code: isize = msg_send![error, code];
     let domain = nsobject_to_string(domain).unwrap_or_default();
-    let message = error_to_anyhow(error);
+    let description = error_description(error);
+    let connect = |failure| Error::connect(Hop::Origin, &origin.host, origin.port, failure);
+    let refused = |kind| {
+        connect(ConnectFailure::Tcp(TcpFailure::new(vec![Attempt::new(
+            None,
+            std::io::Error::new(kind, description.clone()),
+        )])))
+    };
+    let cause = Cause::UrlSession {
+        domain: domain.clone(),
+        code,
+        description: description.clone(),
+    };
     if domain != "NSURLErrorDomain" {
-        return AppleError::bad_gateway(message.context(format!("{domain} {code}")));
+        return Error::exchange(ExchangeFailure::Io, cause);
     }
-    if code == NSURL_ERROR_CANCELLED
-        && let Some(status) = state.take_rejected_tunnel(task_id)
+    if code == nsurl::CANCELLED
+        && let Some(rejected) = state.take_rejected_tunnel(task_id)
     {
-        return AppleError::Proxy(ProxyErrorKind::TunnelRejected(status));
+        return Error::connect(
+            Hop::Proxy,
+            rejected.host,
+            rejected.port,
+            ConnectFailure::Tunnel(TunnelError::Rejected(rejected.status)),
+        );
     }
-    if NSURL_TLS_ERROR_CODES.contains(&code) {
-        AppleError::Tls(message)
-    } else {
-        AppleError::bad_gateway(message.context(format!("{domain} {code}")))
+    match code {
+        nsurl::TIMED_OUT => Error::Timeout(TimedOut::ResponseHead),
+        nsurl::CANNOT_FIND_HOST => connect(ConnectFailure::Resolve(ResolveError::NoAddress)),
+        nsurl::DNS_LOOKUP_FAILED => connect(ConnectFailure::Resolve(ResolveError::Lookup(cause))),
+        nsurl::CANNOT_CONNECT_TO_HOST => refused(std::io::ErrorKind::ConnectionRefused),
+        nsurl::NOT_CONNECTED_TO_INTERNET => refused(std::io::ErrorKind::NetworkUnreachable),
+        nsurl::NETWORK_CONNECTION_LOST => Error::exchange(ExchangeFailure::Terminated, cause),
+        code if nsurl::SERVER_CERTIFICATE.contains(&code) => connect(ConnectFailure::Tls(
+            TlsError::new(TlsFailure::Certificate, cause),
+        )),
+        code if nsurl::TLS.contains(&code) => connect(ConnectFailure::Tls(TlsError::new(
+            TlsFailure::Protocol,
+            cause,
+        ))),
+        _ => Error::exchange(ExchangeFailure::Io, cause),
     }
 }
 
-unsafe fn str_to_nsurl(url: &str) -> Result<*mut Object, AppleError> {
+unsafe fn str_to_nsurl(url: &str) -> Result<*mut Object, Error> {
     let string = str_to_nsstring(url)?;
     let ns_url: *mut Object = msg_send![class!(NSURL), URLWithString: string];
     if ns_url.is_null() {
-        Err(AppleError::bad_request(anyhow!(
-            "Invalid URL for URLSession"
+        Err(Error::InvalidUri(format!(
+            "{url}: not a URL URLSession accepts"
         )))
     } else {
         Ok(ns_url)
     }
 }
 
-unsafe fn str_to_nsstring(value: &str) -> Result<*mut Object, AppleError> {
-    let c_string = CString::new(value).map_err(AppleError::bad_request)?;
+unsafe fn str_to_nsstring(value: &str) -> Result<*mut Object, Error> {
+    let c_string = CString::new(value).map_err(invalid)?;
     let ns_string: *mut Object =
         msg_send![class!(NSString), stringWithUTF8String: c_string.as_ptr()];
     if ns_string.is_null() {
-        Err(AppleError::bad_request(anyhow!(
-            "Failed to create NSString"
-        )))
+        Err(invalid("Failed to create NSString"))
     } else {
         Ok(ns_string)
     }
@@ -757,7 +792,7 @@ unsafe fn nsobject_to_string(obj: *mut Object) -> Option<String> {
 
 /// The error's description, followed by the chain of underlying errors with
 /// their domains and codes, so a TLS or proxy failure names its real cause.
-unsafe fn error_to_anyhow(error: *mut Object) -> Error {
+unsafe fn error_description(error: *mut Object) -> String {
     let description: *mut Object = msg_send![error, localizedDescription];
     let mut message =
         nsobject_to_string(description).unwrap_or_else(|| "URLSession error".to_owned());
@@ -785,7 +820,7 @@ unsafe fn error_to_anyhow(error: *mut Object) -> Error {
         );
         current = underlying;
     }
-    anyhow!(message)
+    message
 }
 
 /// What the delegate needs to answer authentication challenges.
@@ -797,18 +832,25 @@ struct DelegateState {
     anchors: Vec<SecCertificate>,
     /// Proxy verdicts for tasks whose challenge the delegate cancelled, by
     /// task identifier, until the completion handler collects them.
-    rejected_tunnels: Mutex<HashMap<usize, StatusCode>>,
+    rejected_tunnels: Mutex<HashMap<usize, RejectedTunnel>>,
+}
+
+/// A proxy's refusal of a `CONNECT`: its status, and the proxy that gave it.
+struct RejectedTunnel {
+    status: StatusCode,
+    host: String,
+    port: u16,
 }
 
 impl DelegateState {
-    fn record_rejected_tunnel(&self, task_id: usize, status: StatusCode) {
+    fn record_rejected_tunnel(&self, task_id: usize, rejected: RejectedTunnel) {
         self.rejected_tunnels
             .lock()
             .expect("rejected tunnels")
-            .insert(task_id, status);
+            .insert(task_id, rejected);
     }
 
-    fn take_rejected_tunnel(&self, task_id: usize) -> Option<StatusCode> {
+    fn take_rejected_tunnel(&self, task_id: usize) -> Option<RejectedTunnel> {
         self.rejected_tunnels
             .lock()
             .expect("rejected tunnels")
@@ -972,7 +1014,17 @@ unsafe fn answer_challenge(
             .flatten()
             .unwrap_or(StatusCode::PROXY_AUTHENTICATION_REQUIRED);
         let task_id: usize = msg_send![task, taskIdentifier];
-        state.record_rejected_tunnel(task_id, status);
+        // The protection space names the proxy that challenged.
+        let host: *mut Object = msg_send![space, host];
+        let port: isize = msg_send![space, port];
+        state.record_rejected_tunnel(
+            task_id,
+            RejectedTunnel {
+                status,
+                host: nsobject_to_string(host).unwrap_or_default(),
+                port: u16::try_from(port).unwrap_or_default(),
+            },
+        );
         return (CANCEL_AUTHENTICATION_CHALLENGE, ptr::null_mut());
     }
     (PERFORM_DEFAULT_HANDLING, ptr::null_mut())

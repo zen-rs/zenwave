@@ -22,8 +22,19 @@ use http_body_util::BodyExt as _;
 use http_kit::BodyFrame;
 use tracing::debug;
 
-use super::HyperError;
-use crate::{Error, transport::Spawn};
+use crate::{Cause, ConnectFailure, Error, ExchangeFailure, Hop, transport::Spawn};
+
+/// How a failure on an HTTP/3 request stream reads to a request: a stream the
+/// peer or the connection ended is [`ExchangeFailure::Terminated`], anything
+/// else a socket failure; the `h3` error is kept as the cause.
+fn stream_error(error: h3::error::StreamError) -> Error {
+    let failure = match error {
+        h3::error::StreamError::RemoteTerminate { .. }
+        | h3::error::StreamError::ConnectionError { .. } => ExchangeFailure::Terminated,
+        _ => ExchangeFailure::Io,
+    };
+    Error::exchange(failure, Cause::H3Stream(error))
+}
 
 /// One HTTP/3 connection to an origin: an h3 send-request handle over a QUIC
 /// connection whose driver runs in the background.
@@ -60,14 +71,23 @@ impl H3Connection {
         server_name: &str,
         spawn: &Spawn,
     ) -> Result<Self, Error> {
+        // A failure of this handshake is the QUIC leg's of the connect.
+        let fail = |cause: Cause| {
+            Error::connect(
+                Hop::Origin,
+                server_name,
+                addr.port(),
+                ConnectFailure::Quic(cause),
+            )
+        };
         let connection = endpoint
             .connect_with(config, addr, server_name)
-            .map_err(HyperError::http3)?
+            .map_err(|error| fail(Cause::QuinnConnect(error)))?
             .await
-            .map_err(HyperError::http3)?;
+            .map_err(|error| fail(Cause::Quinn(error)))?;
         let (mut driver, sender) = h3::client::new(h3_quinn::Connection::new(connection))
             .await
-            .map_err(HyperError::http3)?;
+            .map_err(|error| fail(Cause::H3Connection(error)))?;
         let closed = Arc::new(AtomicBool::new(false));
         (spawn)(Box::pin({
             let closed = closed.clone();
@@ -114,7 +134,7 @@ impl H3Connection {
             .sender
             .send_request(http::Request::from_parts(parts, ()))
             .await
-            .map_err(HyperError::http3)?;
+            .map_err(stream_error)?;
 
         let sent = 'send: {
             while let Some(frame) = body.frame().await {
@@ -144,10 +164,10 @@ impl H3Connection {
             Err(h3::error::StreamError::RemoteTerminate { code, .. }) => {
                 debug!(%code, "server stopped reading the request; reading its response");
             }
-            Err(error) => return Err(HyperError::http3(error).into()),
+            Err(error) => return Err(stream_error(error)),
         }
 
-        let response = stream.recv_response().await.map_err(HyperError::http3)?;
+        let response = stream.recv_response().await.map_err(stream_error)?;
         let (parts, ()) = response.into_parts();
         // Fused: body readers may poll a stream once more after `None` —
         // `unfold` alone panics on that.
