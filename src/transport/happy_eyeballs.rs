@@ -114,14 +114,39 @@ pub async fn connect<D: Dialer>(dialer: &D, host: &str, port: u16) -> io::Result
     race(dialer, Resolution(start_resolution(host, port))).await
 }
 
+/// `dial`'s outcome, or a [`io::ErrorKind::TimedOut`] error once `deadline`
+/// passes on `dialer`'s clock. A dial whose attempts are bounded by the
+/// rest of one deadline (see [`Dialer::attempt_timeout`]) is also bounded
+/// as a whole by it, resolution included.
+#[cfg(any(http3, native_h3))]
+pub async fn within<D: Dialer, T>(
+    dialer: &D,
+    host: &str,
+    port: u16,
+    deadline: Instant,
+    dial: impl Future<Output = io::Result<T>>,
+) -> io::Result<T> {
+    let expire = dialer.sleep_until(deadline);
+    pin_mut!(dial, expire);
+    match select(dial, expire).await {
+        Either::Left((result, _)) => result,
+        Either::Right(((), _)) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("connect to {host}:{port} timed out"),
+        )),
+    }
+}
+
 /// A name's lookups in flight: each family's answer and the system's
 /// sorted snapshot, as they arrive.
 pub struct Resolution(UnboundedReceiver<ResolutionEvent>);
 
 #[cfg(all(
     test,
-    native_h3,
-    any(feature = "native-compio", feature = "native-tokio")
+    any(
+        http3,
+        all(native_h3, any(feature = "native-compio", feature = "native-tokio"))
+    )
 ))]
 impl Resolution {
     /// `answer`'s family answered at once and the other family's lookup
@@ -151,8 +176,10 @@ impl Resolution {
 /// dropped.
 #[cfg(all(
     test,
-    native_h3,
-    any(feature = "native-compio", feature = "native-tokio")
+    any(
+        http3,
+        all(native_h3, any(feature = "native-compio", feature = "native-tokio"))
+    )
 ))]
 pub struct Stall(#[expect(dead_code)] futures_channel::mpsc::UnboundedSender<ResolutionEvent>);
 

@@ -316,9 +316,10 @@ enum Dialed {
 }
 
 /// A QUIC handshake to `host`:`h3_port` on the transport's shared endpoint.
-/// The resolved addresses are tried in the order `happy_eyeballs` would dial
-/// TCP — getaddrinfo's RFC 6724 ordering — with `timeout` covering all of
-/// them together.
+/// The addresses are raced as a TCP dial races them (RFC 8305): the dial
+/// starts with the addresses known and takes a late family's as its lookup
+/// answers, so one stalled lookup does not hold the other family back.
+/// `timeout` covers resolution and every attempt together.
 #[cfg(http3)]
 async fn quic_dial(
     transport: &Transport,
@@ -327,48 +328,63 @@ async fn quic_dial(
     h3_port: u16,
     timeout: Duration,
 ) -> Result<h3::H3Connection, crate::Error> {
-    // The deadline covers resolution too: the detached loser is bounded by
-    // `timeout` end to end, not just across the handshakes.
+    // The detached loser is bounded by `timeout` end to end.
     let deadline = Instant::now() + timeout;
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let addrs = {
-        let resolve = happy_eyeballs::resolve(host, h3_port);
-        let timer = async_io::Timer::after(remaining);
-        pin_mut!(resolve);
-        pin_mut!(timer);
-        match select(resolve, timer).await {
-            Either::Left((result, _)) => {
-                result.map_err(|error| crate::Error::Transport(Box::new(error)))?
-            }
-            Either::Right(_) => Vec::new(),
-        }
+    let dialer = QuicDialer {
+        endpoint: transport.quic_endpoint(spawn.clone())?,
+        config: quic::client_config(transport.tls().client_config())?,
+        spawn: &spawn,
+        host,
+        deadline,
     };
-    let endpoint = transport.quic_endpoint(spawn.clone())?;
-    let config = quic::client_config(transport.tls().client_config())?;
-    let mut last_error = None;
-    for addr in addrs {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        let attempt = h3::H3Connection::connect(endpoint, config.clone(), addr, host, &spawn);
-        let timer = async_io::Timer::after(remaining);
-        pin_mut!(attempt);
-        pin_mut!(timer);
-        match select(attempt, timer).await {
-            Either::Left((result, _)) => match result {
-                Ok(connection) => return Ok(connection),
-                Err(error) => last_error = Some(error),
-            },
-            Either::Right(_) => break,
-        }
+    happy_eyeballs::within(
+        &dialer,
+        host,
+        h3_port,
+        deadline,
+        happy_eyeballs::connect(&dialer, host, h3_port),
+    )
+    .await
+    .map_err(|error| crate::Error::Transport(Box::new(error)))
+}
+
+/// The happy eyeballs dialer for QUIC: an address is one handshake.
+#[cfg(http3)]
+struct QuicDialer<'a> {
+    endpoint: &'a quinn::Endpoint,
+    config: quinn::ClientConfig,
+    spawn: &'a Spawn,
+    host: &'a str,
+    deadline: Instant,
+}
+
+#[cfg(http3)]
+impl happy_eyeballs::Dialer for QuicDialer<'_> {
+    type Stream = h3::H3Connection;
+
+    async fn dial(&self, addr: std::net::SocketAddr) -> std::io::Result<Self::Stream> {
+        h3::H3Connection::connect(
+            self.endpoint,
+            self.config.clone(),
+            addr,
+            self.host,
+            self.spawn,
+        )
+        .await
+        .map_err(|error| {
+            debug!(host = %self.host, peer = %addr, %error, "QUIC attempt failed");
+            std::io::Error::other(error)
+        })
     }
-    Err(last_error.unwrap_or_else(|| {
-        crate::Error::Transport(Box::new(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("QUIC connect to {host}:{h3_port} timed out"),
-        )))
-    }))
+
+    async fn sleep_until(&self, deadline: Instant) {
+        async_io::Timer::at(deadline).await;
+    }
+
+    /// A QUIC handshake has the whole dial deadline, not TCP's bound.
+    fn attempt_timeout(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
 }
 
 impl core::fmt::Display for HyperError {
@@ -1345,7 +1361,7 @@ mod tests {
     mod h3_discovery {
         use std::{
             collections::HashSet,
-            net::UdpSocket,
+            net::{Ipv4Addr, SocketAddr, UdpSocket},
             sync::mpsc,
             thread,
             time::{Duration, Instant},
@@ -1355,8 +1371,10 @@ mod tests {
         use http::uri::Scheme;
 
         use super::super::{
-            HyperBackend,
-            test_support::{H3Server, TestCa, TlsServer, block_on_test, wait_until},
+            HyperBackend, QuicDialer,
+            test_support::{
+                H3Server, TRAILERS_BODY, TestCa, TlsServer, block_on_test, thread_spawn, wait_until,
+            },
         };
         use crate::{
             Client as _, Proxy, Transport,
@@ -1365,7 +1383,9 @@ mod tests {
                     self,
                     test_support::{answer, resolver_config, serve},
                 },
+                happy_eyeballs,
                 pool::{HttpsRr, Origin},
+                quic,
             },
         };
 
@@ -1379,6 +1399,75 @@ mod tests {
                 host: host.to_owned(),
                 port,
             }
+        }
+
+        /// A QUIC dial to a name whose AAAA lookup never answers connects
+        /// over the IPv4 address that did, far inside the dial's deadline:
+        /// the dial does not wait on the stalled lookup. The connection then
+        /// carries a request whose CJK body arrives intact.
+        #[test]
+        fn a_stalled_aaaa_does_not_hold_the_quic_dial() {
+            let ca = TestCa::new();
+            let server = H3Server::start(&ca);
+            let transport = ca.transport();
+            // The server's socket is dual-stack, so its IPv4 loopback
+            // address reaches it.
+            let peer = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), server.addr().port());
+
+            block_on_test(async {
+                let spawn = thread_spawn();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let dialer = QuicDialer {
+                    endpoint: transport
+                        .quic_endpoint(spawn.clone())
+                        .expect("client endpoint binds"),
+                    config: quic::client_config(transport.tls().client_config())
+                        .expect("QUIC client config"),
+                    spawn: &spawn,
+                    host: "localhost",
+                    deadline,
+                };
+                // The A lookup answers with the server; the AAAA lookup is
+                // held for as long as `stalled` lives.
+                let (resolution, stalled) =
+                    happy_eyeballs::Resolution::with_other_family_stalled(peer);
+                let started = Instant::now();
+                let mut connection = happy_eyeballs::within(
+                    &dialer,
+                    "localhost",
+                    peer.port(),
+                    deadline,
+                    happy_eyeballs::race(&dialer, resolution),
+                )
+                .await
+                .expect("the dial connects over IPv4 while AAAA is stalled");
+                let took = started.elapsed();
+                assert!(
+                    took < Duration::from_secs(2),
+                    "connected in {took:?}, well inside the 5 s deadline",
+                );
+                assert_eq!(server.connection_count(), 1);
+
+                let response = connection
+                    .request(
+                        http::Request::builder()
+                            .method("GET")
+                            .uri(server.uri("/trailers"))
+                            .body(http_kit::Body::empty())
+                            .expect("request builds"),
+                    )
+                    .await
+                    .expect("the connection serves a request");
+                assert_eq!(
+                    response
+                        .into_body()
+                        .into_string()
+                        .await
+                        .expect("body is UTF-8"),
+                    TRAILERS_BODY
+                );
+                drop(stalled);
+            });
         }
 
         /// The `x-zenwave-protocol` the fixture answered with — `Some("h3")`

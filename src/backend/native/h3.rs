@@ -312,33 +312,15 @@ async fn connect<I: Io>(
         host,
         deadline,
     };
-    within(
-        io,
+    happy_eyeballs::within(
+        &dialer,
         host,
         port,
         deadline,
         happy_eyeballs::connect(&dialer, host, port),
     )
     .await
-}
-
-/// `dial`'s outcome, or a timeout once `deadline` passes.
-async fn within<I: Io>(
-    io: &I,
-    host: &str,
-    port: u16,
-    deadline: Instant,
-    dial: impl Future<Output = std::io::Result<Established>>,
-) -> Result<Established, Error> {
-    let expire = io.sleep_until(deadline);
-    pin_mut!(dial, expire);
-    match select(dial, expire).await {
-        Either::Left((result, _)) => result.map_err(|error| Error::Transport(Box::new(error))),
-        Either::Right(((), _)) => Err(Error::Transport(Box::new(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("QUIC connect to {host}:{port} timed out"),
-        )))),
-    }
+    .map_err(|error| Error::Transport(Box::new(error)))
 }
 
 /// The happy eyeballs dialer for QUIC: an address is one handshake.
@@ -804,8 +786,8 @@ mod tests {
             deadline: Instant::now() + std::time::Duration::from_secs(5),
         };
         let started = Instant::now();
-        let dial = within(
-            &io,
+        let dial = happy_eyeballs::within(
+            &dialer,
             "localhost",
             peer.port(),
             dialer.deadline,
