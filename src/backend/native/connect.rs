@@ -3,9 +3,18 @@
 //! with every leg on owned-buffer streams and TLS through `http-kit-tls`,
 //! the origin's session inside the proxy's when the proxy is HTTPS.
 
-use std::{future::Future, io, net::SocketAddr, time::Instant};
+use std::{
+    future::Future,
+    io,
+    net::SocketAddr,
+    pin::pin,
+    time::{Duration, Instant},
+};
 
-use futures_util::{FutureExt, future::LocalBoxFuture};
+use futures_util::{
+    FutureExt,
+    future::{Either, LocalBoxFuture, select},
+};
 use http::{HeaderValue, Method, header, uri::Scheme};
 use http_kit::{Body, Request};
 use http_kit_h1::{ClientConfig, ClientOutcome, RequestTarget, SendRequest, handshake_stream};
@@ -67,18 +76,53 @@ impl H1Send {
 
 /// Connects to `origin` the way the transport's rules say — its unix domain
 /// socket when it has one, else TCP through whatever proxy the rules pick —
-/// and runs the HTTP/1.1 handshake over the result.
+/// and runs the HTTP/1.1 handshake over the result, within the transport's
+/// connect timeout.
 ///
 /// # Errors
 ///
-/// Every leg's failure.
+/// Every leg's failure; [`Error::Timeout`] when the connect timeout passed
+/// first.
 pub async fn dial<I: NativeIo>(
     io: &I,
     transport: &Transport,
     tls: &TlsConnector,
     origin: &Origin,
 ) -> Result<Dialed, Error> {
+    let Some(deadline) = transport
+        .connect_timeout()
+        .and_then(|timeout| Instant::now().checked_add(timeout))
+    else {
+        return dial_route(io, transport, tls, origin).await;
+    };
+    // Dropping the dial at the deadline closes whatever sockets it opened.
+    match select(
+        pin!(dial_route(io, transport, tls, origin)),
+        pin!(io.sleep_until(deadline)),
+    )
+    .await
+    {
+        Either::Left((dialed, _)) => dialed,
+        Either::Right(((), _)) => {
+            debug!(host = %origin.host, "connect timeout passed before the dial finished");
+            Err(Error::Timeout)
+        }
+    }
+}
+
+/// [`dial`], unbounded.
+async fn dial_route<I: NativeIo>(
+    io: &I,
+    transport: &Transport,
+    tls: &TlsConnector,
+    origin: &Origin,
+) -> Result<Dialed, Error> {
     let secure = origin.scheme == Scheme::HTTPS;
+    let last = LastLeg {
+        io,
+        tls,
+        read_timeout: transport.read_timeout(),
+    };
 
     #[cfg(unix_socket)]
     if let Some(path) = transport.unix_socket() {
@@ -88,7 +132,7 @@ pub async fn dial<I: NativeIo>(
                 format!("unix domain socket {}: {error}", path.display()),
             )))
         })?;
-        return finish(io, tls, &origin.host, secure, unix, Via::Direct).await;
+        return last.finish(&origin.host, secure, unix, Via::Direct).await;
     }
 
     let target = Target {
@@ -101,16 +145,14 @@ pub async fn dial<I: NativeIo>(
     match route(transport.proxy(), target)? {
         Route::Direct => {
             let tcp = tcp(io, &origin.host, origin.port).await?;
-            finish(io, tls, &origin.host, secure, tcp, Via::Direct).await
+            last.finish(&origin.host, secure, tcp, Via::Direct).await
         }
         Route::Forward {
             proxy,
             authorization,
         } => {
             let tcp = tcp(io, &proxy.host, proxy.port).await?;
-            finish(
-                io,
-                tls,
+            last.finish(
                 &proxy.host,
                 proxy.tls,
                 tcp,
@@ -132,10 +174,12 @@ pub async fn dial<I: NativeIo>(
                     .await
                     .map_err(Error::tls)?;
                 let tunneled = tunnel(io, secured, &authority, authorization).await?;
-                finish(io, tls, &origin.host, secure, tunneled, Via::Direct).await
+                last.finish(&origin.host, secure, tunneled, Via::Direct)
+                    .await
             } else {
                 let tunneled = tunnel(io, tcp, &authority, authorization).await?;
-                finish(io, tls, &origin.host, secure, tunneled, Via::Direct).await
+                last.finish(&origin.host, secure, tunneled, Via::Direct)
+                    .await
             }
         }
         Route::Socks5 {
@@ -155,40 +199,46 @@ pub async fn dial<I: NativeIo>(
                 resolve_remotely,
             )
             .await?;
-            finish(io, tls, &origin.host, secure, tcp, Via::Direct).await
+            last.finish(&origin.host, secure, tcp, Via::Direct).await
         }
     }
 }
 
-/// Wraps `stream` in TLS for `host` when `secure`, then starts
-/// HTTP/1.1 on it.
-async fn finish<I, S>(
-    io: &I,
-    tls: &TlsConnector,
-    host: &str,
-    secure: bool,
-    stream: S,
-    via: Via,
-) -> Result<Dialed, Error>
-where
-    I: Io,
-    S: TlsTransport,
-{
-    let config = ClientConfig {
-        request_target: match via {
+/// What the last leg of every route needs: TLS to the host that leg
+/// reaches, and the read timeout the connection's reads run under.
+struct LastLeg<'a, I> {
+    io: &'a I,
+    tls: &'a TlsConnector,
+    read_timeout: Option<Duration>,
+}
+
+impl<I: Io> LastLeg<'_, I> {
+    /// Wraps `stream` in TLS for `host` when `secure`, then starts
+    /// HTTP/1.1 on it.
+    async fn finish<S: TlsTransport>(
+        &self,
+        host: &str,
+        secure: bool,
+        stream: S,
+        via: Via,
+    ) -> Result<Dialed, Error> {
+        let mut config = ClientConfig::default();
+        config.request_target = match via {
             Via::Direct => RequestTarget::Origin,
             Via::HttpProxy { .. } => RequestTarget::Absolute,
-        },
-        ..ClientConfig::default()
-    };
-    if !secure {
-        return Ok(start(stream, io.clone(), config, via));
+        };
+        config.read_timeout = self.read_timeout;
+        let io = self.io.clone();
+        if !secure {
+            return Ok(start(stream, io, config, via));
+        }
+        let stream = self
+            .tls
+            .connect(server_name(host)?, stream, self.io)
+            .await
+            .map_err(Error::tls)?;
+        Ok(start(stream, io, config, via))
     }
-    let stream = tls
-        .connect(server_name(host)?, stream, io)
-        .await
-        .map_err(Error::tls)?;
-    Ok(start(stream, io.clone(), config, via))
 }
 
 /// `host` as the name a TLS handshake sends and verifies.
@@ -196,9 +246,9 @@ fn server_name(host: &str) -> Result<ServerName<'static>, Error> {
     ServerName::try_from(host.to_owned()).map_err(Error::tls)
 }
 
-/// Runs the HTTP/1.1 client over `stream`; the driver logs how it ended,
-/// and when a request switched the connection, holds the switched stream
-/// on this thread until the request's [`Upgrade`] claims it.
+/// Runs the HTTP/1.1 client over `stream`; the driver logs how it ended, and
+/// when a request switched the connection, holds the switched stream on this
+/// thread until the request's [`Upgrade`] claims it.
 fn start<S, T>(stream: S, timer: T, config: ClientConfig, via: Via) -> Dialed
 where
     S: Split + 'static,

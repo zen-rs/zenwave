@@ -9,6 +9,7 @@
 use std::{
     fmt,
     net::SocketAddr,
+    pin::pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -17,6 +18,8 @@ use std::{
 
 use bytes::{Buf, Bytes};
 use futures_util::{StreamExt, stream};
+use http_body_util::BodyExt as _;
+use http_kit::BodyFrame;
 use tracing::debug;
 
 use super::HyperError;
@@ -90,8 +93,8 @@ impl H3Connection {
     /// response with a streaming body.
     ///
     /// The request URI must be absolute: h3 requests carry `:scheme` and
-    /// `:authority`. `http_kit::Body` has no trailer surface, so response
-    /// trailers are consumed and dropped.
+    /// `:authority`. Trailers travel as the body's trailers frame in both
+    /// directions.
     ///
     /// A send failure is final — never retried by the caller: the `h3`
     /// crate's `StreamError` does not expose which `send_request` failures
@@ -104,8 +107,9 @@ impl H3Connection {
         request: http::Request<http_kit::Body>,
     ) -> Result<http::Response<http_kit::Body>, Error> {
         let (parts, body) = request.into_parts();
-        // QUIC streams cannot send a file, so file regions are read out here.
-        let mut body = body.into_data_stream();
+        // QUIC streams cannot send a file, so `http_body` reads file regions
+        // out here; it keeps the trailers frame the data stream would drop.
+        let mut body = pin!(body);
         let mut stream = self
             .sender
             .send_request(http::Request::from_parts(parts, ()))
@@ -113,11 +117,17 @@ impl H3Connection {
             .map_err(HyperError::http3)?;
 
         let sent = 'send: {
-            while let Some(chunk) = body.next().await {
-                let chunk = chunk?;
-                if !chunk.is_empty()
-                    && let Err(error) = stream.send_data(chunk).await
-                {
+            while let Some(frame) = body.frame().await {
+                let frame = frame?;
+                let sent = match frame.into_data() {
+                    Ok(chunk) if chunk.is_empty() => Ok(()),
+                    Ok(chunk) => stream.send_data(chunk).await,
+                    Err(frame) => match frame.into_trailers() {
+                        Ok(trailers) => stream.send_trailers(trailers).await,
+                        Err(_) => Ok(()),
+                    },
+                };
+                if let Err(error) = sent {
                     break 'send Err(error);
                 }
             }
@@ -141,20 +151,30 @@ impl H3Connection {
         let (parts, ()) = response.into_parts();
         // Fused: body readers may poll a stream once more after `None` —
         // `unfold` alone panics on that.
-        let body = http_kit::Body::from_stream(
-            stream::unfold(stream, |mut stream| async move {
+        let body = http_kit::Body::from_frames(
+            stream::unfold(Some(stream), |stream| async move {
+                let mut stream = stream?;
                 match stream.recv_data().await {
                     Ok(Some(mut data)) => {
                         let chunk = data.copy_to_bytes(data.remaining());
-                        Some((Ok::<_, http_kit::BodyError>(chunk), stream))
+                        Some((
+                            Ok::<_, http_kit::BodyError>(BodyFrame::Data(chunk)),
+                            Some(stream),
+                        ))
                     }
-                    Ok(None) => {
-                        // Body has no trailer surface; drain them so the
-                        // stream terminates cleanly.
-                        let _ = stream.recv_trailers().await;
-                        None
-                    }
-                    Err(error) => Some((Err(http_kit::BodyError::Other(Box::new(error))), stream)),
+                    // The trailers end the body: one frame after the data,
+                    // then the stream is finished.
+                    Ok(None) => match stream.recv_trailers().await {
+                        Ok(Some(trailers)) => Some((Ok(BodyFrame::Trailers(trailers)), None)),
+                        Ok(None) => None,
+                        Err(error) => {
+                            Some((Err(http_kit::BodyError::Other(Box::new(error))), None))
+                        }
+                    },
+                    Err(error) => Some((
+                        Err(http_kit::BodyError::Other(Box::new(error))),
+                        Some(stream),
+                    )),
                 }
             })
             .fuse(),
@@ -168,7 +188,11 @@ mod tests {
     use bytes::Bytes;
     use futures_util::{StreamExt, TryStreamExt, stream};
 
-    use crate::backend::test_support::{H3Server, TestCa, block_on_test, h3_connection};
+    use http_kit::BodyFrame;
+
+    use crate::backend::test_support::{
+        H3Server, TRAILERS_BODY, TestCa, block_on_test, h3_connection,
+    };
 
     const ECHO_BODY_SIZE: usize = 1024 * 1024;
 
@@ -203,6 +227,72 @@ mod tests {
                 .expect("request succeeds");
             assert_eq!(response.status(), http::StatusCode::OK);
             assert_eq!(body_bytes(response.into_body()).await, b"hello over h3");
+        });
+    }
+
+    /// The CJK body and both trailer fields the server sent reach the caller
+    /// as the body's data and trailers frames, in that order.
+    #[test]
+    fn response_trailers_reach_the_body() {
+        let server = H3Server::start(&TestCa::new());
+        block_on_test(async {
+            let (_transport, mut connection) = h3_connection(&server).await;
+            let response = connection
+                .request(request(
+                    "GET",
+                    server.uri("/trailers"),
+                    http_kit::Body::empty(),
+                ))
+                .await
+                .expect("request succeeds");
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let mut data = Vec::new();
+            let mut trailers = None;
+            let mut body = response.into_body();
+            while let Some(frame) = body.next().await {
+                match frame.expect("frame is valid") {
+                    BodyFrame::Data(chunk) => {
+                        assert!(trailers.is_none(), "no data follows the trailers");
+                        data.extend_from_slice(&chunk);
+                    }
+                    BodyFrame::Trailers(map) => trailers = Some(map),
+                    _ => unreachable!("an h3 response has no file frames"),
+                }
+            }
+            assert_eq!(
+                std::str::from_utf8(&data).expect("body is UTF-8"),
+                TRAILERS_BODY
+            );
+            let trailers = trailers.expect("the trailers frame arrives");
+            assert_eq!(trailers["x-checksum"], "abc123");
+            assert_eq!(trailers["x-status"], "complete");
+        });
+    }
+
+    /// A request body ending in a trailers frame sends them: the server
+    /// reports the value it read.
+    #[test]
+    fn request_trailers_reach_the_server() {
+        let server = H3Server::start(&TestCa::new());
+        block_on_test(async {
+            let (_transport, mut connection) = h3_connection(&server).await;
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert("x-request-trailer", http::HeaderValue::from_static("sent"));
+            let body = http_kit::Body::from_frames(stream::iter([
+                Ok::<_, http_kit::BodyError>(BodyFrame::Data(Bytes::from_static(
+                    TRAILERS_BODY.as_bytes(),
+                ))),
+                Ok(BodyFrame::Trailers(trailers)),
+            ]));
+            let response = connection
+                .request(request("POST", server.uri("/request-trailers"), body))
+                .await
+                .expect("request succeeds");
+            assert_eq!(response.headers()["x-seen-trailer"], "sent");
+            assert_eq!(
+                body_bytes(response.into_body()).await,
+                TRAILERS_BODY.as_bytes()
+            );
         });
     }
 

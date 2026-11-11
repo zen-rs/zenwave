@@ -12,7 +12,14 @@
     reason = "every scenario runs on one thread's local executor, beside the pool it drives"
 )]
 
-use std::{cell::RefCell, future::Future, net::SocketAddr, rc::Rc, sync::Arc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    future::Future,
+    net::SocketAddr,
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use executor_core::{LocalExecutor, Task as _};
 use futures_util::{future::select, pin_mut};
@@ -117,11 +124,16 @@ struct H1Options {
     /// How long every connection after the first waits before its TLS
     /// handshake.
     stall_after_first: Option<Duration>,
+    /// Counts the connections accepted.
+    accepted: Rc<Cell<usize>>,
 }
 
 /// Echoes the request body after the method and path, labelled with the
 /// protocol that carried it, with the fields `options` asks for.
 async fn echo(request: Request, protocol: &'static str, options: &H1Options) -> Response {
+    if request.uri().path() == "/trailers" {
+        return trailers_response(protocol);
+    }
     let head = format!("{} {} ", request.method(), request.uri().path());
     let body = request
         .into_body()
@@ -143,6 +155,21 @@ async fn echo(request: Request, protocol: &'static str, options: &H1Options) -> 
     response
 }
 
+/// The CJK greeting followed by two trailer fields.
+fn trailers_response(protocol: &'static str) -> Response {
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert("x-checksum", "abc123".parse().expect("header value"));
+    trailers.insert("x-status", "complete".parse().expect("header value"));
+    let mut response = Response::new(Body::from_frames(futures_util::stream::iter([
+        Ok::<_, std::io::Error>(http_kit::BodyFrame::Data(GREETING.as_bytes().into())),
+        Ok(http_kit::BodyFrame::Trailers(trailers)),
+    ])));
+    response
+        .headers_mut()
+        .insert("x-protocol", protocol.parse().expect("header value"));
+    response
+}
+
 /// Serves HTTP/1.1 on `listener` as `options` says, one local task per
 /// connection; runs until dropped.
 async fn serve_h1<I: NativeIo, E: LocalExecutor>(
@@ -155,6 +182,7 @@ async fn serve_h1<I: NativeIo, E: LocalExecutor>(
     loop {
         let (stream, _) = listener.accept().await.expect("accept");
         accepted += 1;
+        options.accepted.set(accepted);
         let stall = options.stall_after_first.filter(|_| accepted > 1);
         let io = io.clone();
         let options = options.clone();
@@ -337,11 +365,28 @@ async fn read_len(read: &mut impl Read, len: usize) -> Vec<u8> {
 /// switched stream: first the bytes the server wrote right behind its head,
 /// then a ping out and a pong back on the same connection.
 async fn upgrade<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    switch(io, executor, None).await;
+}
+
+/// The switched stream belongs to its owner: a pong that takes three times
+/// the transport's read timeout still arrives on it.
+async fn upgrade_outlives_read_timeout<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    switch(io, executor, Some(Duration::from_millis(200))).await;
+}
+
+/// The upgrade scenario, on a transport with `read_timeout`; the server
+/// holds its pong back for three times that long.
+async fn switch<I: NativeIo, E: LocalExecutor>(
+    io: I,
+    executor: &E,
+    read_timeout: Option<Duration>,
+) {
     use futures_util::{AsyncReadExt as _, AsyncWriteExt as _};
     use zenwave::backend::Upgrade;
 
     let listener = io.bind_tcp(loopback()).expect("bind");
     let port = listener.local_addr().expect("local address").port();
+    let server_io = io.clone();
     let server = async move {
         let (stream, _) = listener.accept().await.expect("accept");
         let (mut read, mut write) = stream.split();
@@ -357,6 +402,9 @@ async fn upgrade<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
         write.write_all(answer).await.0.expect("the 101 writes");
         let ping = read_len(&mut read, PING.len()).await;
         assert_eq!(ping, PING.as_bytes());
+        if let Some(read_timeout) = read_timeout {
+            server_io.sleep(read_timeout * 3).await;
+        }
         write
             .write_all(PONG.as_bytes().to_vec())
             .await
@@ -364,10 +412,11 @@ async fn upgrade<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
             .expect("the pong writes");
         futures_util::future::pending::<()>().await;
     };
-    let transport = Transport::builder()
-        .proxy(Proxy::none())
-        .build()
-        .expect("transport builds");
+    let mut transport = Transport::builder().proxy(Proxy::none());
+    if let Some(read_timeout) = read_timeout {
+        transport = transport.read_timeout(read_timeout);
+    }
+    let transport = transport.build().expect("transport builds");
     let mut client = NativeBackend::on_current_thread(transport, io, executor);
     against(server, async {
         let mut response = client
@@ -548,6 +597,264 @@ async fn https_proxy<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
     );
 }
 
+/// The read timeout the timeout scenarios run under.
+const READ_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// A transport with no proxy, bounded as given.
+fn bounded(connect: Option<Duration>, read: Option<Duration>) -> Transport {
+    let mut builder = Transport::builder().proxy(Proxy::none());
+    if let Some(connect) = connect {
+        builder = builder.connect_timeout(connect);
+    }
+    if let Some(read) = read {
+        builder = builder.read_timeout(read);
+    }
+    builder.build().expect("transport builds")
+}
+
+/// What a scripted server writes once it has read a request head: each
+/// part after its delay. Then it writes nothing more and holds the
+/// connection open.
+type Script = Vec<(Duration, Vec<u8>)>;
+
+/// Plays `script` on every connection `listener` accepts, inside TLS with
+/// `tls` when given; runs until dropped.
+async fn serve_script<I: NativeIo, E: LocalExecutor>(
+    io: I,
+    executor: &E,
+    listener: I::TcpListener,
+    tls: Option<TlsAcceptor>,
+    script: Script,
+) {
+    loop {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let io = io.clone();
+        let tls = tls.clone();
+        let script = script.clone();
+        let connection = async move {
+            match tls {
+                Some(tls) => {
+                    let stream = tls.accept(stream, &io).await.expect("TLS handshake");
+                    play(&io, stream, script).await;
+                }
+                None => play(&io, stream, script).await,
+            }
+        };
+        executor.spawn_local(connection).detach();
+    }
+}
+
+async fn play<I: NativeIo, S: http_kit_io::Split>(io: &I, stream: S, script: Script) {
+    let (mut read, mut write) = stream.split();
+    read_head(&mut read).await;
+    for (delay, bytes) in script {
+        io.sleep(delay).await;
+        write
+            .write_all(bytes)
+            .await
+            .0
+            .expect("the scripted bytes write");
+    }
+    futures_util::future::pending::<()>().await;
+}
+
+/// A server that accepts TCP and never answers the TLS handshake: the
+/// connect timeout fails the request with `Error::Timeout`, about when it
+/// runs out.
+async fn stalled_connect<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    // The one dial is accepted and held open, unanswered.
+    let server = async move {
+        let _held = listener.accept().await.expect("accept");
+        futures_util::future::pending::<()>().await;
+    };
+    let timeout = Duration::from_millis(300);
+    let mut client = NativeBackend::on_current_thread(bounded(Some(timeout), None), io, executor);
+    against(server, async {
+        let started = Instant::now();
+        let error = client
+            .get(format!("https://127.0.0.1:{port}/"))
+            .expect("request builds")
+            .await
+            .expect_err("a handshake the server never answers fails");
+        let elapsed = started.elapsed();
+        assert!(error.is_timeout(), "a timeout, got {error:?}");
+        assert!(
+            elapsed >= timeout && elapsed < timeout * 10,
+            "the connect timeout bounds the dial: {elapsed:?}"
+        );
+    })
+    .await;
+}
+
+/// A server that reads the request and never answers: the read timeout
+/// fails the request with `Error::Timeout`, in plaintext or over TLS.
+async fn stalled_head_on<I: NativeIo, E: LocalExecutor>(io: I, executor: &E, pki: Option<&Pki>) {
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let server = serve_script(
+        io.clone(),
+        executor,
+        listener,
+        pki.map(Pki::tls_acceptor),
+        Vec::new(),
+    );
+    let mut transport = Transport::builder()
+        .proxy(Proxy::none())
+        .read_timeout(READ_TIMEOUT);
+    if let Some(pki) = pki {
+        transport = transport.extra_root_certificate_der(pki.ca_der.to_vec());
+    }
+    let url = if pki.is_some() {
+        format!("https://localhost:{port}/")
+    } else {
+        format!("http://127.0.0.1:{port}/")
+    };
+    let transport = transport.build().expect("transport builds");
+    let mut client = NativeBackend::on_current_thread(transport, io, executor);
+    against(server, async {
+        let started = Instant::now();
+        let error = client
+            .get(url)
+            .expect("request builds")
+            .await
+            .expect_err("a head that never comes fails");
+        let elapsed = started.elapsed();
+        assert!(error.is_timeout(), "a timeout, got {error:?}");
+        assert!(
+            elapsed >= READ_TIMEOUT && elapsed < READ_TIMEOUT * 10,
+            "the read timeout bounds the wait for the head: {elapsed:?}"
+        );
+    })
+    .await;
+}
+
+async fn stalled_head<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    stalled_head_on(io, executor, None).await;
+}
+
+async fn stalled_head_tls<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    stalled_head_on(io, executor, Some(&Pki::new())).await;
+}
+
+/// A server that sends the head and half the body, then stalls: the
+/// response arrives, and reading its body fails with an I/O timeout that
+/// carries `Error::Timeout`.
+async fn stalled_body<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let half = GREETING.as_bytes();
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n",
+        half.len() * 2
+    );
+    let server = serve_script(
+        io.clone(),
+        executor,
+        listener,
+        None,
+        vec![(Duration::ZERO, [head.as_bytes(), half].concat())],
+    );
+    let mut client =
+        NativeBackend::on_current_thread(bounded(None, Some(READ_TIMEOUT)), io, executor);
+    against(server, async {
+        let response = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .expect("request builds")
+            .await
+            .expect("the head arrives");
+        let error = response
+            .into_body()
+            .into_bytes()
+            .await
+            .expect_err("a body that stalls halfway fails");
+        let http_kit::BodyError::Io(io_error) = &error else {
+            panic!("an I/O error, got {error:?}");
+        };
+        assert_eq!(io_error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            io_error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<zenwave::Error>())
+                .is_some_and(zenwave::Error::is_timeout),
+            "the I/O error carries zenwave's timeout: {io_error:?}"
+        );
+    })
+    .await;
+}
+
+/// A body that arrives in eight parts a third of the read timeout apart,
+/// taking well over the read timeout in all: every part restarts the wait,
+/// so the whole body arrives.
+async fn slow_body<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let body = GREETING.repeat(8).into_bytes();
+    let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+    let mut script = vec![(Duration::ZERO, head.into_bytes())];
+    script.extend(
+        body.chunks(body.len().div_ceil(8))
+            .map(|part| (READ_TIMEOUT / 3, part.to_vec())),
+    );
+    let server = serve_script(io.clone(), executor, listener, None, script);
+    let mut client =
+        NativeBackend::on_current_thread(bounded(None, Some(READ_TIMEOUT)), io, executor);
+    against(server, async {
+        let started = Instant::now();
+        let response = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .expect("request builds")
+            .await
+            .expect("the head arrives");
+        let received = response.into_body().into_bytes().await.expect("body reads");
+        assert_eq!(received.as_ref(), body.as_slice());
+        assert!(
+            started.elapsed() > READ_TIMEOUT * 2,
+            "the body took longer than the read timeout in all"
+        );
+    })
+    .await;
+}
+
+/// A pooled connection is not waiting for anything: one left idle for
+/// three times the read timeout still carries the next request.
+async fn idle_outlives_read_timeout<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+    let listener = io.bind_tcp(loopback()).expect("bind");
+    let port = listener.local_addr().expect("local address").port();
+    let accepted = Rc::new(Cell::new(0));
+    let server = serve_h1(
+        io.clone(),
+        executor,
+        listener,
+        H1Options {
+            accepted: Rc::clone(&accepted),
+            ..H1Options::default()
+        },
+    );
+    let mut client =
+        NativeBackend::on_current_thread(bounded(None, Some(READ_TIMEOUT)), io.clone(), executor);
+    against(server, async {
+        for round in 0..2 {
+            if round > 0 {
+                io.sleep(READ_TIMEOUT * 3).await;
+            }
+            let response = client
+                .post(format!("http://127.0.0.1:{port}/idle"))
+                .expect("request builds")
+                .bytes_body(GREETING.as_bytes().to_vec())
+                .await
+                .unwrap_or_else(|error| panic!("POST {round} succeeds: {error}"));
+            assert_eq!(
+                &*response.into_string().await.expect("body reads"),
+                format!("POST /idle {GREETING}")
+            );
+        }
+    })
+    .await;
+    assert_eq!(accepted.get(), 1, "the idle connection carried both");
+}
+
 #[cfg(feature = "native-compio")]
 mod compio_runtime {
     use http_kit_io::compio::Compio;
@@ -555,6 +862,41 @@ mod compio_runtime {
     fn run(test: impl AsyncFnOnce(Compio, &compio::runtime::Runtime)) {
         let runtime = compio::runtime::Runtime::new().expect("compio runtime");
         runtime.block_on(test(Compio, &runtime));
+    }
+
+    #[test]
+    fn connect_timeout_bounds_a_stalled_handshake() {
+        run(super::stalled_connect);
+    }
+
+    #[test]
+    fn read_timeout_bounds_a_stalled_head() {
+        run(super::stalled_head);
+    }
+
+    #[test]
+    fn read_timeout_bounds_a_stalled_head_over_tls() {
+        run(super::stalled_head_tls);
+    }
+
+    #[test]
+    fn read_timeout_bounds_a_stalled_body() {
+        run(super::stalled_body);
+    }
+
+    #[test]
+    fn read_timeout_lets_a_slow_body_through() {
+        run(super::slow_body);
+    }
+
+    #[test]
+    fn read_timeout_spares_idle_connections() {
+        run(super::idle_outlives_read_timeout);
+    }
+
+    #[test]
+    fn read_timeout_spares_the_switched_stream() {
+        run(super::upgrade_outlives_read_timeout);
     }
 
     #[test]
@@ -586,6 +928,12 @@ mod compio_runtime {
     #[test]
     fn h3_after_alt_svc() {
         run(super::h3::upgrade);
+    }
+
+    #[cfg(feature = "native-http3")]
+    #[test]
+    fn h3_delivers_response_trailers() {
+        run(super::h3::trailers);
     }
 
     #[cfg(feature = "native-http3")]
@@ -621,6 +969,41 @@ mod tokio_runtime {
     }
 
     #[test]
+    fn connect_timeout_bounds_a_stalled_handshake() {
+        run(super::stalled_connect);
+    }
+
+    #[test]
+    fn read_timeout_bounds_a_stalled_head() {
+        run(super::stalled_head);
+    }
+
+    #[test]
+    fn read_timeout_bounds_a_stalled_head_over_tls() {
+        run(super::stalled_head_tls);
+    }
+
+    #[test]
+    fn read_timeout_bounds_a_stalled_body() {
+        run(super::stalled_body);
+    }
+
+    #[test]
+    fn read_timeout_lets_a_slow_body_through() {
+        run(super::slow_body);
+    }
+
+    #[test]
+    fn read_timeout_spares_idle_connections() {
+        run(super::idle_outlives_read_timeout);
+    }
+
+    #[test]
+    fn read_timeout_spares_the_switched_stream() {
+        run(super::upgrade_outlives_read_timeout);
+    }
+
+    #[test]
     fn plaintext_h1() {
         run(super::plaintext);
     }
@@ -649,6 +1032,12 @@ mod tokio_runtime {
     #[test]
     fn h3_after_alt_svc() {
         run(super::h3::upgrade);
+    }
+
+    #[cfg(feature = "native-http3")]
+    #[test]
+    fn h3_delivers_response_trailers() {
+        run(super::h3::trailers);
     }
 
     #[cfg(feature = "native-http3")]
@@ -831,6 +1220,50 @@ mod h3 {
                 &*response.into_string().await.expect("body reads"),
                 format!("POST /upgrade {GREETING}")
             );
+        })
+        .await;
+    }
+
+    /// A response over HTTP/3 delivers its trailers after the body, the
+    /// CJK body intact.
+    pub async fn trailers<I: NativeIo, E: LocalExecutor>(io: I, executor: &E) {
+        use futures_util::StreamExt as _;
+
+        let pki = Pki::new();
+        let (server, port) = advertised(&io, executor, &pki, &pki, None);
+        let mut client = NativeBackend::on_current_thread(pki.transport(), io.clone(), executor);
+        against(server, async {
+            let uri = format!("https://localhost:{port}/upgrade");
+            let mut protocol = String::new();
+            for _ in 0..50 {
+                protocol = get(&mut client, &uri, true).await;
+                if protocol == "h3" {
+                    break;
+                }
+                io.sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(protocol, "h3", "the advertised h3 endpoint takes over");
+
+            let response = client
+                .get(format!("https://localhost:{port}/trailers"))
+                .expect("request builds")
+                .await
+                .expect("GET succeeds over HTTP/3");
+            assert_eq!(response.headers()["x-protocol"], "h3");
+            let mut data = Vec::new();
+            let mut trailers = None;
+            let mut body = response.into_body();
+            while let Some(frame) = body.next().await {
+                match frame.expect("frame is valid") {
+                    http_kit::BodyFrame::Data(chunk) => data.extend_from_slice(&chunk),
+                    http_kit::BodyFrame::Trailers(map) => trailers = Some(map),
+                    _ => unreachable!("no file frames"),
+                }
+            }
+            assert_eq!(std::str::from_utf8(&data).expect("UTF-8"), GREETING);
+            let trailers = trailers.expect("the trailers frame arrives");
+            assert_eq!(trailers["x-checksum"], "abc123");
+            assert_eq!(trailers["x-status"], "complete");
         })
         .await;
     }

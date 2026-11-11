@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/zen-rs/zenwave/compare/v0.10.0...v0.10.1) - 2026-11-11
+
+### Added
+
+- *(native)* connect and read timeouts on the transport
+
+### Fixed
+
+- *(native)* race QUIC dials over the streaming resolution
+- *(native)* gate the h3 OCSP test helpers on a runtime
+- *(native)* pass the stapled OCSP response to the HTTP/3 verifier
+- *(transport)* answer localhost without the system resolver and honour the resolution delay
+- *(hyper)* carry HTTP/3 trailers through the body in both directions
+
+### Other
+
+- *(native)* show the stapled OCSP response to the verifier over TLS as over HTTP/3
+- *(native)* read timeout through http-kit-h1's client config
+- Merge remote-tracking branch 'origin/dev' into feat/169-native-timeouts
+
 ## [0.10.0](https://github.com/zen-rs/zenwave/compare/v0.9.1...v0.10.0) - 2026-11-10
 
 ### Added

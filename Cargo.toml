@@ -1,6 +1,6 @@
 [package]
 name = "zenwave"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 authors = ["Lexo Liu<me@lexo.cool>"]
 repository = "https://github.com/zen-rs/zenwave"
@@ -215,9 +215,9 @@ executor-core = { version = "0.7.2" }
 # The native backend: owned-buffer sockets, HTTP/1.1, TLS and HTTP/3 on them,
 # and the runtimes it can drive itself.
 http-kit-io = { version = "0.4.0", optional = true }
-http-kit-h1 = { version = "0.3.0", optional = true }
-http-kit-tls = { version = "0.2.0", optional = true }
-http-kit-h3 = { version = "0.3.0", optional = true }
+http-kit-h1 = { version = "0.4.0", optional = true }
+http-kit-tls = { version = "0.2.2", optional = true }
+http-kit-h3 = { version = "0.4.0", optional = true }
 compio = { version = "0.19.2", default-features = false, features = ["runtime"], optional = true }
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time"], optional = true }
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
