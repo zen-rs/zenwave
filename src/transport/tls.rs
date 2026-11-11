@@ -29,7 +29,7 @@ mod engine {
     #[cfg(onecrl)]
     use super::super::onecrl::Additions;
     use super::Protocols;
-    #[cfg(any(connector, android_verifier))]
+    #[cfg(any(connector, android_verifier, wasi_verifier))]
     use crate::Cause;
     use crate::Error;
     #[cfg(connector)]
