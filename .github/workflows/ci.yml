@@ -8,9 +8,6 @@ permissions:
 on:
   pull_request:
     branches: ["**"]
-  # The OneCRL pin workflow and release-plz open their pull requests under
-  # GITHUB_TOKEN, which starts no workflow, so both dispatch CI on the
-  # pull request's branch.
   workflow_dispatch:
 
 concurrency:

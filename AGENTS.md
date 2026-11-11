@@ -136,8 +136,9 @@ release-plz computes the bump and opens a PR to main.
 
 Runs on every PR and manual dispatch (`.github/workflows/ci.yml` +
 `test.yml`), never on push. Every run is the full set below, except a
-release-plz bump branch, which runs nothing; release.yml dispatches CI on
-it because release-plz's pull request starts no workflow. `CI result`
+release-plz bump branch, which runs nothing; GitHub holds the runs of a
+pull request the Actions bot opened until approved, so release.yml and
+onecrl-pin.yml approve them (`.github/scripts/approve-held-runs.sh`). `CI result`
 aggregates all jobs and is the required check on `main`.
 - `cargo fmt --check`
 - Features: clippy over every valid feature combination (`scripts/check-features.sh`,
