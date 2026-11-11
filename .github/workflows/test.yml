@@ -2,12 +2,6 @@ name: Test
 
 on:
   workflow_call:
-    inputs:
-      # `full` for pull requests into `main`, `linux` otherwise; computed
-      # by the `tier` job in ci.yml.
-      tier:
-        required: true
-        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(inputs.tier == 'full' && '["ubuntu-latest","windows-latest","macos-latest"]' || '["ubuntu-latest"]') }}
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -41,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(inputs.tier == 'full' && '["ubuntu-latest","windows-latest","macos-latest"]' || '["ubuntu-latest"]') }}
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -64,7 +58,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(inputs.tier == 'full' && '["ubuntu-latest","windows-latest","macos-latest"]' || '["ubuntu-latest"]') }}
+        os: [ubuntu-latest, windows-latest, macos-latest]
         runtime: [compio, tokio]
     steps:
       - uses: actions/checkout@v4
@@ -79,9 +73,7 @@ jobs:
         run: cargo test --doc --no-default-features --features native-${{ matrix.runtime }},native-http3 --workspace
 
   wasm-linux:
-    name: wasm-pack (Linux - ${{ matrix.browser }})
-    if: ${{ inputs.tier == 'full' }}
-    runs-on: ubuntu-latest
+    name: wasm-pack (Linux - ${{ matrix.browser }})    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -100,9 +92,7 @@ jobs:
         run: bash scripts/test-wasm.sh ${{ matrix.browser }}
 
   wasm-macos:
-    name: wasm-pack (macOS Safari)
-    if: ${{ inputs.tier == 'full' }}
-    runs-on: macos-15-intel
+    name: wasm-pack (macOS Safari)    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
 
@@ -124,9 +114,7 @@ jobs:
         run: bash scripts/test-wasm.sh safari
 
   apple-backend:
-    name: Apple backend (macOS)
-    if: ${{ inputs.tier == 'full' }}
-    runs-on: macos-latest
+    name: Apple backend (macOS)    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -139,9 +127,7 @@ jobs:
         run: bash scripts/test-apple.sh
 
   ios-simulator:
-    name: iOS simulator
-    if: ${{ inputs.tier == 'full' }}
-    runs-on: macos-latest
+    name: iOS simulator    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -154,9 +140,7 @@ jobs:
         run: bash scripts/test-ios.sh
 
   workerd:
-    name: Cloudflare Worker (workerd via wrangler)
-    if: ${{ inputs.tier == 'full' }}
-    runs-on: ubuntu-latest
+    name: Cloudflare Worker (workerd via wrangler)    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -1,21 +1,17 @@
 name: Release
 
-# `release` publishes on pushes to `main`; the required `CI result` check
-# there already guarantees a merged commit passed the full CI set, so the
-# job does not wait on checks itself. `release-pr` runs on pushes to
-# `dev` and keeps the version bump and changelog pull request open
-# against `dev`. The bump belongs on `dev` because a pull request opened
-# with the default `GITHUB_TOKEN` starts no workflow runs, so one
-# targeting `main` could never satisfy the required check there and no
-# release could ever be merged.
+# Every push to `main` runs both jobs: `release` publishes what the push
+# carries (the required `CI result` check on `main` already guarantees the
+# merged commit passed the full CI set), and `release-pr` opens or refreshes
+# the version bump and changelog pull request against `main`. Merging that
+# pull request is the release.
 on:
   push:
-    branches: [main, dev]
+    branches: [main]
 
 jobs:
   release:
     name: Publish release
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -64,37 +60,35 @@ jobs:
 
   release-pr:
     name: Prepare next release
-    if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
+      # The dispatch below starts CI on the release branch.
+      actions: write
     concurrency:
-      group: release-plz-dev
+      group: release-plz-pr
       cancel-in-progress: false
     steps:
-      - name: Checkout tested dev commit
+      - name: Checkout the pushed main commit
         uses: actions/checkout@v6
         with:
-          ref: dev
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify tested commit
-        env:
-          EXPECTED_SHA: ${{ github.sha }}
-        run: |
-          actual_sha="$(git rev-parse HEAD)"
-          if [[ "$actual_sha" != "$EXPECTED_SHA" ]]; then
-            echo "::error::dev moved after this push: expected $EXPECTED_SHA, checked out $actual_sha"
-            exit 1
-          fi
       - *rust-toolchain
-      # The pull request lands the bump on `dev`; the release itself is the
-      # `dev` -> `main` pull request that carries it, which runs the full
-      # check set.
       - name: Create or update release PR
+        id: release-plz
         uses: release-plz/action@v0.5
         with:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # A pull request opened or pushed under GITHUB_TOKEN starts no
+      # workflow, so the required `CI result` would never report on it;
+      # dispatching CI on its branch is the exception GITHUB_TOKEN allows.
+      - name: Run CI on the release branch
+        if: steps.release-plz.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.release-plz.outputs.pr }}
+        run: gh workflow run ci.yml -R "$GITHUB_REPOSITORY" --ref "$(jq -er .head_branch <<<"$PR")"

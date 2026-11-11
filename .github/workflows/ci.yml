@@ -8,8 +8,9 @@ permissions:
 on:
   pull_request:
     branches: ["**"]
-  # The OneCRL pin workflow dispatches CI on its own pull requests, which
-  # the GITHUB_TOKEN that opens them cannot trigger otherwise.
+  # The OneCRL pin workflow and release-plz open their pull requests under
+  # GITHUB_TOKEN, which starts no workflow, so both dispatch CI on the
+  # pull request's branch.
   workflow_dispatch:
 
 concurrency:
@@ -20,35 +21,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  tier:
-    # A pull request into `main` runs the full set; every other run
-    # (dev PRs, manual dispatches) runs the Linux set. release-plz bump
-    # pull requests (`release-plz-*` heads) run nothing at all, so this
-    # job skips itself and every other job skips through `needs: tier`.
-    name: Tier
-    if: ${{ !startsWith(github.head_ref, 'release-plz-') }}
+  bump:
+    # Every run gates `main`, a pull request or a dispatch on one alike, so
+    # every run is the full set. release-plz bump branches (`release-plz-*`,
+    # as a pull request head or a dispatched ref) run nothing at all, so
+    # this job skips itself and every other job skips through `needs: bump`.
+    name: Not a release bump
+    if: ${{ !startsWith(github.head_ref || github.ref_name, 'release-plz-') }}
     runs-on: ubuntu-latest
-    outputs:
-      name: ${{ steps.tier.outputs.name }}
-      os: ${{ steps.tier.outputs.os }}
     steps:
-      - id: tier
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.base_ref }}" = "main" ]; then
-            {
-              echo 'name=full'
-              echo 'os=["ubuntu-latest","windows-latest","macos-latest"]'
-            } >> "$GITHUB_OUTPUT"
-          else
-            {
-              echo 'name=linux'
-              echo 'os=["ubuntu-latest"]'
-            } >> "$GITHUB_OUTPUT"
-          fi
+      - run: echo "${GITHUB_HEAD_REF:-$GITHUB_REF_NAME} runs the full set"
 
   fmt:
     name: Format
-    needs: tier
+    needs: bump
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -60,14 +46,14 @@ jobs:
   features:
     # Every valid feature combination, on every desktop OS, through clippy.
     # One slice per TLS engine, and one for the native backend, so the
-    # powerset runs in parallel. The Linux set carries the ubuntu legs only.
+    # powerset runs in parallel.
     name: Features (${{ matrix.os }}, ${{ matrix.engine }})
-    needs: tier
+    needs: bump
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(needs.tier.outputs.os) }}
+        os: [ubuntu-latest, windows-latest, macos-latest]
         engine: [rustls, native-tls, none, native]
     steps:
       - uses: actions/checkout@v4
@@ -83,7 +69,7 @@ jobs:
 
   wasm:
     name: WASM
-    needs: tier
+    needs: bump
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -102,10 +88,9 @@ jobs:
   mobile:
     # Cross-compilation for the mobile targets, tests included. The suites run
     # on an iOS simulator in test.yml and on a physical Android device through
-    # scripts/test-android.sh (emulators are not used). Full set only.
+    # scripts/test-android.sh (emulators are not used).
     name: Mobile (${{ matrix.name }})
-    needs: tier
-    if: ${{ needs.tier.outputs.name == 'full' }}
+    needs: bump
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -182,7 +167,7 @@ jobs:
 
   coverage:
     name: Coverage
-    needs: tier
+    needs: bump
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -202,7 +187,7 @@ jobs:
 
   audit:
     name: Security Audit
-    needs: tier
+    needs: bump
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -217,7 +202,7 @@ jobs:
 
   unused-deps:
     name: Unused Dependencies
-    needs: tier
+    needs: bump
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -230,18 +215,16 @@ jobs:
 
   test:
     name: Test
-    needs: tier
+    needs: bump
     uses: ./.github/workflows/test.yml
-    with:
-      tier: ${{ needs.tier.outputs.name }}
 
   ci-result:
     # The required check on `main`: green when every job it needs
-    # succeeded or was skipped (the tier skips what a run does not
-    # cover), and the only job present on release-plz pull requests.
+    # succeeded or was skipped, and the only job that runs on a release-plz
+    # bump branch.
     name: CI result
     if: always()
-    needs: [tier, fmt, features, wasm, mobile, coverage, audit, unused-deps, test]
+    needs: [bump, fmt, features, wasm, mobile, coverage, audit, unused-deps, test]
     runs-on: ubuntu-latest
     steps:
       - name: Check job results

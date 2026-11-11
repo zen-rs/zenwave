@@ -123,8 +123,8 @@ The `http-kit` crate (separate dependency) defines `Endpoint`, `Middleware`,
 
 ## Branching
 
-- `main` — release branch, release-plz creates PRs into it
-- `dev` — development branch, PRs go here
+`main` is the only long-lived branch: topic branches start from it and merge
+into it, and merging release-plz's release PR into it is the release.
 
 ## Release
 
@@ -135,20 +135,18 @@ release-plz computes the bump and opens a PR to main.
 ## CI
 
 Runs on every PR and manual dispatch (`.github/workflows/ci.yml` +
-`test.yml`), never on push. A PR into `main` runs the full set below;
-every other run (dev PRs, dispatches) runs only the Linux legs.
-release-plz bump PRs run nothing. `CI result` aggregates all jobs and
-is the required check on `main`.
+`test.yml`), never on push. Every run is the full set below, except a
+release-plz bump branch, which runs nothing; release.yml dispatches CI on
+it because release-plz's pull request starts no workflow. `CI result`
+aggregates all jobs and is the required check on `main`.
 - `cargo fmt --check`
 - Features: clippy over every valid feature combination (`scripts/check-features.sh`,
-  cargo-hack powerset) on Linux, Windows and macOS (Linux only outside
-  `main` PRs), one slice per TLS engine plus one for the native backend
+  cargo-hack powerset) on Linux, Windows and macOS, one slice per TLS engine
+  plus one for the native backend
 - WASM build + clippy; mobile cross-compilation (iOS device/simulator,
-  Android arm64/x86_64/armv7; `main` PRs only) with tests
+  Android arm64/x86_64/armv7) with tests
 - Tests: hyper (rustls and native-tls), curl, and native (compio and tokio,
-  HTTP/3 included) on Linux/Windows/macOS
-  (Linux only outside `main` PRs); `main` PRs also run apple-backend on
-  macOS, the suite on an iOS simulator (`scripts/test-ios.sh`,
+  HTTP/3 included) on Linux/Windows/macOS; apple-backend on macOS, the suite on an iOS simulator (`scripts/test-ios.sh`,
   `simctl spawn`), wasm-pack in Chrome/Firefox/Safari, workerd
 - Android runs on a physical device, not in CI: `scripts/test-android.sh`
   over adb (never an emulator); TLS on Android needs the JVM and is covered by
