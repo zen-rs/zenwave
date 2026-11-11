@@ -39,7 +39,9 @@ use rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
 
+#[cfg(onecrl_refresh)]
 pub mod record;
+#[cfg(onecrl_refresh)]
 pub mod refresh;
 
 /// The pinned snapshot table, compiled by `build.rs`.
@@ -47,6 +49,7 @@ const TABLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/onecrl.bin"));
 
 /// The changeset timestamp the compiled table covers — the refresher asks
 /// Remote Settings for everything after it.
+#[cfg(onecrl_refresh)]
 pub fn baseline_timestamp() -> u64 {
     u64::from_le_bytes(TABLE[..8].try_into().expect("the table has a header"))
 }
@@ -54,10 +57,12 @@ pub fn baseline_timestamp() -> u64 {
 /// Records published after the compiled baseline, fetched by the refresher
 /// and persisted under the cache directory. The maps are replaced wholesale
 /// under `ArcSwap`, so a verification never observes a half-merged round.
+/// Where there is no refresher the table stays empty.
 #[derive(Clone, Debug, Default)]
 pub struct Additions {
     /// The newest changeset timestamp the maps cover; 0 while only the
     /// baseline applies.
+    #[cfg(onecrl_refresh)]
     timestamp: u64,
     /// Issuer name → listed serials.
     issuers: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>,
@@ -67,17 +72,20 @@ pub struct Additions {
 
 impl Additions {
     /// The newest changeset timestamp the maps cover.
+    #[cfg(onecrl_refresh)]
     pub const fn timestamp(&self) -> u64 {
         self.timestamp
     }
 
     /// Advance the covered timestamp to `timestamp` when it is newer. A
     /// changeset with no usable records still counts as seen.
+    #[cfg(onecrl_refresh)]
     pub fn advance(&mut self, timestamp: u64) {
         self.timestamp = self.timestamp.max(timestamp);
     }
 
     /// Fold `entry` in.
+    #[cfg(onecrl_refresh)]
     pub fn insert(&mut self, entry: record::Entry) {
         match entry {
             record::Entry::IssuerSerial { issuer, serial } => {

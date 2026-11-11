@@ -268,7 +268,7 @@ struct TokenEndpointResponse {
     expires_in: Option<u64>,
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, reactor))]
 mod tests {
     use super::*;
     use async_lock::Mutex;

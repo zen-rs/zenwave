@@ -228,7 +228,7 @@ pub enum WebSocketErrorKind {
 
 impl Error {
     /// Wrap a TLS engine or trust-store failure.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(native)]
     pub(crate) fn tls(source: impl Into<Box<dyn StdError + Send + Sync>>) -> Self {
         Self::Tls(source.into())
     }

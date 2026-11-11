@@ -25,6 +25,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 # WASM build check
 cargo build --target wasm32-unknown-unknown
+
+# WASI (the native backend over the host's sockets, resolver and clock).
+# ring's C archive needs llvm-ar: AR_wasm32_wasip2 / RANLIB_wasm32_wasip2.
+cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend -- -D warnings
 ```
 
 ## Project layout

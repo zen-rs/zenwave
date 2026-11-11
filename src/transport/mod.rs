@@ -34,7 +34,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 #[cfg(native)]
 use std::sync::Arc;
-#[cfg(any(onecrl, native_backend))]
+#[cfg(any(onecrl_refresh, native_backend))]
 use std::time::Duration;
 #[cfg(any(all(connector, feature = "hyper-backend"), https_lookup))]
 use std::{future::Future, pin::Pin};
@@ -361,7 +361,7 @@ pub struct TransportBuilder {
     #[cfg(native_backend)]
     read_timeout: Option<Duration>,
     /// OneCRL additions refresh — enabled by [`Self::onecrl_refresh`].
-    #[cfg(onecrl)]
+    #[cfg(onecrl_refresh)]
     onecrl: onecrl::refresh::Refresh,
     /// Resolver configuration override — tests point it at an in-process
     /// DNS server instead of the system's.
@@ -402,7 +402,7 @@ impl fmt::Debug for TransportBuilder {
         debug
             .field("connect_timeout", &self.connect_timeout)
             .field("read_timeout", &self.read_timeout);
-        #[cfg(onecrl)]
+        #[cfg(onecrl_refresh)]
         debug.field("onecrl_refresh", &self.onecrl.interval);
         debug.finish_non_exhaustive()
     }
@@ -510,7 +510,7 @@ impl TransportBuilder {
     /// under `dirs::cache_dir()/zenwave/onecrl/` so the
     /// next process starts from them. On Android the
     /// cache directory is the app's `Context.getCacheDir()`.
-    #[cfg(onecrl)]
+    #[cfg(onecrl_refresh)]
     #[must_use]
     pub const fn onecrl_refresh(mut self, interval: Duration) -> Self {
         self.onecrl.interval = Some(interval);
@@ -520,7 +520,7 @@ impl TransportBuilder {
     /// Point OneCRL refresh at `endpoint`, persisting under `cache_dir`
     /// instead of the platform cache directory — a constructor for tests,
     /// not a runtime hook.
-    #[cfg(all(onecrl, test))]
+    #[cfg(all(onecrl_refresh, test))]
     #[must_use]
     pub(crate) fn onecrl_refresh_endpoint(
         mut self,
@@ -555,7 +555,7 @@ impl TransportBuilder {
         {
             // Resolving the refresh plan here — not on the refresher thread —
             // lets `build` report a missing cache directory.
-            #[cfg(onecrl)]
+            #[cfg(onecrl_refresh)]
             let refresh = self.onecrl.resolve()?.map(|plan| {
                 (
                     plan,
@@ -565,7 +565,10 @@ impl TransportBuilder {
             #[cfg(tls_engine)]
             let tls = tls::TlsConnector::new(
                 &self.extra_roots,
-                #[cfg(onecrl)]
+                // Without a refresher the compiled table is the whole list.
+                #[cfg(all(onecrl, not(onecrl_refresh)))]
+                None,
+                #[cfg(onecrl_refresh)]
                 refresh.as_ref().map(|(_, additions)| Arc::clone(additions)),
                 #[cfg(all(test, tls_rustls))]
                 self.verifier_wrap,
@@ -621,7 +624,7 @@ impl TransportBuilder {
             };
             // The refresher holds a `Weak`; spawning after `inner` exists also
             // covers the thread failing to start as a build error.
-            #[cfg(onecrl)]
+            #[cfg(onecrl_refresh)]
             if let Some((plan, additions)) = refresh {
                 onecrl::refresh::spawn(&transport.inner, additions, plan)?;
             }
