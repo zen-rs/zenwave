@@ -847,7 +847,7 @@ mod tests {
     fn h3_slow_handshake_succeeds_inside_the_deadline_on_compio() {
         let runtime = compio::runtime::Runtime::new().expect("compio runtime");
         runtime.block_on(slow_quic_handshake_has_the_dial_deadline(
-            http_kit_io::compio::Compio,
+            http_kit_io::compio::Compio::default(),
         ));
     }
 
@@ -870,7 +870,7 @@ mod tests {
     fn h3_dial_survives_a_stalled_aaaa_on_compio() {
         let runtime = compio::runtime::Runtime::new().expect("compio runtime");
         runtime.block_on(stalled_aaaa_does_not_hold_the_dial(
-            http_kit_io::compio::Compio,
+            http_kit_io::compio::Compio::default(),
         ));
     }
 
@@ -931,12 +931,16 @@ mod tests {
     )]
     async fn stapled_status_reaches_the_verifier_over_tls<I, E>(io: I, executor: &E)
     where
-        I: super::NativeIo + Listen,
+        I: super::NativeIo
+            + Listen<Listener: http_kit_io::Listener<Stream: http_kit_tls::Transport>>,
         E: executor_core::LocalExecutor,
     {
         use http_kit_io::Listener as _;
 
-        async fn serve<I: super::NativeIo + Listen>(
+        async fn serve<
+            I: super::NativeIo
+                + Listen<Listener: http_kit_io::Listener<Stream: http_kit_tls::Transport>>,
+        >(
             io: I,
             listener: I::Listener,
             acceptor: http_kit_tls::TlsAcceptor,
@@ -968,7 +972,8 @@ mod tests {
             staple: Option<&[u8]>,
         ) -> (Result<(), Error>, Vec<Vec<u8>>)
         where
-            I: super::NativeIo + Listen,
+            I: super::NativeIo
+                + Listen<Listener: http_kit_io::Listener<Stream: http_kit_tls::Transport>>,
             E: executor_core::LocalExecutor,
         {
             let issued = issue("zenwave tls ocsp test CA");
@@ -1054,7 +1059,7 @@ mod tests {
     fn tls_stapled_ocsp_reaches_the_verifier_on_compio() {
         let runtime = compio::runtime::Runtime::new().expect("compio runtime");
         runtime.block_on(stapled_status_reaches_the_verifier_over_tls(
-            http_kit_io::compio::Compio,
+            http_kit_io::compio::Compio::default(),
             &runtime,
         ));
     }
@@ -1078,7 +1083,7 @@ mod tests {
     fn h3_stapled_ocsp_reaches_the_verifier_on_compio() {
         let runtime = compio::runtime::Runtime::new().expect("compio runtime");
         runtime.block_on(stapled_status_reaches_the_verifier(
-            http_kit_io::compio::Compio,
+            http_kit_io::compio::Compio::default(),
         ));
     }
 

@@ -24,7 +24,7 @@ use std::{
 use executor_core::{LocalExecutor, Task as _};
 use futures_util::{future::select, pin_mut};
 use http_kit::{Body, Request, Response};
-use http_kit_io::{BufResult, FromStd, Listener as _, Read, Split as _, Write};
+use http_kit_io::{BufResult, FromStd, Listen, Listener, Read, Split as _, Write};
 use http_kit_tls::TlsAcceptor;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -40,10 +40,15 @@ use zenwave::{
 };
 
 /// What the scenarios need of an `http-kit-io` implementation: the native
-/// backend's own bounds, and sockets to serve on.
-trait TestIo: NativeIo + FromStd {}
+/// backend's own bounds, and sockets to serve on whose accepted streams a
+/// TLS acceptor takes (with kernel TLS that asks more of a stream than
+/// being one).
+trait TestIo: NativeIo + FromStd + Listen<Listener: Listener<Stream: http_kit_tls::Transport>> {}
 
-impl<I: NativeIo + FromStd> TestIo for I {}
+impl<I> TestIo for I where
+    I: NativeIo + FromStd + Listen<Listener: Listener<Stream: http_kit_tls::Transport>>
+{
+}
 
 /// A backend on the current thread over `io`, resolving through the system's
 /// resolver.
@@ -1038,7 +1043,7 @@ mod compio_runtime {
 
     fn run(test: impl AsyncFnOnce(Compio, &compio::runtime::Runtime)) {
         let runtime = compio::runtime::Runtime::new().expect("compio runtime");
-        runtime.block_on(test(Compio, &runtime));
+        runtime.block_on(test(Compio::default(), &runtime));
     }
 
     #[test]

@@ -565,7 +565,7 @@ mod tests {
     fn unsent_requests_come_back_on_compio() {
         compio::runtime::Runtime::new()
             .expect("compio runtime")
-            .block_on(unsent_requests_come_back(Compio));
+            .block_on(unsent_requests_come_back(Compio::default()));
     }
 
     #[cfg(feature = "native-tokio")]

@@ -668,7 +668,7 @@ mod tests {
     fn https_runs_over_kernel_tls_on_compio() {
         compio::runtime::Runtime::new()
             .expect("compio runtime")
-            .block_on(https_runs_over_kernel_tls(super::super::Compio));
+            .block_on(https_runs_over_kernel_tls(super::super::Compio::default()));
     }
 
     #[cfg(feature = "native-tokio")]
@@ -793,7 +793,7 @@ mod tests {
     fn a_kernel_tls_switch_splices_on_compio() {
         compio::runtime::Runtime::new()
             .expect("compio runtime")
-            .block_on(switched_over_tls(super::super::Compio, true));
+            .block_on(switched_over_tls(super::super::Compio::default(), true));
     }
 
     #[cfg(feature = "native-compio")]
@@ -801,7 +801,7 @@ mod tests {
     fn a_user_space_tls_switch_does_not_splice_on_compio() {
         compio::runtime::Runtime::new()
             .expect("compio runtime")
-            .block_on(switched_over_tls(super::super::Compio, false));
+            .block_on(switched_over_tls(super::super::Compio::default(), false));
     }
 
     #[cfg(feature = "native-tokio")]
