@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/zen-rs/zenwave/compare/v0.12.0...v0.13.0) - 2026-11-12
+
+### Added
+
+- [**breaking**] per-request timeouts
+- [**breaking**] typed connect, exchange, timeout and configuration failures
+- the native backend builds for wasm32-wasip2
+
+### Fixed
+
+- fail a dial's expired waiters with the phase it reached
+- bound a dial by the requests waiting for it
+- *(tls)* import Cause for the WASI verifier
+- *(transport)* report the WASI root store's failures as trust-store errors
+- *(transport)* bound a TCP attempt only by the caller's connect timeout
+- *(error)* leave native-tls verification failures unclassified
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into deps/208-fork-sources
+- *(deps)* take executor-core from main
+- *(deps)* take http-kit, compio and executor-core from git
+- take compio from the branch http-kit builds on
+- name the refusal each runtime reports for a closed port
+- Merge remote-tracking branch 'origin/main' into feat/194-typed-failures
+- Merge remote-tracking branch 'origin/main' into feat/196-native-wasip2
+- Merge remote-tracking branch 'origin/main' into feat/194-typed-failures
+- *(onecrl)* move the snapshot pin to 1794348206673
+- build the native backend for wasm32-wasip2
+
 ## [0.12.0](https://github.com/zen-rs/zenwave/compare/v0.11.0...v0.12.0) - 2026-11-11
 
 ### Added
