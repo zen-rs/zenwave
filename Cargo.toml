@@ -230,7 +230,7 @@ async-tungstenite = { version = "0.35.0", default-features = false, features = [
 # native target including WASI, whose host supplies sockets, resolver and clock.
 [target.'cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))'.dependencies]
 async-trait = "0.1.92"
-executor-core = { git = "https://github.com/lexoliu/executor-core", branch = "deps/22-compio-fork" }
+executor-core = { git = "https://github.com/lexoliu/executor-core", branch = "main" }
 # The native backend: owned-buffer sockets, HTTP/1.1 and TLS on them.
 http-kit-io = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
 http-kit-h1 = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
