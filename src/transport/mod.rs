@@ -45,6 +45,8 @@ use rustls_pki_types::{CertificateDer, pem::PemObject};
 #[cfg(native)]
 use crate::Cause;
 use crate::Error;
+#[cfg(native_backend)]
+use crate::Timeouts;
 
 // RFC 7838 Alt-Svc parsing, for HTTP/3 discovery.
 #[cfg(https_rr)]
@@ -137,12 +139,9 @@ struct Inner {
     /// when the transport was built with one.
     #[cfg(unix_socket)]
     unix_socket: Option<PathBuf>,
-    /// The bound on one connection attempt, when set.
+    /// The timeouts a request that sets none of its own gets.
     #[cfg(native_backend)]
-    connect_timeout: Option<Duration>,
-    /// The bound on each wait for bytes from the server, when set.
-    #[cfg(native_backend)]
-    read_timeout: Option<Duration>,
+    timeouts: Timeouts,
     /// Platform roots plus extras as PEM, for libcurl. `None` without extras.
     #[cfg(feature = "curl-backend")]
     ca_bundle: Option<Vec<u8>>,
@@ -235,18 +234,13 @@ impl Transport {
         self.inner.unix_socket.as_deref()
     }
 
-    /// How long one connection attempt may take, when bounded
-    /// ([`TransportBuilder::connect_timeout`]).
+    /// The defaults a request's own [`Timeouts`] override
+    /// ([`TransportBuilder::connect_timeout`],
+    /// [`response_head_timeout`](TransportBuilder::response_head_timeout) and
+    /// [`body_idle_timeout`](TransportBuilder::body_idle_timeout)).
     #[cfg(native_backend)]
-    pub(crate) fn connect_timeout(&self) -> Option<Duration> {
-        self.inner.connect_timeout
-    }
-
-    /// How long each wait for bytes from the server may take, when bounded
-    /// ([`TransportBuilder::read_timeout`]).
-    #[cfg(native_backend)]
-    pub(crate) fn read_timeout(&self) -> Option<Duration> {
-        self.inner.read_timeout
+    pub(crate) fn timeouts(&self) -> Timeouts {
+        self.inner.timeouts
     }
 
     #[cfg(tls_engine)]
@@ -338,9 +332,7 @@ impl fmt::Debug for Transport {
         #[cfg(unix_socket)]
         debug.field("unix_socket", &self.inner.unix_socket);
         #[cfg(native_backend)]
-        debug
-            .field("connect_timeout", &self.inner.connect_timeout)
-            .field("read_timeout", &self.inner.read_timeout);
+        debug.field("timeouts", &self.inner.timeouts);
         debug.finish_non_exhaustive()
     }
 }
@@ -359,9 +351,7 @@ pub struct TransportBuilder {
     #[cfg(unix_socket)]
     unix_socket: Option<PathBuf>,
     #[cfg(native_backend)]
-    connect_timeout: Option<Duration>,
-    #[cfg(native_backend)]
-    read_timeout: Option<Duration>,
+    timeouts: Timeouts,
     /// OneCRL additions refresh — enabled by [`Self::onecrl_refresh`].
     #[cfg(onecrl_refresh)]
     onecrl: onecrl::refresh::Refresh,
@@ -401,9 +391,7 @@ impl fmt::Debug for TransportBuilder {
         #[cfg(unix_socket)]
         debug.field("unix_socket", &self.unix_socket);
         #[cfg(native_backend)]
-        debug
-            .field("connect_timeout", &self.connect_timeout)
-            .field("read_timeout", &self.read_timeout);
+        debug.field("timeouts", &self.timeouts);
         #[cfg(onecrl_refresh)]
         debug.field("onecrl_refresh", &self.onecrl.interval);
         debug.finish_non_exhaustive()
@@ -464,49 +452,66 @@ impl TransportBuilder {
         self
     }
 
-    /// Bound each connection attempt by `timeout`: resolving the host, the
-    /// TCP connect (every address happy eyeballs races), a proxy's TLS
-    /// handshake and `CONNECT` tunnel or SOCKS5 handshake, and the origin's
-    /// TLS handshake, together; for HTTP/3, the QUIC handshake. An attempt
-    /// that takes longer fails with [`Error::Timeout`] holding
-    /// [`TimedOut::Connect`](crate::TimedOut::Connect) and the phase it was in.
+    /// The default bound on a request's wait for a connection, which a
+    /// request's own [`Timeouts::connect`] overrides: a pooled connection, or
+    /// one a dial opens (resolving the host, the TCP connect, every address
+    /// happy eyeballs races, a proxy's TLS handshake and `CONNECT` tunnel or
+    /// SOCKS5 handshake, and the origin's TLS handshake, together; for
+    /// HTTP/3, the QUIC handshake). A wait that runs out fails with
+    /// [`Error::Timeout`] holding
+    /// [`TimedOut::Connect`](crate::TimedOut::Connect) and the phase the
+    /// connection was in. A dial itself stops only once no request waiting
+    /// for it has time left.
     ///
     /// Off unless set. Applied by the native backend
-    /// ([`NativeBackend`](crate::backend::NativeBackend)); a caller that
-    /// needs several bounds builds one transport, and one backend, per
-    /// bound.
+    /// ([`NativeBackend`](crate::backend::NativeBackend)).
     #[cfg(native_backend)]
     #[must_use]
     pub const fn connect_timeout(mut self, timeout: Duration) -> Self {
-        self.connect_timeout = Some(timeout);
+        self.timeouts.connect = Some(timeout);
         self
     }
 
-    /// Bound each wait for bytes from the server by `timeout`, on an
-    /// HTTP/1.1 connection over any route (direct, TLS, a proxy's tunnel, a
-    /// unix domain socket): the wait for the response head, which starts
-    /// when the request does (interim `1xx` responses included), and each
-    /// wait for more of the response body. Every read that yields data
-    /// starts the next wait afresh, so a slow body that keeps arriving
-    /// takes as long as it needs. The bound is on the socket, not on a
-    /// consumer slow to read the body. HTTP/3 response reads are not
-    /// timed.
+    /// The default bound on the wait for a response head, which a request's
+    /// own [`Deadlines::response_head`](http_kit::Deadlines::response_head)
+    /// overrides, on an HTTP/1.1 connection over any route (direct, TLS, a
+    /// proxy's tunnel, a unix domain socket). It starts when the connection
+    /// takes the request, interim `1xx` responses included. HTTP/3 reads
+    /// take the same deadline from the request.
     ///
     /// A wait that runs out closes the connection and fails the request
-    /// with [`Error::Timeout`] holding [`TimedOut::ResponseHead`](crate::TimedOut::ResponseHead),
-    /// never retried since the server may have the request; during the body,
-    /// the body's read fails with [`TimedOut::BodyIdle`](crate::TimedOut::BodyIdle)
-    /// once it reaches a [`crate::Error`]. An idle pooled connection
-    /// is not waiting and is never timed, and a stream a `101` handed over
+    /// with [`Error::Timeout`] holding
+    /// [`TimedOut::ResponseHead`](crate::TimedOut::ResponseHead), never
+    /// retried since the server may have the request.
+    ///
+    /// Off unless set. Applied by the native backend
+    /// ([`NativeBackend`](crate::backend::NativeBackend)).
+    #[cfg(native_backend)]
+    #[must_use]
+    pub const fn response_head_timeout(mut self, timeout: Duration) -> Self {
+        self.timeouts = self.timeouts.with_response_head(timeout);
+        self
+    }
+
+    /// The default bound on each wait for more of a response body, which a
+    /// request's own [`Deadlines::body_idle`](http_kit::Deadlines::body_idle)
+    /// overrides. Every read that yields data starts the next wait afresh,
+    /// so a slow body that keeps arriving takes as long as it needs. The
+    /// bound is on the socket, not on a consumer slow to read the body.
+    ///
+    /// A wait that runs out closes the connection, and the body's read fails
+    /// with [`TimedOut::BodyIdle`](crate::TimedOut::BodyIdle) once it
+    /// reaches a [`crate::Error`]. An idle pooled connection is not waiting
+    /// and is never timed, and a stream a `101` handed over
     /// ([`Switched`](crate::backend::Switched)) belongs to its owner and is
     /// not timed either.
     ///
-    /// Off unless set. Applied by the native backend's HTTP/1.1
-    /// connections ([`NativeBackend`](crate::backend::NativeBackend)).
+    /// Off unless set. Applied by the native backend
+    /// ([`NativeBackend`](crate::backend::NativeBackend)).
     #[cfg(native_backend)]
     #[must_use]
-    pub const fn read_timeout(mut self, timeout: Duration) -> Self {
-        self.read_timeout = Some(timeout);
+    pub const fn body_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.timeouts = self.timeouts.with_body_idle(timeout);
         self
     }
 
@@ -609,9 +614,7 @@ impl TransportBuilder {
                     #[cfg(unix_socket)]
                     unix_socket: self.unix_socket,
                     #[cfg(native_backend)]
-                    connect_timeout: self.connect_timeout,
-                    #[cfg(native_backend)]
-                    read_timeout: self.read_timeout,
+                    timeouts: self.timeouts,
                     #[cfg(feature = "curl-backend")]
                     ca_bundle,
                     #[cfg(tls_engine)]

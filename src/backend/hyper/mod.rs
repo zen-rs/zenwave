@@ -455,6 +455,7 @@ impl HyperBackend {
 impl Endpoint for HyperBackend {
     type Error = crate::Error;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+        crate::timeouts::refuse(request)?;
         let mut request = take_request(request);
         // The absolute URI, kept so a request taken back from a dead
         // connection can be reshaped for whichever checkout serves the retry.

@@ -94,6 +94,7 @@ impl Endpoint for WebBackend {
         &mut self,
         request: &mut http_kit::Request,
     ) -> Result<http_kit::Response, Self::Error> {
+        crate::timeouts::refuse(request)?;
         fetch(&self.scope, request).await
     }
 }
