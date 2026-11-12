@@ -231,7 +231,7 @@ async-tungstenite = { version = "0.35.0", default-features = false, features = [
 # native target including WASI, whose host supplies sockets, resolver and clock.
 [target.'cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))'.dependencies]
 async-trait = "0.1.92"
-executor-core = { version = "0.7.2" }
+executor-core = { git = "https://github.com/lexoliu/executor-core", branch = "main" }
 # The native backend: owned-buffer sockets, HTTP/1.1 and TLS on them.
 http-kit-io = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
 http-kit-h1 = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
@@ -264,7 +264,7 @@ curl = { version = "0.4.51", optional = true }
 dns-lookup = { version = "4.0.2", optional = true }
 # HTTP/3 for the native backend: quiche.
 http-kit-h3 = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
-compio = { version = "0.19.2", default-features = false, features = ["runtime"], optional = true }
+compio = { git = "https://github.com/lexoliu/compio", branch = "skyzen", default-features = false, features = ["runtime"], optional = true }
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time"], optional = true }
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 hickory-resolver = { version = "0.26.3", default-features = false, features = ["system-config"] }
@@ -337,12 +337,6 @@ required-features = ["hyper-backend", "ws"]
 # names them.
 [package.metadata.cargo-machete]
 ignored = ["webpki-roots", "webpki-root-certs"]
-
-# http-kit's main builds on compio from this branch; compio from crates.io
-# (here and through executor-core) would be a second runtime, and a socket
-# made by one panics outside the other.
-[patch.crates-io]
-compio = { git = "https://github.com/lexoliu/compio", branch = "skyzen" }
 
 [lints]
 rust.missing_docs = "warn"
