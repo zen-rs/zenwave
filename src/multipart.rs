@@ -157,5 +157,5 @@ fn default_boundary() -> String {
 fn monotonic_suffix() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or_else(|_| 0, |duration| duration.as_micros())
+        .map_or(0, |duration| duration.as_micros())
 }
