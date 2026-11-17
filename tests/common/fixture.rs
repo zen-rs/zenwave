@@ -65,6 +65,7 @@ struct TestRequest {
     /// The request target, origin-form (`/path?query`).
     target: String,
     headers: Vec<(String, String)>,
+    trailers: Vec<(String, String)>,
     /// The drained request body.
     body: Bytes,
 }
@@ -80,6 +81,11 @@ struct TestResponse {
 enum TestBody {
     /// The whole body, framed with `Content-Length`.
     Full(Vec<u8>),
+    /// A chunked body followed by trailing headers.
+    Trailers {
+        data: Vec<u8>,
+        trailers: Vec<(String, String)>,
+    },
     /// One chunk, then a body that never ends: the connection can only
     /// finish when the client abandons it, which is what a test of an
     /// abandoned body needs — the bytes it did not read cannot be
@@ -91,6 +97,20 @@ impl From<TestBody> for BoxBody<Bytes, Infallible> {
     fn from(body: TestBody) -> Self {
         match body {
             TestBody::Full(bytes) => Self::new(Full::new(Bytes::from(bytes))),
+            TestBody::Trailers { data, trailers } => {
+                let mut map = hyper::header::HeaderMap::new();
+                for (name, value) in trailers {
+                    let name = hyper::header::HeaderName::from_bytes(name.as_bytes())
+                        .expect("valid trailer name");
+                    let value =
+                        hyper::header::HeaderValue::from_str(&value).expect("valid trailer value");
+                    map.append(name, value);
+                }
+                Self::new(StreamBody::new(stream::iter([
+                    Ok(Frame::data(Bytes::from(data))),
+                    Ok(Frame::trailers(map)),
+                ])))
+            }
             TestBody::Stalled(first) => Self::new(StreamBody::new(
                 stream::once(async move { Ok(Frame::data(Bytes::from(first))) })
                     .chain(stream::pending()),
@@ -325,10 +345,12 @@ async fn route(
         return Ok(accept_echo_upgrade(request));
     }
     let (parts, body) = request.into_parts();
-    let body = body
-        .collect()
-        .await
-        .map_or_else(|_| Bytes::new(), http_body_util::Collected::to_bytes);
+    let collected = body.collect().await.ok();
+    let trailers = collected
+        .as_ref()
+        .and_then(http_body_util::Collected::trailers)
+        .map_or_default(header_pairs);
+    let body = collected.map_or_else(Bytes::new, http_body_util::Collected::to_bytes);
     // A preflight asks about the route rather than taking it, so it is
     // answered before routing on any path.
     if parts.method == hyper::Method::OPTIONS {
@@ -339,19 +361,23 @@ async fn route(
             .uri
             .path_and_query()
             .map_or_else(|| parts.uri.path().to_owned(), ToString::to_string),
-        headers: parts
-            .headers
-            .iter()
-            .map(|(name, value)| {
-                (
-                    name.as_str().to_owned(),
-                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                )
-            })
-            .collect(),
+        headers: header_pairs(&parts.headers),
+        trailers,
         body,
     };
     Ok(handle_request(&request).into())
+}
+
+fn header_pairs(headers: &hyper::header::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect()
 }
 
 fn handle_request(request: &TestRequest) -> TestResponse {
@@ -419,12 +445,22 @@ fn handle_request(request: &TestRequest) -> TestResponse {
                 "json": serde_json::from_slice::<serde_json::Value>(&request.body)
                     .unwrap_or(serde_json::Value::Null),
                 "headers": headers_object(&request.headers),
+                "trailers": headers_object(&request.trailers),
                 "url": request_url(request),
             }),
         ),
         "/gzip" => bytes_response(200, b"gzip response"),
         // A body that arrives in several reads.
         "/stream" => bytes_response(200, vec![0xA5; 256 * 1024]),
+        // A chunked response carrying trailing headers.
+        "/trailers" => TestResponse {
+            status: 200,
+            headers: vec![("Trailer".to_owned(), "x-checksum".to_owned())],
+            body: TestBody::Trailers {
+                data: b"trailing payload".to_vec(),
+                trailers: vec![("x-checksum".to_owned(), "sha256-ok".to_owned())],
+            },
+        },
         // A body that never completes; see `TestBody::Stalled`.
         "/stream/stalled" => TestResponse {
             status: 200,
@@ -437,28 +473,39 @@ fn handle_request(request: &TestRequest) -> TestResponse {
             text_response(200, "delayed")
         }
         "/html" => text_response(200, "<html><body>not json</body></html>"),
-        _ => {
-            if let Some(stripped) = path.strip_prefix("/basic-auth/") {
-                return handle_basic_auth(request, stripped);
-            }
-            if let Some(stripped) = path.strip_prefix("/cookies/set/") {
-                return handle_set_cookie(stripped, &query);
-            }
-            if let Some(stripped) = path.strip_prefix("/status/") {
-                return handle_status(stripped);
-            }
-            if let Some(stripped) = path.strip_prefix("/base64/") {
-                return handle_base64(stripped);
-            }
-            if path.starts_with("/redirect/") {
-                return handle_redirect(path.as_str());
-            }
-            if path == "/redirect-to" {
-                return handle_redirect_to(&query);
-            }
-            text_response(404, format!("no route for {path}"))
-        }
+        _ => handle_dynamic_route(request, &path, &query),
     }
+}
+
+fn handle_dynamic_route(
+    request: &TestRequest,
+    path: &str,
+    query: &[(String, String)],
+) -> TestResponse {
+    if let Some(stripped) = path.strip_prefix("/delay-ms/") {
+        let ms = stripped.parse::<u64>().unwrap_or(0).min(5_000);
+        thread::sleep(Duration::from_millis(ms));
+        return text_response(200, "delayed");
+    }
+    if let Some(stripped) = path.strip_prefix("/basic-auth/") {
+        return handle_basic_auth(request, stripped);
+    }
+    if let Some(stripped) = path.strip_prefix("/cookies/set/") {
+        return handle_set_cookie(stripped, query);
+    }
+    if let Some(stripped) = path.strip_prefix("/status/") {
+        return handle_status(stripped);
+    }
+    if let Some(stripped) = path.strip_prefix("/base64/") {
+        return handle_base64(stripped);
+    }
+    if path.starts_with("/redirect/") {
+        return handle_redirect(path);
+    }
+    if path == "/redirect-to" {
+        return handle_redirect_to(query);
+    }
+    text_response(404, format!("no route for {path}"))
 }
 
 fn handle_basic_auth(request: &TestRequest, path: &str) -> TestResponse {

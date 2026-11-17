@@ -1,0 +1,18 @@
+# Standalone WASI Preview 3 component smoke test executed under Wasmtime by
+# `scripts/test-wasip3.sh`. Not published and not a workspace member.
+[package]
+name = "zenwave-wasip3-smoke"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zenwave = { path = "../..", default-features = false, features = ["wasi-backend", "public-suffix"] }
+wasip3 = { version = "0.10.0", default-features = false, features = ["std"] }
+serde_json = "1"
+futures-util = "0.3"

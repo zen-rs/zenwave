@@ -4,10 +4,12 @@
 
 use std::mem::replace;
 
+#[cfg(any(default_hyper, native_backend))]
 use http::{HeaderValue, header, uri::Scheme};
 use http_kit::{Body, Method, Request, Response};
 use tracing::debug;
 
+#[cfg(any(default_hyper, native_backend))]
 use crate::{
     Error,
     transport::route::{Origin, Via},
@@ -46,6 +48,7 @@ pub fn replayable_request(request: &http::Request<Body>) -> Option<http::Request
 /// # Errors
 ///
 /// The URI has no host, or a scheme other than `http` and `https`.
+#[cfg(any(default_hyper, native_backend))]
 pub fn request_origin(uri: &http::Uri) -> Result<Origin, Error> {
     let host = uri
         .host()
@@ -71,6 +74,7 @@ pub fn request_origin(uri: &http::Uri) -> Result<Origin, Error> {
 /// # Errors
 ///
 /// The request's path does not form an origin-form target.
+#[cfg(any(default_hyper, native_backend))]
 pub fn shape_h1_request(request: &mut http::Request<Body>, via: &Via) -> Result<(), Error> {
     if request.headers().get(header::HOST).is_none()
         && let Some(authority) = request.uri().authority()

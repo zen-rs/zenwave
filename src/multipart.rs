@@ -134,8 +134,7 @@ fn encode_with(boundary_override: Option<String>, parts: Vec<MultipartPart>) -> 
                 "Content-Disposition: form-data; name=\"{}\"{}\r\n",
                 part.name(),
                 part.filename()
-                    .map(|name| format!("; filename=\"{name}\""))
-                    .unwrap_or_default()
+                    .map_or_default(|name| format!("; filename=\"{name}\""))
             )
             .as_bytes(),
         );

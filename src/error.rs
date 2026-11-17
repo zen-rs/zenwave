@@ -609,6 +609,10 @@ pub enum Cause {
     #[cfg(browser)]
     #[error("{0}")]
     Js(String),
+    /// The WASI host's `wasi:http` implementation.
+    #[cfg(wasi_backend)]
+    #[error(transparent)]
+    Wasi(wasip3::http::types::ErrorCode),
     /// A message, where the engine has no error value of its own.
     #[error("{0}")]
     Detail(String),
@@ -773,7 +777,7 @@ impl Error {
     }
 
     /// A failure to connect to `host`:`port`, the `hop` of the route.
-    #[cfg(native)]
+    #[cfg(any(native, wasi_backend))]
     pub(crate) fn connect(
         hop: Hop,
         host: impl Into<String>,

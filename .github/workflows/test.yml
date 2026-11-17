@@ -170,3 +170,24 @@ jobs:
         run: npm install --global wrangler@4
       - name: Run zenwave inside workerd
         run: bash scripts/test-workerd.sh
+
+  wasip3:
+    name: WASI Preview 3 (Wasmtime)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-wasip3
+          workspaces: |
+            . -> target
+            tests/fixture-server -> target
+            tests/wasip3 -> target
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasmtime@50.0.2
+      - name: Run zenwave inside Wasmtime (wasi:http@0.3)
+        run: bash scripts/test-wasip3.sh

@@ -6,6 +6,7 @@ tests/workerd/target/
 tests/workerd/dist/
 tests/workerd/.skyzen/
 tests/fixture-server/target/
+tests/wasip3/target/
 .wrangler/
 tests/workerd/wrangler-dev.log
 onecrl.json

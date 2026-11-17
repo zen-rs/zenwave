@@ -11,16 +11,21 @@
 //! No backend selection is available or needed - the web backend uses the browser's
 //! native Fetch API.
 //!
-//! ## WASI (`wasm32-wasip2`)
-//! A WASI host has no browser and no OS reactor, but sockets, name resolution
-//! and a clock through the host. Only `native-backend` exists there:
-//! `NativeBackend::on_current_thread` over the host's `http-kit-io`
-//! implementation (`Dial`, `Resolve`, `Timer`), HTTP/1.1, and TLS verified
-//! against `webpki-roots` compiled into the binary, with the compiled OneCRL
-//! table applied (its refresher needs a thread and a connector, and is left
-//! out). `hyper-backend`, `curl-backend`, `ws`, `native-tls`, `native-compio`,
+//! ## WASI (`wasm32-wasip2` / `wasm32-wasip3`)
+//! Two complementary paths exist on Component Model WASI targets:
+//! - **`wasi-backend`**: [`WasiBackend`] delegates requests to the host's
+//!   `wasi:http/client` (`wasi:http@0.3`) and sleeps to
+//!   `wasi:clocks/monotonic-clock`, with no guest TLS or socket dependencies.
+//!   It is the [`DefaultBackend`] on WASI when enabled.
+//! - **`native-backend`**: `NativeBackend::on_current_thread` over the host's
+//!   `http-kit-io` implementation (`Dial`, `Resolve`, `Timer`), HTTP/1.1, and
+//!   TLS verified against `webpki-roots` compiled into the binary, with the
+//!   compiled OneCRL table applied (its refresher needs a thread and a
+//!   connector, and is left out).
+//!
+//! `hyper-backend`, `curl-backend`, `ws`, `native-tls`, `native-compio`,
 //! `native-tokio`, `native-http3` and `native-kernel-tls` are refused with a
-//! compile error.
+//! compile error on WASI.
 //!
 //! ## Native Platforms
 //! On native platforms, users can choose their preferred backend:
@@ -41,8 +46,8 @@
 //! Every backend is built from a [`crate::Transport`], which carries the
 //! trusted roots; `Default` uses [`crate::Transport::system`].
 
-// Request and response handling the hyper and native backends share.
-#[cfg(any(default_hyper, native_backend))]
+// Request and response handling shared across backends.
+#[cfg(any(default_hyper, native_backend, wasi_backend))]
 mod shared;
 
 #[cfg(all(reactor, feature = "hyper-backend"))]
@@ -125,7 +130,20 @@ pub use web::WebBackend;
 pub type DefaultBackend = WebBackend;
 
 // ============================================================================
-// Compile-time validation for native platforms
+// WASI Preview 3 backend (`wasi:http/client`)
+// ============================================================================
+
+#[cfg(wasi_backend)]
+mod wasi;
+#[cfg(wasi_backend)]
+pub use wasi::WasiBackend;
+
+/// The default HTTP client backend for WASI Preview 3 (`wasi:http/client`).
+#[cfg(default_wasi)]
+pub type DefaultBackend = WasiBackend;
+
+// ============================================================================
+// Compile-time validation for native and WASI platforms
 // ============================================================================
 
 // `native-backend` alone is a backend without a default: its caller drives
@@ -133,17 +151,19 @@ pub type DefaultBackend = WebBackend;
 // need a `DefaultBackend` (`zenwave::client()`, `DefaultClient`, the
 // one-shot request functions) are absent.
 #[cfg(all(
-    native,
+    any(native, target_os = "wasi"),
     not(apple_backend),
     not(feature = "hyper-backend"),
     not(feature = "curl-backend"),
-    not(native_backend)
+    not(native_backend),
+    not(wasi_backend)
 ))]
 compile_error!(
-    "No backend enabled for native platform. \
-     Please enable one of: `hyper-backend` (recommended), `curl-backend`, \
+    "No backend enabled for this platform. \
+     Please enable one of: `hyper-backend` (recommended on desktop/mobile), `curl-backend`, \
      `native-compio` or `native-tokio` (the native backend with a runtime of its own), \
      `native-backend` (the native backend on the caller's runtime, with no default client), \
+     `wasi-backend` (WASI Preview 3 `wasi:http/client`), \
      or `apple-backend` (Apple platforms only). \
      The default feature set includes `hyper-backend` with `rustls` TLS."
 );
@@ -183,6 +203,12 @@ compile_error!(
      Please remove the `curl-backend` feature when targeting wasm32."
 );
 
+#[cfg(all(browser, feature = "wasi-backend"))]
+compile_error!(
+    "`wasi-backend` requires a Component Model WASI target (`wasm32-wasip2` or `wasm32-wasip3`). \
+     On browser `wasm32-unknown-unknown`, the Fetch API `WebBackend` is always used."
+);
+
 // ============================================================================
 // Compile-time validation for WASI: the native backend over the host's sockets
 // ============================================================================
@@ -192,16 +218,22 @@ compile_error!(
 // and `Timer` with HTTP/1.1 over TLS, and every feature that needs more is
 // refused instead of compiling to nothing.
 
+#[cfg(all(target_os = "wasi", target_env = "p1", feature = "wasi-backend"))]
+compile_error!(
+    "`wasi-backend` uses Component Model `wasi:http@0.3` async streams and futures; \
+     target `wasm32-wasip2` or `wasm32-wasip3` instead of `wasm32-wasip1`."
+);
+
 #[cfg(all(target_os = "wasi", feature = "hyper-backend"))]
 compile_error!(
     "`hyper-backend` needs an OS reactor, which WASI does not have. \
-     Use `native-backend` with the host's `Dial`, `Resolve` and `Timer`."
+     Use `wasi-backend` (`wasi:http@0.3`) or `native-backend` with the host's `Dial`, `Resolve` and `Timer`."
 );
 
 #[cfg(all(target_os = "wasi", feature = "curl-backend"))]
 compile_error!(
     "`curl-backend` needs libcurl and an OS reactor, which WASI does not have. \
-     Use `native-backend` with the host's `Dial`, `Resolve` and `Timer`."
+     Use `wasi-backend` (`wasi:http@0.3`) or `native-backend` with the host's `Dial`, `Resolve` and `Timer`."
 );
 
 #[cfg(all(target_os = "wasi", feature = "ws"))]

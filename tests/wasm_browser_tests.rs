@@ -1,10 +1,10 @@
 #![allow(missing_docs)]
 //! Browser-based integration tests for the WASM backend.
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(browser)]
 mod common;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(browser)]
 mod wasm_tests {
     use super::common::httpbin_uri;
     #[cfg(feature = "ws")]

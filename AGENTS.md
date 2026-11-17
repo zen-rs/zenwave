@@ -1,7 +1,7 @@
 # Zenwave
 
 Async HTTP client library for Rust. Single crate, multiple backends
-(Hyper, libcurl, Apple URLSession, browser Fetch), same API surface.
+(Hyper, libcurl, Apple URLSession, browser Fetch, WASI Preview 3), same API surface.
 
 ## Build and test
 
@@ -25,6 +25,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 # WASM build check
 cargo build --target wasm32-unknown-unknown
+
+# WASI Preview 3 (`wasi:http/client`) — no C toolchain needed.
+cargo clippy --target wasm32-wasip2 --no-default-features --features wasi-backend,public-suffix --lib --test wasi_backend -- -D warnings
+cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features wasi-backend,public-suffix --lib --test wasi_backend -- -D warnings
 
 # WASI (the native backend over the host's sockets, resolver and clock).
 # ring's C archive needs llvm-ar: AR_wasm32_wasip2 / RANLIB_wasm32_wasip2.
@@ -59,6 +63,7 @@ src/
     curl.rs       — libcurl backend
     apple.rs      — URLSession backend (Apple platforms)
     web.rs        — Fetch API backend (wasm32)
+    wasi.rs       — WASI Preview 3 (`wasi:http/client`) backend
   transport/
     mod.rs        — Transport / TransportBuilder (proxy rules + trusted roots; all targets)
     proxy.rs      — Proxy / ProxyBuilder over hyper-util's matcher (env + OS settings)

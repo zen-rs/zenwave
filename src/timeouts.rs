@@ -13,8 +13,8 @@ use http_kit::Deadlines;
 /// `connect_timeout`, `response_head_timeout` and `body_idle_timeout`, or
 /// inserts the value into its extensions itself.
 ///
-/// Only the native backend applies them. Every other backend answers a
-/// request that carries one with
+/// Only the native and WASI backends apply them. Every other backend answers
+/// a request that carries one with
 /// [`ConfigError::Unsupported`](crate::ConfigError::Unsupported).
 ///
 /// # Examples
