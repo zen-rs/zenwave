@@ -81,6 +81,8 @@ jobs:
       # The desktop clippy lanes never compile the wasm32-only code. The
       # examples block on async-io and are native-only, so they stay out.
       - run: cargo clippy --target wasm32-unknown-unknown --lib --tests -- -D warnings
+      # Pure WASI Preview 3 (`wasi:http/client`) compiles with zero C toolchain.
+      - run: cargo clippy --target wasm32-wasip2 --no-default-features --features wasi-backend,public-suffix --lib --test wasi_backend -- -D warnings
       # The native backend over a WASI host's sockets. ring compiles C for
       # wasm32, which takes the image's LLVM: its clang, and its archiver,
       # because GNU ar writes an index wasm-ld cannot read.
@@ -93,6 +95,12 @@ jobs:
             echo "RANLIB_wasm32_wasip2=$llvm/llvm-ranlib"
           } >> "$GITHUB_ENV"
       - run: cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend --lib --test wasi_native_backend -- -D warnings
+      - run: cargo clippy --target wasm32-wasip2 --no-default-features --features wasi-backend,native-backend --lib --test wasi_backend --test wasi_native_backend -- -D warnings
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: wasm32-wasip3
+          components: clippy
+      - run: cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features wasi-backend,public-suffix --lib --test wasi_backend -- -D warnings
 
   mobile:
     # Cross-compilation for the mobile targets, tests included. The suites run

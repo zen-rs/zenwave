@@ -27,9 +27,14 @@
 //! powered by the browser's Fetch API. No configuration is needed or available.
 //! **Note:** Explicitly selecting a backend on wasm32 will result in a compile error.
 //!
-//! ## WASI (`wasm32-wasip2`)
-//! Only `native-backend` exists: `NativeBackend::on_current_thread` over the
-//! host's `http-kit-io` sockets, resolver and clock. See [`backend`].
+//! ## WASI (`wasm32-wasip2` / `wasm32-wasip3`)
+//! - **`wasi-backend`**: `WasiBackend`, speaking `wasi:http/client`
+//!   (`wasi:http@0.3`) through the host and sleeping on
+//!   `wasi:clocks/monotonic-clock`, with no guest TLS or socket dependencies.
+//!   Supplies [`DefaultBackend`](backend::DefaultBackend), [`client()`],
+//!   [`get()`] and friends.
+//! - **`native-backend`**: `NativeBackend::on_current_thread` over the
+//!   host's `http-kit-io` sockets, resolver and clock. See [`backend`].
 //!
 //! ## Native Platforms
 //! On native platforms, Zenwave supports multiple HTTP client backends and,

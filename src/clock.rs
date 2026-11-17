@@ -92,3 +92,18 @@ impl Clock for BrowserClock {
         SingleThreaded(gloo_timers::future::TimeoutFuture::new(millis))
     }
 }
+
+/// The WASI host's monotonic clock (`wasi:clocks/monotonic-clock`).
+#[cfg(wasi_backend)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WasiClock;
+
+#[cfg(wasi_backend)]
+impl Clock for WasiClock {
+    type Sleep = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
+
+    fn sleep(&self, duration: Duration) -> Self::Sleep {
+        let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        Box::pin(wasip3::clocks::monotonic_clock::wait_for(nanos))
+    }
+}

@@ -34,7 +34,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 #[cfg(native)]
 use std::sync::Arc;
-#[cfg(any(onecrl_refresh, native_backend))]
+#[cfg(any(onecrl_refresh, transport_timeouts))]
 use std::time::Duration;
 #[cfg(any(all(connector, feature = "hyper-backend"), https_lookup))]
 use std::{future::Future, pin::Pin};
@@ -45,7 +45,7 @@ use rustls_pki_types::{CertificateDer, pem::PemObject};
 #[cfg(native)]
 use crate::Cause;
 use crate::Error;
-#[cfg(native_backend)]
+#[cfg(transport_timeouts)]
 use crate::Timeouts;
 
 // RFC 7838 Alt-Svc parsing, for HTTP/3 discovery.
@@ -129,6 +129,8 @@ pub(crate) fn spawn_thread(future: Pin<Box<dyn Future<Output = ()> + Send>>) {
 pub struct Transport {
     #[cfg(native)]
     inner: Arc<Inner>,
+    #[cfg(all(not(native), wasi_backend))]
+    timeouts: Timeouts,
 }
 
 #[cfg(native)]
@@ -140,7 +142,7 @@ struct Inner {
     #[cfg(unix_socket)]
     unix_socket: Option<PathBuf>,
     /// The timeouts a request that sets none of its own gets.
-    #[cfg(native_backend)]
+    #[cfg(transport_timeouts)]
     timeouts: Timeouts,
     /// Platform roots plus extras as PEM, for libcurl. `None` without extras.
     #[cfg(feature = "curl-backend")]
@@ -197,11 +199,21 @@ impl Transport {
             .clone()
     }
 
+    /// The platform default: the WASI host owns proxying and trust, and no
+    /// default timeouts are applied.
+    #[cfg(all(not(native), wasi_backend))]
+    #[must_use]
+    pub fn system() -> Self {
+        Self {
+            timeouts: Timeouts::default(),
+        }
+    }
+
     /// The platform default: system proxy settings and the system trust store.
     ///
     /// On wasm32 the browser owns proxying and trust, so the transport
     /// carries no configuration at all.
-    #[cfg(not(native))]
+    #[cfg(all(not(native), not(wasi_backend)))]
     #[must_use]
     pub const fn system() -> Self {
         Self {}
@@ -238,9 +250,17 @@ impl Transport {
     /// ([`TransportBuilder::connect_timeout`],
     /// [`response_head_timeout`](TransportBuilder::response_head_timeout) and
     /// [`body_idle_timeout`](TransportBuilder::body_idle_timeout)).
-    #[cfg(native_backend)]
+    #[cfg(transport_timeouts)]
+    #[allow(clippy::missing_const_for_fn)]
     pub(crate) fn timeouts(&self) -> Timeouts {
-        self.inner.timeouts
+        #[cfg(native)]
+        {
+            self.inner.timeouts
+        }
+        #[cfg(not(native))]
+        {
+            self.timeouts
+        }
     }
 
     #[cfg(tls_engine)]
@@ -331,8 +351,8 @@ impl fmt::Debug for Transport {
             .field("extra_roots", &self.inner.extra_roots.len());
         #[cfg(unix_socket)]
         debug.field("unix_socket", &self.inner.unix_socket);
-        #[cfg(native_backend)]
-        debug.field("timeouts", &self.inner.timeouts);
+        #[cfg(transport_timeouts)]
+        debug.field("timeouts", &self.timeouts());
         debug.finish_non_exhaustive()
     }
 }
@@ -350,7 +370,7 @@ pub struct TransportBuilder {
     extra_roots: Vec<CertificateDer<'static>>,
     #[cfg(unix_socket)]
     unix_socket: Option<PathBuf>,
-    #[cfg(native_backend)]
+    #[cfg(transport_timeouts)]
     timeouts: Timeouts,
     /// OneCRL additions refresh — enabled by [`Self::onecrl_refresh`].
     #[cfg(onecrl_refresh)]
@@ -390,7 +410,7 @@ impl fmt::Debug for TransportBuilder {
             .field("extra_roots", &self.extra_roots.len());
         #[cfg(unix_socket)]
         debug.field("unix_socket", &self.unix_socket);
-        #[cfg(native_backend)]
+        #[cfg(transport_timeouts)]
         debug.field("timeouts", &self.timeouts);
         #[cfg(onecrl_refresh)]
         debug.field("onecrl_refresh", &self.onecrl.interval);
@@ -463,9 +483,8 @@ impl TransportBuilder {
     /// connection was in. A dial itself stops only once no request waiting
     /// for it has time left.
     ///
-    /// Off unless set. Applied by the native backend
-    /// ([`NativeBackend`](crate::backend::NativeBackend)).
-    #[cfg(native_backend)]
+    /// Off unless set. Applied by `NativeBackend` and `WasiBackend`.
+    #[cfg(transport_timeouts)]
     #[must_use]
     pub const fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.timeouts.connect = Some(timeout);
@@ -484,9 +503,8 @@ impl TransportBuilder {
     /// [`TimedOut::ResponseHead`](crate::TimedOut::ResponseHead), never
     /// retried since the server may have the request.
     ///
-    /// Off unless set. Applied by the native backend
-    /// ([`NativeBackend`](crate::backend::NativeBackend)).
-    #[cfg(native_backend)]
+    /// Off unless set. Applied by `NativeBackend` and `WasiBackend`.
+    #[cfg(transport_timeouts)]
     #[must_use]
     pub const fn response_head_timeout(mut self, timeout: Duration) -> Self {
         self.timeouts = self.timeouts.with_response_head(timeout);
@@ -503,12 +521,10 @@ impl TransportBuilder {
     /// with [`TimedOut::BodyIdle`](crate::TimedOut::BodyIdle) once it
     /// reaches a [`crate::Error`]. An idle pooled connection is not waiting
     /// and is never timed, and a stream a `101` handed over
-    /// ([`Switched`](crate::backend::Switched)) belongs to its owner and is
-    /// not timed either.
+    /// (`Switched`) belongs to its owner and is not timed either.
     ///
-    /// Off unless set. Applied by the native backend
-    /// ([`NativeBackend`](crate::backend::NativeBackend)).
-    #[cfg(native_backend)]
+    /// Off unless set. Applied by `NativeBackend` and `WasiBackend`.
+    #[cfg(transport_timeouts)]
     #[must_use]
     pub const fn body_idle_timeout(mut self, timeout: Duration) -> Self {
         self.timeouts = self.timeouts.with_body_idle(timeout);
@@ -613,7 +629,7 @@ impl TransportBuilder {
                     extra_roots: self.extra_roots,
                     #[cfg(unix_socket)]
                     unix_socket: self.unix_socket,
-                    #[cfg(native_backend)]
+                    #[cfg(transport_timeouts)]
                     timeouts: self.timeouts,
                     #[cfg(feature = "curl-backend")]
                     ca_bundle,
@@ -643,14 +659,18 @@ impl TransportBuilder {
         }
     }
 
-    /// Build the transport. The browser owns proxying and trust, so there
-    /// is nothing to load.
+    /// Build the transport. The host owns proxying and trust, so there is
+    /// nothing to load.
     ///
     /// # Errors
     ///
-    /// Never fails on wasm32; the `Result` keeps the native signature.
+    /// Never fails on browser or pure WASI targets; the `Result` keeps the
+    /// native signature.
     #[cfg(not(native))]
     pub const fn build(self) -> Result<Transport, Error> {
-        Ok(Transport {})
+        Ok(Transport {
+            #[cfg(wasi_backend)]
+            timeouts: self.timeouts,
+        })
     }
 }

@@ -55,9 +55,9 @@ mod pinned {
                 .unwrap_or_else(|error| panic!("write downloaded {asset}: {error}"));
             bytes
         };
-        let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(&bytes);
         assert!(
-            digest.as_ref() == hex(expected).as_slice(),
+            digest.as_slice() == hex(expected).as_slice(),
             "{label}'s SHA-256 does not match {pin_file}'s {expected}"
         );
         bytes
@@ -84,15 +84,21 @@ mod pinned {
 
 fn main() {
     cfg_aliases! {
-        // Everything that is not the browser/Workers Fetch backend: every
-        // non-wasm32 target and WASI, whose host supplies sockets.
-        native: { any(not(target_arch = "wasm32"), target_os = "wasi") },
+        // Everything that uses guest transport configuration (proxy rules,
+        // extra roots): every non-wasm32 target, and WASI when the native
+        // backend is compiled in.
+        native: { any(not(target_arch = "wasm32"), all(target_os = "wasi", feature = "native-backend")) },
         // The browser/Workers Fetch backend and its JS timers: wasm32 without
         // a WASI host.
         browser: { all(target_arch = "wasm32", not(target_os = "wasi")) },
-        // async-io's reactor, which drives the sockets and timers of every
-        // backend but the browser's and WASI's, whose hosts have no OS reactor.
-        reactor: { all(native, not(target_os = "wasi")) },
+        // async-io's reactor, which drives the sockets, timers and filesystem
+        // I/O of every desktop/mobile backend.
+        reactor: { not(target_arch = "wasm32") },
+        // WASI Preview 3 HTTP client backend (`wasi:http/client` +
+        // `wasi:clocks/monotonic-clock`) on Component Model WASI targets.
+        wasi_backend: { all(target_os = "wasi", not(target_env = "p1"), feature = "wasi-backend") },
+        // Transport-level defaults for `Timeouts`.
+        transport_timeouts: { any(native_backend, wasi_backend) },
         // The `getaddrinfo` resolver and the `http-kit-io` it implements.
         getaddrinfo: { all(reactor, feature = "getaddrinfo") },
         // The shared async-net TCP/TLS connector is needed by hyper, by native
@@ -149,7 +155,8 @@ fn main() {
         // one for the life of the binary.
         onecrl_refresh: { all(onecrl, reactor) },
         // Which backend `DefaultBackend` resolves to: hyper wins, then the
-        // native backend with a runtime, then URLSession, then libcurl.
+        // native backend with a runtime, then URLSession, then libcurl, then
+        // WASI Preview 3.
         apple_backend: { all(target_vendor = "apple", feature = "apple-backend") },
         default_hyper: { all(reactor, feature = "hyper-backend") },
         default_native: { all(native_driver, not(feature = "hyper-backend")) },
@@ -161,10 +168,16 @@ fn main() {
             not(default_native),
             not(all(target_vendor = "apple", feature = "apple-backend"))
         ) },
+        default_wasi: { all(
+            wasi_backend,
+            not(default_hyper),
+            not(default_native),
+            not(default_apple),
+            not(default_curl)
+        ) },
         // Whether there is a `DefaultBackend` at all: `native-backend` without
-        // a driver runtime has none, and neither has `zenwave::client()`. A
-        // WASI host has none either: its caller supplies the sockets.
-        default_backend: { any(browser, default_hyper, default_native, default_apple, default_curl) },
+        // a driver runtime has none, and neither has `zenwave::client()`.
+        default_backend: { any(browser, default_wasi, default_hyper, default_native, default_apple, default_curl) },
     }
 
     // The pins and their packaged assets are inputs to the compiled tables.

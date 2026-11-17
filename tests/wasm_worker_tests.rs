@@ -5,10 +5,10 @@
 //! `Window`; the backend must find `fetch` on whatever `globalThis` is. This
 //! suite is the browser-runnable stand-in for a Cloudflare Worker.
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(browser)]
 mod common;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(browser)]
 mod worker_tests {
     use super::common::httpbin_uri;
     use serde_json::Value;

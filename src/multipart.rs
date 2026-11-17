@@ -134,8 +134,7 @@ fn encode_with(boundary_override: Option<String>, parts: Vec<MultipartPart>) -> 
                 "Content-Disposition: form-data; name=\"{}\"{}\r\n",
                 part.name(),
                 part.filename()
-                    .map(|name| format!("; filename=\"{name}\""))
-                    .unwrap_or_default()
+                    .map_or_default(|name| format!("; filename=\"{name}\""))
             )
             .as_bytes(),
         );
@@ -158,5 +157,5 @@ fn default_boundary() -> String {
 fn monotonic_suffix() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or_else(|_| 0, |duration| duration.as_micros())
+        .map_or(0, |duration| duration.as_micros())
 }
