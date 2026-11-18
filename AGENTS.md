@@ -36,19 +36,19 @@ cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features wa
 cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend --lib --test wasi_native_backend -- -D warnings
 cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features native-backend --lib --test wasi_native_backend -- -D warnings
 
-# WASI with HTTP/3 (`native-http3`): cross-compiles BoringSSL (`boring-sys` / `quiche`) through
-# `scripts/wasi-boringssl.cmake` (`zig cc`/`zig c++` or `WASI_SDK_PATH`, single-threaded:
+# WASI with HTTP/3 (`native-http3`): cross-compiles BoringSSL (`boring-sys` / `quiche`) against
+# `wasi-sdk-34+` (`WASI_SDK_PATH`) through `scripts/wasi-boringssl.cmake` (single-threaded:
 # `-DOPENSSL_NO_ASM -DOPENSSL_NO_SOCK -DOPENSSL_NO_POSIX_IO -DOPENSSL_NO_THREADS_CORRUPT_MEMORY_AND_LEAK_SECRETS_IF_THREADED`,
-# staging `libc++.a` + `libc++abi.a` for `BORING_BSSL_RUST_CPPLIB=c++`), and passes WASI libc headers
-# plus `-fvisibility=default` to bindgen.
-ZIG_LIB="$(zig env | sed -n 's/.*lib_dir[" ]*[:=][ "]*\([^"]*\).*/\1/p')"
-WASI_BINDGEN="--target=wasm32-wasi -fvisibility=default -nostdlibinc -idirafter $ZIG_LIB/libc/include/wasm-wasi-musl -idirafter $ZIG_LIB/libc/include/generic-musl -DOPENSSL_NO_ASM -DOPENSSL_NO_SOCK -DOPENSSL_NO_POSIX_IO -DOPENSSL_NO_THREADS_CORRUPT_MEMORY_AND_LEAK_SECRETS_IF_THREADED"
-CMAKE_GENERATOR=Ninja \
+# merging `noeh/libc++.a` + `noeh/libc++abi.a` for `BORING_BSSL_RUST_CPPLIB=c++`).
+WASI_BINDGEN="--sysroot=$WASI_SDK_PATH/share/wasi-sysroot -fvisibility=default -DOPENSSL_NO_ASM -DOPENSSL_NO_SOCK -DOPENSSL_NO_POSIX_IO -DOPENSSL_NO_THREADS_CORRUPT_MEMORY_AND_LEAK_SECRETS_IF_THREADED"
+LIBCLANG_PATH="$WASI_SDK_PATH/lib" \
+  CMAKE_GENERATOR=Ninja \
   CMAKE_TOOLCHAIN_FILE_wasm32_wasip2="$PWD/scripts/wasi-boringssl.cmake" \
   BORING_BSSL_RUST_CPPLIB_wasm32_wasip2=c++ \
   BINDGEN_EXTRA_CLANG_ARGS_wasm32_wasip2="$WASI_BINDGEN" \
   cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend,native-http3 --lib --test wasi_native_backend -- -D warnings
-CMAKE_GENERATOR=Ninja \
+LIBCLANG_PATH="$WASI_SDK_PATH/lib" \
+  CMAKE_GENERATOR=Ninja \
   CMAKE_TOOLCHAIN_FILE_wasm32_wasip3="$PWD/scripts/wasi-boringssl.cmake" \
   BORING_BSSL_RUST_CPPLIB_wasm32_wasip3=c++ \
   BINDGEN_EXTRA_CLANG_ARGS_wasm32_wasip3="$WASI_BINDGEN" \
