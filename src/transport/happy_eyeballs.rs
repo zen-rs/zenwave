@@ -719,6 +719,8 @@ impl HappyEyeballsState {
         self.ipv6.is_finished() && self.ipv4.is_finished()
     }
 
+    // `VecDeque::is_empty` is not `const` at our MSRV / stable toolchain.
+    #[allow(clippy::missing_const_for_fn)]
     fn is_terminal(&self, no_attempts_running: bool) -> bool {
         no_attempts_running && self.pending.is_empty() && self.resolution_complete()
     }

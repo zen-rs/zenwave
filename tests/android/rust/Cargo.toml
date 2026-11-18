@@ -19,7 +19,7 @@ default = ["ws"]
 ws = ["zenwave/ws", "dep:async-tungstenite"]
 
 [dependencies]
-zenwave = { path = "../../..", default-features = false, features = ["hyper-backend", "rustls"] }
+zenwave = { path = "../../..", default-features = false, features = ["hyper-backend", "rustls-ring"] }
 jni = "0.22.4"
 
 # What `tests/common` needs.

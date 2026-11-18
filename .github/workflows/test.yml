@@ -27,7 +27,7 @@ jobs:
         run: cargo test --doc --no-default-features --features curl-backend --workspace
       - name: Run curl backend tests with websockets
         if: matrix.os == 'ubuntu-latest'
-        run: cargo nextest run --no-default-features --features curl-backend,ws,rustls --workspace
+        run: cargo nextest run --no-default-features --features curl-backend,ws,rustls-ring --workspace
 
   hyper-backend:
     name: Hyper backend (${{ matrix.os }})
@@ -45,11 +45,13 @@ jobs:
       - uses: taiki-e/install-action@nextest
       # `onecrl` only compiles where webpki verifies (Linux here); elsewhere it is a no-op.
       - name: Run hyper backend tests (rustls)
-        run: cargo nextest run --no-default-features --features hyper-backend,rustls,ws,onecrl --workspace
+        run: cargo nextest run --no-default-features --features hyper-backend,rustls-ring,ws,onecrl --workspace
+      - name: Run rustls without rustls-ring (installed CryptoProvider)
+        run: cargo nextest run --no-default-features --features hyper-backend,rustls --test custom_crypto_provider
       - name: Run hyper backend tests (native-tls)
         run: cargo nextest run --no-default-features --features hyper-backend,native-tls,ws --workspace
       - name: Run hyper backend doctests
-        run: cargo test --doc --no-default-features --features hyper-backend,rustls,ws --workspace
+        run: cargo test --doc --no-default-features --features hyper-backend,rustls-ring,ws --workspace
 
   native-backend:
     # The native backend on each driver runtime, HTTP/3 included.
