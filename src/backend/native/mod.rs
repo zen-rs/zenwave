@@ -23,7 +23,8 @@ mod connect;
 #[cfg(native_h3)]
 #[expect(clippy::future_not_send)]
 mod h3;
-#[expect(clippy::future_not_send)]
+// Triggered on stable clippy; nightly clippy no longer flags `pool` on wasm32-wasip3.
+#[allow(clippy::future_not_send)]
 mod pool;
 #[cfg(native_driver)]
 mod runtime;

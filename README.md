@@ -251,14 +251,15 @@ On native, pick a backend, and for hyper a TLS engine:
 
 | Feature | Backend | TLS | Notes |
 |---|---|---|---|
-| `hyper-backend` + `rustls` | Hyper | rustls, verified by the OS (`rustls-platform-verifier`) | **Default.** |
+| `hyper-backend` + `rustls-ring` | Hyper | rustls (`ring`), verified by the OS (`rustls-platform-verifier`) | **Default.** |
+| `hyper-backend` + `rustls` | Hyper | rustls over a caller-installed `CryptoProvider` | Pure-Rust / custom crypto |
 | `hyper-backend` + `native-tls` | Hyper | Platform native | OpenSSL / SChannel / Security.framework |
 | `curl-backend` | libcurl | libcurl's | Smaller binary if you have system libcurl |
 | `apple-backend` | URLSession | Security.framework | Experimental. macOS/iOS only |
 
 `ws` (websockets) uses the same engine as hyper. When `rustls` and `native-tls`
 are both enabled, `rustls` takes precedence. The `default` feature enables
-`hyper-backend`, `rustls`, `ws` and `http2`.
+`hyper-backend`, `rustls-ring`, `ws`, `http2`, `http3`, `onecrl` and `public-suffix`.
 
 The hyper backend negotiates HTTP/2 through ALPN by default on every TLS
 connection that allows it (`http2` feature); servers that only speak HTTP/1.1

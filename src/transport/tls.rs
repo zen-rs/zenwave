@@ -19,9 +19,10 @@ mod engine {
     use arc_swap::ArcSwap;
     #[cfg(connector)]
     use futures_io::{AsyncRead, AsyncWrite};
+    use rustls::ClientConfig;
+    use rustls::crypto::CryptoProvider;
     #[cfg(connector)]
     use rustls::pki_types::ServerName;
-    use rustls::{ClientConfig, crypto::ring};
     use rustls_pki_types::CertificateDer;
     #[cfg(not(any(android_verifier, wasi_verifier)))]
     use rustls_platform_verifier::Verifier;
@@ -29,7 +30,12 @@ mod engine {
     #[cfg(onecrl)]
     use super::super::onecrl::Additions;
     use super::Protocols;
-    #[cfg(any(connector, android_verifier, wasi_verifier))]
+    #[cfg(any(
+        connector,
+        android_verifier,
+        wasi_verifier,
+        not(feature = "rustls-ring")
+    ))]
     use crate::Cause;
     use crate::Error;
     #[cfg(connector)]
@@ -159,7 +165,16 @@ mod engine {
             #[cfg(onecrl)] additions: Option<Arc<ArcSwap<Additions>>>,
             #[cfg(test)] wrap: Option<VerifierWrap>,
         ) -> Result<Self, Error> {
-            let provider = Arc::new(ring::default_provider());
+            #[cfg(feature = "rustls-ring")]
+            let provider = CryptoProvider::get_default()
+                .cloned()
+                .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+            #[cfg(not(feature = "rustls-ring"))]
+            let provider = CryptoProvider::get_default().cloned().ok_or_else(|| {
+                Error::tls_config(Cause::Detail(String::from(
+                    "no rustls CryptoProvider installed; enable the `rustls-ring` feature or call `CryptoProvider::install_default`",
+                )))
+            })?;
             let verifier = verifier(
                 extra_roots,
                 Arc::clone(&provider),

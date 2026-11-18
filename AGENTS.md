@@ -14,7 +14,7 @@ cargo test
 
 # Specific backend / TLS engine
 cargo test --no-default-features --features curl-backend
-cargo test --no-default-features --features hyper-backend,rustls,ws
+cargo test --no-default-features --features hyper-backend,rustls-ring,ws
 cargo test --no-default-features --features hyper-backend,native-tls,ws
 cargo test --no-default-features --features apple-backend  # macOS only
 cargo test --no-default-features --features native-compio,native-http3
@@ -31,8 +31,10 @@ cargo clippy --target wasm32-wasip2 --no-default-features --features wasi-backen
 cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features wasi-backend,public-suffix --lib --test wasi_backend -- -D warnings
 
 # WASI (the native backend over the host's sockets, resolver and clock).
-# ring's C archive needs llvm-ar: AR_wasm32_wasip2 / RANLIB_wasm32_wasip2.
-cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend -- -D warnings
+# Pure-Rust (`native-backend` without `rustls-ring`, caller installs a CryptoProvider) needs no C toolchain;
+# adding `rustls-ring` builds ring's C archive and needs llvm-ar: AR_wasm32_wasip2 / RANLIB_wasm32_wasip2.
+cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend --lib --test wasi_native_backend -- -D warnings
+cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features native-backend --lib --test wasi_native_backend -- -D warnings
 ```
 
 ## Project layout

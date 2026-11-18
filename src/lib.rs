@@ -41,7 +41,7 @@
 //! for hyper and websockets, two TLS engines.
 //!
 //! ### Default
-//! `hyper-backend` + `rustls` + `ws`. rustls verifies certificates through the
+//! `hyper-backend` + `rustls-ring` + `ws`. rustls verifies certificates through the
 //! operating system (`rustls-platform-verifier`): Security.framework on
 //! Apple platforms, `CryptoAPI` on Windows, and the system CA bundle on Linux.
 //! On Android it verifies with webpki against the system trust anchors read
@@ -50,17 +50,20 @@
 //! [`Transport`] for adding roots.
 //!
 //! ### Features
-//! - **`hyper-backend`**: hyper over async-io. Needs `rustls` or `native-tls`.
+//! - **`hyper-backend`**: hyper over async-io. Needs `rustls` (with `rustls-ring` or an installed `CryptoProvider`) or `native-tls`.
 //! - **`native-compio`** / **`native-tokio`**: HTTP/1.1 (and HTTP/3 with
 //!   `native-http3`) on http-kit's owned-buffer I/O, driven by compio or
 //!   tokio; the default backend when `hyper-backend` is off. `native-backend`
 //!   alone gives the runtime-neutral backend for callers that drive it on
-//!   their own thread; such a build has no default backend, so
+//!   their own thread (installing a `CryptoProvider` or enabling `rustls-ring`);
+//!   such a build has no default backend, so
 //!   `zenwave::client()`, `DefaultClient`, the one-shot request functions and
 //!   the `OAuth2` middleware (which fetches its token through `client()`)
 //!   are absent.
-//! - **`rustls`** / **`native-tls`**: the TLS engine for hyper and websockets.
-//!   Both may be enabled; `rustls` takes precedence.
+//! - **`rustls`** / **`rustls-ring`** / **`native-tls`**: the TLS engine for hyper and websockets.
+//!   `rustls-ring` adds `ring` as the default `CryptoProvider`; `rustls` alone
+//!   uses the process-default `CryptoProvider`. Both `rustls` and `native-tls`
+//!   may be enabled; `rustls` takes precedence.
 //! - **`curl-backend`**: libcurl-based backend with its own TLS.
 //! - **`apple-backend`**: Apple's native `NSURLSession` (macOS/iOS only).
 //! - **`ws`**: websocket support.

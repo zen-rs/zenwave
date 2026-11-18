@@ -11,7 +11,7 @@
 # needs `gradle` on the PATH.
 set -euo pipefail
 
-features=${1:-hyper-backend,rustls,ws}
+features=${1:-hyper-backend,rustls-ring,ws}
 
 if [[ -z "${ANDROID_SERIAL:-}" ]]; then
   devices=$(adb devices | awk 'NR > 1 && $2 == "device" { print $1 }')

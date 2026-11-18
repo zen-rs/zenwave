@@ -86,7 +86,7 @@ webpki-roots = { version = "1.0.11", optional = true }
 # store (`rustls-platform-verifier`), websockets, HTTP/2 and HTTP/3. On wasm32
 # the built-in Fetch backend is always used and none of the native features
 # apply.
-default = ["hyper-backend", "rustls", "ws", "http2", "http3", "onecrl", "public-suffix"]
+default = ["hyper-backend", "rustls-ring", "ws", "http2", "http3", "onecrl", "public-suffix"]
 
 # HTTP backends (native platforms only). At least one must be enabled.
 #
@@ -119,6 +119,10 @@ rustls = [
     "dep:webpki-root-certs",
     "dep:webpki-roots",
 ]
+# Enable the `ring` cryptography provider for rustls (included in `default`).
+# Without this feature, the caller must install a `rustls::crypto::CryptoProvider`
+# via `CryptoProvider::install_default`.
+rustls-ring = ["rustls", "rustls/ring", "futures-rustls?/ring"]
 # The platform's native TLS library (OpenSSL, SChannel, or Security.framework),
 # driven on futures-io streams by an in-tree adapter.
 native-tls = ["dep:native-tls"]
@@ -145,9 +149,9 @@ native-backend = [
     "http-kit-h1/pipe",
 ]
 # compio (io_uring, IOCP, polling) for the native backend.
-native-compio = ["native-backend", "getaddrinfo", "http-kit-io/compio", "executor-core/compio", "dep:compio"]
+native-compio = ["native-backend", "rustls-ring", "getaddrinfo", "http-kit-io/compio", "executor-core/compio", "dep:compio"]
 # tokio's reactor for the native backend.
-native-tokio = ["native-backend", "getaddrinfo", "http-kit-io/tokio", "executor-core/tokio", "dep:tokio"]
+native-tokio = ["native-backend", "rustls-ring", "getaddrinfo", "http-kit-io/tokio", "executor-core/tokio", "dep:tokio"]
 # HTTP/3 for the native backend through `http-kit-h3` (quiche; builds
 # BoringSSL with cmake). The server's chain goes to the same verifier as a TCP
 # connection's: the platform verifier with the transport's extra roots, and
@@ -161,15 +165,15 @@ native-http3 = ["native-backend", "dep:http-kit-h3", "http-kit-h3/quiche", "http
 native-kernel-tls = ["native-backend", "http-kit-tls/kernel"]
 
 # Shorthands.
-hyper-rustls = ["hyper-backend", "rustls"]
+hyper-rustls = ["hyper-backend", "rustls-ring"]
 hyper-native-tls = ["hyper-backend", "native-tls"]
 
 # Websocket support (async-tungstenite on native, web-sys WebSocket on wasm).
 ws = ["getaddrinfo", "dep:async-tungstenite", "dep:hyper-util", "dep:rustls-pki-types"]
 
 # HTTP/3 over QUIC for the hyper backend. QUIC needs a QUIC-capable TLS
-# library, so it requires the `rustls` engine.
-http3 = ["rustls", "dep:bytes", "dep:h3", "dep:h3-quinn", "dep:quinn"]
+# library, so it requires the `rustls` engine with `ring`.
+http3 = ["rustls-ring", "dep:bytes", "dep:h3", "dep:h3-quinn", "dep:quinn"]
 
 # Refuse certificates listed by Mozilla's OneCRL on the paths that verify
 # chains with webpki (`src/transport/onecrl.rs`). A pinned snapshot of the
@@ -244,8 +248,8 @@ executor-core = { git = "https://github.com/lexoliu/executor-core", branch = "ma
 http-kit-io = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
 http-kit-h1 = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
 http-kit-tls = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
-futures-rustls = { version = "0.26.0", optional = true, default-features = false, features = ["ring", "tls12"] }
-rustls = { version = "0.23.46", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+futures-rustls = { version = "0.26.0", optional = true, default-features = false, features = ["tls12"] }
+rustls = { version = "0.23.46", optional = true, default-features = false, features = ["std", "tls12"] }
 rustls-pki-types = { version = "1.15.1", optional = true, features = ["std"] }
 # The environment's proxy rules (`transport::proxy`).
 hyper-util = { version = "0.1.21", optional = true, default-features = false, features = ["client-proxy", "client-proxy-system"] }

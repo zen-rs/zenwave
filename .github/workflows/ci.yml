@@ -81,11 +81,13 @@ jobs:
       # The desktop clippy lanes never compile the wasm32-only code. The
       # examples block on async-io and are native-only, so they stay out.
       - run: cargo clippy --target wasm32-unknown-unknown --lib --tests -- -D warnings
-      # Pure WASI Preview 3 (`wasi:http/client`) compiles with zero C toolchain.
+      # Pure WASI Preview 3 (`wasi:http/client`) and pure-Rust `native-backend`
+      # (without `rustls-ring`) compile with zero C toolchain.
       - run: cargo clippy --target wasm32-wasip2 --no-default-features --features wasi-backend,public-suffix --lib --test wasi_backend -- -D warnings
-      # The native backend over a WASI host's sockets. ring compiles C for
-      # wasm32, which takes the image's LLVM: its clang, and its archiver,
-      # because GNU ar writes an index wasm-ld cannot read.
+      - run: cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend --lib --test wasi_native_backend -- -D warnings
+      # With `rustls-ring`, ring compiles C for wasm32, which takes the image's
+      # LLVM: its clang, and its archiver, because GNU ar writes an index
+      # wasm-ld cannot read.
       - name: Point ring's C build at LLVM for wasm32-wasip2
         run: |
           llvm="$(ls -d /usr/lib/llvm-* | sort -V | tail -n 1)/bin"
@@ -94,13 +96,14 @@ jobs:
             echo "AR_wasm32_wasip2=$llvm/llvm-ar"
             echo "RANLIB_wasm32_wasip2=$llvm/llvm-ranlib"
           } >> "$GITHUB_ENV"
-      - run: cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend --lib --test wasi_native_backend -- -D warnings
-      - run: cargo clippy --target wasm32-wasip2 --no-default-features --features wasi-backend,native-backend --lib --test wasi_backend --test wasi_native_backend -- -D warnings
+      - run: cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend,rustls-ring --lib --test wasi_native_backend -- -D warnings
+      - run: cargo clippy --target wasm32-wasip2 --no-default-features --features wasi-backend,native-backend,rustls-ring --lib --test wasi_backend --test wasi_native_backend -- -D warnings
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: wasm32-wasip3
           components: clippy
       - run: cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features wasi-backend,public-suffix --lib --test wasi_backend -- -D warnings
+      - run: cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features native-backend --lib --test wasi_native_backend -- -D warnings
 
   mobile:
     # Cross-compilation for the mobile targets, tests included. The suites run
@@ -116,35 +119,35 @@ jobs:
           - name: iOS device
             os: macos-latest
             target: aarch64-apple-ios
-            features: apple-backend,hyper-backend,rustls,ws
+            features: apple-backend,hyper-backend,rustls-ring,ws
             android-api: ""
             android-clang-prefix: ""
             android-rust-target-env: ""
           - name: iOS simulator
             os: macos-latest
             target: aarch64-apple-ios-sim
-            features: apple-backend,hyper-backend,rustls,ws
+            features: apple-backend,hyper-backend,rustls-ring,ws
             android-api: ""
             android-clang-prefix: ""
             android-rust-target-env: ""
           - name: Android arm64
             os: ubuntu-latest
             target: aarch64-linux-android
-            features: hyper-backend,rustls,ws
+            features: hyper-backend,rustls-ring,ws
             android-api: "35"
             android-clang-prefix: aarch64-linux-android
             android-rust-target-env: aarch64_linux_android
           - name: Android x86_64
             os: ubuntu-latest
             target: x86_64-linux-android
-            features: hyper-backend,rustls,ws
+            features: hyper-backend,rustls-ring,ws
             android-api: "35"
             android-clang-prefix: x86_64-linux-android
             android-rust-target-env: x86_64_linux_android
           - name: Android armv7
             os: ubuntu-latest
             target: armv7-linux-androideabi
-            features: hyper-backend,rustls,ws
+            features: hyper-backend,rustls-ring,ws
             android-api: "35"
             android-clang-prefix: armv7a-linux-androideabi
             android-rust-target-env: armv7_linux_androideabi
