@@ -85,25 +85,51 @@ jobs:
       # (without `rustls-ring`) compile with zero C toolchain.
       - run: cargo clippy --target wasm32-wasip2 --no-default-features --features wasi-backend,public-suffix --lib --test wasi_backend -- -D warnings
       - run: cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend --lib --test wasi_native_backend -- -D warnings
-      # With `rustls-ring`, ring compiles C for wasm32, which takes the image's
-      # LLVM: its clang, and its archiver, because GNU ar writes an index
-      # wasm-ld cannot read.
-      - name: Point ring's C build at LLVM for wasm32-wasip2
+      # With `rustls-ring` or `native-http3`, ring and BoringSSL (`boring-sys` /
+      # `quiche`) compile C/C++ for wasm32: ring takes the runner's LLVM clang
+      # and llvm-ar (GNU ar writes an index wasm-ld cannot read), and BoringSSL
+      # cross-compiles against Zig's single-threaded WASI sysroot through
+      # `scripts/wasi-boringssl.cmake`.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: Install WASI BoringSSL build dependencies
         run: |
-          llvm="$(ls -d /usr/lib/llvm-* | sort -V | tail -n 1)/bin"
+          if ! command -v cmake >/dev/null || ! command -v ninja >/dev/null || ! dpkg -s libclang-dev >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends cmake ninja-build libclang-dev
+          fi
+      - name: Configure WASI C/C++ toolchain for ring and BoringSSL
+        run: |
+          llvm_root="$(ls -d /usr/lib/llvm-* | sort -V | tail -n 1)"
+          llvm="$llvm_root/bin"
+          zig_lib="$(zig env | sed -n 's/.*lib_dir[" ]*[:=][ "]*\([^"]*\).*/\1/p')"
+          wasi_bindgen="--target=wasm32-wasi -fvisibility=default -nostdlibinc -idirafter $zig_lib/libc/include/wasm-wasi-musl -idirafter $zig_lib/libc/include/generic-musl -DOPENSSL_NO_ASM -DOPENSSL_NO_SOCK -DOPENSSL_NO_POSIX_IO -DOPENSSL_NO_THREADS_CORRUPT_MEMORY_AND_LEAK_SECRETS_IF_THREADED"
+          echo "$llvm" >> "$GITHUB_PATH"
           {
+            echo "LIBCLANG_PATH=$llvm_root/lib"
             echo "CC_wasm32_wasip2=$llvm/clang"
             echo "AR_wasm32_wasip2=$llvm/llvm-ar"
             echo "RANLIB_wasm32_wasip2=$llvm/llvm-ranlib"
+            echo "CMAKE_GENERATOR=Ninja"
+            echo "CMAKE_TOOLCHAIN_FILE_wasm32_wasip2=$GITHUB_WORKSPACE/scripts/wasi-boringssl.cmake"
+            echo "CMAKE_TOOLCHAIN_FILE_wasm32_wasip3=$GITHUB_WORKSPACE/scripts/wasi-boringssl.cmake"
+            echo "BORING_BSSL_RUST_CPPLIB_wasm32_wasip2=c++"
+            echo "BORING_BSSL_RUST_CPPLIB_wasm32_wasip3=c++"
+            echo "BINDGEN_EXTRA_CLANG_ARGS_wasm32_wasip2=$wasi_bindgen"
+            echo "BINDGEN_EXTRA_CLANG_ARGS_wasm32_wasip3=$wasi_bindgen"
           } >> "$GITHUB_ENV"
       - run: cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend,rustls-ring --lib --test wasi_native_backend -- -D warnings
       - run: cargo clippy --target wasm32-wasip2 --no-default-features --features wasi-backend,native-backend,rustls-ring --lib --test wasi_backend --test wasi_native_backend -- -D warnings
+      - run: cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend,native-http3 --lib --test wasi_native_backend -- -D warnings
+      - run: cargo test --no-run --target wasm32-wasip2 --no-default-features --features native-backend,native-http3 --test wasi_native_backend
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: wasm32-wasip3
           components: clippy
       - run: cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features wasi-backend,public-suffix --lib --test wasi_backend -- -D warnings
       - run: cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features native-backend --lib --test wasi_native_backend -- -D warnings
+      - run: cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features native-backend,native-http3 --lib --test wasi_native_backend -- -D warnings
 
   mobile:
     # Cross-compilation for the mobile targets, tests included. The suites run

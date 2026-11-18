@@ -552,7 +552,7 @@ pub(super) fn report_alt_svc(pool: &super::PoolHandle, origin: &Origin, headers:
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, reactor))]
 mod tests {
     use rcgen::{
         BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,

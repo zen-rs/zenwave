@@ -34,7 +34,8 @@
 //!   Supplies [`DefaultBackend`](backend::DefaultBackend), [`client()`],
 //!   [`get()`] and friends.
 //! - **`native-backend`**: `NativeBackend::on_current_thread` over the
-//!   host's `http-kit-io` sockets, resolver and clock. See [`backend`].
+//!   host's `http-kit-io` sockets, resolver and clock (HTTP/1.1, and HTTP/3
+//!   with `native-http3`). See [`backend`].
 //!
 //! ## Native Platforms
 //! On native platforms, Zenwave supports multiple HTTP client backends and,

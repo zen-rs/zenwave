@@ -18,14 +18,15 @@
 //!   `wasi:clocks/monotonic-clock`, with no guest TLS or socket dependencies.
 //!   It is the [`DefaultBackend`] on WASI when enabled.
 //! - **`native-backend`**: `NativeBackend::on_current_thread` over the host's
-//!   `http-kit-io` implementation (`Dial`, `Resolve`, `Timer`), HTTP/1.1, and
-//!   TLS verified against `webpki-roots` compiled into the binary, with the
-//!   compiled OneCRL table applied (its refresher needs a thread and a
-//!   connector, and is left out).
+//!   `http-kit-io` implementation (`Dial`, `Resolve`, `Timer`, plus `Datagram`
+//!   and `ResolveHttps` with `native-http3`), HTTP/1.1 (and HTTP/3 with
+//!   `native-http3`), and TLS verified against `webpki-roots` compiled into the
+//!   binary, with the compiled OneCRL table applied (its refresher needs a
+//!   thread and a connector, and is left out).
 //!
 //! `hyper-backend`, `curl-backend`, `ws`, `native-tls`, `native-compio`,
-//! `native-tokio`, `native-http3` and `native-kernel-tls` are refused with a
-//! compile error on WASI.
+//! `native-tokio` and `native-kernel-tls` are refused with a compile error on
+//! WASI.
 //!
 //! ## Native Platforms
 //! On native platforms, users can choose their preferred backend:
@@ -213,10 +214,10 @@ compile_error!(
 // Compile-time validation for WASI: the native backend over the host's sockets
 // ============================================================================
 
-// A WASI host has no OS reactor, no `getaddrinfo`, no QUIC socket and no
-// kernel TLS: the native backend runs there on the caller's `Dial`, `Resolve`
-// and `Timer` with HTTP/1.1 over TLS, and every feature that needs more is
-// refused instead of compiling to nothing.
+// A WASI host has no OS reactor, no `getaddrinfo` and no kernel TLS: the
+// native backend runs there on the caller's `Dial`, `Resolve` and `Timer`
+// (plus `Datagram` and `ResolveHttps` with `native-http3`), and every feature
+// that needs more is refused instead of compiling to nothing.
 
 #[cfg(all(target_os = "wasi", target_env = "p1", feature = "wasi-backend"))]
 compile_error!(
@@ -256,12 +257,6 @@ compile_error!(
     "`native-compio` and `native-tokio` drive the native backend on an OS reactor, \
      which WASI does not have. Construct `NativeBackend::on_current_thread` on the \
      host's executor instead."
-);
-
-#[cfg(all(target_os = "wasi", feature = "native-http3"))]
-compile_error!(
-    "`native-http3` needs QUIC sockets and a C toolchain for quiche, which are not \
-     available on WASI."
 );
 
 #[cfg(all(target_os = "wasi", feature = "native-kernel-tls"))]
