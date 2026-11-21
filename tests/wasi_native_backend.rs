@@ -1,5 +1,5 @@
 //! Compile- and link-checked WASI native backend tests (`native-backend`, plus
-//! `native-http3`).
+//! `native-http2` and `native-http3`).
 //!
 //! Verifies that `NativeBackend::on_current_thread` builds and links on
 //! `wasm32-wasip2` and `wasm32-wasip3` over a host's `Dial`, `Datagram`,

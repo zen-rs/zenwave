@@ -254,6 +254,7 @@ On native, pick a backend, and for hyper a TLS engine:
 | `hyper-backend` + `rustls-ring` | Hyper | rustls (`ring`), verified by the OS (`rustls-platform-verifier`) | **Default.** |
 | `hyper-backend` + `rustls` | Hyper | rustls over a caller-installed `CryptoProvider` | Pure-Rust / custom crypto |
 | `hyper-backend` + `native-tls` | Hyper | Platform native | OpenSSL / SChannel / Security.framework |
+| `native-compio` / `native-tokio` | Native (`http-kit`) | rustls (`http-kit-tls`) | Owned-buffer I/O; add `native-http2` / `native-http3` for HTTP/2 and HTTP/3 |
 | `curl-backend` | libcurl | libcurl's | Smaller binary if you have system libcurl |
 | `apple-backend` | URLSession | Security.framework | Experimental. macOS/iOS only |
 
@@ -261,13 +262,14 @@ On native, pick a backend, and for hyper a TLS engine:
 are both enabled, `rustls` takes precedence. The `default` feature enables
 `hyper-backend`, `rustls-ring`, `ws`, `http2`, `http3`, `onecrl` and `public-suffix`.
 
-The hyper backend negotiates HTTP/2 through ALPN by default on every TLS
-connection that allows it (`http2` feature); servers that only speak HTTP/1.1
-keep working unchanged. It also upgrades an origin to HTTP/3 (`http3`
-feature) when the origin advertises it — through an `Alt-Svc` response header
-or an HTTPS DNS record — racing QUIC against TCP and falling back to TCP when
-QUIC is unavailable. Disable with `default-features = false` for a smaller
-build.
+The hyper backend (`http2`, on by default) and the native backend
+(`native-http2`) negotiate HTTP/2 through ALPN on every TLS connection that
+allows it; servers that only speak HTTP/1.1 keep working unchanged. Both
+backends also upgrade an origin to HTTP/3 (`http3` on hyper, `native-http3` on
+the native backend) when the origin advertises it — through an `Alt-Svc`
+response header or an HTTPS DNS record — racing QUIC against TCP and falling
+back to TCP when QUIC is unavailable. Disable with `default-features = false`
+for a smaller build.
 
 Common dependency lines:
 

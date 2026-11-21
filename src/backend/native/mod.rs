@@ -1,6 +1,7 @@
-//! The runtime-neutral backend: HTTP/1.1 through `http-kit-h1` and, with
-//! `native-http3`, HTTP/3 through `http-kit-h3`, over `http-kit-io`'s
-//! owned-buffer sockets, with TLS through `http-kit-tls`.
+//! The runtime-neutral backend: HTTP/1.1 through `http-kit-h1`, HTTP/2
+//! through `http-kit-h2` (`native-http2`), and HTTP/3 through `http-kit-h3`
+//! (`native-http3`), over `http-kit-io`'s owned-buffer sockets, with TLS
+//! through `http-kit-tls`.
 //!
 //! Connections live in a per-thread pool ([`pool`]) on whichever runtime
 //! drives it: the caller's own thread, for a thread-per-core server, or a
@@ -256,6 +257,84 @@ impl NativeBackend {
         ))
     }
 
+    /// Sends `request` on a shared HTTP/2 connection, handing it back for a
+    /// fresh checkout when the peer rejected it unprocessed (`GOAWAY` or
+    /// `REFUSED_STREAM`), when a reused connection took none of it, or when a
+    /// reused connection closed under an idempotent replayable request.
+    #[cfg(native_h2)]
+    async fn send_h2(
+        &self,
+        origin: &Origin,
+        mut request: http::Request<Body>,
+        send: http_kit_h2::SendRequest,
+        reused: bool,
+        allow_retry: bool,
+        deadlines: Deadlines,
+    ) -> Result<Result<Response, http::Request<Body>>, Error> {
+        let mut replay = allow_retry.then(|| replayable_request(&request)).flatten();
+        request.extensions_mut().insert(deadlines);
+        let mut failure = match send.try_send(request).await {
+            Ok(response) => return Ok(Ok(response.map(|body| keep_pool(body, &self.pool)))),
+            Err(failure) => failure,
+        };
+        if matches!(
+            failure.error(),
+            http_kit_h2::Error::Timeout(http_kit_h2::Timeout::ResponseHead)
+        ) {
+            return Err(Error::Timeout(TimedOut::ResponseHead));
+        }
+        if matches!(
+            failure.error(),
+            http_kit_h2::Error::Timeout(http_kit_h2::Timeout::BodyIdle)
+        ) {
+            return Err(Error::Timeout(TimedOut::BodyIdle));
+        }
+        if allow_retry {
+            // RFC 9113 §6.8, §8.7: a stream above the peer's GOAWAY
+            // last-stream-id or reset with REFUSED_STREAM was never processed,
+            // whatever its method.
+            if matches!(failure.error(), http_kit_h2::Error::RequestRejected)
+                && let Some(unsent) = failure.take_request().or_else(|| replay.take())
+            {
+                tracing::debug!(
+                    host = %origin.host,
+                    error = %failure,
+                    "HTTP/2 server rejected request unprocessed; dialing fresh"
+                );
+                return Ok(Err(unsent));
+            }
+            if reused {
+                if let Some(unsent) = failure.take_request() {
+                    tracing::debug!(
+                        host = %origin.host,
+                        error = %failure,
+                        "reused HTTP/2 connection took none of the request; dialing fresh"
+                    );
+                    return Ok(Err(unsent));
+                }
+                if let Some(replay) = replay.filter(|req| idempotent(req.method()))
+                    && matches!(
+                        failure.error(),
+                        http_kit_h2::Error::ConnectionClosed
+                            | http_kit_h2::Error::PeerGoAway { .. }
+                            | http_kit_h2::Error::Io(_)
+                    )
+                {
+                    tracing::debug!(
+                        host = %origin.host,
+                        error = %failure,
+                        "reused HTTP/2 connection failed under an idempotent request; dialing fresh"
+                    );
+                    return Ok(Err(replay));
+                }
+            }
+        }
+        Err(h2_error(
+            failure.into_error(),
+            origin.scheme == Scheme::HTTPS,
+        ))
+    }
+
     /// Sends `request` on the origin's HTTP/3 connection, whose handshake
     /// has completed.
     #[cfg(native_h3)]
@@ -319,6 +398,48 @@ fn h1_error(error: http_kit_h1::Error, tls: bool) -> Error {
     Error::exchange(failure, Cause::H1(error))
 }
 
+/// How an HTTP/2 client failure reads to a request. `tls` says the connection
+/// carries TLS, where invalid data from the socket is the TLS layer's.
+#[cfg(native_h2)]
+fn h2_error(error: http_kit_h2::Error, tls: bool) -> Error {
+    use std::io::ErrorKind;
+
+    use http_kit_h2::{Error as H2, Malformed, Timeout};
+
+    let failure = match &error {
+        H2::Timeout(Timeout::ResponseHead) => return Error::Timeout(TimedOut::ResponseHead),
+        H2::Timeout(Timeout::BodyIdle) => return Error::Timeout(TimedOut::BodyIdle),
+        H2::ConnectionClosed
+        | H2::StreamReset(_)
+        | H2::RequestRejected
+        | H2::PeerGoAway { .. }
+        | H2::StreamsExhausted
+        | H2::Timeout(_) => ExchangeFailure::Terminated,
+        H2::Malformed(Malformed::HeaderListTooLarge { limit }) => ExchangeFailure::HeadTooLarge {
+            limit: *limit as usize,
+        },
+        H2::Protocol { .. } | H2::Malformed(_) => ExchangeFailure::Protocol,
+        H2::Body(_) => ExchangeFailure::RequestBody,
+        H2::ContentLengthMismatch { declared } => ExchangeFailure::RequestBodyLength {
+            declared: *declared,
+        },
+        H2::MissingAuthority
+        | H2::InformationalResponse(_)
+        | H2::UnsupportedFrame
+        | H2::UnsupportedExtendedConnect => ExchangeFailure::InvalidRequest,
+        H2::Io(io) => match io.kind() {
+            ErrorKind::InvalidData if tls => ExchangeFailure::Tls,
+            ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof => ExchangeFailure::Terminated,
+            _ => ExchangeFailure::Io,
+        },
+        _ => ExchangeFailure::Io,
+    };
+    Error::exchange(failure, Cause::H2(error))
+}
+
 /// Whether `method` is idempotent (RFC 9110 §9.2.2): one a client may send
 /// again after a connection failed under it.
 const fn idempotent(method: &Method) -> bool {
@@ -344,6 +465,7 @@ impl Endpoint for NativeBackend {
         // whichever connection serves the retry.
         let uri = request.uri().clone();
         let origin = request_origin(&uri)?;
+        let upgrade_requested = request.headers().contains_key(http::header::UPGRADE);
         // The request's own timeouts over the transport's defaults. They stay
         // on the slot with the rest of the extensions; the connection takes
         // the exchange's deadlines with each send, so a request handed back
@@ -354,12 +476,24 @@ impl Endpoint for NativeBackend {
             .copied()
             .unwrap_or_default()
             .or(self.transport.timeouts());
-        let mut fresh = false;
+        let mut retried = false;
+        #[cfg(native_h2)]
+        let mut avoid_h2 = None;
         #[cfg(native_h3)]
-        let h3 = self.h3_use(&origin)?;
+        let h3 = if upgrade_requested {
+            pool::H3Use::Blocked
+        } else {
+            self.h3_use(&origin)?
+        };
+        #[cfg(not(any(native_h2, native_h3)))]
+        let _ = upgrade_requested;
         loop {
             let want = Want {
-                fresh,
+                fresh: retried,
+                #[cfg(native_h2)]
+                allow_h2: !upgrade_requested,
+                #[cfg(native_h2)]
+                avoid_h2,
                 #[cfg(native_h3)]
                 h3,
             };
@@ -369,11 +503,27 @@ impl Endpoint for NativeBackend {
                 .await?;
             let sent = match granted {
                 Grant::H1 { send, via, reused } => {
+                    self.send_h1(
+                        &origin,
+                        request,
+                        send,
+                        via,
+                        reused && !retried,
+                        timeouts.exchange,
+                    )
+                    .await?
+                }
+                #[cfg(native_h2)]
+                Grant::H2 {
+                    send,
+                    generation,
+                    reused,
+                } => {
                     let sent = self
-                        .send_h1(&origin, request, send, via, reused, timeouts.exchange)
+                        .send_h2(&origin, request, send, reused, !retried, timeouts.exchange)
                         .await?;
                     if sent.is_err() {
-                        fresh = true;
+                        avoid_h2 = Some(generation);
                     }
                     sent
                 }
@@ -390,6 +540,7 @@ impl Endpoint for NativeBackend {
                     return Ok(response);
                 }
                 Err(unsent) => {
+                    retried = true;
                     request = unsent;
                     *request.uri_mut() = uri.clone();
                 }
@@ -485,9 +636,9 @@ impl FrameSource for LeaseReturn {
     }
 }
 
-/// An HTTP/3 response body that keeps the pool, and with it the
-/// connection's driver, running until the body is done.
-#[cfg(native_h3)]
+/// A multiplexed response body (HTTP/2 or HTTP/3) that keeps the pool, and
+/// with it the connection's driver, running until the body is done.
+#[cfg(any(native_h2, native_h3))]
 fn keep_pool(body: Body, pool: &PoolHandle) -> Body {
     Body::from_source(KeepPool {
         inner: body,
@@ -496,13 +647,13 @@ fn keep_pool(body: Body, pool: &PoolHandle) -> Body {
 }
 
 /// The consumer's [`PipeOffer`] passes through to the connection's body.
-#[cfg(native_h3)]
+#[cfg(any(native_h2, native_h3))]
 struct KeepPool {
     inner: Body,
     _pool: PoolHandle,
 }
 
-#[cfg(native_h3)]
+#[cfg(any(native_h2, native_h3))]
 impl FrameSource for KeepPool {
     fn poll_next_frame(
         self: Pin<&mut Self>,
@@ -550,6 +701,23 @@ mod tests {
             requests: send,
             upgrade: upgrade::channel().0,
         }
+    }
+
+    #[cfg(native_h2)]
+    async fn stopped_h2<I: NativeIo + Listen>(io: &I) -> http_kit_h2::SendRequest {
+        let listener = io
+            .bind_tcp("127.0.0.1:0".parse().expect("loopback"))
+            .expect("bind");
+        let addr = listener.local_addr().expect("local address");
+        let (stream, accepted) = futures_util::join!(io.connect(addr), listener.accept());
+        accepted.expect("accept");
+        let (send, connection) = http_kit_h2::handshake_stream(
+            stream.expect("connect"),
+            io.clone(),
+            http_kit_h2::ClientConfig::default(),
+        );
+        drop(connection);
+        send
     }
 
     fn post() -> http::Request<Body> {
@@ -605,6 +773,53 @@ mod tests {
         );
     }
 
+    #[cfg(native_h2)]
+    async fn unsent_h2_requests_come_back<I: NativeIo + Listen>(io: I) {
+        let (pool, _receiver) = PoolHandle::channel();
+        let transport = Transport::builder()
+            .proxy(Proxy::none())
+            .build()
+            .expect("transport builds");
+        let backend = NativeBackend { transport, pool };
+        let mut https_post = post();
+        *https_post.uri_mut() = "https://localhost:9/orders".parse().expect("URI");
+        let origin = request_origin(&https_post.uri().clone()).expect("origin");
+
+        let sent = backend
+            .send_h2(
+                &origin,
+                https_post,
+                stopped_h2(&io).await,
+                true,
+                true,
+                Deadlines::default(),
+            )
+            .await;
+        let Ok(Err(returned)) = sent else {
+            panic!("the unsent H2 POST must come back, got {sent:?}");
+        };
+        assert_eq!(returned.method(), Method::POST);
+        let body = returned.into_body().into_bytes().await.expect("body reads");
+        assert_eq!(body.as_ref(), ORDER.as_bytes());
+
+        let mut fresh_post = post();
+        *fresh_post.uri_mut() = "https://localhost:9/orders".parse().expect("URI");
+        let sent = backend
+            .send_h2(
+                &origin,
+                fresh_post,
+                stopped_h2(&io).await,
+                false,
+                true,
+                Deadlines::default(),
+            )
+            .await;
+        assert!(
+            sent.is_err(),
+            "a fresh H2 connection's closure is the request's"
+        );
+    }
+
     #[cfg(feature = "native-compio")]
     #[test]
     fn unsent_requests_come_back_on_compio() {
@@ -621,5 +836,23 @@ mod tests {
             .build()
             .expect("tokio runtime")
             .block_on(unsent_requests_come_back(Tokio));
+    }
+
+    #[cfg(all(native_h2, feature = "native-compio"))]
+    #[test]
+    fn unsent_h2_requests_come_back_on_compio() {
+        compio::runtime::Runtime::new()
+            .expect("compio runtime")
+            .block_on(unsent_h2_requests_come_back(Compio::default()));
+    }
+
+    #[cfg(all(native_h2, feature = "native-tokio"))]
+    #[test]
+    fn unsent_h2_requests_come_back_on_tokio() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(unsent_h2_requests_come_back(Tokio));
     }
 }

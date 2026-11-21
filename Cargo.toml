@@ -128,7 +128,8 @@ rustls-ring = ["rustls", "rustls/ring", "futures-rustls?/ring"]
 native-tls = ["dep:native-tls"]
 
 # The runtime-neutral backend on `http-kit-io`'s owned-buffer sockets:
-# HTTP/1.1 through `http-kit-h1`, TLS through `http-kit-tls` (rustls, verified
+# HTTP/1.1 through `http-kit-h1` (plus HTTP/2 with `native-http2` and HTTP/3
+# with `native-http3`), TLS through `http-kit-tls` (rustls, verified
 # as the hyper backend verifies). It runs on whichever runtime the caller's
 # thread runs; `native-compio` or `native-tokio` adds that runtime as the
 # driver behind `NativeBackend::new` for callers on no runtime at all. It is
@@ -152,6 +153,9 @@ native-backend = [
 native-compio = ["native-backend", "rustls-ring", "getaddrinfo", "http-kit-io/compio", "executor-core/compio", "dep:compio"]
 # tokio's reactor for the native backend.
 native-tokio = ["native-backend", "rustls-ring", "getaddrinfo", "http-kit-io/tokio", "executor-core/tokio", "dep:tokio"]
+# HTTP/2 for the native backend through `http-kit-h2`, negotiated with the
+# server through ALPN.
+native-http2 = ["native-backend", "dep:http-kit-h2", "http-kit-h2/pipe"]
 # HTTP/3 for the native backend through `http-kit-h3` (quiche; builds
 # BoringSSL with cmake). The server's chain goes to the same verifier as a TCP
 # connection's: the platform verifier with the transport's extra roots, and
@@ -244,9 +248,10 @@ time = "0.3.55"
 # native target including WASI, whose host supplies sockets, resolver and clock.
 [target.'cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))'.dependencies]
 executor-core = { git = "https://github.com/lexoliu/executor-core", branch = "main", optional = true }
-# The native backend: owned-buffer sockets, HTTP/1.1, HTTP/3 and TLS on them.
+# The native backend: owned-buffer sockets, HTTP/1.1, HTTP/2, HTTP/3 and TLS on them.
 http-kit-io = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
 http-kit-h1 = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
+http-kit-h2 = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
 http-kit-h3 = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
 http-kit-tls = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
 futures-rustls = { version = "0.26.0", optional = true, default-features = false, features = ["tls12"] }

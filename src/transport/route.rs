@@ -18,13 +18,14 @@ use crate::{ConfigError, Error};
 #[derive(Clone, Copy, Debug)]
 pub enum Protocols {
     /// Offer `http/1.1` only: plaintext connections, websockets, the TLS leg
-    /// to a forward proxy (hyper's h2 client cannot speak absolute-form), and
-    /// every native-backend connection.
+    /// to a forward proxy (neither h2 client speaks absolute-form), and
+    /// native-backend requests that ask to switch HTTP/1.1 protocols.
     Http1,
-    /// Offer `h2` and `http/1.1`, letting the server pick. Without the `http2`
-    /// feature this offers `http/1.1` alone.
-    #[cfg_attr(not(feature = "hyper-backend"), allow(dead_code))]
-    // only the hyper backend asks for h2; websockets never do
+    /// Offer `h2` and `http/1.1`, letting the server pick. Without the
+    /// backend's HTTP/2 feature (`http2` or `native-http2`) this offers
+    /// `http/1.1` alone.
+    #[cfg_attr(not(any(feature = "hyper-backend", native_h2)), allow(dead_code))]
+    // websockets never ask for h2
     Http2OrHttp1,
 }
 
@@ -52,8 +53,8 @@ pub enum Via {
 pub const MAX_H1_PER_ORIGIN: usize = 6;
 
 /// An idle h1 connection is dropped once it has gone unused for this long.
-/// The same window bounds a pooled h3 connection: QUIC keep-alives stop the
-/// protocol's own idle timeout from closing it, so the pool applies its own.
+/// The same window bounds pooled h2 and h3 connections in the native pool and
+/// pooled h3 connections in the hyper pool.
 #[cfg(pooled)]
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -80,7 +81,7 @@ pub struct Target<'a> {
     /// instead of sending absolute-form requests. Websockets need this.
     pub tunnel_plaintext: bool,
     /// The HTTP versions offered to the target through ALPN.
-    #[cfg_attr(not(connector), allow(dead_code))] // the native backend offers http/1.1 alone
+    #[cfg_attr(not(connector), allow(dead_code))]
     pub protocols: Protocols,
 }
 

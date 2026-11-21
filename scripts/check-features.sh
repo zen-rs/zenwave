@@ -11,7 +11,7 @@
 #   check-features.sh none        backends that need no engine, the default
 #                                 feature set, and the engine shorthands
 #   check-features.sh native      powerset of the native backend's runtimes,
-#                                 HTTP/3 and kernel TLS, alone and beside the defaults
+#                                 HTTP/2, HTTP/3 and kernel TLS, alone and beside the defaults
 #   check-features.sh             all of the above, in sequence
 set -euo pipefail
 
@@ -58,11 +58,11 @@ without_engine() {
 
 native() {
   # The native backend brings rustls itself; alone it has no default backend
-  # (its caller drives it), and a driver runtime makes it one. `native-http3`
-  # adds quiche on top of any of them.
+  # (its caller drives it), and a driver runtime makes it one. `native-http2`
+  # adds HTTP/2 and `native-http3` adds quiche on top of any of them.
   echo "::group::native backend powerset"
-  "${powerset[@]}" --include-features native-backend,native-compio,native-tokio,native-http3,native-kernel-tls \
-    --at-least-one-of native-backend,native-compio,native-tokio,native-http3,native-kernel-tls -- -D warnings
+  "${powerset[@]}" --include-features native-backend,native-compio,native-tokio,native-http2,native-http3,native-kernel-tls \
+    --at-least-one-of native-backend,native-compio,native-tokio,native-http2,native-http3,native-kernel-tls -- -D warnings
   echo "::endgroup::"
 
   echo "::group::native backend beside the native-tls engine"
@@ -70,7 +70,7 @@ native() {
   echo "::endgroup::"
 
   echo "::group::native backend beside the default features"
-  cargo clippy --all-targets --features native-compio,native-tokio,native-http3,native-kernel-tls -- -D warnings
+  cargo clippy --all-targets --features native-compio,native-tokio,native-http2,native-http3,native-kernel-tls -- -D warnings
   echo "::endgroup::"
 }
 

@@ -17,8 +17,8 @@ cargo test --no-default-features --features curl-backend
 cargo test --no-default-features --features hyper-backend,rustls-ring,ws
 cargo test --no-default-features --features hyper-backend,native-tls,ws
 cargo test --no-default-features --features apple-backend  # macOS only
-cargo test --no-default-features --features native-compio,native-http3
-cargo test --no-default-features --features native-tokio,native-http3
+cargo test --no-default-features --features native-compio,native-http2,native-http3
+cargo test --no-default-features --features native-tokio,native-http2,native-http3
 
 # Clippy (treat warnings as errors, matches CI)
 cargo clippy --all-targets --all-features -- -D warnings
@@ -33,8 +33,8 @@ cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features wa
 # WASI (the native backend over the host's sockets, resolver and clock).
 # Pure-Rust (`native-backend` without `rustls-ring`, caller installs a CryptoProvider) needs no C toolchain;
 # adding `rustls-ring` builds ring's C archive and needs llvm-ar: AR_wasm32_wasip2 / RANLIB_wasm32_wasip2.
-cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend --lib --test wasi_native_backend -- -D warnings
-cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features native-backend --lib --test wasi_native_backend -- -D warnings
+cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend,native-http2 --lib --test wasi_native_backend -- -D warnings
+cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features native-backend,native-http2 --lib --test wasi_native_backend -- -D warnings
 
 # WASI with HTTP/3 (`native-http3`): cross-compiles BoringSSL (`boring-sys` / `quiche`) against
 # `wasi-sdk-34+` (`WASI_SDK_PATH`) through `scripts/wasi-boringssl.cmake` (single-threaded:
@@ -46,13 +46,13 @@ LIBCLANG_PATH="$WASI_SDK_PATH/lib" \
   CMAKE_TOOLCHAIN_FILE_wasm32_wasip2="$PWD/scripts/wasi-boringssl.cmake" \
   BORING_BSSL_RUST_CPPLIB_wasm32_wasip2=c++ \
   BINDGEN_EXTRA_CLANG_ARGS_wasm32_wasip2="$WASI_BINDGEN" \
-  cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend,native-http3 --lib --test wasi_native_backend -- -D warnings
+  cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend,native-http2,native-http3 --lib --test wasi_native_backend -- -D warnings
 LIBCLANG_PATH="$WASI_SDK_PATH/lib" \
   CMAKE_GENERATOR=Ninja \
   CMAKE_TOOLCHAIN_FILE_wasm32_wasip3="$PWD/scripts/wasi-boringssl.cmake" \
   BORING_BSSL_RUST_CPPLIB_wasm32_wasip3=c++ \
   BINDGEN_EXTRA_CLANG_ARGS_wasm32_wasip3="$WASI_BINDGEN" \
-  cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features native-backend,native-http3 --lib --test wasi_native_backend -- -D warnings
+  cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features native-backend,native-http2,native-http3 --lib --test wasi_native_backend -- -D warnings
 ```
 
 ## Project layout
@@ -74,8 +74,8 @@ src/
       h3.rs       — HTTP/3 connection over QUIC (h3 + h3-quinn; http3 feature)
       test_support.rs — shared test fixtures: throwaway CA, TLS and h3 servers
     native/
-      mod.rs      — NativeBackend: h1 on http-kit-h1, h3 on http-kit-h3, over http-kit-io
-      pool.rs     — the per-thread pool actor: h1 leases, waiters, dial results
+      mod.rs      — NativeBackend: h1 on http-kit-h1, h2 on http-kit-h2, h3 on http-kit-h3, over http-kit-io
+      pool.rs     — the per-thread pool actor: h1 leases, shared h2, dial coalescing, waiters, dial results
       h3.rs       — the pool's h3 slot: QUIC dials raced against TCP, the transport's verifier, discovery
       connect.rs  — route execution on http-kit-io: unix sockets, happy eyeballs, CONNECT (TLS in TLS), SOCKS5, TLS
       runtime.rs  — Driver: compio and tokio driver threads for callers on no runtime
@@ -144,8 +144,8 @@ them. The native backend's pool is an actor owned by one thread
 (`backend/native/pool.rs`): a `NativeBackend` holds only a channel to it, so a
 thread-per-core caller builds one per thread and nothing crosses a lock.
 `cfg` aliases (`native`, `tls_rustls`, `tls_native`, `tls_engine`,
-`connector`, `dialer`, `native_backend`, `native_driver`, `native_h3`,
-`https_rr`, `android_verifier`) come from `build.rs`.
+`connector`, `dialer`, `native_backend`, `native_driver`, `native_h2`,
+`native_h3`, `https_rr`, `android_verifier`) come from `build.rs`.
 
 The `http-kit` crate (separate dependency) defines `Endpoint`, `Middleware`,
 `Request`, `Response`, `Body`, and SSE types.
@@ -176,7 +176,7 @@ aggregates all jobs and is the required check on `main`.
 - WASM build + clippy; mobile cross-compilation (iOS device/simulator,
   Android arm64/x86_64/armv7) with tests
 - Tests: hyper (rustls and native-tls), curl, and native (compio and tokio,
-  HTTP/3 included) on Linux/Windows/macOS; apple-backend on macOS, the suite on an iOS simulator (`scripts/test-ios.sh`,
+  HTTP/2 and HTTP/3 included) on Linux/Windows/macOS; apple-backend on macOS, the suite on an iOS simulator (`scripts/test-ios.sh`,
   `simctl spawn`), wasm-pack in Chrome/Firefox/Safari, workerd
 - Android runs on a physical device, not in CI: `scripts/test-android.sh`
   over adb (never an emulator); TLS on Android needs the JVM and is covered by

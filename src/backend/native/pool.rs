@@ -5,16 +5,16 @@
 //! nothing in it is shared and nothing is locked. Requests reach it through
 //! a [`PoolHandle`], a channel sender that is `Send` and `Sync`: a request
 //! future asks for a connection, gets back a `Send` handle (an HTTP/1.1
-//! sender leased exclusively, or a clone of the origin's HTTP/3 sender), and
-//! talks to the connection through it. A thread-per-core caller runs one
-//! pool per thread and its requests never leave that thread.
+//! sender leased exclusively, or a clone of the origin's HTTP/2 or HTTP/3
+//! sender), and talks to the connection through it. A thread-per-core caller
+//! runs one pool per thread and its requests never leave that thread.
 //!
-//! HTTP/1.1 follows the hyper pool's rules: at most
-//! [`MAX_H1_PER_ORIGIN`] connections leased or dialing per origin, idle
-//! connections parked until [`IDLE_TIMEOUT`], waiters served in order. A
-//! dial belongs to the origin, not to the request that caused it: the
-//! connection it opens goes to the first request still waiting, so a
-//! request that a QUIC connection served meanwhile leaves it to the next.
+//! HTTP/1.1 and HTTP/2 follow the hyper pool's rules: an HTTPS origin whose
+//! protocol is not yet known (or is known to be HTTP/2) coalesces concurrent
+//! dials into one handshake so a single HTTP/2 connection serves every
+//! waiter; an origin known to speak HTTP/1.1 opens up to
+//! [`MAX_H1_PER_ORIGIN`] connections leased or dialing per origin, parks idle
+//! connections until [`IDLE_TIMEOUT`], and serves waiters in order.
 
 use std::{
     cell::Cell,
@@ -33,16 +33,18 @@ use futures_util::{
     pin_mut,
     stream::FuturesUnordered,
 };
-use http_kit_tls::TlsConnector;
 use tracing::debug;
 
-use super::connect::{self, Dialed, H1Send, NativeIo, NativeResolve};
+use super::connect::{
+    self, DialBound, DialOptions, Dialed, DialedConn, H1Send, NativeIo, NativeResolve,
+    TlsConnectors,
+};
 use crate::{
     ConnectPhase, Error, TimedOut,
     clock::Clock,
     transport::{
         WeakTransport,
-        route::{IDLE_TIMEOUT, MAX_H1_PER_ORIGIN, Origin, Via},
+        route::{IDLE_TIMEOUT, MAX_H1_PER_ORIGIN, Origin, Protocols, Via},
     },
 };
 
@@ -53,19 +55,29 @@ use super::h3::{self, H3Slot};
 #[cfg(native_h3)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum H3Use {
-    /// Never: the request is plaintext or goes through a proxy.
+    /// Never: the request is plaintext, asks for an HTTP/1.1 upgrade, or goes
+    /// through a proxy.
     Blocked,
     /// Whenever the origin has a connection whose handshake completed, or
-    /// one completes while the request waits for HTTP/1.1.
+    /// one completes while the request waits for TCP.
     Allowed,
 }
 
 /// What a request asks the pool for.
 #[derive(Clone, Copy, Debug)]
 pub struct Want {
-    /// Dial a new HTTP/1.1 connection rather than reuse an idle one: the
-    /// retry after a reused connection failed under the request.
+    /// Dial a new connection rather than reuse an idle one: the retry after a
+    /// pooled connection failed under the request.
     pub fresh: bool,
+    /// Whether the request may use HTTP/2 (`false` when asking for an
+    /// HTTP/1.1 `101 Switching Protocols` upgrade).
+    #[cfg(native_h2)]
+    pub allow_h2: bool,
+    /// An HTTP/2 connection generation that already rejected or failed this
+    /// request: evict it if still pooled, while allowing reuse of a newer
+    /// generation another task already opened.
+    #[cfg(native_h2)]
+    pub avoid_h2: Option<u64>,
     #[cfg(native_h3)]
     pub h3: H3Use,
 }
@@ -78,6 +90,13 @@ pub enum Grant {
     H1 {
         send: H1Send,
         via: Via,
+        reused: bool,
+    },
+    /// The origin's shared HTTP/2 connection.
+    #[cfg(native_h2)]
+    H2 {
+        send: http_kit_h2::SendRequest,
+        generation: u64,
         reused: bool,
     },
     /// The origin's HTTP/3 connection.
@@ -224,12 +243,20 @@ const fn phase_rank(phase: ConnectPhase) -> u8 {
 
 /// Something a pool task finished.
 pub enum Event {
-    /// An HTTP/1.1 dial for `origin` ended.
-    H1Dialed {
+    /// A TCP/TLS dial for `origin` ended.
+    TcpDialed {
         origin: Origin,
-        /// The phase the dial was in, which the origin stops reporting.
+        protocols: Protocols,
+        /// The phase tracker identifying this dial in `Entry::dials`.
         phase: Rc<Cell<ConnectPhase>>,
         result: Result<Dialed, Error>,
+    },
+    /// An HTTP/2 connection driver for `origin` ended.
+    #[cfg(native_h2)]
+    H2Ended {
+        origin: Origin,
+        generation: u64,
+        result: Result<(), http_kit_h2::Error>,
     },
     /// A request's connect timeout passed while it waited at `origin`.
     CheckoutExpired { origin: Origin, waiter: WaiterId },
@@ -252,6 +279,10 @@ struct Waiter {
     _expiry: Option<oneshot::Sender<()>>,
     reply: oneshot::Sender<Result<Grant, Error>>,
     fresh: bool,
+    #[cfg(native_h2)]
+    allow_h2: bool,
+    #[cfg(native_h2)]
+    avoid_h2: Option<u64>,
     /// The request may take an HTTP/3 connection whose dial completes
     /// while it waits.
     #[cfg(native_h3)]
@@ -284,8 +315,8 @@ impl Waiter {
         self.deadline.is_some_and(|deadline| deadline <= now)
     }
 
-    /// Whether the request is owed an HTTP/1.1 dial: unless its own failed
-    /// while it waits on QUIC.
+    /// Whether the request is owed a TCP dial: unless its own failed while it
+    /// waits on QUIC.
     #[cfg_attr(
         not(native_h3),
         expect(
@@ -300,6 +331,41 @@ impl Waiter {
         true
     }
 
+    /// Whether this waiter may take an HTTP/1.1 connection (`reused` when it
+    /// already served a request) at an origin where `known_h1` says HTTP/1.1
+    /// is the origin's protocol.
+    const fn accepts_h1(&self, known_h1: bool, reused: bool) -> bool {
+        if reused && self.fresh {
+            return false;
+        }
+        #[cfg(native_h2)]
+        if self.allow_h2 && !known_h1 {
+            return false;
+        }
+        #[cfg(not(native_h2))]
+        let _ = known_h1;
+        true
+    }
+
+    /// Whether this waiter needs an `Http1` dial (`known_h1` says the origin
+    /// only speaks HTTP/1.1).
+    #[cfg_attr(
+        not(native_h2),
+        expect(
+            clippy::unused_self,
+            reason = "without HTTP/2 every waiter dials HTTP/1.1"
+        )
+    )]
+    const fn needs_h1_dial(&self, known_h1: bool) -> bool {
+        #[cfg(native_h2)]
+        return known_h1 || !self.allow_h2;
+        #[cfg(not(native_h2))]
+        {
+            let _ = known_h1;
+            true
+        }
+    }
+
     /// Hands `grant` over, or back when the request is gone.
     fn grant(self, grant: Grant) -> Option<Grant> {
         self.reply.send(Ok(grant)).err().and_then(Result::ok)
@@ -309,6 +375,8 @@ impl Waiter {
     fn grant_h1(self, send: H1Send, via: Via, reused: bool) -> Option<(H1Send, Via)> {
         match self.grant(Grant::H1 { send, via, reused })? {
             Grant::H1 { send, via, .. } => Some((send, via)),
+            #[cfg(native_h2)]
+            Grant::H2 { .. } => unreachable!("an HTTP/1.1 grant comes back as one"),
             #[cfg(native_h3)]
             Grant::H3(_) => unreachable!("an HTTP/1.1 grant comes back as one"),
         }
@@ -319,6 +387,38 @@ impl Waiter {
             debug!("a dial failed for a request that is gone");
         }
     }
+}
+
+/// The TCP HTTP version an origin was found to speak.
+#[cfg(native_h2)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Protocol {
+    /// Plaintext (`http://`), or `https://` where ALPN did not choose `h2`.
+    Http1,
+    /// `https://` where ALPN chose `h2`.
+    Http2,
+}
+
+/// The origin's shared HTTP/2 connection.
+#[cfg(native_h2)]
+struct PooledH2 {
+    send: http_kit_h2::SendRequest,
+    generation: u64,
+    since: Instant,
+}
+
+#[cfg(native_h2)]
+impl PooledH2 {
+    fn usable(&self) -> bool {
+        !self.send.is_closed() && self.since.elapsed() < IDLE_TIMEOUT
+    }
+}
+
+/// A TCP/TLS dial currently running for an origin.
+struct InFlightDial {
+    protocols: Protocols,
+    phase: Rc<Cell<ConnectPhase>>,
+    bound: Rc<DialBound>,
 }
 
 /// An HTTP/1.1 connection parked between requests.
@@ -339,31 +439,145 @@ pub struct Entry {
     idle: Vec<Idle>,
     /// HTTP/1.1 connections leased to requests.
     leased: usize,
-    /// HTTP/1.1 dials in flight.
-    dialing: usize,
-    /// The phase of each HTTP/1.1 dial in flight.
-    dial_phases: Vec<Rc<Cell<ConnectPhase>>>,
+    /// TCP/TLS dials in flight (`Http1` or coalesced `Http2OrHttp1`).
+    dials: Vec<InFlightDial>,
     waiters: VecDeque<Waiter>,
+    #[cfg(native_h2)]
+    protocol: Option<Protocol>,
+    #[cfg(native_h2)]
+    h2: Option<PooledH2>,
+    #[cfg(native_h2)]
+    h2_generation: u64,
     #[cfg(native_h3)]
     pub h3: H3Slot,
 }
 
 impl Entry {
-    const fn new(#[cfg_attr(not(native_h3), expect(unused_variables))] origin: &Origin) -> Self {
+    #[allow(clippy::missing_const_for_fn)] // `Scheme` equality under `native_h2` is not `const`
+    fn new(
+        #[cfg_attr(not(any(native_h2, native_h3)), expect(unused_variables))] origin: &Origin,
+    ) -> Self {
         Self {
             idle: Vec::new(),
             leased: 0,
-            dialing: 0,
-            dial_phases: Vec::new(),
+            dials: Vec::new(),
             waiters: VecDeque::new(),
+            #[cfg(native_h2)]
+            protocol: (origin.scheme == http::uri::Scheme::HTTP).then_some(Protocol::Http1),
+            #[cfg(native_h2)]
+            h2: None,
+            #[cfg(native_h2)]
+            h2_generation: 0,
             #[cfg(native_h3)]
             h3: H3Slot::new(origin.port),
+        }
+    }
+
+    #[cfg_attr(
+        not(native_h2),
+        expect(clippy::unused_self, reason = "without HTTP/2 every origin speaks h1")
+    )]
+    const fn is_known_h1(&self) -> bool {
+        #[cfg(native_h2)]
+        return matches!(self.protocol, Some(Protocol::Http1));
+        #[cfg(not(native_h2))]
+        true
+    }
+
+    #[cfg_attr(
+        not(native_h2),
+        expect(
+            clippy::unused_self,
+            reason = "without HTTP/2 every idle h1 connection may park"
+        )
+    )]
+    const fn may_park_h1(&self) -> bool {
+        #[cfg(native_h2)]
+        return !matches!(self.protocol, Some(Protocol::Http2));
+        #[cfg(not(native_h2))]
+        true
+    }
+
+    fn h1_dialing(&self) -> usize {
+        self.dials
+            .iter()
+            .filter(|dial| matches!(dial.protocols, Protocols::Http1))
+            .count()
+    }
+
+    /// Hands clones of the pooled HTTP/2 connection to every waiter that may
+    /// use it.
+    #[cfg(native_h2)]
+    fn grant_pooled_h2(&mut self, now: Instant) {
+        if self.h2.as_ref().is_some_and(|h2| !h2.usable()) {
+            self.h2 = None;
+        }
+        let Some(h2) = self.h2.as_mut() else {
+            return;
+        };
+        let generation = h2.generation;
+        let send = h2.send.clone();
+        let mut handed_out = false;
+        for waiter in std::mem::take(&mut self.waiters) {
+            if waiter.allow_h2
+                && waiter.avoid_h2 != Some(generation)
+                && !(waiter.fresh && waiter.avoid_h2.is_none())
+            {
+                if waiter
+                    .grant(Grant::H2 {
+                        send: send.clone(),
+                        generation,
+                        reused: true,
+                    })
+                    .is_none()
+                {
+                    handed_out = true;
+                }
+            } else {
+                self.waiters.push_back(waiter);
+            }
+        }
+        if handed_out {
+            h2.since = now;
+        }
+    }
+
+    /// Leases parked HTTP/1.1 connections to the first waiters that accept one.
+    fn grant_idle_h1(&mut self, now: Instant) {
+        let known_h1 = self.is_known_h1();
+        let mut next = 0;
+        while next < self.waiters.len()
+            && let Some(idle) = self.idle.pop()
+        {
+            if !self.waiters[next].accepts_h1(known_h1, true) {
+                self.idle.push(idle);
+                next += 1;
+                continue;
+            }
+            let waiter = self.waiters.remove(next).expect("the index is in range");
+            match waiter.grant_h1(idle.send, idle.via, true) {
+                None => self.leased += 1,
+                Some((send, via)) => self.idle.push(Idle {
+                    send,
+                    via,
+                    since: now,
+                }),
+            }
         }
     }
 
     /// Whether nothing here would change a later request's work.
     fn vacant(&mut self, now: Instant) -> bool {
         self.idle.retain(Idle::usable);
+        #[cfg(native_h2)]
+        let h2 = {
+            if self.h2.as_ref().is_some_and(|h2| !h2.usable()) {
+                self.h2 = None;
+            }
+            self.h2.is_none()
+        };
+        #[cfg(not(native_h2))]
+        let h2 = true;
         #[cfg(native_h3)]
         let h3 = self.h3.vacant(now);
         #[cfg(not(native_h3))]
@@ -373,8 +587,9 @@ impl Entry {
         };
         self.idle.is_empty()
             && self.leased == 0
-            && self.dialing == 0
+            && self.dials.is_empty()
             && self.waiters.is_empty()
+            && h2
             && h3
     }
 }
@@ -385,7 +600,7 @@ pub struct Pool<I, R> {
     /// The resolver every dial task shares, on the pool's thread.
     pub resolver: Rc<R>,
     pub transport: WeakTransport,
-    tls: Option<TlsConnector>,
+    tls: Option<TlsConnectors>,
     pub origins: HashMap<Origin, Entry>,
     /// The id the next waiter takes.
     next_waiter: u64,
@@ -485,11 +700,18 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
 
     fn event(&mut self, event: Event) {
         match event {
-            Event::H1Dialed {
+            Event::TcpDialed {
                 origin,
+                protocols,
                 phase,
                 result,
-            } => self.h1_dialed(&origin, &phase, result),
+            } => self.tcp_dialed(&origin, protocols, &phase, result),
+            #[cfg(native_h2)]
+            Event::H2Ended {
+                origin,
+                generation,
+                result,
+            } => self.h2_ended(&origin, generation, result),
             Event::CheckoutExpired { origin, waiter } => self.checkout_expired(&origin, waiter),
             #[cfg(native_h3)]
             Event::H3(event) => self.h3_event(event),
@@ -528,6 +750,15 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
             }
             return;
         }
+        #[cfg(native_h2)]
+        if want.allow_h2
+            && let Some(grant) = self.h2_checkout(origin, want)
+        {
+            if reply.send(Ok(grant)).is_err() {
+                debug!("an HTTP/2 grant found its request gone");
+            }
+            return;
+        }
         let id = WaiterId(self.next_waiter);
         self.next_waiter += 1;
         let expiry = deadline.map(|deadline| self.expire_at(origin, id, deadline));
@@ -537,12 +768,38 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
             _expiry: expiry,
             reply,
             fresh: want.fresh,
+            #[cfg(native_h2)]
+            allow_h2: want.allow_h2,
+            #[cfg(native_h2)]
+            avoid_h2: want.avoid_h2,
             #[cfg(native_h3)]
             h3,
             #[cfg(native_h3)]
             tcp_error: None,
         });
         self.serve_waiters(origin);
+    }
+
+    /// Checks out a clone of `origin`'s live HTTP/2 handle, evicting a closed,
+    /// idle-expired, or explicitly avoided handle along the way.
+    #[cfg(native_h2)]
+    fn h2_checkout(&mut self, origin: &Origin, want: Want) -> Option<Grant> {
+        let entry = self.entry(origin);
+        let evict = entry.h2.as_ref().is_some_and(|h2| {
+            !h2.usable()
+                || want.avoid_h2 == Some(h2.generation)
+                || (want.fresh && want.avoid_h2.is_none())
+        });
+        if evict {
+            entry.h2 = None;
+        }
+        let h2 = entry.h2.as_mut()?;
+        h2.since = Instant::now();
+        Some(Grant::H2 {
+            send: h2.send.clone(),
+            generation: h2.generation,
+            reused: true,
+        })
     }
 
     /// The bound on a QUIC dial for `origin` started for a request with
@@ -597,7 +854,7 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
             return;
         };
         let waiter = entry.waiters.remove(at).expect("the position is in range");
-        let dials = entry.dial_phases.iter().map(|phase| phase.get());
+        let dials = entry.dials.iter().map(|dial| dial.phase.get());
         #[cfg(native_h3)]
         let dials = dials.chain((waiter.h3 && entry.h3.dialing()).then_some(ConnectPhase::Quic));
         let during = dials
@@ -608,9 +865,10 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
         self.serve_waiters(origin);
     }
 
-    /// Serves `origin`'s waiters in order: idle connections to the first
-    /// that may reuse one, then a dial for each waiter no dial covers yet,
-    /// while the origin has slots free.
+    /// Serves `origin`'s waiters in order: live HTTP/2 or idle HTTP/1.1
+    /// connections to waiters that may reuse them, a single coalesced
+    /// `Http2OrHttp1` dial when the origin may speak HTTP/2, and parallel
+    /// `Http1` dials up to [`MAX_H1_PER_ORIGIN`] when HTTP/1.1 is owed.
     fn serve_waiters(&mut self, origin: &Origin) {
         let Some(entry) = self.origins.get_mut(origin) else {
             return;
@@ -618,67 +876,91 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
         let now = Instant::now();
         entry.idle.retain(Idle::usable);
         entry.waiters.retain(|waiter| !waiter.gone());
-        let mut next = 0;
-        while next < entry.waiters.len()
-            && let Some(idle) = entry.idle.pop()
+        #[cfg(native_h2)]
+        entry.grant_pooled_h2(now);
+        entry.grant_idle_h1(now);
+
+        let known_h1 = entry.is_known_h1();
+        #[cfg(native_h2)]
+        let start_h2 = if !known_h1
+            && entry
+                .waiters
+                .iter()
+                .any(|waiter| waiter.awaits_dial() && !waiter.expired(now) && waiter.allow_h2)
         {
-            if entry.waiters[next].fresh {
-                entry.idle.push(idle);
-                next += 1;
-                continue;
-            }
-            let waiter = entry.waiters.remove(next).expect("the index is in range");
-            match waiter.grant_h1(idle.send, idle.via, true) {
-                None => entry.leased += 1,
-                Some((send, via)) => entry.idle.push(Idle {
-                    send,
-                    via,
-                    since: now,
-                }),
+            let bound = latest_deadline(
+                entry
+                    .waiters
+                    .iter()
+                    .filter(|waiter| {
+                        waiter.awaits_dial() && !waiter.expired(now) && waiter.allow_h2
+                    })
+                    .map(|waiter| waiter.deadline),
+            );
+            entry
+                .dials
+                .iter()
+                .find(|dial| matches!(dial.protocols, Protocols::Http2OrHttp1))
+                .map_or(Some(bound), |running| {
+                    running.bound.set(bound);
+                    None
+                })
+        } else {
+            None
+        };
+
+        let h1_waiter = |waiter: &&Waiter| -> bool {
+            waiter.awaits_dial() && !waiter.expired(now) && waiter.needs_h1_dial(known_h1)
+        };
+        let active_h1 = entry.waiters.iter().filter(h1_waiter).count();
+        let h1_bound = latest_deadline(entry.waiters.iter().filter(h1_waiter).map(|w| w.deadline));
+        if active_h1 > 0 {
+            for dial in &entry.dials {
+                if matches!(dial.protocols, Protocols::Http1) {
+                    dial.bound.set(h1_bound);
+                }
             }
         }
-        let owed = entry
-            .waiters
-            .iter()
-            .filter(|waiter| waiter.awaits_dial() && !waiter.expired(now))
-            .count()
-            .saturating_sub(entry.dialing);
-        let mut dials = 0;
-        while dials < owed && entry.leased + entry.dialing < MAX_H1_PER_ORIGIN {
+        let mut h1_dialing = entry.h1_dialing();
+        let owed = active_h1.saturating_sub(h1_dialing);
+        let mut h1_dials = 0;
+        while h1_dials < owed && entry.leased + h1_dialing < MAX_H1_PER_ORIGIN {
             // An idle connection beyond the limit gives way so the total
             // stays within it.
-            if entry.leased + entry.dialing + entry.idle.len() >= MAX_H1_PER_ORIGIN
+            if entry.leased + h1_dialing + entry.idle.len() >= MAX_H1_PER_ORIGIN
                 && !entry.idle.is_empty()
             {
                 entry.idle.remove(0);
             }
-            entry.dialing += 1;
-            dials += 1;
+            h1_dialing += 1;
+            h1_dials += 1;
         }
-        // A dial outlasts no request it could still serve: it stops at the
-        // latest of their deadlines, and never when one has none.
-        let bound = latest_deadline(
-            entry
-                .waiters
-                .iter()
-                .filter(|waiter| waiter.awaits_dial() && !waiter.expired(now))
-                .map(|waiter| waiter.deadline),
-        );
-        for _ in 0..dials {
-            self.dial_h1(origin.clone(), bound);
+
+        #[cfg(native_h2)]
+        if let Some(bound) = start_h2 {
+            self.start_dial(origin.clone(), Protocols::Http2OrHttp1, bound);
+        }
+        for _ in 0..h1_dials {
+            self.start_dial(origin.clone(), Protocols::Http1, h1_bound);
         }
     }
 
-    /// Starts an HTTP/1.1 dial for `origin`, stopped at `bound` when there
-    /// is one.
-    fn dial_h1(&mut self, origin: Origin, bound: Option<Instant>) {
+    /// Starts a TCP/TLS dial for `origin` offering `protocols`, bounded by
+    /// `initial_bound` (and updated in place as later waiters join).
+    fn start_dial(&mut self, origin: Origin, protocols: Protocols, initial_bound: Option<Instant>) {
         let phase = Rc::new(Cell::new(ConnectPhase::Resolve));
-        self.entry(&origin).dial_phases.push(Rc::clone(&phase));
+        let bound = Rc::new(DialBound::new(initial_bound));
+        self.entry(&origin).dials.push(InFlightDial {
+            protocols,
+            phase: Rc::clone(&phase),
+            bound: Rc::clone(&bound),
+        });
         let Some(transport) = self.transport.upgrade() else {
             self.tasks.push(
                 async move {
-                    Some(Event::H1Dialed {
+                    Some(Event::TcpDialed {
                         origin,
+                        protocols,
                         phase,
                         result: Err(gone()),
                     })
@@ -689,13 +971,14 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
         };
         let tls = match &self.tls {
             Some(tls) => tls.clone(),
-            None => match connect::connector(transport.tls().http1_config().clone()) {
+            None => match connect::connectors(transport.tls()) {
                 Ok(tls) => self.tls.insert(tls).clone(),
                 Err(error) => {
                     self.tasks.push(
                         async move {
-                            Some(Event::H1Dialed {
+                            Some(Event::TcpDialed {
                                 origin,
+                                protocols,
                                 phase,
                                 result: Err(error),
                             })
@@ -710,10 +993,22 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
         let resolver = Rc::clone(&self.resolver);
         self.tasks.push(
             async move {
-                let result =
-                    connect::dial(&io, &*resolver, &transport, &tls, &origin, bound, &phase).await;
-                Some(Event::H1Dialed {
+                let result = connect::dial(
+                    &io,
+                    &*resolver,
+                    &transport,
+                    &tls,
+                    &origin,
+                    DialOptions {
+                        protocols,
+                        bound: &bound,
+                        phase: &phase,
+                    },
+                )
+                .await;
+                Some(Event::TcpDialed {
                     origin,
+                    protocols,
                     phase,
                     result,
                 })
@@ -722,28 +1017,110 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
         );
     }
 
-    fn h1_dialed(
+    fn tcp_dialed(
         &mut self,
         origin: &Origin,
+        protocols: Protocols,
         phase: &Rc<Cell<ConnectPhase>>,
         result: Result<Dialed, Error>,
     ) {
         let entry = self.entry(origin);
-        entry.dialing -= 1;
         entry
-            .dial_phases
-            .retain(|running| !Rc::ptr_eq(running, phase));
+            .dials
+            .retain(|running| !Rc::ptr_eq(&running.phase, phase));
         match result {
             Ok(Dialed {
-                send, via, driver, ..
+                conn: DialedConn::H1 { send, via, driver },
+                ..
             }) => {
+                #[cfg(native_h2)]
+                if matches!(protocols, Protocols::Http2OrHttp1) {
+                    entry.protocol = Some(Protocol::Http1);
+                }
+                #[cfg(not(native_h2))]
+                let _ = protocols;
                 self.tasks.push(driver.map(|()| None).boxed_local());
                 self.offer(origin, send, via, false);
             }
-            Err(error) => {
-                self.dial_failed(origin, error);
+            #[cfg(native_h2)]
+            Ok(Dialed {
+                conn: DialedConn::H2 { send, driver },
+                ..
+            }) => {
+                let now = Instant::now();
+                entry.protocol = Some(Protocol::Http2);
+                entry.idle.clear();
+                entry.h2_generation += 1;
+                let generation = entry.h2_generation;
+                entry.h2 = Some(PooledH2 {
+                    send: send.clone(),
+                    generation,
+                    since: now,
+                });
+                let ended = origin.clone();
+                self.tasks.push(
+                    driver
+                        .map(move |result| {
+                            Some(Event::H2Ended {
+                                origin: ended,
+                                generation,
+                                result,
+                            })
+                        })
+                        .boxed_local(),
+                );
+                let entry = self.entry(origin);
+                let mut first = true;
+                for waiter in std::mem::take(&mut entry.waiters) {
+                    if waiter.gone() {
+                        continue;
+                    }
+                    if waiter.allow_h2 {
+                        let reused = !first;
+                        if waiter
+                            .grant(Grant::H2 {
+                                send: send.clone(),
+                                generation,
+                                reused,
+                            })
+                            .is_none()
+                        {
+                            first = false;
+                        } else {
+                            debug!("an HTTP/2 grant found its request gone");
+                        }
+                    } else {
+                        entry.waiters.push_back(waiter);
+                    }
+                }
                 self.serve_waiters(origin);
             }
+            Err(error) => {
+                self.dial_failed(origin, protocols, error);
+                self.serve_waiters(origin);
+            }
+        }
+    }
+
+    #[cfg(native_h2)]
+    fn h2_ended(
+        &mut self,
+        origin: &Origin,
+        generation: u64,
+        result: Result<(), http_kit_h2::Error>,
+    ) {
+        if let Err(error) = result {
+            debug!(host = %origin.host, %error, "HTTP/2 connection ended with an error");
+        }
+        let Some(entry) = self.origins.get_mut(origin) else {
+            return;
+        };
+        if entry
+            .h2
+            .as_ref()
+            .is_some_and(|h2| h2.generation == generation)
+        {
+            entry.h2 = None;
         }
     }
 
@@ -752,19 +1129,22 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
     fn offer(&mut self, origin: &Origin, send: H1Send, via: Via, reused: bool) {
         let now = Instant::now();
         let entry = self.entry(origin);
+        let known_h1 = entry.is_known_h1();
         let mut free = (!send.is_closed()).then_some((send, via));
         while let Some((send, via)) = free.take() {
             entry.waiters.retain(|waiter| !waiter.gone());
             let Some(at) = entry
                 .waiters
                 .iter()
-                .position(|waiter| !(reused && waiter.fresh))
+                .position(|waiter| waiter.accepts_h1(known_h1, reused))
             else {
-                entry.idle.push(Idle {
-                    send,
-                    via,
-                    since: now,
-                });
+                if entry.may_park_h1() {
+                    entry.idle.push(Idle {
+                        send,
+                        via,
+                        since: now,
+                    });
+                }
                 break;
             };
             let waiter = entry.waiters.remove(at).expect("the position is in range");
@@ -776,19 +1156,15 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
         self.serve_waiters(origin);
     }
 
-    /// A dial for `origin` failed: the first waiter still owed one gets the
-    /// error, unless a QUIC dial races for it, which it then waits on. A
-    /// dial that timed out answers no one: it stopped at the latest deadline
-    /// of the waiters it was started for, which have expired through their
-    /// own tasks, and a waiter still within its deadline stays queued for
-    /// the next dial.
-    fn dial_failed(&mut self, origin: &Origin, error: Error) {
+    /// A dial for `origin` failed: the first waiter still owed a dial of that
+    /// kind gets the error, unless a QUIC dial races for it, which it then
+    /// waits on. A dial that timed out answers no one: it stopped at the
+    /// latest deadline of the waiters it was started for, which have expired
+    /// through their own tasks, and a waiter still within its deadline stays
+    /// queued for the next dial.
+    fn dial_failed(&mut self, origin: &Origin, protocols: Protocols, error: Error) {
         let entry = self.entry(origin);
         if let Error::Timeout(TimedOut::Connect { during }) = error {
-            // The dial's deadline is the latest of its waiters', so they have
-            // all expired; whichever of the two events the pool sees first,
-            // they fail with the phase the dial reached. A waiter whose
-            // deadline is still ahead stays queued for the next dial.
             debug!(host = %origin.host, %error, "a dial stopped at its deadline");
             let now = Instant::now();
             for waiter in std::mem::take(&mut entry.waiters) {
@@ -801,7 +1177,23 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
             return;
         }
         entry.waiters.retain(|waiter| !waiter.gone());
-        let Some(at) = entry.waiters.iter().position(Waiter::awaits_dial) else {
+        let known_h1 = entry.is_known_h1();
+        let matches_dial = |waiter: &Waiter| -> bool {
+            if !waiter.awaits_dial() {
+                return false;
+            }
+            #[cfg(native_h2)]
+            return match protocols {
+                Protocols::Http2OrHttp1 => waiter.allow_h2,
+                Protocols::Http1 => known_h1 || !waiter.allow_h2,
+            };
+            #[cfg(not(native_h2))]
+            {
+                let _ = (protocols, known_h1);
+                true
+            }
+        };
+        let Some(at) = entry.waiters.iter().position(matches_dial) else {
             debug!(host = %origin.host, %error, "a dial failed with no request waiting on it");
             return;
         };
@@ -835,7 +1227,7 @@ impl<I: NativeIo, R: NativeResolve> Pool<I, R> {
     }
 
     /// The QUIC dial to `origin` failed: the waiters whose TCP dial had
-    /// failed too fail with that error; the rest stay on HTTP/1.1.
+    /// failed too fail with that error; the rest stay on TCP.
     #[cfg(native_h3)]
     pub(super) fn h3_lost(&mut self, origin: &Origin) {
         let entry = self.entry(origin);
