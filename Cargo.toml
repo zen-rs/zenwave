@@ -172,7 +172,7 @@ native-http2 = ["native-backend", "dep:http-kit-h2", "http-kit-h2/pipe"]
 # BoringSSL with cmake). The server's chain goes to the same verifier as a TCP
 # connection's: the platform verifier with the transport's extra roots, and
 # OneCRL where it applies.
-native-http3 = ["native-backend", "dep:http-kit-h3", "http-kit-h3/quiche", "http-kit-h3/pipe", "dep:hickory-proto", "dep:hickory-resolver", "dep:async-trait", "dep:socket2", "dep:ring", "dep:async-net", "dep:jni-min-helper"]
+native-http3 = ["native-backend", "getaddrinfo", "dep:http-kit-h3", "http-kit-h3/quiche", "http-kit-h3/pipe", "dep:hickory-proto", "dep:hickory-resolver", "dep:async-trait", "dep:socket2", "dep:ring", "dep:async-net", "dep:jni-min-helper"]
 
 # Kernel TLS for the native backend on Linux: once a handshake completes and
 # the kernel takes the negotiated suite, the connection's record layer moves
