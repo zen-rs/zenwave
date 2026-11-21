@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 #![cfg(all(not(target_arch = "wasm32"), feature = "ws"))]
-mod common;
+use zenwave_test_fixture as common;
 
 use std::{
     env,

@@ -124,7 +124,16 @@ fn main() {
         // engine feature enabled next to curl or URLSession alone has nothing
         // to serve. Features are additive, so `rustls` wins when both engines
         // are enabled.
-        tls_rustls: { all(dialer, feature = "rustls") },
+        // The ring CryptoProvider, auto-installed by `rustls-ring` for the
+        // connector and unconditionally for the native backend (its TLS has no
+        // other provider choice).
+        ring: { any(feature = "rustls-ring", feature = "native-ring") },
+        tls_rustls: { all(dialer, feature = "rustls-engine") },
+        // The async-net connector's TLS stream over futures-rustls: only the
+        // `rustls` feature supplies the `futures-rustls` crate; `rustls-engine`
+        // alone (what the native backend pulls) does not give the connector a
+        // rustls stream to offer.
+        rustls_stream: { all(connector, feature = "rustls") },
         tls_native: { all(connector, feature = "native-tls", not(feature = "rustls")) },
         tls_engine: { any(tls_rustls, tls_native) },
         // rustls-platform-verifier needs a JVM handle on Android.

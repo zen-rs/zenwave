@@ -6,9 +6,9 @@ use http_kit::{Endpoint, Method};
 use zenwave::backend::HyperBackend;
 
 #[cfg(default_hyper)]
-mod common;
-#[cfg(default_hyper)]
 use common::httpbin_uri;
+#[cfg(default_hyper)]
+use zenwave_test_fixture as common;
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
