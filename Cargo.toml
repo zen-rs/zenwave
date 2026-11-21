@@ -169,7 +169,7 @@ native-http2 = ["native-backend", "dep:http-kit-h2", "http-kit-h2/pipe"]
 # BoringSSL with cmake). The server's chain goes to the same verifier as a TCP
 # connection's: the platform verifier with the transport's extra roots, and
 # OneCRL where it applies.
-native-http3 = ["native-backend", "dep:http-kit-h3", "http-kit-h3/quiche", "http-kit-h3/pipe", "dep:hickory-proto", "dep:hickory-resolver", "dep:async-trait", "dep:socket2", "dep:ring"]
+native-http3 = ["native-backend", "dep:http-kit-h3", "http-kit-h3/quiche", "http-kit-h3/pipe", "dep:hickory-proto", "dep:hickory-resolver", "dep:async-trait", "dep:socket2", "dep:ring", "dep:async-net"]
 
 # Kernel TLS for the native backend on Linux: once a handshake completes and
 # the kernel takes the negotiated suite, the connection's record layer moves
@@ -247,6 +247,9 @@ wasm-bindgen-test = "0.3.79"
 smol = "2.0.2"
 rcgen = "0.14.10"
 async-net = "2.0.0"
+# `src/backend/hyper/test_support.rs` (kept in-crate, it uses private APIs)
+# still drives `futures_rustls` under `#[cfg(test)]` on every engine combo.
+futures-rustls = { version = "0.26.0", default-features = false, features = ["ring", "tls12"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 hyper = { version = "1.12.0", features = ["server", "http1", "http2"] }
 async-tungstenite = { version = "0.35.0", default-features = false, features = ["smol-runtime"] }
@@ -339,14 +342,18 @@ rustls-platform-verifier = { version = "0.7.1", optional = true }
 [target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
 libc = "0.2.191"
 
-# `webpki-roots` and `webpki-root-certs` are version floors only, never named
+# `webpki-roots` supplies the Mozilla root store only on WASI, the one target
+# with no platform trust store for the engine verifier to delegate to.
+[target.'cfg(target_os = "wasi")'.dependencies]
+webpki-roots = { version = "1.0.11", optional = true }
+
+# `webpki-root-certs` is a version floor only, never named
 # in code: `minreq`'s `https-rustls` and `rustls-platform-verifier` trust the
 # Mozilla bundle, and pre-1.0.10 releases ship the distrusted emSign root
 # (RUSTSEC-2026-0383). `cargo::unused_dependencies` would flag dependencies no
 # target compiles against; declaring them under `cfg(false)` keeps the floors
 # in the resolution without compiling them.
 [target.'cfg(false)'.dependencies]
-webpki-roots = { version = "1.0.11", optional = true }
 webpki-root-certs = { version = "1.0.11", optional = true }
 
 [[example]]
