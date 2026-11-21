@@ -2,10 +2,10 @@
 // Every test here runs through `zenwave::client()`.
 #![cfg(default_backend)]
 
-use http_kit::Method;
-use zenwave_test_fixture as common;
 use common::httpbin_uri;
+use http_kit::Method;
 use zenwave::{Client, client, get};
+use zenwave_test_fixture as common;
 
 #[test_executors::async_test]
 async fn test_invalid_url_error() {

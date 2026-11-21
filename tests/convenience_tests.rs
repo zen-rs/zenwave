@@ -2,9 +2,9 @@
 // The one-shot functions exist only beside a default backend.
 #![cfg(default_backend)]
 
-use zenwave_test_fixture as common;
 use common::httpbin_uri;
 use zenwave::{delete, get, post, put};
+use zenwave_test_fixture as common;
 
 #[test_executors::async_test]
 async fn test_convenience_get() {
