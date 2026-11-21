@@ -335,9 +335,9 @@ rustls-platform-verifier = { version = "0.7.1", optional = true }
 [target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
 libc = "0.2.191"
 
-# `webpki-roots` supplies the Mozilla root store wherever the rustls engine
-# does not delegate trust to the platform verifier (so: not Android, not WASI).
-[target.'cfg(all(not(target_os = "android"), not(target_os = "wasi")))'.dependencies]
+# `webpki-roots` supplies the Mozilla root store only on WASI, the one target
+# with no platform trust store for the engine verifier to delegate to.
+[target.'cfg(target_os = "wasi")'.dependencies]
 webpki-roots = { version = "1.0.11", optional = true }
 
 # `webpki-root-certs` is a version floor only, never named
