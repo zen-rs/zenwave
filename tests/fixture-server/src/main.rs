@@ -21,4 +21,8 @@ fn main() {
     let mut stdout = stdout.lock();
     writeln!(stdout, "{base}").expect("report the fixture URL");
     stdout.flush().expect("flush the fixture URL");
+
+    loop {
+        std::thread::park();
+    }
 }
