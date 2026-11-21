@@ -18,7 +18,7 @@ use zenwave::HttpError;
 use zenwave::redirect::FollowRedirect;
 use zenwave::{Body, Client, Endpoint, Middleware, Request, Response, StatusCode, client};
 
-mod common;
+use zenwave_test_fixture as common;
 use common::{httpbin_base, httpbin_uri};
 
 #[test_executors::async_test]

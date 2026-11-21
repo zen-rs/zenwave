@@ -4,7 +4,7 @@
 // Every test here runs through `zenwave::client()`.
 #![cfg(default_backend)]
 
-mod common;
+use zenwave_test_fixture as common;
 use common::httpbin_uri;
 use zenwave::{Client, Method, client, get};
 

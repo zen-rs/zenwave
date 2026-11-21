@@ -14,7 +14,7 @@ use zenwave::Client;
 use zenwave::redirect::{FollowRedirect, FollowRedirectError};
 
 #[cfg(default_backend)]
-mod common;
+use zenwave_test_fixture as common;
 #[cfg(default_backend)]
 use common::httpbin_uri;
 
