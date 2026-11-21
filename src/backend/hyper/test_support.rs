@@ -17,8 +17,6 @@ use async_net::TcpListener;
 use bytes::Buf;
 #[cfg(any(feature = "http2", http3))]
 use futures_channel::oneshot;
-#[cfg(any(feature = "http2", http3))]
-use futures_rustls::TlsAcceptor;
 #[cfg(feature = "http2")]
 use http::{Version, header::HOST};
 #[cfg(any(feature = "http2", http3))]
@@ -40,6 +38,8 @@ use std::net::UdpSocket;
 #[cfg(feature = "http2")]
 use std::sync::{Mutex, mpsc};
 use time::{Duration as TimeDelta, OffsetDateTime};
+#[cfg(any(feature = "http2", http3))]
+use zenwave_test_fixture::futures_rustls::TlsAcceptor;
 
 #[cfg(http3)]
 use super::h3::H3Connection;
@@ -870,10 +870,10 @@ async fn serve_status(
 mod tests {
     use std::{pin::pin, sync::Arc};
 
-    use futures_rustls::TlsConnector;
     use futures_util::future::{Either, join, select};
     use hyper::body::Bytes;
     use rustls::{ClientConfig, RootCertStore, crypto::ring, pki_types::ServerName};
+    use zenwave_test_fixture::futures_rustls::TlsConnector;
 
     use super::{GoAway, TEST_TIMEOUT, TestCa, TlsServer, TokioCompat};
 

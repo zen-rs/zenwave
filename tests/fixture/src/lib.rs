@@ -14,6 +14,12 @@ mod fixture;
 #[allow(unused_imports)]
 pub use fixture::*;
 
+// `src/backend/hyper/test_support.rs` and `tests/common/tls.rs` reach
+// `futures_rustls` through this crate, so the parent manifest needs no
+// dev-dependency entry whose usage domain cannot be feature-scoped.
+#[cfg(not(target_arch = "wasm32"))]
+pub use futures_rustls;
+
 #[cfg(not(target_arch = "wasm32"))]
 pub mod proxy;
 
