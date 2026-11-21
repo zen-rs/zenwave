@@ -30,12 +30,7 @@ mod engine {
     #[cfg(onecrl)]
     use super::super::onecrl::Additions;
     use super::Protocols;
-    #[cfg(any(
-        connector,
-        android_verifier,
-        wasi_verifier,
-        not(ring)
-    ))]
+    #[cfg(any(connector, android_verifier, wasi_verifier, not(ring)))]
     use crate::Cause;
     use crate::Error;
     #[cfg(rustls_stream)]
