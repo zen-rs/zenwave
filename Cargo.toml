@@ -169,7 +169,7 @@ native-http2 = ["native-backend", "dep:http-kit-h2", "http-kit-h2/pipe"]
 # BoringSSL with cmake). The server's chain goes to the same verifier as a TCP
 # connection's: the platform verifier with the transport's extra roots, and
 # OneCRL where it applies.
-native-http3 = ["native-backend", "getaddrinfo", "dep:http-kit-h3", "http-kit-h3/quiche", "http-kit-h3/pipe", "dep:hickory-proto", "dep:hickory-resolver", "dep:async-trait", "dep:socket2", "dep:ring", "dep:async-net", "dep:jni-min-helper"]
+native-http3 = ["native-backend", "getaddrinfo", "dep:http-kit-h3", "http-kit-h3/quiche", "http-kit-h3/pipe", "dep:hickory-proto", "dep:hickory-resolver", "dep:async-trait", "dep:socket2", "dep:ring", "dep:async-net", "dep:jni-min-helper", "dep:jni", "dep:ndk-context"]
 
 # Kernel TLS for the native backend on Linux: once a handshake completes and
 # the kernel takes the negotiated suite, the connection's record layer moves
@@ -186,7 +186,7 @@ ws = ["getaddrinfo", "dep:async-tungstenite", "dep:async-net", "dep:hyper", "dep
 
 # HTTP/3 over QUIC for the hyper backend. QUIC needs a QUIC-capable TLS
 # library, so it requires the `rustls` engine with `ring`.
-http3 = ["hyper-backend", "rustls-ring", "dep:bytes", "dep:h3", "dep:h3-quinn", "dep:quinn", "dep:hickory-proto", "dep:hickory-resolver", "dep:async-trait", "dep:socket2", "dep:jni-min-helper"]
+http3 = ["hyper-backend", "rustls-ring", "dep:bytes", "dep:h3", "dep:h3-quinn", "dep:quinn", "dep:hickory-proto", "dep:hickory-resolver", "dep:async-trait", "dep:socket2", "dep:jni-min-helper", "dep:jni", "dep:ndk-context"]
 
 # Refuse certificates listed by Mozilla's OneCRL on the paths that verify
 # chains with webpki (`src/transport/onecrl.rs`). A pinned snapshot of the
@@ -323,8 +323,8 @@ arc-swap = { version = "1.9.3", optional = true, default-features = false }
 # (src/transport/dns/android.rs); `jni-min-helper` supplies the Java proxy that
 # delivers the callback into Rust.
 [target.'cfg(target_os = "android")'.dependencies]
-jni = "0.22.4"
-ndk-context = "0.1.1"
+jni = { version = "0.22.4", optional = true }
+ndk-context = { version = "0.1.1", optional = true }
 jni-min-helper = { version = "0.4.7", optional = true }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
