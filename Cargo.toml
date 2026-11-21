@@ -48,6 +48,9 @@ async-lock = "3.4.2"
 http = "1.5.0"
 httpdate = "1.0.3"
 tracing = "0.1.44"
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+# The environment's proxy rules (`transport::proxy`).
+hyper-util = { version = "0.1.21", default-features = false, features = ["client-proxy", "client-proxy-system"] }
 cookie_store = { version = "0.22.1", default-features = false, features = [
     "serde_json",
 ] }
@@ -260,9 +263,6 @@ http-kit-h3 = { git = "https://github.com/zen-rs/http-kit", branch = "main", opt
 http-kit-tls = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
 futures-rustls = { version = "0.26.0", optional = true, default-features = false, features = ["tls12"] }
 rustls = { version = "0.23.46", optional = true, default-features = false, features = ["std", "tls12"] }
-rustls-pki-types = { version = "1.15.1", features = ["std"] }
-# The environment's proxy rules (`transport::proxy`).
-hyper-util = { version = "0.1.21", default-features = false, features = ["client-proxy", "client-proxy-system"] }
 bytes = { version = "1.12.1", optional = true }
 
 # WASI Preview 3 HTTP client and monotonic clock (`wasi-backend` feature):
