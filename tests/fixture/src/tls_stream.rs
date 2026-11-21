@@ -210,11 +210,8 @@ mod tests {
     #[test]
     fn loopback_handshake() {
         // A minimal ECDSA cert for localhost — the same shape the fixtures use.
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-            .expect("rcgen");
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            cert.signing_key.serialize_der(),
-        ));
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("rcgen");
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.cert.clone().into()).expect("root");
         let server = ServerConfig::builder()
