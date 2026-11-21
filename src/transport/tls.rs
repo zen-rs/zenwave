@@ -11,17 +11,17 @@ use super::route::Protocols;
 
 #[cfg(tls_rustls)]
 mod engine {
-    #[cfg(connector)]
+    #[cfg(rustls_stream)]
     use std::io;
     use std::sync::Arc;
 
     #[cfg(onecrl)]
     use arc_swap::ArcSwap;
-    #[cfg(connector)]
+    #[cfg(rustls_stream)]
     use futures_io::{AsyncRead, AsyncWrite};
     use rustls::ClientConfig;
     use rustls::crypto::CryptoProvider;
-    #[cfg(connector)]
+    #[cfg(rustls_stream)]
     use rustls::pki_types::ServerName;
     use rustls_pki_types::CertificateDer;
     #[cfg(not(any(android_verifier, wasi_verifier)))]
@@ -34,14 +34,14 @@ mod engine {
         connector,
         android_verifier,
         wasi_verifier,
-        not(feature = "rustls-ring")
+        not(ring)
     ))]
     use crate::Cause;
     use crate::Error;
-    #[cfg(connector)]
+    #[cfg(rustls_stream)]
     use crate::{ConnectFailure, Hop, TlsError, TlsFailure};
 
-    #[cfg(connector)]
+    #[cfg(rustls_stream)]
     pub type TlsStream<S> = futures_rustls::client::TlsStream<S>;
 
     /// The platform verifier, extended with `extra_roots`.
@@ -148,9 +148,9 @@ mod engine {
         /// backend's HTTP/3 handshakes call too.
         #[cfg(native_h3)]
         verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
-        #[cfg(connector)]
+        #[cfg(rustls_stream)]
         http1: futures_rustls::TlsConnector,
-        #[cfg(connector)]
+        #[cfg(rustls_stream)]
         http2_or_http1: futures_rustls::TlsConnector,
     }
 
@@ -169,11 +169,11 @@ mod engine {
             #[cfg(onecrl)] additions: Option<Arc<ArcSwap<Additions>>>,
             #[cfg(test)] wrap: Option<VerifierWrap>,
         ) -> Result<Self, Error> {
-            #[cfg(feature = "rustls-ring")]
+            #[cfg(ring)]
             let provider = CryptoProvider::get_default()
                 .cloned()
                 .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
-            #[cfg(not(feature = "rustls-ring"))]
+            #[cfg(not(ring))]
             let provider = CryptoProvider::get_default().cloned().ok_or_else(|| {
                 Error::tls_config(Cause::Detail(String::from(
                     "no rustls CryptoProvider installed; enable the `rustls-ring` feature or call `CryptoProvider::install_default`",
@@ -211,7 +211,7 @@ mod engine {
                 Arc::new(config)
             };
             Ok(Self {
-                #[cfg(connector)]
+                #[cfg(rustls_stream)]
                 http2_or_http1: futures_rustls::TlsConnector::from(with_alpn(
                     Protocols::Http2OrHttp1,
                 )),
@@ -223,7 +223,7 @@ mod engine {
                 http2_or_http1_config,
                 #[cfg(native_h3)]
                 verifier: shared,
-                #[cfg(connector)]
+                #[cfg(rustls_stream)]
                 http1: futures_rustls::TlsConnector::from(http1),
             })
         }
@@ -265,7 +265,7 @@ mod engine {
         /// # Errors
         ///
         /// `host` is no server name, or the handshake failed.
-        #[cfg(connector)]
+        #[cfg(rustls_stream)]
         pub async fn connect<S>(
             &self,
             hop: Hop,
@@ -302,7 +302,7 @@ mod engine {
     /// comes back out of the `io::Error` once, here. A transport failure or a
     /// peer closing mid-handshake is no `rustls::Error`: it stays the
     /// `io::Error`.
-    #[cfg(connector)]
+    #[cfg(rustls_stream)]
     fn failure(error: io::Error) -> TlsError {
         match error.downcast::<rustls::Error>() {
             Ok(error) => TlsError::new(TlsFailure::of_rustls(&error), Cause::Rustls(error)),
@@ -313,7 +313,7 @@ mod engine {
     /// The protocol `stream`'s TLS session negotiated through ALPN, if any.
     ///
     /// Infallible for rustls — the signature matches the native-tls engine.
-    #[cfg(connector)]
+    #[cfg(rustls_stream)]
     #[allow(clippy::unnecessary_wraps)] // the native-tls engine can fail here
     pub fn negotiated_alpn<S>(stream: &TlsStream<S>) -> Result<Option<Vec<u8>>, Error> {
         let (_, connection) = stream.get_ref();
