@@ -37,20 +37,3 @@ smol = "2.0.2"
 time = "0.3.55"
 tiny_http = "0.12.0"
 url = "2.5.8"
-
-# The fixtures live in `tests/common`, pulled in through `#[path]`; cargo-machete
-# only scans this directory and so cannot see these being used.
-[package.metadata.cargo-machete]
-ignored = [
-  "async-net",
-  "async-tungstenite",
-  "futures-rustls",
-  "futures-util",
-  "httparse",
-  "once_cell",
-  "rcgen",
-  "rustls",
-  "time",
-  "tiny_http",
-  "url",
-]

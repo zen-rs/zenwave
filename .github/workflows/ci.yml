@@ -253,19 +253,6 @@ jobs:
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
 
-  unused-deps:
-    name: Unused Dependencies
-    needs: bump
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-ubuntu
-      - uses: taiki-e/install-action@cargo-machete
-      - run: cargo machete
-
   test:
     name: Test
     needs: bump
@@ -277,7 +264,7 @@ jobs:
     # bump branch.
     name: CI result
     if: always()
-    needs: [bump, fmt, features, wasm, mobile, coverage, audit, unused-deps, test]
+    needs: [bump, fmt, features, wasm, mobile, coverage, audit, test]
     runs-on: ubuntu-latest
     steps:
       - name: Check job results

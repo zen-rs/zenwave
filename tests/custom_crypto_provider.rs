@@ -1,11 +1,7 @@
 //! Without `rustls-ring`, `zenwave` compiles no built-in cryptography provider:
 //! building a `Transport` fails with a TLS configuration error until the
 //! application installs a process-default `rustls::crypto::CryptoProvider`.
-#![cfg(all(
-    not(target_arch = "wasm32"),
-    feature = "rustls",
-    not(feature = "rustls-ring")
-))]
+#![cfg(all(not(target_arch = "wasm32"), feature = "rustls", not(ring)))]
 
 use zenwave::Transport;
 
