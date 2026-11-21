@@ -34,8 +34,8 @@
 //!   Supplies [`DefaultBackend`](backend::DefaultBackend), [`client()`],
 //!   [`get()`] and friends.
 //! - **`native-backend`**: `NativeBackend::on_current_thread` over the
-//!   host's `http-kit-io` sockets, resolver and clock (HTTP/1.1, and HTTP/3
-//!   with `native-http3`). See [`backend`].
+//!   host's `http-kit-io` sockets, resolver and clock (HTTP/1.1, HTTP/2 with
+//!   `native-http2`, and HTTP/3 with `native-http3`). See [`backend`].
 //!
 //! ## Native Platforms
 //! On native platforms, Zenwave supports multiple HTTP client backends and,
@@ -52,9 +52,10 @@
 //!
 //! ### Features
 //! - **`hyper-backend`**: hyper over async-io. Needs `rustls` (with `rustls-ring` or an installed `CryptoProvider`) or `native-tls`.
-//! - **`native-compio`** / **`native-tokio`**: HTTP/1.1 (and HTTP/3 with
-//!   `native-http3`) on http-kit's owned-buffer I/O, driven by compio or
-//!   tokio; the default backend when `hyper-backend` is off. `native-backend`
+//! - **`native-compio`** / **`native-tokio`**: HTTP/1.1 (with HTTP/2 under
+//!   `native-http2` and HTTP/3 under `native-http3`) on http-kit's
+//!   owned-buffer I/O, driven by compio or tokio; the default backend when
+//!   `hyper-backend` is off. `native-backend`
 //!   alone gives the runtime-neutral backend for callers that drive it on
 //!   their own thread (installing a `CryptoProvider` or enabling `rustls-ring`);
 //!   such a build has no default backend, so

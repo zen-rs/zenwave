@@ -1,8 +1,9 @@
 //! The native backend against in-process `http-kit` servers on the same
-//! thread: HTTP/1.1 in plaintext and over `http-kit-tls`, through an HTTPS
-//! proxy's tunnel, on connections the server closes after each response,
-//! and HTTP/3 over `http-kit-h3` once the TLS server advertises it, each on
-//! compio and on tokio with the pool on the calling thread.
+//! thread: HTTP/1.1 in plaintext and over `http-kit-tls`, HTTP/2 over
+//! `http-kit-h2` (`native-http2`), through an HTTPS proxy's tunnel, on
+//! connections the server closes after each response, and HTTP/3 over
+//! `http-kit-h3` once the TLS server advertises it, each on compio and on
+//! tokio with the pool on the calling thread.
 #![cfg(all(
     not(target_arch = "wasm32"),
     any(feature = "native-compio", feature = "native-tokio")
@@ -128,6 +129,10 @@ impl Pki {
     }
 
     fn tls_acceptor(&self) -> TlsAcceptor {
+        self.tls_acceptor_with_alpn(&[b"http/1.1"])
+    }
+
+    fn tls_acceptor_with_alpn(&self, alpn_protocols: &[&[u8]]) -> TlsAcceptor {
         let mut config =
             rustls::ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
                 .with_safe_default_protocol_versions()
@@ -138,7 +143,7 @@ impl Pki {
                     PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.leaf_key.serialize_der())),
                 )
                 .expect("server certificate");
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.alpn_protocols = alpn_protocols.iter().map(|alpn| alpn.to_vec()).collect();
         TlsAcceptor::new(Arc::new(config))
     }
 }
@@ -1735,6 +1740,60 @@ mod compio_runtime {
         run(super::https_proxy);
     }
 
+    #[cfg(feature = "native-http2")]
+    #[test]
+    fn h2_coalesces_dials_and_multiplexes_streams() {
+        run(super::h2::coalescing_and_multiplexing);
+    }
+
+    #[cfg(feature = "native-http2")]
+    #[test]
+    fn h2_falls_back_to_parallel_h1() {
+        run(super::h2::alpn_fallback_to_h1);
+    }
+
+    #[cfg(feature = "native-http2")]
+    #[test]
+    fn h2_graceful_goaway_recovers_post_and_get() {
+        run(super::h2::graceful_goaway);
+    }
+
+    #[cfg(feature = "native-http2")]
+    #[test]
+    fn h2_refused_stream_recovers_post_and_get() {
+        run(super::h2::refused_stream);
+    }
+
+    #[cfg(feature = "native-http2")]
+    #[test]
+    fn h2_in_flight_goaway_recovers_post() {
+        run(super::h2::in_flight_goaway);
+    }
+
+    #[cfg(feature = "native-http2")]
+    #[test]
+    fn h2_inside_an_https_proxy_tunnel() {
+        run(super::h2::https_proxy_tunnel);
+    }
+
+    #[cfg(feature = "native-http2")]
+    #[test]
+    fn h2_upgrade_request_bypasses_pooled_h2() {
+        run(super::h2::upgrade_bypasses_h2);
+    }
+
+    #[cfg(feature = "native-http2")]
+    #[test]
+    fn h2_timeouts_and_response_trailers() {
+        run(super::h2::timeouts_and_trailers);
+    }
+
+    #[cfg(all(feature = "native-http2", feature = "native-http3"))]
+    #[test]
+    fn h2_upgrades_to_h3_after_alt_svc() {
+        run(super::h2::upgrade_to_h3);
+    }
+
     #[cfg(feature = "native-http3")]
     #[test]
     fn h3_after_alt_svc() {
@@ -1902,6 +1961,60 @@ mod tokio_runtime {
         run(super::https_proxy);
     }
 
+    #[cfg(feature = "native-http2")]
+    #[test]
+    fn h2_coalesces_dials_and_multiplexes_streams() {
+        run(super::h2::coalescing_and_multiplexing);
+    }
+
+    #[cfg(feature = "native-http2")]
+    #[test]
+    fn h2_falls_back_to_parallel_h1() {
+        run(super::h2::alpn_fallback_to_h1);
+    }
+
+    #[cfg(feature = "native-http2")]
+    #[test]
+    fn h2_graceful_goaway_recovers_post_and_get() {
+        run(super::h2::graceful_goaway);
+    }
+
+    #[cfg(feature = "native-http2")]
+    #[test]
+    fn h2_refused_stream_recovers_post_and_get() {
+        run(super::h2::refused_stream);
+    }
+
+    #[cfg(feature = "native-http2")]
+    #[test]
+    fn h2_in_flight_goaway_recovers_post() {
+        run(super::h2::in_flight_goaway);
+    }
+
+    #[cfg(feature = "native-http2")]
+    #[test]
+    fn h2_inside_an_https_proxy_tunnel() {
+        run(super::h2::https_proxy_tunnel);
+    }
+
+    #[cfg(feature = "native-http2")]
+    #[test]
+    fn h2_upgrade_request_bypasses_pooled_h2() {
+        run(super::h2::upgrade_bypasses_h2);
+    }
+
+    #[cfg(feature = "native-http2")]
+    #[test]
+    fn h2_timeouts_and_response_trailers() {
+        run(super::h2::timeouts_and_trailers);
+    }
+
+    #[cfg(all(feature = "native-http2", feature = "native-http3"))]
+    #[test]
+    fn h2_upgrades_to_h3_after_alt_svc() {
+        run(super::h2::upgrade_to_h3);
+    }
+
     #[cfg(feature = "native-http3")]
     #[test]
     fn h3_after_alt_svc() {
@@ -1946,7 +2059,7 @@ mod h3 {
 
     /// Serves HTTP/3 with `pki`'s leaf on a dual-stack UDP socket —
     /// `localhost` may resolve to `::1` first — and returns its port.
-    fn bind_h3<I: TestIo>(
+    pub fn bind_h3<I: TestIo>(
         io: &I,
         pki: &Pki,
     ) -> (http_kit_h3::Server<<I as Datagram>::UdpSocket, I>, u16) {
@@ -2182,6 +2295,849 @@ mod h3 {
                 assert_eq!(get(&mut client, &uri, true).await, "h1");
                 io.sleep(Duration::from_millis(100)).await;
             }
+        })
+        .await;
+    }
+}
+
+#[cfg(feature = "native-http2")]
+mod h2 {
+    use futures_channel::oneshot;
+    use futures_util::StreamExt as _;
+    use http::HeaderValue;
+
+    use super::*;
+
+    /// Custom header value in Chinese, Japanese and Korean UTF-8 octets
+    /// (`0x80..=0xFF` opaque field-content bytes per RFC 9113 §8.2.1).
+    const CJK_LABEL: &[u8] = "标签：茶。ラベル：お茶。라벨: 차.".as_bytes();
+
+    #[derive(Clone, Default)]
+    struct H2Options {
+        alt_svc: Option<String>,
+        delay: Option<Duration>,
+        accepted: Rc<Cell<usize>>,
+    }
+
+    async fn h2_echo<I: TestIo>(io: &I, request: Request, options: &H2Options) -> Response {
+        match request.uri().path() {
+            "/trailers" => return trailers_response("h2"),
+            "/slow-head" => {
+                io.sleep(READ_TIMEOUT * 5).await;
+            }
+            "/stalled-body" => {
+                let mut response = Response::new(Body::from_frames(
+                    futures_util::stream::iter([Ok::<_, std::io::Error>(
+                        http_kit::BodyFrame::Data(GREETING.as_bytes().into()),
+                    )])
+                    .chain(futures_util::stream::pending()),
+                ));
+                response
+                    .headers_mut()
+                    .insert("x-protocol", HeaderValue::from_static("h2"));
+                return response;
+            }
+            _ => {}
+        }
+        if let Some(delay) = options.delay {
+            io.sleep(delay).await;
+        }
+        let label = request.headers().get("x-cjk").cloned();
+        let mut response = echo(
+            request,
+            "h2",
+            &H1Options {
+                alt_svc: options.alt_svc.clone(),
+                ..H1Options::default()
+            },
+        )
+        .await;
+        if let Some(label) = label {
+            response.headers_mut().insert("x-cjk", label);
+        }
+        response
+    }
+
+    async fn serve_h2<I: TestIo, E: LocalExecutor>(
+        io: I,
+        executor: &E,
+        listener: I::Listener,
+        tls: TlsAcceptor,
+        options: H2Options,
+    ) {
+        let mut accepted = 0_usize;
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept");
+            accepted += 1;
+            options.accepted.set(accepted);
+            let io = io.clone();
+            let tls = tls.clone();
+            let options = options.clone();
+            executor
+                .spawn_local(async move {
+                    let Ok(stream) = tls.accept(stream, &io).await else {
+                        return;
+                    };
+                    assert_eq!(stream.alpn_protocol(), Some(&b"h2"[..]));
+                    let service_io = io.clone();
+                    let service = move |request: Request| {
+                        let io = service_io.clone();
+                        let options = options.clone();
+                        async move { h2_echo(&io, request, &options).await }
+                    };
+                    let _ = http_kit_h2::ServerConnection::from_stream(
+                        stream,
+                        io,
+                        http_kit_h2::ServerConfig::default(),
+                    )
+                    .serve(&service)
+                    .await;
+                })
+                .detach();
+        }
+    }
+
+    /// Eight concurrent first requests to an unknown HTTPS origin coalesce
+    /// onto a single TLS + HTTP/2 dial and multiplex as concurrent streams on
+    /// that one TCP connection, echoing CJK headers and CJK bodies.
+    pub async fn coalescing_and_multiplexing<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
+        let pki = Pki::new();
+        let listener = io.bind_tcp(loopback()).expect("bind");
+        let port = listener.local_addr().expect("local address").port();
+        let accepted = Rc::new(Cell::new(0));
+        let server = serve_h2(
+            io.clone(),
+            executor,
+            listener,
+            pki.tls_acceptor_with_alpn(&[b"h2", b"http/1.1"]),
+            H2Options {
+                delay: Some(Duration::from_millis(40)),
+                accepted: Rc::clone(&accepted),
+                ..H2Options::default()
+            },
+        );
+        let client = backend(pki.transport(), io, executor);
+        against(server, async {
+            let tasks = (0..8).map(|index| {
+                let mut client = client.clone();
+                async move {
+                    let path = format!("/stream/{index}");
+                    let url = format!("https://localhost:{port}{path}");
+                    let label = HeaderValue::from_bytes(CJK_LABEL).expect("CJK header value");
+                    let response = if index % 2 == 0 {
+                        client
+                            .post(&url)
+                            .expect("request builds")
+                            .header("x-cjk", label.clone())
+                            .expect("header")
+                            .bytes_body(GREETING.as_bytes().to_vec())
+                            .await
+                            .expect("H2 POST succeeds")
+                    } else {
+                        client
+                            .get(&url)
+                            .expect("request builds")
+                            .header("x-cjk", label.clone())
+                            .expect("header")
+                            .await
+                            .expect("H2 GET succeeds")
+                    };
+                    assert_eq!(response.headers()["x-protocol"], "h2");
+                    assert_eq!(response.headers()["x-cjk"].as_bytes(), CJK_LABEL);
+                    let expected = if index % 2 == 0 {
+                        format!("POST {path} {GREETING}")
+                    } else {
+                        format!("GET {path} ")
+                    };
+                    assert_eq!(
+                        &*response.into_string().await.expect("body reads"),
+                        expected
+                    );
+                }
+            });
+            futures_util::future::join_all(tasks).await;
+        })
+        .await;
+        assert_eq!(
+            accepted.get(),
+            1,
+            "dial coalescing and stream multiplexing must open exactly 1 TCP connection"
+        );
+    }
+
+    /// When the HTTPS origin selects `http/1.1` through ALPN, the pool records
+    /// HTTP/1.1 and fans out parallel dials for the remaining concurrent
+    /// waiters up to `MAX_H1_PER_ORIGIN`.
+    pub async fn alpn_fallback_to_h1<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
+        let pki = Pki::new();
+        let listener = io.bind_tcp(loopback()).expect("bind");
+        let port = listener.local_addr().expect("local address").port();
+        let accepted = Rc::new(Cell::new(0));
+        let server_io = io.clone();
+        let server_accepted = Rc::clone(&accepted);
+        let tls = pki.tls_acceptor();
+        let server = async move {
+            let mut count = 0_usize;
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                count += 1;
+                server_accepted.set(count);
+                let io = server_io.clone();
+                let tls = tls.clone();
+                executor
+                    .spawn_local(async move {
+                        let stream = tls.accept(stream, &io).await.expect("TLS handshake");
+                        let service_io = io.clone();
+                        let service = move |request: Request| {
+                            let io = service_io.clone();
+                            async move {
+                                io.sleep(Duration::from_millis(50)).await;
+                                echo(request, "h1", &H1Options::default()).await
+                            }
+                        };
+                        let _ = http_kit_h1::ServerConnection::from_stream(
+                            stream,
+                            io,
+                            http_kit_h1::ServerConfig::default(),
+                        )
+                        .serve(&service)
+                        .await;
+                    })
+                    .detach();
+            }
+        };
+        let client = backend(pki.transport(), io, executor);
+        against(server, async {
+            let tasks = (0..6).map(|index| {
+                let mut client = client.clone();
+                async move {
+                    let response = client
+                        .post(format!("https://localhost:{port}/h1/{index}"))
+                        .expect("request builds")
+                        .bytes_body(GREETING.as_bytes().to_vec())
+                        .await
+                        .expect("fallback H1 POST succeeds");
+                    assert_eq!(response.headers()["x-protocol"], "h1");
+                    assert_eq!(
+                        &*response.into_string().await.expect("body reads"),
+                        format!("POST /h1/{index} {GREETING}")
+                    );
+                }
+            });
+            futures_util::future::join_all(tasks).await;
+        })
+        .await;
+        assert!(
+            (2..=6).contains(&accepted.get()),
+            "after learning HTTP/1.1, concurrent waiters dial in parallel up to 6: got {}",
+            accepted.get()
+        );
+    }
+
+    /// Graceful `GOAWAY` after the first stream causes subsequent `POST` and
+    /// `GET` requests to transparently open a second connection, delivering
+    /// the `POST` body once.
+    pub async fn graceful_goaway<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
+        let pki = Pki::new();
+        let listener = io.bind_tcp(loopback()).expect("bind");
+        let port = listener.local_addr().expect("local address").port();
+        let accepted = Rc::new(Cell::new(0));
+        let posts = Rc::new(Cell::new(0_usize));
+        let tls = pki.tls_acceptor_with_alpn(&[b"h2"]);
+        let server_io = io.clone();
+        let server_accepted = Rc::clone(&accepted);
+        let server_posts = Rc::clone(&posts);
+        let server = async move {
+            let mut conn_index = 0_usize;
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                conn_index += 1;
+                server_accepted.set(conn_index);
+                let first_conn = conn_index == 1;
+                let io = server_io.clone();
+                let tls = tls.clone();
+                let posts = Rc::clone(&server_posts);
+                executor
+                    .spawn_local(async move {
+                        let stream = tls.accept(stream, &io).await.expect("TLS handshake");
+                        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+                        let stop_tx = RefCell::new(Some(stop_tx));
+                        let service = move |request: Request| {
+                            if request.method() == http::Method::POST {
+                                posts.set(posts.get() + 1);
+                            }
+                            if first_conn && let Some(tx) = stop_tx.borrow_mut().take() {
+                                let _ = tx.send(());
+                            }
+                            async move { echo(request, "h2", &H1Options::default()).await }
+                        };
+                        let conn = http_kit_h2::ServerConnection::from_stream(
+                            stream,
+                            io,
+                            http_kit_h2::ServerConfig::default(),
+                        );
+                        if first_conn {
+                            let _ = conn
+                                .serve_until(&service, async move {
+                                    let _ = stop_rx.await;
+                                })
+                                .await;
+                        } else {
+                            let _ = conn.serve(&service).await;
+                        }
+                    })
+                    .detach();
+            }
+        };
+        let mut client = backend(pki.transport(), io.clone(), executor);
+        against(server, async {
+            let first = client
+                .get(format!("https://localhost:{port}/warmup"))
+                .expect("request builds")
+                .await
+                .expect("warmup succeeds");
+            assert_eq!(first.headers()["x-protocol"], "h2");
+            first.into_string().await.expect("body reads");
+            // Let the graceful GOAWAY frames arrive on the pooled connection.
+            io.sleep(Duration::from_millis(30)).await;
+
+            let posted = client
+                .post(format!("https://localhost:{port}/order"))
+                .expect("request builds")
+                .bytes_body(GREETING.as_bytes().to_vec())
+                .await
+                .expect("POST after graceful GOAWAY succeeds");
+            assert_eq!(posted.headers()["x-protocol"], "h2");
+            assert_eq!(
+                &*posted.into_string().await.expect("body reads"),
+                format!("POST /order {GREETING}")
+            );
+
+            let get = client
+                .get(format!("https://localhost:{port}/status"))
+                .expect("request builds")
+                .await
+                .expect("GET on replacement H2 connection succeeds");
+            assert_eq!(get.headers()["x-protocol"], "h2");
+            assert_eq!(
+                &*get.into_string().await.expect("body reads"),
+                "GET /status "
+            );
+        })
+        .await;
+        assert_eq!(
+            posts.get(),
+            1,
+            "POST executed once on replacement connection"
+        );
+        assert_eq!(accepted.get(), 2, "one replacement connection opened");
+    }
+
+    enum WireRejection {
+        RefusedStream,
+        GoAwayAfterEndStream,
+    }
+
+    async fn take_exact(read: &mut impl Read, buf: &mut Vec<u8>, len: usize) -> Vec<u8> {
+        while buf.len() < len {
+            let BufResult(filled, chunk) = read.read(Vec::with_capacity(1024)).await;
+            assert!(
+                filled.expect("the stream reads") > 0,
+                "the peer closed early"
+            );
+            buf.extend_from_slice(&chunk);
+        }
+        buf.drain(..len).collect()
+    }
+
+    /// Reads raw HTTP/2 frames on `stream` and rejects streams on the wire per
+    /// `mode` (`RST_STREAM(REFUSED_STREAM)` or `GOAWAY(last_stream_id=0)` after
+    /// reading the full request body).
+    async fn reject_on_wire<S: http_kit_io::Split>(stream: S, mode: WireRejection) {
+        const PREFACE_LEN: usize = 24;
+        const EMPTY_SETTINGS: [u8; 9] = [0, 0, 0, 4, 0, 0, 0, 0, 0];
+        const SETTINGS_ACK: [u8; 9] = [0, 0, 0, 4, 1, 0, 0, 0, 0];
+
+        let (mut read, mut write) = stream.split();
+        let mut buf = Vec::new();
+        let preface = take_exact(&mut read, &mut buf, PREFACE_LEN).await;
+        assert_eq!(preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        write
+            .write_all(EMPTY_SETTINGS.to_vec())
+            .await
+            .0
+            .expect("server SETTINGS writes");
+        loop {
+            let header = take_exact(&mut read, &mut buf, 9).await;
+            let len = (usize::from(header[0]) << 16)
+                | (usize::from(header[1]) << 8)
+                | usize::from(header[2]);
+            let kind = header[3];
+            let flags = header[4];
+            let stream_id = u32::from_be_bytes([header[5] & 0x7f, header[6], header[7], header[8]]);
+            if len > 0 {
+                let _ = take_exact(&mut read, &mut buf, len).await;
+            }
+            if kind == 4 && (flags & 0x1) == 0 {
+                write
+                    .write_all(SETTINGS_ACK.to_vec())
+                    .await
+                    .0
+                    .expect("SETTINGS ACK writes");
+            }
+            match mode {
+                WireRejection::RefusedStream if kind == 1 && stream_id > 0 => {
+                    let mut rst = vec![0, 0, 4, 3, 0];
+                    rst.extend_from_slice(&stream_id.to_be_bytes());
+                    rst.extend_from_slice(&7_u32.to_be_bytes());
+                    write.write_all(rst).await.0.expect("RST_STREAM writes");
+                    futures_util::future::pending::<()>().await;
+                }
+                WireRejection::GoAwayAfterEndStream
+                    if (kind == 0 || kind == 1) && stream_id > 0 && (flags & 0x1) != 0 =>
+                {
+                    let goaway = vec![0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                    write.write_all(goaway).await.0.expect("GOAWAY writes");
+                    write.shutdown().await.ok();
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn serve_reject_then_echo<I: TestIo, E: LocalExecutor>(
+        io: I,
+        executor: &E,
+        listener: I::Listener,
+        tls: TlsAcceptor,
+        accepted: Rc<Cell<usize>>,
+        first_mode: WireRejection,
+    ) {
+        let mut mode = Some(first_mode);
+        let mut count = 0_usize;
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept");
+            count += 1;
+            accepted.set(count);
+            let io = io.clone();
+            let tls = tls.clone();
+            let plan = mode.take();
+            executor
+                .spawn_local(async move {
+                    let stream = tls.accept(stream, &io).await.expect("TLS handshake");
+                    if let Some(plan) = plan {
+                        reject_on_wire(stream, plan).await;
+                    } else {
+                        let service = |request: Request| async move {
+                            echo(request, "h2", &H1Options::default()).await
+                        };
+                        let _ = http_kit_h2::ServerConnection::from_stream(
+                            stream,
+                            io,
+                            http_kit_h2::ServerConfig::default(),
+                        )
+                        .serve(&service)
+                        .await;
+                    }
+                })
+                .detach();
+        }
+    }
+
+    /// `RST_STREAM(REFUSED_STREAM)` on the first connection retries both `POST`
+    /// (with a CJK body) and `GET` onto a fresh connection.
+    pub async fn refused_stream<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
+        let pki = Pki::new();
+        let listener = io.bind_tcp(loopback()).expect("bind");
+        let port = listener.local_addr().expect("local address").port();
+        let accepted = Rc::new(Cell::new(0));
+        let server = serve_reject_then_echo(
+            io.clone(),
+            executor,
+            listener,
+            pki.tls_acceptor_with_alpn(&[b"h2"]),
+            Rc::clone(&accepted),
+            WireRejection::RefusedStream,
+        );
+        let mut client = backend(pki.transport(), io, executor);
+        against(server, async {
+            let posted = client
+                .post(format!("https://localhost:{port}/refused"))
+                .expect("request builds")
+                .bytes_body(GREETING.as_bytes().to_vec())
+                .await
+                .expect("POST refused with REFUSED_STREAM recovers");
+            assert_eq!(posted.headers()["x-protocol"], "h2");
+            assert_eq!(
+                &*posted.into_string().await.expect("body reads"),
+                format!("POST /refused {GREETING}")
+            );
+
+            let get = client
+                .get(format!("https://localhost:{port}/ok"))
+                .expect("request builds")
+                .await
+                .expect("GET reuses replacement connection");
+            assert_eq!(get.headers()["x-protocol"], "h2");
+            assert_eq!(&*get.into_string().await.expect("body reads"), "GET /ok ");
+        })
+        .await;
+        assert_eq!(
+            accepted.get(),
+            2,
+            "retried onto a single replacement connection"
+        );
+    }
+
+    /// An in-flight `GOAWAY(last_stream_id = 0)` arriving after the client has
+    /// already written `HEADERS` and `DATA` for a `POST` still recovers the
+    /// unprocessed `POST` onto a fresh connection.
+    pub async fn in_flight_goaway<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
+        let pki = Pki::new();
+        let listener = io.bind_tcp(loopback()).expect("bind");
+        let port = listener.local_addr().expect("local address").port();
+        let accepted = Rc::new(Cell::new(0));
+        let server = serve_reject_then_echo(
+            io.clone(),
+            executor,
+            listener,
+            pki.tls_acceptor_with_alpn(&[b"h2"]),
+            Rc::clone(&accepted),
+            WireRejection::GoAwayAfterEndStream,
+        );
+        let mut client = backend(pki.transport(), io, executor);
+        against(server, async {
+            let posted = client
+                .post(format!("https://localhost:{port}/in-flight"))
+                .expect("request builds")
+                .bytes_body(GREETING.as_bytes().to_vec())
+                .await
+                .expect("unprocessed POST above GOAWAY last_stream_id recovers");
+            assert_eq!(posted.headers()["x-protocol"], "h2");
+            assert_eq!(
+                &*posted.into_string().await.expect("body reads"),
+                format!("POST /in-flight {GREETING}")
+            );
+        })
+        .await;
+        assert_eq!(accepted.get(), 2, "retried onto a second connection");
+    }
+
+    /// Through an HTTPS `CONNECT` proxy, the proxy leg speaks HTTP/1.1 while
+    /// the inner TLS session to the origin negotiates HTTP/2 and multiplexes
+    /// concurrent streams over one tunnel.
+    pub async fn https_proxy_tunnel<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
+        let pki = Pki::new();
+        let listener = io.bind_tcp(loopback()).expect("bind");
+        let port = listener.local_addr().expect("local address").port();
+        let accepted = Rc::new(Cell::new(0));
+        let origin = serve_h2(
+            io.clone(),
+            executor,
+            listener,
+            pki.tls_acceptor_with_alpn(&[b"h2", b"http/1.1"]),
+            H2Options {
+                delay: Some(Duration::from_millis(30)),
+                accepted: Rc::clone(&accepted),
+                ..H2Options::default()
+            },
+        );
+        let proxy_listener = io.bind_tcp(loopback()).expect("bind");
+        let proxy_port = proxy_listener.local_addr().expect("local address").port();
+        let connects = Rc::new(RefCell::new(Vec::new()));
+        let proxy = serve_tls_proxy(
+            io.clone(),
+            executor,
+            proxy_listener,
+            pki.tls_acceptor(),
+            Rc::clone(&connects),
+        );
+        let server = async {
+            futures_util::join!(origin, proxy);
+        };
+        let rules = Proxy::builder()
+            .https(format!("https://localhost:{proxy_port}"))
+            .build();
+        let client = backend(pki.transport_through(rules), io, executor);
+        against(server, async {
+            let tasks = (0..4).map(|index| {
+                let mut client = client.clone();
+                async move {
+                    let response = client
+                        .post(format!("https://localhost:{port}/tunnel/{index}"))
+                        .expect("request builds")
+                        .bytes_body(GREETING.as_bytes().to_vec())
+                        .await
+                        .expect("H2 POST over HTTPS proxy tunnel succeeds");
+                    assert_eq!(response.headers()["x-protocol"], "h2");
+                    assert_eq!(
+                        &*response.into_string().await.expect("body reads"),
+                        format!("POST /tunnel/{index} {GREETING}")
+                    );
+                }
+            });
+            futures_util::future::join_all(tasks).await;
+        })
+        .await;
+        assert_eq!(
+            *connects.borrow(),
+            [format!("localhost:{port}")],
+            "all concurrent H2 streams share a single CONNECT tunnel"
+        );
+        assert_eq!(
+            accepted.get(),
+            1,
+            "one upstream connection inside the tunnel"
+        );
+    }
+
+    /// A request carrying `Upgrade` bypasses a pooled HTTP/2 connection, dials
+    /// with ALPN `http/1.1` to switch protocols, and leaves the pooled HTTP/2
+    /// connection intact for regular requests.
+    pub async fn upgrade_bypasses_h2<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
+        use futures_util::{AsyncReadExt as _, AsyncWriteExt as _};
+        use zenwave::backend::Upgrade;
+
+        let pki = Pki::new();
+        let listener = io.bind_tcp(loopback()).expect("bind");
+        let port = listener.local_addr().expect("local address").port();
+        let accepted = Rc::new(Cell::new(0));
+        let server_io = io.clone();
+        let server_accepted = Rc::clone(&accepted);
+        let tls = pki.tls_acceptor_with_alpn(&[b"h2", b"http/1.1"]);
+        let server = async move {
+            let mut count = 0_usize;
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                count += 1;
+                server_accepted.set(count);
+                let io = server_io.clone();
+                let tls = tls.clone();
+                executor
+                    .spawn_local(async move {
+                        let stream = tls.accept(stream, &io).await.expect("TLS handshake");
+                        if stream.alpn_protocol() == Some(&b"h2"[..]) {
+                            let service = |request: Request| async move {
+                                echo(request, "h2", &H1Options::default()).await
+                            };
+                            let _ = http_kit_h2::ServerConnection::from_stream(
+                                stream,
+                                io,
+                                http_kit_h2::ServerConfig::default(),
+                            )
+                            .serve(&service)
+                            .await;
+                        } else {
+                            assert_eq!(stream.alpn_protocol(), Some(&b"http/1.1"[..]));
+                            let (mut read, mut write) = stream.split();
+                            let head = read_head(&mut read).await.to_ascii_lowercase();
+                            assert!(head.contains("upgrade: echo"), "{head}");
+                            let mut answer = b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: echo\r\n\r\n".to_vec();
+                            answer.extend_from_slice(EARLY.as_bytes());
+                            write.write_all(answer).await.0.expect("101 writes");
+                            assert_eq!(read_len(&mut read, PING.len()).await, PING.as_bytes());
+                            write
+                                .write_all(PONG.as_bytes().to_vec())
+                                .await
+                                .0
+                                .expect("pong writes");
+                            futures_util::future::pending::<()>().await;
+                        }
+                    })
+                    .detach();
+            }
+        };
+        let mut client = backend(pki.transport(), io, executor);
+        against(server, async {
+            let first = client
+                .post(format!("https://localhost:{port}/regular"))
+                .expect("request builds")
+                .bytes_body(GREETING.as_bytes().to_vec())
+                .await
+                .expect("H2 POST succeeds");
+            assert_eq!(first.headers()["x-protocol"], "h2");
+            first.into_string().await.expect("body reads");
+            assert_eq!(accepted.get(), 1);
+
+            let mut upgraded = client
+                .get(format!("https://localhost:{port}/switch"))
+                .expect("request builds")
+                .header("connection", "upgrade")
+                .expect("header")
+                .header("upgrade", "echo")
+                .expect("header")
+                .await
+                .expect("HTTP/1.1 upgrade succeeds");
+            assert_eq!(upgraded.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+            let mut switched = Upgrade::on(&mut upgraded)
+                .expect("101 carries Upgrade")
+                .switched()
+                .await
+                .expect("switched stream handed over");
+            let mut early = vec![0; EARLY.len()];
+            switched.read_exact(&mut early).await.expect("early reads");
+            assert_eq!(early, EARLY.as_bytes());
+            switched.write_all(PING.as_bytes()).await.expect("ping");
+            switched.flush().await.expect("flush");
+            let mut pong = vec![0; PONG.len()];
+            switched.read_exact(&mut pong).await.expect("pong reads");
+            assert_eq!(pong, PONG.as_bytes());
+            assert_eq!(accepted.get(), 2);
+
+            let after = client
+                .get(format!("https://localhost:{port}/still-h2"))
+                .expect("request builds")
+                .await
+                .expect("pooled H2 connection stays live");
+            assert_eq!(after.headers()["x-protocol"], "h2");
+            after.into_string().await.expect("body reads");
+            assert_eq!(accepted.get(), 2, "regular request still uses pooled H2");
+        })
+        .await;
+    }
+
+    /// Response trailers, response-head timeout (resetting one stream while
+    /// keeping the shared HTTP/2 connection open), and body-idle timeout over
+    /// HTTP/2.
+    pub async fn timeouts_and_trailers<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
+        let pki = Pki::new();
+        let listener = io.bind_tcp(loopback()).expect("bind");
+        let port = listener.local_addr().expect("local address").port();
+        let accepted = Rc::new(Cell::new(0));
+        let server = serve_h2(
+            io.clone(),
+            executor,
+            listener,
+            pki.tls_acceptor_with_alpn(&[b"h2"]),
+            H2Options {
+                accepted: Rc::clone(&accepted),
+                ..H2Options::default()
+            },
+        );
+        let mut client = backend(pki.transport(), io, executor);
+        against(server, async {
+            let response = client
+                .get(format!("https://localhost:{port}/trailers"))
+                .expect("request builds")
+                .await
+                .expect("trailers GET succeeds");
+            assert_eq!(response.headers()["x-protocol"], "h2");
+            let mut data = Vec::new();
+            let mut trailers = None;
+            let mut body = response.into_body();
+            while let Some(frame) = body.next().await {
+                match frame.expect("frame reads") {
+                    http_kit::BodyFrame::Data(chunk) => data.extend_from_slice(&chunk),
+                    http_kit::BodyFrame::Trailers(map) => trailers = Some(map),
+                    _ => unreachable!("no file frames"),
+                }
+            }
+            assert_eq!(std::str::from_utf8(&data).expect("UTF-8"), GREETING);
+            let trailers = trailers.expect("trailers arrive");
+            assert_eq!(trailers["x-checksum"], "abc123");
+            assert_eq!(trailers["x-status"], "complete");
+
+            let head_err = client
+                .get(format!("https://localhost:{port}/slow-head"))
+                .expect("request builds")
+                .response_head_timeout(READ_TIMEOUT)
+                .await
+                .expect_err("slow H2 head times out");
+            assert!(
+                matches!(head_err, Error::Timeout(TimedOut::ResponseHead)),
+                "expected ResponseHead timeout, got {head_err:?}"
+            );
+
+            let fast = client
+                .get(format!("https://localhost:{port}/fast"))
+                .expect("request builds")
+                .await
+                .expect("shared H2 connection survives a single stream timeout");
+            assert_eq!(fast.headers()["x-protocol"], "h2");
+            fast.into_string().await.expect("body reads");
+            assert_eq!(
+                accepted.get(),
+                1,
+                "stream timeout resets the stream without dropping the H2 connection"
+            );
+
+            let stalled = client
+                .get(format!("https://localhost:{port}/stalled-body"))
+                .expect("request builds")
+                .body_idle_timeout(READ_TIMEOUT)
+                .await
+                .expect("stalled body response head arrives");
+            let body_err = stalled
+                .into_body()
+                .into_bytes()
+                .await
+                .expect_err("stalled H2 body fails");
+            assert!(
+                matches!(Error::from(body_err), Error::Timeout(TimedOut::BodyIdle)),
+                "expected BodyIdle timeout"
+            );
+        })
+        .await;
+    }
+
+    /// An HTTP/2 origin advertising `Alt-Svc: h3` upgrades subsequent requests
+    /// to HTTP/3 once the background QUIC handshake finishes.
+    #[cfg(feature = "native-http3")]
+    pub async fn upgrade_to_h3<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
+        let pki = Pki::new();
+        let (h3_server, h3_port) = super::h3::bind_h3(&io, &pki);
+        let listener = io.bind_tcp(loopback()).expect("bind");
+        let port = listener.local_addr().expect("local address").port();
+        let h2 = serve_h2(
+            io.clone(),
+            executor,
+            listener,
+            pki.tls_acceptor_with_alpn(&[b"h2", b"http/1.1"]),
+            H2Options {
+                alt_svc: Some(format!("h3=\":{h3_port}\"; ma=60")),
+                ..H2Options::default()
+            },
+        );
+        let h3 = async move {
+            let options = H1Options::default();
+            let service = |request: Request| echo(request, "h3", &options);
+            h3_server.serve(&service).await.expect("h3 server runs");
+        };
+        let server = async {
+            futures_util::join!(h2, h3);
+        };
+        let mut client = backend(pki.transport(), io.clone(), executor);
+        against(server, async {
+            let uri = format!("https://localhost:{port}/h2-to-h3");
+            let first = client
+                .get(&uri)
+                .expect("request builds")
+                .await
+                .expect("initial GET succeeds");
+            assert_eq!(first.headers()["x-protocol"], "h2");
+            first.into_string().await.expect("body reads");
+
+            let mut protocol = String::new();
+            for _ in 0..50 {
+                let response = client
+                    .post(&uri)
+                    .expect("request builds")
+                    .bytes_body(GREETING.as_bytes().to_vec())
+                    .await
+                    .expect("POST succeeds");
+                protocol = response.headers()["x-protocol"]
+                    .to_str()
+                    .expect("ASCII")
+                    .to_owned();
+                let body = response.into_string().await.expect("body reads");
+                assert_eq!(&*body, format!("POST /h2-to-h3 {GREETING}"));
+                if protocol == "h3" {
+                    break;
+                }
+                io.sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(protocol, "h3", "advertised h3 takes over from pooled h2");
         })
         .await;
     }

@@ -140,6 +140,10 @@ mod engine {
         /// `http-kit-tls` as is.
         #[cfg(native_backend)]
         http1_config: Arc<ClientConfig>,
+        /// The `h2` + `http/1.1` configuration, which the native backend hands
+        /// to `http-kit-tls` when `native-http2` is enabled and allowed.
+        #[cfg(native_h2)]
+        http2_or_http1_config: Arc<ClientConfig>,
         /// The verifier every configuration above runs, which the native
         /// backend's HTTP/3 handshakes call too.
         #[cfg(native_h3)]
@@ -200,6 +204,12 @@ mod engine {
                 Arc::new(config)
             };
             let http1 = with_alpn(Protocols::Http1);
+            #[cfg(native_h2)]
+            let http2_or_http1_config = {
+                let mut config = base.clone();
+                config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+                Arc::new(config)
+            };
             Ok(Self {
                 #[cfg(connector)]
                 http2_or_http1: futures_rustls::TlsConnector::from(with_alpn(
@@ -209,6 +219,8 @@ mod engine {
                 base: Arc::new(base),
                 #[cfg(native_backend)]
                 http1_config: Arc::clone(&http1),
+                #[cfg(native_h2)]
+                http2_or_http1_config,
                 #[cfg(native_h3)]
                 verifier: shared,
                 #[cfg(connector)]
@@ -229,6 +241,15 @@ mod engine {
         #[cfg(native_backend)]
         pub const fn http1_config(&self) -> &Arc<ClientConfig> {
             &self.http1_config
+        }
+
+        /// The configuration offering `h2` and `http/1.1`, with the platform
+        /// verifier (and OneCRL, where it applies) — what the native
+        /// backend's `http-kit-tls` handshakes run with when HTTP/2 is
+        /// enabled and allowed.
+        #[cfg(native_h2)]
+        pub const fn http2_or_http1_config(&self) -> &Arc<ClientConfig> {
+            &self.http2_or_http1_config
         }
 
         /// The shared client configuration; `transport::quic` clones it with

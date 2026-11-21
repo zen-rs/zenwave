@@ -85,6 +85,7 @@ jobs:
       # (without `rustls-ring`) compile with zero C toolchain.
       - run: cargo clippy --target wasm32-wasip2 --no-default-features --features wasi-backend,public-suffix --lib --test wasi_backend -- -D warnings
       - run: cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend --lib --test wasi_native_backend -- -D warnings
+      - run: cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend,native-http2 --lib --test wasi_native_backend -- -D warnings
       # With `rustls-ring` or `native-http3`, ring and BoringSSL (`boring-sys` /
       # `quiche`) compile C/C++ for WASI against `wasi-sdk-34` (Clang 23 +
       # `wasm32-wasip2` and cooperative-threaded `wasm32-wasip3` sysroots)
@@ -123,18 +124,19 @@ jobs:
             echo "BINDGEN_EXTRA_CLANG_ARGS_wasm32_wasip2=$wasi_bindgen"
             echo "BINDGEN_EXTRA_CLANG_ARGS_wasm32_wasip3=$wasi_bindgen"
           } >> "$GITHUB_ENV"
-      - run: cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend,rustls-ring --lib --test wasi_native_backend -- -D warnings
+      - run: cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend,native-http2,rustls-ring --lib --test wasi_native_backend -- -D warnings
       - run: cargo clippy --target wasm32-wasip2 --no-default-features --features wasi-backend,native-backend,rustls-ring --lib --test wasi_backend --test wasi_native_backend -- -D warnings
-      - run: cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend,native-http3 --lib --test wasi_native_backend -- -D warnings
-      - run: cargo test --no-run --target wasm32-wasip2 --no-default-features --features native-backend,native-http3 --test wasi_native_backend
+      - run: cargo clippy --target wasm32-wasip2 --no-default-features --features native-backend,native-http2,native-http3 --lib --test wasi_native_backend -- -D warnings
+      - run: cargo test --no-run --target wasm32-wasip2 --no-default-features --features native-backend,native-http2,native-http3 --test wasi_native_backend
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: wasm32-wasip3
           components: clippy
       - run: cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features wasi-backend,public-suffix --lib --test wasi_backend -- -D warnings
       - run: cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features native-backend --lib --test wasi_native_backend -- -D warnings
-      - run: cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features native-backend,native-http3 --lib --test wasi_native_backend -- -D warnings
-      - run: cargo +nightly test --no-run --target wasm32-wasip3 --no-default-features --features native-backend,native-http3 --test wasi_native_backend
+      - run: cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features native-backend,native-http2 --lib --test wasi_native_backend -- -D warnings
+      - run: cargo +nightly clippy --target wasm32-wasip3 --no-default-features --features native-backend,native-http2,native-http3 --lib --test wasi_native_backend -- -D warnings
+      - run: cargo +nightly test --no-run --target wasm32-wasip3 --no-default-features --features native-backend,native-http2,native-http3 --test wasi_native_backend
 
   mobile:
     # Cross-compilation for the mobile targets, tests included. The suites run

@@ -19,10 +19,10 @@
 //!   It is the [`DefaultBackend`] on WASI when enabled.
 //! - **`native-backend`**: `NativeBackend::on_current_thread` over the host's
 //!   `http-kit-io` implementation (`Dial`, `Resolve`, `Timer`, plus `Datagram`
-//!   and `ResolveHttps` with `native-http3`), HTTP/1.1 (and HTTP/3 with
-//!   `native-http3`), and TLS verified against `webpki-roots` compiled into the
-//!   binary, with the compiled OneCRL table applied (its refresher needs a
-//!   thread and a connector, and is left out).
+//!   and `ResolveHttps` with `native-http3`), HTTP/1.1 (plus HTTP/2 with
+//!   `native-http2` and HTTP/3 with `native-http3`), and TLS verified against
+//!   `webpki-roots` compiled into the binary, with the compiled OneCRL table
+//!   applied (its refresher needs a thread and a connector, and is left out).
 //!
 //! `hyper-backend`, `curl-backend`, `ws`, `native-tls`, `native-compio`,
 //! `native-tokio` and `native-kernel-tls` are refused with a compile error on
@@ -33,14 +33,16 @@
 //!
 //! - **`hyper-backend`** (default): Uses hyper with async-io/async-net. TLS comes
 //!   from `rustls` (default) or `native-tls`; `rustls` wins when both are on.
-//!   The only backend that speaks HTTP/2.
-//! - **`native-backend`**: `NativeBackend`, HTTP/1.1 on `http-kit-h1` and,
-//!   with `native-http3`, HTTP/3 on `http-kit-h3`, over `http-kit-io`'s
-//!   owned-buffer streams, generic over the runtime. Its connection pool is
-//!   an actor on one thread: a thread-per-core caller builds one per thread
-//!   with `NativeBackend::on_current_thread`. `native-compio` or
-//!   `native-tokio` adds a driver thread for callers on no runtime, and makes
-//!   it the default backend when `hyper-backend` is off.
+//!   Speaks HTTP/1.1, HTTP/2 (`http2`, on by default) and HTTP/3 (`http3`, on by
+//!   default).
+//! - **`native-backend`**: `NativeBackend`, HTTP/1.1 on `http-kit-h1`, HTTP/2 on
+//!   `http-kit-h2` (with `native-http2`), and HTTP/3 on `http-kit-h3` (with
+//!   `native-http3`), over `http-kit-io`'s owned-buffer streams, generic over
+//!   the runtime. Its connection pool is an actor on one thread: a
+//!   thread-per-core caller builds one per thread with
+//!   `NativeBackend::on_current_thread`. `native-compio` or `native-tokio` adds
+//!   a driver thread for callers on no runtime, and makes it the default backend
+//!   when `hyper-backend` is off.
 //! - **`curl-backend`**: Uses libcurl via the `curl` crate. Includes proxy support.
 //! - **`apple-backend`**: Uses Apple's native `NSURLSession` (macOS/iOS only).
 //!

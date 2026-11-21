@@ -1,9 +1,17 @@
-//! Opening an HTTP/1.1 connection on `http-kit-io` sockets, through the
-//! transport's proxy rules: the [`route`] the async-net connector follows,
-//! with every leg on owned-buffer streams and TLS through `http-kit-tls`,
-//! the origin's session inside the proxy's when the proxy is HTTPS.
+//! Opening an HTTP/1.1 or HTTP/2 connection on `http-kit-io` sockets, through
+//! the transport's proxy rules: the [`route`] the async-net connector follows,
+//! with every leg on owned-buffer streams and TLS through `http-kit-tls`, the
+//! origin's session inside the proxy's when the proxy is HTTPS.
 
-use std::{cell::Cell, future::Future, io, net::SocketAddr, pin::pin, sync::Arc, time::Instant};
+use std::{
+    cell::Cell,
+    future::Future,
+    io,
+    net::SocketAddr,
+    pin::pin,
+    task::{Poll, Waker},
+    time::Instant,
+};
 
 use futures_util::{
     FutureExt,
@@ -105,12 +113,79 @@ pub trait QuicBind {}
 #[cfg(not(native_h3))]
 impl<I> QuicBind for I {}
 
-/// A fresh HTTP/1.1 connection: its handle, how requests on it are shaped,
-/// and the future that drives its socket.
+/// The deadline a dial runs under, updated in place on the pool's thread as
+/// later requests join the wait for it.
+pub struct DialBound {
+    deadline: Cell<Option<Instant>>,
+    waker: Cell<Option<Waker>>,
+}
+
+impl DialBound {
+    /// A bound starting at `deadline` (`None` when unbounded).
+    pub const fn new(deadline: Option<Instant>) -> Self {
+        Self {
+            deadline: Cell::new(deadline),
+            waker: Cell::new(None),
+        }
+    }
+
+    /// Updates the deadline, waking the dial if it was sleeping on the old one.
+    pub fn set(&self, deadline: Option<Instant>) {
+        if self.deadline.get() != deadline {
+            self.deadline.set(deadline);
+            if let Some(waker) = self.waker.take() {
+                waker.wake();
+            }
+        }
+    }
+
+    /// Resolves once the current deadline elapses on `timer`; `None` waits
+    /// unless a later [`set`](Self::set) installs a finite bound.
+    pub async fn expired<T: Timer>(&self, timer: &T) {
+        loop {
+            let target = self.deadline.get();
+            let changed = std::future::poll_fn(|cx| {
+                if self.deadline.get() == target {
+                    self.waker.set(Some(cx.waker().clone()));
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            });
+            match target {
+                Some(deadline) => {
+                    match select(pin!(timer.sleep_until(deadline)), pin!(changed)).await {
+                        Either::Left(((), _)) if self.deadline.get() == Some(deadline) => return,
+                        Either::Left(((), _)) | Either::Right(((), _)) => {}
+                    }
+                }
+                None => changed.await,
+            }
+        }
+    }
+}
+
+/// The HTTP connection a dial started after its TLS handshake settled the
+/// protocol.
+pub enum DialedConn {
+    /// HTTP/1.1: exclusive handle, how requests on it are shaped, and the
+    /// future that drives its socket.
+    H1 {
+        send: H1Send,
+        via: Via,
+        driver: LocalBoxFuture<'static, ()>,
+    },
+    /// HTTP/2: shared handle and the future that drives its socket.
+    #[cfg(native_h2)]
+    H2 {
+        send: http_kit_h2::SendRequest,
+        driver: LocalBoxFuture<'static, Result<(), http_kit_h2::Error>>,
+    },
+}
+
+/// A fresh connection opened by [`dial`].
 pub struct Dialed {
-    pub send: H1Send,
-    pub via: Via,
-    pub driver: LocalBoxFuture<'static, ()>,
+    pub conn: DialedConn,
     /// Where the origin's TLS records are encrypted, for a TLS connection.
     #[cfg(all(
         test,
@@ -121,9 +196,31 @@ pub struct Dialed {
     pub tls_mode: Option<http_kit_tls::Mode>,
 }
 
-/// The TLS connector for `config`. With `native-kernel-tls` on Linux the
-/// kernel is probed here, once for the connector the pool keeps, and each
-/// handshake the kernel can take moves to kernel TLS.
+/// The pool's `http-kit-tls` connectors, one per ALPN offer.
+#[derive(Clone)]
+pub struct TlsConnectors {
+    /// Offers `http/1.1` alone: proxy TLS legs and HTTP/1.1-only dials.
+    pub http1: TlsConnector,
+    /// Offers `h2` and `http/1.1`, letting the origin choose.
+    #[cfg(native_h2)]
+    pub http2_or_http1: TlsConnector,
+}
+
+impl TlsConnectors {
+    const fn for_protocols(&self, protocols: Protocols) -> &TlsConnector {
+        match protocols {
+            Protocols::Http1 => &self.http1,
+            #[cfg(native_h2)]
+            Protocols::Http2OrHttp1 => &self.http2_or_http1,
+            #[cfg(not(native_h2))]
+            Protocols::Http2OrHttp1 => &self.http1,
+        }
+    }
+}
+
+/// Builds the pool's TLS connectors from `tls`. With `native-kernel-tls` on
+/// Linux the kernel is probed once here, and each handshake the kernel can
+/// take moves its record layer to the kernel.
 ///
 /// # Errors
 ///
@@ -136,14 +233,25 @@ pub struct Dialed {
         reason = "only a Linux kernel TLS build can fail to probe"
     )
 )]
-pub fn connector(config: Arc<http_kit_tls::rustls::ClientConfig>) -> Result<TlsConnector, Error> {
-    let connector = TlsConnector::new(config);
+pub fn connectors(tls: &crate::transport::tls::TlsConnector) -> Result<TlsConnectors, Error> {
     #[cfg(all(feature = "native-kernel-tls", target_os = "linux"))]
-    let connector = connector.with_kernel_tls(
-        http_kit_tls::KernelTls::probe()
-            .map_err(|error| Error::Config(ConfigError::KernelTls(error)))?,
-    );
-    Ok(connector)
+    let kernel = http_kit_tls::KernelTls::probe()
+        .map_err(|error| Error::Config(ConfigError::KernelTls(error)))?;
+
+    let http1 = TlsConnector::new(tls.http1_config().clone());
+    #[cfg(all(feature = "native-kernel-tls", target_os = "linux"))]
+    let http1 = http1.with_kernel_tls(kernel);
+
+    #[cfg(native_h2)]
+    let http2_or_http1 = TlsConnector::new(tls.http2_or_http1_config().clone());
+    #[cfg(all(native_h2, feature = "native-kernel-tls", target_os = "linux"))]
+    let http2_or_http1 = http2_or_http1.with_kernel_tls(kernel);
+
+    Ok(TlsConnectors {
+        http1,
+        #[cfg(native_h2)]
+        http2_or_http1,
+    })
 }
 
 /// An HTTP/1.1 connection's request handle, with the token to the stream a
@@ -161,42 +269,51 @@ impl H1Send {
     }
 }
 
+/// Per-dial protocol offer, deadline tracker, and phase observer.
+pub struct DialOptions<'a> {
+    pub protocols: Protocols,
+    pub bound: &'a DialBound,
+    pub phase: &'a Cell<ConnectPhase>,
+}
+
 /// Connects to `origin` the way the transport's rules say — its unix domain
 /// socket when it has one, else TCP through whatever proxy the rules pick —
-/// and runs the HTTP/1.1 handshake over the result, within the transport's
-/// `deadline`, when there is one: the latest bound among the requests the
-/// dial serves, so it only stops a dial no request still waits for.
+/// offering `options.protocols` on the origin's TLS leg, and starts the
+/// negotiated HTTP client over the result within `options.bound`: the latest
+/// deadline among the requests the dial serves, so it only stops a dial no
+/// request still waits for.
 ///
 /// # Errors
 ///
-/// Every leg's failure; [`TimedOut::Connect`] when `deadline` passed first,
-/// with the phase the dial was in.
-///
-/// `phase` follows the dial, so the pool can report where a request that
-/// gave up waiting for it found it.
+/// Every leg's failure; [`TimedOut::Connect`] when `options.bound` passed
+/// first, with the phase the dial was in.
 pub async fn dial<I: NativeIo, R: Resolve>(
     io: &I,
     resolver: &R,
     transport: &Transport,
-    tls: &TlsConnector,
+    tls: &TlsConnectors,
     origin: &Origin,
-    deadline: Option<Instant>,
-    phase: &Cell<ConnectPhase>,
+    options: DialOptions<'_>,
 ) -> Result<Dialed, Error> {
-    phase.set(ConnectPhase::Resolve);
-    let Some(deadline) = deadline else {
-        return dial_route(io, resolver, transport, tls, origin, phase).await;
-    };
+    options.phase.set(ConnectPhase::Resolve);
     // Dropping the dial at the deadline closes whatever sockets it opened.
     match select(
-        pin!(dial_route(io, resolver, transport, tls, origin, phase)),
-        pin!(io.sleep_until(deadline)),
+        pin!(dial_route(
+            io,
+            resolver,
+            transport,
+            tls,
+            origin,
+            options.protocols,
+            options.phase
+        )),
+        pin!(options.bound.expired(io)),
     )
     .await
     {
         Either::Left((dialed, _)) => dialed,
         Either::Right(((), _)) => {
-            let during = phase.get();
+            let during = options.phase.get();
             debug!(host = %origin.host, %during, "connect timeout passed before the dial finished");
             Err(Error::Timeout(TimedOut::Connect { during }))
         }
@@ -209,8 +326,9 @@ async fn dial_route<I: NativeIo, R: Resolve>(
     io: &I,
     resolver: &R,
     transport: &Transport,
-    tls: &TlsConnector,
+    tls: &TlsConnectors,
     origin: &Origin,
+    protocols: Protocols,
     phase: &Cell<ConnectPhase>,
 ) -> Result<Dialed, Error> {
     let secure = origin.scheme == Scheme::HTTPS;
@@ -230,7 +348,7 @@ async fn dial_route<I: NativeIo, R: Resolve>(
                 },
             )
         })?;
-        return last.finish_origin(origin, unix).await;
+        return last.finish_origin(origin, protocols, unix).await;
     }
 
     let target = Target {
@@ -238,23 +356,24 @@ async fn dial_route<I: NativeIo, R: Resolve>(
         port: origin.port,
         tls: secure,
         tunnel_plaintext: false,
-        protocols: Protocols::Http1,
+        protocols,
     };
     match route(transport.proxy(), target)? {
         Route::Direct => {
             let tcp = tcp(io, resolver, Hop::Origin, &origin.host, origin.port, phase).await?;
-            last.finish_origin(origin, tcp).await
+            last.finish_origin(origin, protocols, tcp).await
         }
         Route::Forward {
             proxy,
             authorization,
         } => {
             let tcp = tcp(io, resolver, Hop::Proxy, &proxy.host, proxy.port, phase).await?;
+            // Forward-proxy requests use HTTP/1.1 absolute-form, so the proxy
+            // TLS leg never offers `h2`.
             last.finish(
-                Hop::Proxy,
-                &proxy.host,
-                proxy.port,
+                (Hop::Proxy, &proxy.host, proxy.port),
                 proxy.tls,
+                Protocols::Http1,
                 tcp,
                 Via::HttpProxy { authorization },
             )
@@ -268,20 +387,21 @@ async fn dial_route<I: NativeIo, R: Resolve>(
             let tcp = tcp(io, resolver, Hop::Proxy, &proxy.host, proxy.port, phase).await?;
             let via = (proxy.host.as_str(), proxy.port);
             if proxy.tls {
-                // The proxy's session carries the tunnel, and the origin's
-                // runs inside it.
+                // The proxy's session carries the HTTP/1.1 CONNECT tunnel, and
+                // the origin's TLS session runs inside it.
                 phase.set(ConnectPhase::Tls);
                 let secured = tls
+                    .http1
                     .connect(server_name(via.0)?, tcp, io)
                     .await
                     .map_err(|error| handshake_failure(Hop::Proxy, via.0, via.1, error))?;
                 phase.set(ConnectPhase::Proxy);
                 let tunneled = tunnel(io, secured, via, &authority, authorization).await?;
-                last.finish_origin(origin, tunneled).await
+                last.finish_origin(origin, protocols, tunneled).await
             } else {
                 phase.set(ConnectPhase::Proxy);
                 let tunneled = tunnel(io, tcp, via, &authority, authorization).await?;
-                last.finish_origin(origin, tunneled).await
+                last.finish_origin(origin, protocols, tunneled).await
             }
         }
         Route::Socks5 {
@@ -304,7 +424,7 @@ async fn dial_route<I: NativeIo, R: Resolve>(
             )
             .await
             .map_err(|failure| failure.into_error((&host, port), &origin.host, origin.port))?;
-            last.finish_origin(origin, tcp).await
+            last.finish_origin(origin, protocols, tcp).await
         }
     }
 }
@@ -313,53 +433,61 @@ async fn dial_route<I: NativeIo, R: Resolve>(
 /// reaches.
 struct LastLeg<'a, I> {
     io: &'a I,
-    tls: &'a TlsConnector,
+    tls: &'a TlsConnectors,
     phase: &'a Cell<ConnectPhase>,
 }
 
 impl<I: Timer + Clone + 'static> LastLeg<'_, I> {
     /// [`finish`](Self::finish) for a `stream` that ends at `origin`.
-    async fn finish_origin<S>(&self, origin: &Origin, stream: S) -> Result<Dialed, Error>
+    async fn finish_origin<S>(
+        &self,
+        origin: &Origin,
+        protocols: Protocols,
+        stream: S,
+    ) -> Result<Dialed, Error>
     where
         S: TlsTransport + Split<ReadHalf: ReadOwned + SpliceRead, WriteHalf: SpliceWrite>,
     {
         self.finish(
-            Hop::Origin,
-            &origin.host,
-            origin.port,
+            (Hop::Origin, &origin.host, origin.port),
             origin.scheme == Scheme::HTTPS,
+            protocols,
             stream,
             Via::Direct,
         )
         .await
     }
 
-    /// Wraps `stream` in TLS for `host` (the `hop` of the route, at `port`)
-    /// when `secure`, then starts HTTP/1.1 on it.
+    /// Wraps `stream` in TLS for `peer` when `secure`, then starts HTTP/2 when
+    /// ALPN chose `h2` or HTTP/1.1 otherwise.
     async fn finish<S>(
         &self,
-        hop: Hop,
-        host: &str,
-        port: u16,
+        (hop, host, port): (Hop, &str, u16),
         secure: bool,
+        protocols: Protocols,
         stream: S,
         via: Via,
     ) -> Result<Dialed, Error>
     where
         S: TlsTransport + Split<ReadHalf: ReadOwned + SpliceRead, WriteHalf: SpliceWrite>,
     {
-        let mut config = ClientConfig::default();
-        config.request_target = match via {
-            Via::Direct => RequestTarget::Origin,
-            Via::HttpProxy { .. } => RequestTarget::Absolute,
-        };
         let io = self.io.clone();
         if !secure {
-            return Ok(start(stream, io, config, via));
+            return Ok(Dialed {
+                conn: start_h1(stream, io, via),
+                #[cfg(all(
+                    test,
+                    target_os = "linux",
+                    feature = "native-kernel-tls",
+                    native_driver
+                ))]
+                tls_mode: None,
+            });
         }
         self.phase.set(ConnectPhase::Tls);
         let stream = self
             .tls
+            .for_protocols(protocols)
             .connect(server_name(host)?, stream, self.io)
             .await
             .map_err(|error| handshake_failure(hop, host, port, error))?;
@@ -370,15 +498,29 @@ impl<I: Timer + Clone + 'static> LastLeg<'_, I> {
             native_driver
         ))]
         let tls_mode = Some(stream.mode());
-        let dialed = start(stream, io, config, via);
-        #[cfg(all(
-            test,
-            target_os = "linux",
-            feature = "native-kernel-tls",
-            native_driver
-        ))]
-        let dialed = Dialed { tls_mode, ..dialed };
-        Ok(dialed)
+        #[cfg(native_h2)]
+        if matches!(protocols, Protocols::Http2OrHttp1) && stream.alpn_protocol() == Some(b"h2") {
+            return Ok(Dialed {
+                conn: start_h2(stream, io),
+                #[cfg(all(
+                    test,
+                    target_os = "linux",
+                    feature = "native-kernel-tls",
+                    native_driver
+                ))]
+                tls_mode,
+            });
+        }
+        Ok(Dialed {
+            conn: start_h1(stream, io, via),
+            #[cfg(all(
+                test,
+                target_os = "linux",
+                feature = "native-kernel-tls",
+                native_driver
+            ))]
+            tls_mode,
+        })
     }
 }
 
@@ -418,13 +560,18 @@ fn handshake_failure(hop: Hop, host: &str, port: u16, error: HandshakeError) -> 
 /// Runs the HTTP/1.1 client over `stream`; the driver logs how it ended, and
 /// when a request switched the connection, holds the switched stream on this
 /// thread until the request's [`Upgrade`] claims it.
-fn start<S, T>(stream: S, timer: T, config: ClientConfig, via: Via) -> Dialed
+fn start_h1<S, T>(stream: S, timer: T, via: Via) -> DialedConn
 where
     S: Split + 'static,
     S::ReadHalf: ReadOwned + SpliceRead + 'static,
     S::WriteHalf: Write + SendFile + SpliceWrite + 'static,
     T: http_kit_io::Timer + 'static,
 {
+    let mut config = ClientConfig::default();
+    config.request_target = match via {
+        Via::Direct => RequestTarget::Origin,
+        Via::HttpProxy { .. } => RequestTarget::Absolute,
+    };
     let (requests, connection) = handshake_stream(stream, timer, config);
     let (upgrade, claims) = upgrade::channel();
     let driver = async move {
@@ -442,17 +589,29 @@ where
         }
     }
     .boxed_local();
-    Dialed {
+    DialedConn::H1 {
         send: H1Send { requests, upgrade },
         via,
         driver,
-        #[cfg(all(
-            test,
-            target_os = "linux",
-            feature = "native-kernel-tls",
-            native_driver
-        ))]
-        tls_mode: None,
+    }
+}
+
+/// Runs the HTTP/2 client over `stream`.
+#[cfg(native_h2)]
+fn start_h2<S, T>(stream: S, timer: T) -> DialedConn
+where
+    S: Split + 'static,
+    S::ReadHalf: ReadOwned + SpliceRead + 'static,
+    S::WriteHalf: Write + SendFile + SpliceWrite + 'static,
+    T: http_kit_io::Timer + Clone + 'static,
+{
+    let mut config = http_kit_h2::ClientConfig::default();
+    config.keep_alive_interval = Some(std::time::Duration::from_secs(30));
+    config.keep_alive_timeout = std::time::Duration::from_secs(10);
+    let (send, connection) = http_kit_h2::handshake_stream(stream, timer, config);
+    DialedConn::H2 {
+        send,
+        driver: connection.run().boxed_local(),
     }
 }
 
@@ -643,7 +802,7 @@ mod tests {
     /// A transport trusting a throwaway CA, and a user-space TLS acceptor
     /// for a `localhost` certificate that CA signed, so the kernel is the
     /// client's alone.
-    fn pki() -> (Transport, TlsAcceptor) {
+    fn pki_with_alpn(alpn_protocols: &[&[u8]]) -> (Transport, TlsAcceptor) {
         let now = OffsetDateTime::now_utc();
         let ca_key = KeyPair::generate().expect("CA key");
         let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
@@ -670,7 +829,7 @@ mod tests {
                     PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
                 )
                 .expect("server certificate");
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.alpn_protocols = alpn_protocols.iter().map(|alpn| alpn.to_vec()).collect();
         let transport = Transport::builder()
             .proxy(Proxy::none())
             .extra_root_certificate_der(ca_der.to_vec())
@@ -679,7 +838,11 @@ mod tests {
         (transport, TlsAcceptor::new(Arc::new(config)))
     }
 
-    /// Echoes the request body, over one TLS connection.
+    fn pki() -> (Transport, TlsAcceptor) {
+        pki_with_alpn(&[b"http/1.1"])
+    }
+
+    /// Echoes the request body, over one TLS HTTP/1.1 connection.
     async fn serve_once<I: NativeIo + Listen<Listener: Listener<Stream: TlsTransport>>>(
         io: I,
         listener: I::Listener,
@@ -701,6 +864,30 @@ mod tests {
         .expect("connection serves");
     }
 
+    /// Echoes the request body, over one TLS HTTP/2 connection.
+    #[cfg(native_h2)]
+    async fn serve_h2_once<I: NativeIo + Listen<Listener: Listener<Stream: TlsTransport>>>(
+        io: I,
+        listener: I::Listener,
+        tls: TlsAcceptor,
+    ) {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let stream = tls.accept(stream, &io).await.expect("TLS handshake");
+        assert_eq!(stream.alpn_protocol(), Some(&b"h2"[..]));
+        let service = |request: Request| async move {
+            let body = request.into_body().into_bytes().await.expect("body reads");
+            Response::new(Body::from_bytes(body))
+        };
+        http_kit_h2::ServerConnection::from_stream(
+            stream,
+            io,
+            http_kit_h2::ServerConfig::default(),
+        )
+        .serve(&service)
+        .await
+        .expect("connection serves");
+    }
+
     /// A native-backend dial to an HTTPS origin, through the connector the
     /// pool builds, settles on kernel TLS and carries a request.
     async fn https_runs_over_kernel_tls<
@@ -713,7 +900,7 @@ mod tests {
             .bind_tcp("127.0.0.1:0".parse().expect("loopback"))
             .expect("bind");
         let port = listener.local_addr().expect("local address").port();
-        let tls = connector(transport.tls().http1_config().clone()).expect("the kernel probes");
+        let tls = connectors(transport.tls()).expect("the kernel probes");
         let origin = request_origin(
             &format!("https://localhost:{port}/")
                 .parse()
@@ -729,8 +916,11 @@ mod tests {
                 &transport,
                 &tls,
                 &origin,
-                None,
-                &Cell::new(ConnectPhase::Resolve),
+                DialOptions {
+                    protocols: Protocols::Http1,
+                    bound: &DialBound::new(None),
+                    phase: &Cell::new(ConnectPhase::Resolve),
+                },
             )
             .await
             .expect("the dial succeeds");
@@ -744,7 +934,11 @@ mod tests {
             *request.uri_mut() = format!("https://localhost:{port}/echo")
                 .parse()
                 .expect("request URI");
-            let Dialed { send, driver, .. } = dialed;
+            let (send, driver) = match dialed.conn {
+                DialedConn::H1 { send, driver, .. } => (send, driver),
+                #[cfg(native_h2)]
+                DialedConn::H2 { .. } => panic!("an HTTP/1.1 dial"),
+            };
             let exchange = async {
                 let response = send.requests.send(request).await.expect("request sends");
                 let body = response.into_body().into_bytes().await.expect("body reads");
@@ -752,6 +946,70 @@ mod tests {
                 drop(send);
             };
             futures_util::join!(driver, exchange);
+        };
+        match select(pin!(client), pin!(server)).await {
+            Either::Left(((), _)) => {}
+            Either::Right(((), _)) => panic!("the server ended before the client"),
+        }
+    }
+
+    /// An HTTP/2 dial over TLS settles on kernel TLS and exchanges a CJK POST.
+    #[cfg(native_h2)]
+    async fn h2_runs_over_kernel_tls<
+        I: NativeIo + Listen<Listener: Listener<Stream: TlsTransport>>,
+    >(
+        io: I,
+    ) {
+        let (transport, acceptor) = pki_with_alpn(&[b"h2", b"http/1.1"]);
+        let listener = io
+            .bind_tcp("127.0.0.1:0".parse().expect("loopback"))
+            .expect("bind");
+        let port = listener.local_addr().expect("local address").port();
+        let tls = connectors(transport.tls()).expect("the kernel probes");
+        let origin = request_origin(
+            &format!("https://localhost:{port}/")
+                .parse()
+                .expect("origin URI"),
+        )
+        .expect("origin");
+
+        let server = serve_h2_once(io.clone(), listener, acceptor);
+        let client = async {
+            let dialed = dial(
+                &io,
+                &Getaddrinfo,
+                &transport,
+                &tls,
+                &origin,
+                DialOptions {
+                    protocols: Protocols::Http2OrHttp1,
+                    bound: &DialBound::new(None),
+                    phase: &Cell::new(ConnectPhase::Resolve),
+                },
+            )
+            .await
+            .expect("the dial succeeds");
+            assert_eq!(
+                dialed.tls_mode,
+                Some(Mode::Kernel),
+                "the handshake stayed in user space; is the kernel's `tls` module loaded?"
+            );
+            let mut request = Request::new(Body::from_bytes(GREETING.as_bytes().to_vec()));
+            *request.method_mut() = Method::POST;
+            *request.uri_mut() = format!("https://localhost:{port}/echo")
+                .parse()
+                .expect("request URI");
+            let DialedConn::H2 { send, driver } = dialed.conn else {
+                panic!("an HTTP/2 dial");
+            };
+            let exchange = async {
+                let response = send.send(request).await.expect("request sends");
+                let body = response.into_body().into_bytes().await.expect("body reads");
+                assert_eq!(body.as_ref(), GREETING.as_bytes());
+                drop(send);
+            };
+            let (ran, ()) = futures_util::join!(driver, exchange);
+            ran.expect("HTTP/2 connection closes cleanly");
         };
         match select(pin!(client), pin!(server)).await {
             Either::Left(((), _)) => {}
@@ -775,6 +1033,24 @@ mod tests {
             .build()
             .expect("tokio runtime")
             .block_on(https_runs_over_kernel_tls(super::super::Tokio));
+    }
+
+    #[cfg(all(native_h2, feature = "native-compio"))]
+    #[test]
+    fn h2_runs_over_kernel_tls_on_compio() {
+        compio::runtime::Runtime::new()
+            .expect("compio runtime")
+            .block_on(h2_runs_over_kernel_tls(super::super::Compio::default()));
+    }
+
+    #[cfg(all(native_h2, feature = "native-tokio"))]
+    #[test]
+    fn h2_runs_over_kernel_tls_on_tokio() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(h2_runs_over_kernel_tls(super::super::Tokio));
     }
 
     /// Answers one TLS connection's request with a `101` and, in the same
@@ -820,9 +1096,13 @@ mod tests {
             .expect("bind");
         let port = listener.local_addr().expect("local address").port();
         let tls = if kernel {
-            connector(transport.tls().http1_config().clone()).expect("the kernel probes")
+            connectors(transport.tls()).expect("the kernel probes")
         } else {
-            TlsConnector::new(transport.tls().http1_config().clone())
+            TlsConnectors {
+                http1: TlsConnector::new(transport.tls().http1_config().clone()),
+                #[cfg(native_h2)]
+                http2_or_http1: TlsConnector::new(transport.tls().http2_or_http1_config().clone()),
+            }
         };
         let origin = request_origin(
             &format!("https://localhost:{port}/")
@@ -839,8 +1119,11 @@ mod tests {
                 &transport,
                 &tls,
                 &origin,
-                None,
-                &Cell::new(ConnectPhase::Resolve),
+                DialOptions {
+                    protocols: Protocols::Http1,
+                    bound: &DialBound::new(None),
+                    phase: &Cell::new(ConnectPhase::Resolve),
+                },
             )
             .await
             .expect("the dial succeeds");
@@ -860,7 +1143,11 @@ mod tests {
             request
                 .headers_mut()
                 .insert(header::UPGRADE, HeaderValue::from_static("echo"));
-            let Dialed { send, driver, .. } = dialed;
+            let (send, driver) = match dialed.conn {
+                DialedConn::H1 { send, driver, .. } => (send, driver),
+                #[cfg(native_h2)]
+                DialedConn::H2 { .. } => panic!("an HTTP/1.1 dial"),
+            };
             let exchange = async {
                 let response = send.requests.send(request).await.expect("request sends");
                 assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);

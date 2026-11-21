@@ -116,6 +116,7 @@ fn main() {
         // driver runtimes need an OS reactor).
         native_backend: { all(native, feature = "native-backend") },
         native_driver: { all(native_backend, reactor, any(feature = "native-compio", feature = "native-tokio")) },
+        native_h2: { all(native_backend, feature = "native-http2") },
         native_h3: { all(native_backend, feature = "native-http3") },
         // A backend that pools connections per origin: hyper's and the native one.
         pooled: { all(native, any(all(reactor, feature = "hyper-backend"), feature = "native-backend")) },

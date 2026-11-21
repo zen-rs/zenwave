@@ -542,6 +542,10 @@ pub enum Cause {
     #[cfg(native_backend)]
     #[error(transparent)]
     H1(http_kit_h1::Error),
+    /// The native backend's HTTP/2 client.
+    #[cfg(native_h2)]
+    #[error(transparent)]
+    H2(http_kit_h2::Error),
     /// The native backend's TLS handshake.
     #[cfg(native_backend)]
     #[error(transparent)]

@@ -54,7 +54,7 @@ jobs:
         run: cargo test --doc --no-default-features --features hyper-backend,rustls-ring,ws --workspace
 
   native-backend:
-    # The native backend on each driver runtime, HTTP/3 included.
+    # The native backend on each driver runtime, HTTP/2 and HTTP/3 included.
     name: Native backend (${{ matrix.os }}, ${{ matrix.runtime }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -73,9 +73,9 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo modprobe tls
       - name: Run native backend tests
-        run: cargo nextest run --no-default-features --features native-${{ matrix.runtime }},native-http3,native-kernel-tls --workspace
+        run: cargo nextest run --no-default-features --features native-${{ matrix.runtime }},native-http2,native-http3,native-kernel-tls --workspace
       - name: Run native backend doctests
-        run: cargo test --doc --no-default-features --features native-${{ matrix.runtime }},native-http3,native-kernel-tls --workspace
+        run: cargo test --doc --no-default-features --features native-${{ matrix.runtime }},native-http2,native-http3,native-kernel-tls --workspace
 
   wasm-linux:
     name: wasm-pack (Linux - ${{ matrix.browser }})
