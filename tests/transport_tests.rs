@@ -3,7 +3,7 @@
 // Every test here runs through the `DefaultBackend`.
 #![cfg(all(not(target_arch = "wasm32"), default_backend))]
 
-mod common;
+use zenwave_test_fixture as common;
 
 #[cfg(tls_native)]
 use zenwave::Cause;

@@ -4,7 +4,7 @@
 //! it mutates the process environment.
 #![cfg(all(not(target_arch = "wasm32"), feature = "curl-backend"))]
 
-mod common;
+use zenwave_test_fixture as common;
 
 use common::httpbin_uri;
 use zenwave::{Client, Proxy, Transport, backend::CurlBackend};

@@ -6,7 +6,7 @@ use http_kit::{Endpoint, Method};
 use zenwave::backend::HyperBackend;
 
 #[cfg(default_hyper)]
-mod common;
+use zenwave_test_fixture as common;
 #[cfg(default_hyper)]
 use common::httpbin_uri;
 

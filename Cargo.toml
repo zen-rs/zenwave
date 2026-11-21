@@ -1,3 +1,6 @@
+[workspace]
+members = ["tests/fixture"]
+
 [package]
 name = "zenwave"
 version = "0.12.0"
@@ -240,14 +243,18 @@ cookie_store = { version = "0.22.1", default-features = false, features = [
 wasm-bindgen-test = "0.3.79"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# The local servers and shared harness live in `tests/fixture`; integration
+# tests reach them as `common` (`use zenwave_test_fixture as common`).
+zenwave-test-fixture = { path = "tests/fixture" }
 smol = "2.0.2"
 rcgen = "0.14.10"
 async-net = "2.0.0"
 http-body-util = "0.1.5"
+# `src/backend/hyper/test_support.rs` (kept in-crate, it uses private APIs)
+# still drives `futures_rustls` under `#[cfg(test)]` on every engine combo.
 futures-rustls = { version = "0.26.0", default-features = false, features = ["ring", "tls12"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 hyper = { version = "1.12.0", features = ["server", "http1", "http2"] }
-# The websocket echo endpoint in `tests/common/fixture.rs`.
 async-tungstenite = { version = "0.35.0", default-features = false, features = ["smol-runtime"] }
 time = "0.3.55"
 
@@ -370,7 +377,7 @@ clippy.style = "warn"
 clippy.correctness = "warn"
 clippy.complexity = "warn"
 clippy.suspicious = "warn"
-cargo.unused_dependencies = "warn"
+cargo.unused_dependencies = "deny"
 clippy.perf = "warn"
 clippy.pedantic = "warn"
 clippy.nursery = "warn"

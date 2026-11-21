@@ -8,7 +8,7 @@
 
 // The production `futures-io` → `hyper::rt` adapter, shared with the test
 // server rather than duplicated.
-#[path = "../../src/transport/hyper_io.rs"]
+#[path = "../../../src/transport/hyper_io.rs"]
 mod hyper_io;
 
 use std::{

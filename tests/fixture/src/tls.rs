@@ -4,13 +4,11 @@
 //! servers when it was handed the CA through `Transport::extra_root_certificates_pem`.
 #![allow(dead_code)]
 
-#[cfg(feature = "ws")]
 use std::sync::Mutex;
 use std::{net::SocketAddr, sync::Arc, thread};
 
 use async_net::TcpListener;
 use futures_rustls::TlsAcceptor;
-#[cfg(feature = "ws")]
 use futures_util::StreamExt;
 use futures_util::{AsyncReadExt, AsyncWriteExt};
 use once_cell::sync::OnceCell;
@@ -29,10 +27,8 @@ use time::{Duration, OffsetDateTime};
 pub struct TlsFixture {
     pub ca_pem: Vec<u8>,
     https_addr: SocketAddr,
-    #[cfg(feature = "ws")]
     wss_addr: SocketAddr,
     /// The ALPN protocol negotiated on the latest wss connection, if any.
-    #[cfg(feature = "ws")]
     wss_alpn: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
@@ -58,13 +54,11 @@ impl TlsFixture {
     }
 
     /// `wss://localhost:<port>` on the echo server, for direct connections.
-    #[cfg(feature = "ws")]
     pub fn wss_uri(&self) -> String {
         format!("wss://localhost:{}", self.wss_addr.port())
     }
 
     /// The echo server under [`FIXTURE_HOST`](super::FIXTURE_HOST).
-    #[cfg(feature = "ws")]
     pub fn proxied_wss_uri(&self) -> String {
         format!("wss://{}:{}", super::FIXTURE_HOST, self.wss_addr.port())
     }
@@ -73,7 +67,6 @@ impl TlsFixture {
     ///
     /// The wss listener offers `h2` and `http/1.1`, so this reports what the
     /// client asked for: websockets must negotiate `http/1.1` only.
-    #[cfg(feature = "ws")]
     pub fn wss_alpn(&self) -> Option<Vec<u8>> {
         self.wss_alpn.lock().expect("wss ALPN lock").clone()
     }
@@ -163,7 +156,6 @@ fn start() -> TlsFixture {
     // The wss listener offers h2 alongside http/1.1 so tests can assert the
     // client only asked for http/1.1 — the websocket handshake is an HTTP/1.1
     // upgrade and must not negotiate h2.
-    #[cfg(feature = "ws")]
     let wss_acceptor = {
         let mut wss_config = config.clone();
         wss_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
@@ -172,12 +164,9 @@ fn start() -> TlsFixture {
     let acceptor = TlsAcceptor::from(Arc::new(config));
 
     let (https_listener, https_addr) = bind();
-    #[cfg(feature = "ws")]
     let (wss_listener, wss_addr) = bind();
 
-    #[cfg(feature = "ws")]
     let wss_alpn = Arc::new(Mutex::new(None));
-    #[cfg(feature = "ws")]
     {
         let recorded = wss_alpn.clone();
         thread::spawn(move || {
@@ -217,9 +206,7 @@ fn start() -> TlsFixture {
     TlsFixture {
         ca_pem,
         https_addr,
-        #[cfg(feature = "ws")]
         wss_addr,
-        #[cfg(feature = "ws")]
         wss_alpn,
     }
 }
@@ -258,7 +245,6 @@ async fn serve_json<S: AsyncReadExt + AsyncWriteExt + Unpin>(mut stream: S, alt_
     let _ = stream.close().await;
 }
 
-#[cfg(feature = "ws")]
 async fn echo_websocket<S: AsyncReadExt + AsyncWriteExt + Unpin>(stream: S) {
     let Ok(mut socket) = async_tungstenite::accept_async(stream).await else {
         return;

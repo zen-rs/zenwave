@@ -2,7 +2,7 @@
 //! Browser-based integration tests for the WASM backend.
 
 #[cfg(browser)]
-mod common;
+use zenwave_test_fixture as common;
 
 #[cfg(browser)]
 mod wasm_tests {

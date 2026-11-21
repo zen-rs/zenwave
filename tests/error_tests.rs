@@ -3,7 +3,7 @@
 #![cfg(default_backend)]
 
 use http_kit::Method;
-mod common;
+use zenwave_test_fixture as common;
 use common::httpbin_uri;
 use zenwave::{Client, client, get};
 
