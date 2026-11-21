@@ -2,10 +2,10 @@
 // Every test here runs through `zenwave::client()`.
 #![cfg(default_backend)]
 
-use zenwave_test_fixture as common;
 use common::httpbin_uri;
 use zenwave::auth::{BasicAuth, BearerAuth};
 use zenwave::{Client, client};
+use zenwave_test_fixture as common;
 
 #[test_executors::async_test]
 async fn test_bearer_auth_middleware() {

@@ -4,9 +4,9 @@
 // Every test here runs through `zenwave::client()`.
 #![cfg(default_backend)]
 
-use zenwave_test_fixture as common;
 use common::httpbin_uri;
 use zenwave::{Client, Method, client, get};
+use zenwave_test_fixture as common;
 
 fn header<'a>(response: &'a zenwave::Response, name: &str) -> Option<&'a str> {
     response.headers().get(name).and_then(|v| v.to_str().ok())

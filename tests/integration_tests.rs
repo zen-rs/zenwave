@@ -2,10 +2,10 @@
 // Every test here runs through `zenwave::client()`.
 #![cfg(default_backend)]
 
-use zenwave_test_fixture as common;
 use common::httpbin_uri;
 use serde_json::Value;
 use zenwave::{Client, Method, client, get};
+use zenwave_test_fixture as common;
 
 fn endpoint(path: &str) -> String {
     httpbin_uri(path)
