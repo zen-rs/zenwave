@@ -87,7 +87,7 @@ fn serve(chain: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> So
         .with_single_cert(chain, key)
         .expect("server certificate");
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    let acceptor = zenwave_test_fixture::futures_rustls::TlsAcceptor::from(Arc::new(config));
+    let acceptor = zenwave_test_fixture::TlsAcceptor::from(Arc::new(config));
     let (listener, address) = async_io::block_on(async {
         let listener = async_net::TcpListener::bind("127.0.0.1:0")
             .await

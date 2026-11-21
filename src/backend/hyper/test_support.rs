@@ -39,7 +39,7 @@ use std::net::UdpSocket;
 use std::sync::{Mutex, mpsc};
 use time::{Duration as TimeDelta, OffsetDateTime};
 #[cfg(any(feature = "http2", http3))]
-use zenwave_test_fixture::futures_rustls::TlsAcceptor;
+use zenwave_test_fixture::TlsAcceptor;
 
 #[cfg(http3)]
 use super::h3::H3Connection;
@@ -873,7 +873,7 @@ mod tests {
     use futures_util::future::{Either, join, select};
     use hyper::body::Bytes;
     use rustls::{ClientConfig, RootCertStore, crypto::ring, pki_types::ServerName};
-    use zenwave_test_fixture::futures_rustls::TlsConnector;
+    use zenwave_test_fixture::TlsConnector;
 
     use super::{GoAway, TEST_TIMEOUT, TestCa, TlsServer, TokioCompat};
 
