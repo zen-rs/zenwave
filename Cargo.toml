@@ -91,7 +91,7 @@ default = ["hyper-backend", "rustls-ring", "ws", "http2", "http3", "onecrl", "pu
 # HTTP backends (native platforms only). At least one must be enabled.
 #
 # hyper over async-io/async-net. Needs a TLS engine (`rustls` or `native-tls`).
-hyper-backend = ["getaddrinfo", "dep:executor-core", "dep:hyper-util", "dep:rustls-pki-types", "dep:async-net", "dep:hyper", "dep:http-body-util"]
+hyper-backend = ["getaddrinfo", "dep:executor-core", "dep:async-net", "dep:hyper", "dep:http-body-util"]
 # `getaddrinfo` as a resolver (`zenwave::dns::Getaddrinfo`), one thread per
 # query. Every backend that resolves names itself enables it; a native backend
 # over a resolver of the caller's own needs none of it.
@@ -100,9 +100,9 @@ getaddrinfo = ["dep:dns-lookup", "dep:http-kit-io"]
 # Off by default only in `default-features = false` builds.
 http2 = ["hyper/http2", "dep:h2"]
 # libcurl via the `curl` crate. libcurl brings its own TLS engine.
-curl-backend = ["dep:curl", "dep:blocking", "dep:rustls-native-certs", "dep:pem", "dep:hyper-util", "dep:rustls-pki-types"]
+curl-backend = ["dep:curl", "dep:blocking", "dep:rustls-native-certs", "dep:pem"]
 # Apple's NSURLSession (macOS/iOS only). Security.framework does the TLS.
-apple-backend = ["dep:block", "dep:objc", "dep:security-framework", "dep:core-foundation", "dep:hyper-util", "dep:rustls-pki-types"]
+apple-backend = ["dep:block", "dep:objc", "dep:security-framework", "dep:core-foundation"]
 # WASI Preview 3 `wasi:http/client` through `wasip3`. The host owns TLS,
 # certificate verification, proxying and connection pooling.
 wasi-backend = ["dep:wasip3"]
@@ -147,8 +147,6 @@ native-backend = [
     "dep:http-kit-io",
     "dep:http-kit-h1",
     "dep:http-kit-tls",
-    "dep:hyper-util",
-    "dep:rustls-pki-types",
     "http-kit/pipe",
     "http-kit-h1/pipe",
 ]
@@ -180,7 +178,7 @@ hyper-rustls = ["hyper-backend", "rustls-ring"]
 hyper-native-tls = ["hyper-backend", "native-tls"]
 
 # Websocket support (async-tungstenite on native, web-sys WebSocket on wasm).
-ws = ["getaddrinfo", "dep:async-tungstenite", "dep:hyper-util", "dep:rustls-pki-types", "dep:async-net", "dep:hyper", "dep:http-body-util"]
+ws = ["getaddrinfo", "dep:async-tungstenite", "dep:async-net", "dep:hyper", "dep:http-body-util"]
 
 # HTTP/3 over QUIC for the hyper backend. QUIC needs a QUIC-capable TLS
 # library, so it requires the `rustls` engine with `ring`.
@@ -265,9 +263,9 @@ http-kit-h3 = { git = "https://github.com/zen-rs/http-kit", branch = "main", opt
 http-kit-tls = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
 futures-rustls = { version = "0.26.0", optional = true, default-features = false, features = ["tls12"] }
 rustls = { version = "0.23.46", optional = true, default-features = false, features = ["std", "tls12"] }
-rustls-pki-types = { version = "1.15.1", optional = true, features = ["std"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
 # The environment's proxy rules (`transport::proxy`).
-hyper-util = { version = "0.1.21", optional = true, default-features = false, features = ["client-proxy", "client-proxy-system"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["client-proxy", "client-proxy-system"] }
 bytes = { version = "1.12.1", optional = true }
 
 # WASI Preview 3 HTTP client and monotonic clock (`wasi-backend` feature):
