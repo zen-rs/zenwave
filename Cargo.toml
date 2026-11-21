@@ -68,6 +68,10 @@ futures-executor = "0.3.34"
 httparse = "1.10.1"
 # `tokio::io` traits for the raw `h2` server in the hyper test fixtures.
 tokio = { version = "1.54.1", features = ["io-util"] }
+# The local servers and shared harness live in `tests/fixture`; integration
+# tests reach them as `common` (`use zenwave_test_fixture as common`). On wasm
+# only the compile-time URL helpers build, so the crate stays dep-free there.
+zenwave-test-fixture = { path = "tests/fixture" }
 
 [target.'cfg(not(target_os = "wasi"))'.dev-dependencies]
 # Held at 0.4: 0.6 drops `#[async_test]` for `wasm_lite_test`, which does not
@@ -243,9 +247,6 @@ cookie_store = { version = "0.22.1", default-features = false, features = [
 wasm-bindgen-test = "0.3.79"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-# The local servers and shared harness live in `tests/fixture`; integration
-# tests reach them as `common` (`use zenwave_test_fixture as common`).
-zenwave-test-fixture = { path = "tests/fixture" }
 smol = "2.0.2"
 rcgen = "0.14.10"
 async-net = "2.0.0"
