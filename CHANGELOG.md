@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/zen-rs/zenwave/compare/v0.12.0...v0.13.0) - 2026-11-21
+
+### Added
+
+- *(native)* add HTTP/2 support over http-kit-h2
+- *(backend)* enable native-http3 on WASI targets
+- *(tls)* make the ring crypto provider optional behind rustls-ring
+- add WASI Preview 3 HTTP client backend
+- [**breaking**] per-request timeouts
+- [**breaking**] typed connect, exchange, timeout and configuration failures
+- the native backend builds for wasm32-wasip2
+
+### Fixed
+
+- fail a dial's expired waiters with the phase it reached
+- bound a dial by the requests waiting for it
+- *(tls)* import Cause for the WASI verifier
+- *(transport)* report the WASI root store's failures as trust-store errors
+- *(transport)* bound a TCP attempt only by the caller's connect timeout
+- *(error)* leave native-tls verification failures unclassified
+
+### Other
+
+- Skip engine-only combinations in the powerset: the engine's deps are dead beside backends that bring their own TLS
+- fmt
+- Skip the no-builtin-provider test under native-ring as well
+- Scope webpki-roots to WASI, the only target that compiles it
+- Resolve webpki-roots where the engine verifier compiles it and give native-http3 the dns runtime's async-net
+- Move rustls-pki-types and hyper-util to unconditional deps: proxy and transport code reference them on every target
+- fmt
+- Restore rustls-pki-types and hyper-util as unconditional deps and give test code its own async-net and http-body-util
+- replace the cargo-machete job with cargo::unused_dependencies
+- *(onecrl)* move the snapshot pin to 1795116559417
+- *(wasm)* build WASI BoringSSL and ring with wasi-sdk-34
+- apply nightly clippy fix for wasm32-wasip3
+- Merge remote-tracking branch 'origin/main' into deps/208-fork-sources
+- *(deps)* take executor-core from main
+- *(deps)* take http-kit, compio and executor-core from git
+- take compio from the branch http-kit builds on
+- name the refusal each runtime reports for a closed port
+- Merge remote-tracking branch 'origin/main' into feat/194-typed-failures
+- Merge remote-tracking branch 'origin/main' into feat/196-native-wasip2
+- Merge remote-tracking branch 'origin/main' into feat/194-typed-failures
+- *(onecrl)* move the snapshot pin to 1794348206673
+- build the native backend for wasm32-wasip2
+
 ## [0.12.0](https://github.com/zen-rs/zenwave/compare/v0.11.0...v0.12.0) - 2026-11-11
 
 ### Added

@@ -1,6 +1,6 @@
 [package]
 name = "zenwave"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 authors = ["Lexo Liu<me@lexo.cool>"]
 repository = "https://github.com/zen-rs/zenwave"
@@ -370,8 +370,8 @@ clippy.style = "warn"
 clippy.correctness = "warn"
 clippy.complexity = "warn"
 clippy.suspicious = "warn"
-cargo.unused_dependencies = "warn"
 clippy.perf = "warn"
 clippy.pedantic = "warn"
 clippy.nursery = "warn"
 clippy.cargo = "allow"
+cargo.unused_dependencies = "warn"
