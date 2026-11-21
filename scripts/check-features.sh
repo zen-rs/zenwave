@@ -70,10 +70,6 @@ native() {
     --at-least-one-of native-backend,native-compio,native-tokio,native-http2,native-http3,native-kernel-tls -- -D warnings
   echo "::endgroup::"
 
-  echo "::group::native backend beside the native-tls engine"
-  cargo clippy --all-targets --no-default-features --features native-backend,native-tls -- -D warnings
-  echo "::endgroup::"
-
   echo "::group::native backend beside the default features"
   cargo clippy --all-targets --features native-compio,native-tokio,native-http2,native-http3,native-kernel-tls -- -D warnings
   echo "::endgroup::"

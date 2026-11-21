@@ -1,3 +1,6 @@
+[workspace]
+members = ["tests/fixture"]
+
 [package]
 name = "zenwave"
 version = "0.12.0"
@@ -48,9 +51,6 @@ async-lock = "3.4.2"
 http = "1.5.0"
 httpdate = "1.0.3"
 tracing = "0.1.44"
-rustls-pki-types = { version = "1.15.1", features = ["std"] }
-# The environment's proxy rules (`transport::proxy`).
-hyper-util = { version = "0.1.21", default-features = false, features = ["client-proxy", "client-proxy-system"] }
 cookie_store = { version = "0.22.1", default-features = false, features = [
     "serde_json",
 ] }
@@ -65,6 +65,10 @@ futures-executor = "0.3.34"
 httparse = "1.10.1"
 # `tokio::io` traits for the raw `h2` server in the hyper test fixtures.
 tokio = { version = "1.54.1", features = ["io-util"] }
+# The local servers and shared harness live in `tests/fixture`; integration
+# tests reach them as `common` (`use zenwave_test_fixture as common`). On wasm
+# only the compile-time URL helpers build, so the crate stays dep-free there.
+zenwave-test-fixture = { path = "tests/fixture" }
 
 [target.'cfg(not(target_os = "wasi"))'.dev-dependencies]
 # Held at 0.4: 0.6 drops `#[async_test]` for `wasm_lite_test`, which does not
@@ -147,6 +151,8 @@ native-backend = [
     "dep:http-kit-io",
     "dep:http-kit-h1",
     "dep:http-kit-tls",
+    "dep:rustls-pki-types",
+    "dep:hyper-util",
     "http-kit/pipe",
     "http-kit-h1/pipe",
 ]
@@ -165,7 +171,7 @@ native-http2 = ["native-backend", "dep:http-kit-h2", "http-kit-h2/pipe"]
 # BoringSSL with cmake). The server's chain goes to the same verifier as a TCP
 # connection's: the platform verifier with the transport's extra roots, and
 # OneCRL where it applies.
-native-http3 = ["native-backend", "dep:http-kit-h3", "http-kit-h3/quiche", "http-kit-h3/pipe", "dep:hickory-proto", "dep:hickory-resolver", "dep:async-trait", "dep:socket2", "dep:ring", "dep:async-net"]
+native-http3 = ["native-backend", "getaddrinfo", "dep:http-kit-h3", "http-kit-h3/quiche", "http-kit-h3/pipe", "dep:hickory-proto", "dep:hickory-resolver", "dep:async-trait", "dep:socket2", "dep:ring", "dep:async-net", "dep:jni-min-helper", "dep:jni", "dep:ndk-context"]
 
 # Kernel TLS for the native backend on Linux: once a handshake completes and
 # the kernel takes the negotiated suite, the connection's record layer moves
@@ -182,7 +188,7 @@ ws = ["getaddrinfo", "dep:async-tungstenite", "dep:async-net", "dep:hyper", "dep
 
 # HTTP/3 over QUIC for the hyper backend. QUIC needs a QUIC-capable TLS
 # library, so it requires the `rustls` engine with `ring`.
-http3 = ["rustls-ring", "dep:bytes", "dep:h3", "dep:h3-quinn", "dep:quinn", "dep:hickory-proto", "dep:hickory-resolver", "dep:async-trait", "dep:socket2"]
+http3 = ["hyper-backend", "rustls-ring", "dep:bytes", "dep:h3", "dep:h3-quinn", "dep:quinn", "dep:hickory-proto", "dep:hickory-resolver", "dep:async-trait", "dep:socket2", "dep:jni-min-helper", "dep:jni", "dep:ndk-context"]
 
 # Refuse certificates listed by Mozilla's OneCRL on the paths that verify
 # chains with webpki (`src/transport/onecrl.rs`). A pinned snapshot of the
@@ -244,10 +250,8 @@ smol = "2.0.2"
 rcgen = "0.14.10"
 async-net = "2.0.0"
 http-body-util = "0.1.5"
-futures-rustls = { version = "0.26.0", default-features = false, features = ["ring", "tls12"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 hyper = { version = "1.12.0", features = ["server", "http1", "http2"] }
-# The websocket echo endpoint in `tests/common/fixture.rs`.
 async-tungstenite = { version = "0.35.0", default-features = false, features = ["smol-runtime"] }
 time = "0.3.55"
 
@@ -291,6 +295,9 @@ hickory-resolver = { version = "0.26.3", default-features = false, features = ["
 hyper = { version = "1.12.0", default-features = false, features = ["client", "http1"], optional = true }
 # The h2 error type the hyper backend inspects to recognize a remote GOAWAY.
 h2 = { version = "0.4.20", optional = true }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+# The environment's proxy rules (`transport::proxy`).
+hyper-util = { version = "0.1.21", default-features = false, features = ["client-proxy", "client-proxy-system"] }
 http-body-util = { version = "0.1.5", optional = true }
 rustls-native-certs = { version = "0.8.5", optional = true }
 pem = { version = "4.0.0", optional = true }
@@ -316,9 +323,9 @@ arc-swap = { version = "1.9.3", optional = true, default-features = false }
 # (src/transport/dns/android.rs); `jni-min-helper` supplies the Java proxy that
 # delivers the callback into Rust.
 [target.'cfg(target_os = "android")'.dependencies]
-jni = "0.22.4"
-ndk-context = "0.1.1"
-jni-min-helper = "0.4.7"
+jni = { version = "0.22.4", optional = true }
+ndk-context = { version = "0.1.1", optional = true }
+jni-min-helper = { version = "0.4.7", optional = true }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 block = { version = "0.1.6", optional = true }
@@ -339,6 +346,11 @@ libc = "0.2.191"
 # with no platform trust store for the engine verifier to delegate to.
 [target.'cfg(target_os = "wasi")'.dependencies]
 webpki-roots = { version = "1.0.11", optional = true }
+# `cfg(native)` is true on WASI only for `native-backend` builds, which pull
+# these through `dep:` (on every other platform they come from the not-wasm
+# table above, where `native` code is always compiled).
+rustls-pki-types = { version = "1.15.1", features = ["std"], optional = true }
+hyper-util = { version = "0.1.21", default-features = false, features = ["client-proxy", "client-proxy-system"], optional = true }
 
 # `webpki-root-certs` is a version floor only, never named
 # in code: `minreq`'s `https-rustls` and `rustls-platform-verifier` trust the

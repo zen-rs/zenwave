@@ -18,8 +18,8 @@ use zenwave::HttpError;
 use zenwave::redirect::FollowRedirect;
 use zenwave::{Body, Client, Endpoint, Middleware, Request, Response, StatusCode, client};
 
-mod common;
 use common::{httpbin_base, httpbin_uri};
+use zenwave_test_fixture as common;
 
 #[test_executors::async_test]
 async fn test_cookie_store_middleware() {

@@ -14,9 +14,9 @@ use zenwave::Client;
 use zenwave::redirect::{FollowRedirect, FollowRedirectError};
 
 #[cfg(default_backend)]
-mod common;
-#[cfg(default_backend)]
 use common::httpbin_uri;
+#[cfg(default_backend)]
+use zenwave_test_fixture as common;
 
 /// An extension type with no meaning beyond proving hops carry request extensions.
 #[derive(Clone)]

@@ -6,7 +6,7 @@
 //! suite is the browser-runnable stand-in for a Cloudflare Worker.
 
 #[cfg(browser)]
-mod common;
+use zenwave_test_fixture as common;
 
 #[cfg(browser)]
 mod worker_tests {

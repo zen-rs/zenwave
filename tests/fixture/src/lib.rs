@@ -14,6 +14,17 @@ mod fixture;
 #[allow(unused_imports)]
 pub use fixture::*;
 
+// `src/backend/hyper/test_support.rs` and `tests/onecrl_tests.rs` reach the
+// TLS stream types through this crate, so the parent manifest needs no
+// dev-dependency entry whose usage domain cannot be feature-scoped. The
+// adapter lives in tree rather than as `futures-rustls`: a resolved-but-
+// inactive copy of that crate in this package would read as an unused
+// dependency in the parent under `cargo::unused_dependencies`.
+#[cfg(not(target_arch = "wasm32"))]
+mod tls_stream;
+#[cfg(not(target_arch = "wasm32"))]
+pub use tls_stream::{TlsAcceptor, TlsConnector, TlsStream};
+
 #[cfg(not(target_arch = "wasm32"))]
 pub mod proxy;
 
