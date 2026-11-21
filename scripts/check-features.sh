@@ -29,11 +29,16 @@ powerset=(
 
 with_engine() {
   echo "::group::feature powerset with $1"
+  # Backends that bring their own TLS never compile the engine, so an engine
+  # beside them alone is a dead dependency under `cargo::unused_dependencies`.
+  # Every combination needs both a backend and a connector (`hyper-backend`
+  # or `ws`) that compiles the engine against it.
   local include="$backends,ws,http2"
   # http3 needs QUIC-capable TLS, so it only exists in the rustls slice.
   [[ "$1" == rustls ]] && include="$include,http3"
   "${powerset[@]}" --features "$1" \
     --include-features "$include" --at-least-one-of "$backends" \
+    --at-least-one-of "hyper-backend,ws" \
     -- -D warnings
   echo "::endgroup::"
 }
