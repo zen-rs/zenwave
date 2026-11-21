@@ -4,7 +4,7 @@
 #![cfg(all(
     not(target_arch = "wasm32"),
     feature = "rustls",
-    not(feature = "rustls-ring")
+    not(ring)
 ))]
 
 use zenwave::Transport;
