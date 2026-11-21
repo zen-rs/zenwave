@@ -7,8 +7,8 @@
 use std::sync::Mutex;
 use std::{net::SocketAddr, sync::Arc, thread};
 
-use async_net::TcpListener;
 use crate::TlsAcceptor;
+use async_net::TcpListener;
 use futures_util::StreamExt;
 use futures_util::{AsyncReadExt, AsyncWriteExt};
 use once_cell::sync::OnceCell;

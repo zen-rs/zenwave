@@ -210,9 +210,8 @@ impl TlsAcceptor {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let mut conn = Connection::Server(
-            ServerConnection::new(Arc::clone(&self.config)).map_err(tls_error)?,
-        );
+        let mut conn =
+            Connection::Server(ServerConnection::new(Arc::clone(&self.config)).map_err(tls_error)?);
         std::future::poll_fn(|cx| handshake(&mut io, &mut conn, cx)).await?;
         Ok(TlsStream { io, conn })
     }
@@ -232,7 +231,11 @@ impl From<Arc<ClientConfig>> for TlsConnector {
 }
 
 impl TlsConnector {
-    pub async fn connect<S>(&self, domain: ServerName<'static>, mut io: S) -> io::Result<TlsStream<S>>
+    pub async fn connect<S>(
+        &self,
+        domain: ServerName<'static>,
+        mut io: S,
+    ) -> io::Result<TlsStream<S>>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
