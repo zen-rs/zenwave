@@ -62,59 +62,19 @@ fn tls_error(e: rustls::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
-/// Pull ciphertext in until the peer stalls, then fold it into the session.
-fn drive_in<S: AsyncRead + AsyncWrite + Unpin>(
-    io: &mut S,
-    conn: &mut Connection,
-    cx: &mut Context<'_>,
-) -> io::Result<bool> {
-    let mut progressed = false;
-    while conn.wants_read() {
-        match conn.read_tls(&mut Sync(io, cx)) {
-            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed")),
-            Ok(_) => {
-                conn.process_new_packets().map_err(tls_error)?;
-                progressed = true;
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(progressed)
-}
-
-/// Push every TLS record the session has queued.
-fn drive_out<S: AsyncRead + AsyncWrite + Unpin>(
-    io: &mut S,
-    conn: &mut Connection,
-    cx: &mut Context<'_>,
-) -> io::Result<bool> {
-    let mut progressed = false;
-    while conn.wants_write() {
-        match conn.write_tls(&mut Sync(io, cx)) {
-            Ok(_) => progressed = true,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(progressed)
-}
-
 fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     io: &mut S,
     conn: &mut Connection,
     cx: &mut Context<'_>,
 ) -> Poll<io::Result<()>> {
-    loop {
-        let wrote = drive_out(io, conn, cx)?;
-        let read = drive_in(io, conn, cx)?;
-        if !conn.is_handshaking() {
-            return Poll::Ready(Ok(()));
-        }
-        if !wrote && !read {
-            return Poll::Pending;
+    while conn.is_handshaking() {
+        match conn.complete_io(&mut Sync(io, cx)) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Poll::Pending,
+            Err(e) => return Poll::Ready(Err(e)),
         }
     }
+    Poll::Ready(Ok(()))
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TlsStream<S> {
@@ -127,21 +87,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TlsStream<S> {
         loop {
             match this.conn.reader().read(buf) {
                 Ok(0) => {}
+                // `Reader::read` surfaces an empty plaintext buffer as
+                // `WouldBlock` too — both mean "pull more ciphertext first".
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 r => return Poll::Ready(r),
             }
-            if this.conn.is_handshaking() {
-                match handshake(&mut this.io, &mut this.conn, cx) {
-                    Poll::Ready(Ok(())) => continue,
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-            drive_out(&mut this.io, &mut this.conn, cx)?;
-            match this.conn.read_tls(&mut Sync(&mut this.io, cx)) {
-                Ok(0) => return Poll::Ready(Ok(0)),
-                Ok(_) => {
-                    this.conn.process_new_packets().map_err(tls_error)?;
-                }
+            match this.conn.complete_io(&mut Sync(&mut this.io, cx)) {
+                Ok((0, 0)) => return Poll::Pending,
+                Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Poll::Pending,
                 Err(e) => return Poll::Ready(Err(e)),
             }
@@ -157,13 +110,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsStream<S> {
     ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
         let wrote = this.conn.writer().write(buf)?;
-        match drive_out(&mut this.io, &mut this.conn, cx) {
-            Ok(_) => Poll::Ready(Ok(wrote)),
-            // The plaintext is already in the session's outgoing queue: the
-            // record lands on the next drive, so the write still counts.
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Poll::Ready(Ok(wrote)),
-            Err(e) => Poll::Ready(Err(e)),
+        match this.conn.write_tls(&mut Sync(&mut this.io, cx)) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Poll::Ready(Err(e)),
+            Ok(_) => {}
         }
+        // The plaintext is already in the session's outgoing queue even when
+        // the record could not be flushed yet, so the write still counts.
+        Poll::Ready(Ok(wrote))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -244,5 +198,58 @@ impl TlsConnector {
         );
         std::future::poll_fn(|cx| handshake(&mut io, &mut conn, cx)).await?;
         Ok(TlsStream { io, conn })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{AsyncReadExt, AsyncWriteExt};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    #[test]
+    fn loopback_handshake() {
+        // A minimal ECDSA cert for localhost — the same shape the fixtures use.
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .expect("rcgen");
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            cert.signing_key.serialize_der(),
+        ));
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.clone().into()).expect("root");
+        let server = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert.into()], key)
+            .expect("server config");
+        let client = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        smol::block_on(async {
+            let listener = async_net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let accept = async {
+                let (io, _) = listener.accept().await.unwrap();
+                TlsAcceptor::from(Arc::new(server)).accept(io).await
+            };
+            let connect = async {
+                let io = async_net::TcpStream::connect(addr).await.unwrap();
+                TlsConnector::from(Arc::new(client))
+                    .connect(ServerName::try_from("localhost").unwrap().to_owned(), io)
+                    .await
+            };
+            let (a, b) = futures_util::future::join(accept, connect).await;
+            let mut srv = a.expect("accept");
+            let mut cli = b.expect("connect");
+            cli.write_all(b"ping").await.unwrap();
+            cli.flush().await.unwrap();
+            let mut buf = [0u8; 4];
+            srv.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping");
+            srv.write_all(b"pong").await.unwrap();
+            srv.flush().await.unwrap();
+            cli.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"pong");
+        });
     }
 }

@@ -135,8 +135,9 @@ pub fn alt_svc_server(alt_svc: String) -> (Vec<u8>, SocketAddr) {
                 let acceptor = acceptor.clone();
                 let alt_svc = alt_svc.clone();
                 smol::spawn(async move {
-                    if let Ok(tls) = acceptor.accept(stream).await {
-                        serve_json(tls, Some(&alt_svc)).await;
+                    match acceptor.accept(stream).await {
+                        Ok(tls) => serve_json(tls, Some(&alt_svc)).await,
+                        Err(e) => eprintln!("fixture accept failed: {e}"),
                     }
                 })
                 .detach();
