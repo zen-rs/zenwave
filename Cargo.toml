@@ -51,9 +51,6 @@ async-lock = "3.4.2"
 http = "1.5.0"
 httpdate = "1.0.3"
 tracing = "0.1.44"
-rustls-pki-types = { version = "1.15.1", features = ["std"] }
-# The environment's proxy rules (`transport::proxy`).
-hyper-util = { version = "0.1.21", default-features = false, features = ["client-proxy", "client-proxy-system"] }
 cookie_store = { version = "0.22.1", default-features = false, features = [
     "serde_json",
 ] }
@@ -154,6 +151,8 @@ native-backend = [
     "dep:http-kit-io",
     "dep:http-kit-h1",
     "dep:http-kit-tls",
+    "dep:rustls-pki-types",
+    "dep:hyper-util",
     "http-kit/pipe",
     "http-kit-h1/pipe",
 ]
@@ -296,6 +295,9 @@ hickory-resolver = { version = "0.26.3", default-features = false, features = ["
 hyper = { version = "1.12.0", default-features = false, features = ["client", "http1"], optional = true }
 # The h2 error type the hyper backend inspects to recognize a remote GOAWAY.
 h2 = { version = "0.4.20", optional = true }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+# The environment's proxy rules (`transport::proxy`).
+hyper-util = { version = "0.1.21", default-features = false, features = ["client-proxy", "client-proxy-system"] }
 http-body-util = { version = "0.1.5", optional = true }
 rustls-native-certs = { version = "0.8.5", optional = true }
 pem = { version = "4.0.0", optional = true }
@@ -344,6 +346,11 @@ libc = "0.2.191"
 # with no platform trust store for the engine verifier to delegate to.
 [target.'cfg(target_os = "wasi")'.dependencies]
 webpki-roots = { version = "1.0.11", optional = true }
+# `cfg(native)` is true on WASI only for `native-backend` builds, which pull
+# these through `dep:` (on every other platform they come from the not-wasm
+# table above, where `native` code is always compiled).
+rustls-pki-types = { version = "1.15.1", features = ["std"], optional = true }
+hyper-util = { version = "0.1.21", default-features = false, features = ["client-proxy", "client-proxy-system"], optional = true }
 
 # `webpki-root-certs` is a version floor only, never named
 # in code: `minreq`'s `https-rustls` and `rustls-platform-verifier` trust the
