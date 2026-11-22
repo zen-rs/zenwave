@@ -1,0 +1,5 @@
+/target/
+/certs/
+/merged.bin
+/fixture.log
+__pycache__/

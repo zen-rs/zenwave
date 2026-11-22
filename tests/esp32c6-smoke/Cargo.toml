@@ -1,0 +1,73 @@
+# Standalone firmware crate for the ESP32-C6 embedded smoke lane
+# (`scripts/test-esp32c6.sh` / `.github/workflows/test.yml`). Not a workspace
+# member: it builds for `riscv32imac-unknown-none-elf` on nightly and carries
+# the `[patch.crates-io]` entries documented in `docs/embedded.md`.
+[workspace]
+
+[package]
+name    = "zenwave-esp32c6-smoke"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+zenwave = { path = "../..", default-features = false, features = [
+    "embedded-backend",
+    "embedded-tls",
+] }
+embassy-executor = "0.10.0"
+embassy-net = { version = "0.9.1", features = [
+    "dhcpv4",
+    "medium-ethernet",
+    "tcp",
+    "dns",
+] }
+embassy-time = "0.5.1"
+getrandom = { version = "0.4", default-features = false }
+esp-alloc = { version = "0.11.0", features = ["esp32c6"] }
+esp-backtrace = { version = "0.20.0", features = [
+    "esp32c6",
+    "panic-handler",
+    "println",
+] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32c6"] }
+esp-hal = { version = "1.2.2", features = ["esp32c6", "log-04", "unstable"] }
+esp-metadata-generated = { version = "0.5.3", features = ["esp32c6"] }
+esp-println = { version = "0.18.0", default-features = false, features = [
+    "esp32c6",
+    "log-04",
+    "uart",
+    "critical-section",
+] }
+esp-rtos = { version = "0.4.0", features = [
+    "esp32c6",
+    "esp-radio",
+    "embassy",
+    "log-04",
+] }
+esp-radio = { version = "1.0.0-beta.1", features = [
+    "esp32c6",
+    "log-04",
+    "unstable",
+    "wifi",
+] }
+rustls = { version = "0.23.46", default-features = false, features = [
+    "hashbrown",
+    "tls12",
+] }
+rustls-pki-types = { version = "1", default-features = false, features = ["alloc"] }
+rustls-rustcrypto = { version = "=0.1.0-pre.0", default-features = false, features = [
+    "alloc",
+    "tls12",
+] }
+static_cell = "2.1.0"
+
+[patch.crates-io]
+http = { git = "https://github.com/lexoliu/http", branch = "v1.5-no-std" }
+
+[profile.release]
+debug            = true
+debug-assertions = true
+lto              = "fat"
+codegen-units    = 1
+opt-level        = "s"

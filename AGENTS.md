@@ -130,6 +130,10 @@ tests/
                     standalone binary (kept free of `crate::` paths)
   fixture-server/ — zenwave-test-fixture: standalone binary serving the fixture
                     for the wasm and workerd lanes (own workspace, not a member)
+  esp32c6-smoke/  — standalone no_std firmware for the esp-emu lane: esp-hal +
+                    esp-radio + embassy-net + EmbeddedBackend, HTTP and HTTPS
+                    requests against a host fixture (own workspace, not a member;
+                    fixture certs are generated, never committed)
 ```
 
 ## Architecture
@@ -183,7 +187,8 @@ aggregates all jobs and is the required check on `main`.
   Android arm64/x86_64/armv7) with tests
 - Tests: hyper (rustls and native-tls), curl, and native (compio and tokio,
   HTTP/2 and HTTP/3 included) on Linux/Windows/macOS; apple-backend on macOS, the suite on an iOS simulator (`scripts/test-ios.sh`,
-  `simctl spawn`), wasm-pack in Chrome/Firefox/Safari, workerd
+  `simctl spawn`), wasm-pack in Chrome/Firefox/Safari, workerd,
+  ESP32-C6 firmware in esp-emu (`scripts/test-esp32c6.sh`, tests/esp32c6-smoke)
 - Android runs on a physical device, not in CI: `scripts/test-android.sh`
   over adb (never an emulator); TLS on Android needs the JVM and is covered by
   the instrumented app under `tests/android`
