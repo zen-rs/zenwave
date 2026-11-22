@@ -94,19 +94,25 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
       - uses: water-rs/stow@main
-
+      # The arm64 images seed the hosted-compute-agent -> Safari
+      # AppleEvents grant only into the system TCC.db, which automation
+      # consent ignores; repeat it in the writable user TCC.db so the
+      # safaridriver consent prompt never appears.
+      - name: Grant Safari automation consent
+        run: |
+          tccdb="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+          epoch=$(date +%s)
+          for client in /opt/hca/hosted-compute-agent /opt/hca/start_hca.sh /bin/bash /usr/bin/osascript; do
+            sqlite3 "$tccdb" "INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,csreq,policy_id,indirect_object_identifier_type,indirect_object_identifier,indirect_object_code_identity,flags,last_modified) VALUES ('kTCCServiceAppleEvents','$client',1,2,3,1,NULL,NULL,0,'com.apple.Safari',NULL,NULL,$epoch);"
+          done
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-
       - name: Add wasm target
         run: rustup target add wasm32-unknown-unknown
-
       - name: Enable safaridriver
         run: sudo safaridriver --enable
-
       - name: wasm-pack test (Safari)
         run: bash scripts/test-wasm.sh safari
 
