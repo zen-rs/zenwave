@@ -173,6 +173,29 @@ jobs:
       - name: Run zenwave inside workerd
         run: bash scripts/test-workerd.sh
 
+  esp32c6-embedded:
+    name: ESP32-C6 embedded (esp-emu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: riscv32imac-unknown-none-elf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-esp32c6
+          workspaces: |
+            tests/esp32c6-smoke -> target
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: espflash
+      - name: Install esp-emu
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/espressif/esp-emulator/main/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Run zenwave inside esp-emu (HTTP + HTTPS over Wi-Fi NAT)
+        run: bash scripts/test-esp32c6.sh
+
   wasip3:
     name: WASI Preview 3 (Wasmtime)
     runs-on: ubuntu-latest

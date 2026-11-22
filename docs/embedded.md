@@ -69,6 +69,8 @@ rustup target add riscv32imac-unknown-none-elf
 
 ### Memory budget recommendations (512 KiB HP SRAM)
 
+Measured on `esp-emu` with the `tests/esp32c6-smoke` firmware (Wi-Fi associated + DHCP up, `esp-radio` + `embassy-net` running, `rustls-rustcrypto` provider): ~50 KiB heap in use before the first request, ~7 KiB additional per plaintext request, ~67 KiB total after a plaintext + a TLS 1.3 request with X.509 chain verification. The built application image is ~0.9 MiB for HTTP alone and ~1.55 MiB with `embedded-tls` (RustCrypto/rustls code dominates the delta).
+
 - Reserve **128–192 KiB** for `esp_alloc::heap_allocator!` when running Wi-Fi (`esp-radio`) alongside TLS 1.3 handshakes and X.509 chain verification.
 - Bound untrusted response bodies with `ResponseExt::into_bytes_with_limit(limit)` or consume `response.into_body().into_data_stream()` chunk-by-chunk; `EmbeddedRunner` uses a 2-frame bounded channel so TCP receive windows apply backpressure automatically.
 - Size `TcpClientState<N, TX, RX>` buffers to `2048` or `4096` bytes per active socket.
@@ -177,6 +179,32 @@ async fn send_telemetry(
 
 For `crypto_provider` on `riscv32imac-unknown-none-elf`, pass a pure-Rust `no_std` provider such as [`rustls-rustcrypto`](https://crates.io/crates/rustls-rustcrypto) (`Arc::new(rustls_rustcrypto::provider())`), or an ESP32-C6 hardware-accelerated provider backed by `esp-hal`'s SHA/AES/ECC peripherals and `esp_hal::rng::Rng`.
 
+`rustls-rustcrypto` is `no_std`-capable but its **default features pull `std`** back in (`default = ["std", "tls12", "zeroize"]`); disable them and re-select what you need:
+
+```toml
+rustls-rustcrypto = { version = "0.1.0", default-features = false, features = ["alloc", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["hashbrown", "tls12"] }
+rustls-pki-types = { version = "1", default-features = false, features = ["alloc"] }
+```
+
+Its `getrandom` dependency has no backend on `*-none-elf` targets. Enable the custom backend (`--cfg getrandom_backend="custom"` in `.cargo/config.toml` rustflags) and export `__getrandom_v03_custom`, feeding it from the hardware RNG:
+
+```rust
+#[unsafe(no_mangle)]
+unsafe extern "Rust" fn __getrandom_v03_custom(
+    dest: *mut u8,
+    len: usize,
+) -> Result<(), getrandom::Error> {
+    let buf = unsafe { core::slice::from_raw_parts_mut(dest, len) };
+    let rng = esp_hal::rng::Rng::new();
+    for chunk in buf.chunks_mut(4) {
+        let word = rng.random().to_le_bytes();
+        chunk.copy_from_slice(&word[..chunk.len()]);
+    }
+    Ok(())
+}
+```
+
 ## Running in `esp-emulator` (`esp-emu`)
 
 [`espressif/esp-emulator`](https://github.com/espressif/esp-emulator) emulates ESP32-C6's RV32IMAC CPU, HP/LP SRAM, hardware RNG/crypto peripherals, virtual Wi-Fi AP (`myssid` / `mypassword`), OpenETH, and user-mode NAT (`--net user`) without root privileges or firmware code changes:
@@ -192,10 +220,20 @@ For `crypto_provider` on `riscv32imac-unknown-none-elf`, pass a pure-Rust `no_st
    ```sh
    esp-emu --chip esp32c6 \
      --firmware target/esp32c6-merged.bin \
+     --elf target/riscv32imac-unknown-none-elf/release/firmware \
      --net "user,net=10.0.2.0/24" \
      --exit-on "telemetry delivered" \
      --timeout 30s
    ```
+
+Notes measured while bringing up the smoke firmware:
+
+- **Console output**: `esp-println`'s `auto` printer picks UART vs. USB Serial JTAG by probing USB SOF interrupts; with no USB host attached the detection is unreliable and firmware logs can go silent. Lock the transport explicitly: `esp-println = { default-features = false, features = ["<chip>", "log-04", "uart", "critical-section"] }`.
+- **`esp-rtos` executor start**: crates.io `esp-rtos 0.4` takes two arguments — `esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0)`.
+- `TcpClient` in `embassy-net 0.9` is generic over socket count and buffer sizes (`TcpClient<'d, N, TX, RX>`); a `TcpClientState<N, TX, RX>` in a `static_cell` keeps the runner task `'static`.
+- Version matrix verified end-to-end on `esp-emu 1.2.0`: `esp-hal 1.2.2`, `esp-radio 1.0.0-beta.1`, `esp-rtos 0.4.0`, `esp-alloc 0.11.0`, `esp-bootloader-esp-idf 0.6.0`, `esp-println 0.18.0` (`uart`), `esp-metadata-generated 0.5.3`, `embassy-net 0.9.1`, `embassy-executor 0.10.0`, `rustls-rustcrypto 0.1.0-pre.0`, `getrandom 0.4` (`custom` backend).
+
+A complete, CI-exercised reference firmware lives at [`tests/esp32c6-smoke`](../tests/esp32c6-smoke): it joins the emulator's WPA2 SoftAP, runs `EmbeddedBackend` over `embassy-net`, and performs HTTP and HTTPS (rustls + `rustls-rustcrypto`, custom `getrandom` backend, `TimeProvider`) requests against a host fixture via `scripts/test-esp32c6.sh`.
 
 ### Alternative: ESP-IDF (`std`) on ESP32-C6
 
