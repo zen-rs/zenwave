@@ -113,6 +113,20 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
       - name: Enable safaridriver
         run: sudo safaridriver --enable
+      - name: Diagnose safaridriver startup
+        run: |
+          /usr/bin/safaridriver -p 0 &
+          pid=$!
+          sleep 15
+          if ps -p "$pid" >/dev/null; then
+            echo "driver process alive"
+            lsof -nP -iTCP -sTCP:LISTEN -p "$pid" || echo "not listening"
+            kill "$pid" 2>/dev/null || true
+          else
+            echo "driver process exited within 15s"
+          fi
+          echo "=== tccd log (last 3m) ==="
+          sudo log show --last 3m --predicate 'process == "tccd" OR process == "safaridriver"' 2>/dev/null | grep -iE 'denied|deny|prompt|responsible|safari|appleevent|kTCCService' | tail -60 || true
       - name: wasm-pack test (Safari)
         run: bash scripts/test-wasm.sh safari
 
