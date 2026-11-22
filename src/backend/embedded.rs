@@ -152,6 +152,7 @@ impl EmbeddedBackend {
         let runner = EmbeddedRunner {
             transport: transport.clone(),
             limits: Limits::default(),
+            keep_alive: true,
             receiver,
             buffers: RunnerBuffers::new(),
         };
@@ -273,11 +274,15 @@ impl RunnerBuffers {
         }
     }
 
-    fn reset(&mut self) {
+    fn reset_head_only(&mut self) {
         self.head_buf.clear();
         if self.head_buf.capacity() > HEAD_INITIAL_CAP * 2 {
             self.head_buf = BytesMut::with_capacity(HEAD_INITIAL_CAP);
         }
+    }
+
+    fn reset(&mut self) {
+        self.reset_head_only();
         self.app_rx.clear();
         if self.app_rx.capacity() > SOCKET_READ_CHUNK * 2 {
             self.app_rx = BytesMut::with_capacity(SOCKET_READ_CHUNK);
@@ -306,6 +311,7 @@ fn reset_tls_vec(buf: &mut Vec<u8>) {
 pub struct EmbeddedRunner {
     transport: Transport,
     limits: Limits,
+    keep_alive: bool,
     receiver: async_channel::Receiver<RequestCommand>,
     buffers: RunnerBuffers,
 }
@@ -315,6 +321,7 @@ impl fmt::Debug for EmbeddedRunner {
         f.debug_struct("EmbeddedRunner")
             .field("transport", &self.transport)
             .field("limits", &self.limits)
+            .field("keep_alive", &self.keep_alive)
             .finish_non_exhaustive()
     }
 }
@@ -330,6 +337,14 @@ impl EmbeddedRunner {
         self
     }
 
+    /// Enable or disable single-slot HTTP/1.1 keep-alive connection reuse across
+    /// back-to-back same-origin requests (enabled by default).
+    #[must_use]
+    pub const fn with_keep_alive(mut self, enabled: bool) -> Self {
+        self.keep_alive = enabled;
+        self
+    }
+
     /// Drive requests over `tcp` and `dns` until every [`EmbeddedBackend`]
     /// handle is dropped.
     ///
@@ -341,6 +356,7 @@ impl EmbeddedRunner {
         C: TcpConnect,
         D: Dns,
     {
+        let mut idle: Option<IdleConn<C::Connection<'_>>> = None;
         while let Ok(cmd) = self.receiver.recv().await {
             if cmd.reply.is_canceled() {
                 continue;
@@ -354,14 +370,23 @@ impl EmbeddedRunner {
             exchange_one(
                 &self.transport,
                 &self.limits,
+                self.keep_alive,
                 &mut self.buffers,
+                &mut idle,
                 tcp,
                 dns,
                 None::<&NoTimer>,
                 cmd,
             )
             .await;
-            self.buffers.reset();
+            if idle.is_some() {
+                self.buffers.reset_head_only();
+            } else {
+                self.buffers.reset();
+            }
+        }
+        if let Some(conn) = idle {
+            conn.close(&mut self.buffers).await;
         }
     }
 
@@ -375,6 +400,7 @@ impl EmbeddedRunner {
         D: Dns,
         T: EmbeddedTimer,
     {
+        let mut idle: Option<IdleConn<C::Connection<'_>>> = None;
         while let Ok(cmd) = self.receiver.recv().await {
             if cmd.reply.is_canceled() {
                 continue;
@@ -382,14 +408,23 @@ impl EmbeddedRunner {
             exchange_one(
                 &self.transport,
                 &self.limits,
+                self.keep_alive,
                 &mut self.buffers,
+                &mut idle,
                 tcp,
                 dns,
                 Some(timer),
                 cmd,
             )
             .await;
-            self.buffers.reset();
+            if idle.is_some() {
+                self.buffers.reset_head_only();
+            } else {
+                self.buffers.reset();
+            }
+        }
+        if let Some(conn) = idle {
+            conn.close(&mut self.buffers).await;
         }
     }
 }
@@ -956,38 +991,208 @@ impl<S: AsyncRead + AsyncWrite> StreamIo for UnbufferedTlsStream<S> {
     async fn shutdown(&mut self) {
         use rustls::unbuffered::{ConnectionState, EncryptError, UnbufferedStatus};
 
-        if let UnbufferedStatus {
-            discard,
-            state: Ok(ConnectionState::WriteTraffic(mut wt)),
-        } = self
-            .conn
-            .process_tls_records(&mut self.rx_tls[..self.rx_filled])
-        {
-            loop {
-                match wt.queue_close_notify(&mut self.tx_tls[self.tx_filled..]) {
-                    Ok(written) => {
-                        self.tx_filled += written;
-                        break;
+        // Drain any already-buffered post-handshake control records (such as
+        // TLS 1.3 `NewSessionTicket` arriving alongside the final HTTP chunk)
+        // so tickets enter `ClientSessionStore` before we send `close_notify`.
+        loop {
+            let UnbufferedStatus { mut discard, state } = self
+                .conn
+                .process_tls_records(&mut self.rx_tls[..self.rx_filled]);
+            match state {
+                Ok(ConnectionState::WriteTraffic(mut wt)) => {
+                    loop {
+                        match wt.queue_close_notify(&mut self.tx_tls[self.tx_filled..]) {
+                            Ok(written) => {
+                                self.tx_filled += written;
+                                break;
+                            }
+                            Err(EncryptError::InsufficientSize(need)) => {
+                                self.tx_tls.resize(self.tx_filled + need.required_size, 0);
+                            }
+                            Err(EncryptError::EncryptExhausted) => break,
+                        }
                     }
-                    Err(EncryptError::InsufficientSize(need)) => {
-                        self.tx_tls.resize(self.tx_filled + need.required_size, 0);
+                    self.discard_rx(discard);
+                    let _ = self.flush_tx_exchange().await;
+                    break;
+                }
+                Ok(ConnectionState::EncodeTlsData(enc)) => {
+                    encode_tls_record(enc, &mut self.tx_tls, &mut self.tx_filled);
+                    self.discard_rx(discard);
+                }
+                Ok(ConnectionState::TransmitTlsData(tx)) => {
+                    tx.done();
+                    self.discard_rx(discard);
+                    let _ = self.flush_tx_exchange().await;
+                }
+                Ok(ConnectionState::ReadTraffic(mut traffic)) => {
+                    while let Some(Ok(rec)) = traffic.next_record() {
+                        discard += rec.discard;
                     }
-                    Err(EncryptError::EncryptExhausted) => break,
+                    self.discard_rx(discard);
+                }
+                _ => {
+                    self.discard_rx(discard);
+                    break;
                 }
             }
-            self.discard_rx(discard);
-            let _ = self.flush_tx_exchange().await;
         }
         let _ = self.socket.flush().await;
     }
 }
 
-#[allow(clippy::future_not_send)]
-async fn exchange_one<C, D, T>(
+enum ActiveStream<S> {
+    Plain(PlainStream<S>),
+    #[cfg(embedded_tls)]
+    Tls(Box<UnbufferedTlsStream<S>>),
+}
+
+impl<S: AsyncRead + AsyncWrite> ActiveStream<S> {
+    const fn is_reusable(&self) -> bool {
+        match self {
+            Self::Plain(_) => true,
+            #[cfg(embedded_tls)]
+            Self::Tls(tls) => !tls.peer_closed,
+        }
+    }
+
+    #[allow(clippy::future_not_send)]
+    #[cfg_attr(not(embedded_tls), allow(clippy::needless_pass_by_ref_mut))]
+    async fn close(self, buffers: &mut RunnerBuffers) {
+        match self {
+            Self::Plain(mut plain) => {
+                plain.shutdown().await;
+            }
+            #[cfg(embedded_tls)]
+            Self::Tls(mut tls) => {
+                tls.shutdown().await;
+                let (rx_b, tx_b) = tls.into_buffers();
+                buffers.rx_tls = rx_b;
+                buffers.tx_tls = tx_b;
+            }
+        }
+        #[cfg(not(embedded_tls))]
+        let _ = buffers;
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite> StreamIo for ActiveStream<S> {
+    #[allow(clippy::future_not_send)]
+    async fn read_into(&mut self, dst: &mut BytesMut) -> Result<usize, Error> {
+        match self {
+            Self::Plain(plain) => plain.read_into(dst).await,
+            #[cfg(embedded_tls)]
+            Self::Tls(tls) => tls.read_into(dst).await,
+        }
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn write_bytes(&mut self, buf: &[u8]) -> Result<(), Error> {
+        match self {
+            Self::Plain(plain) => plain.write_bytes(buf).await,
+            #[cfg(embedded_tls)]
+            Self::Tls(tls) => tls.write_bytes(buf).await,
+        }
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn flush_bytes(&mut self) -> Result<(), Error> {
+        match self {
+            Self::Plain(plain) => plain.flush_bytes().await,
+            #[cfg(embedded_tls)]
+            Self::Tls(tls) => tls.flush_bytes().await,
+        }
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn shutdown(&mut self) {
+        match self {
+            Self::Plain(plain) => plain.shutdown().await,
+            #[cfg(embedded_tls)]
+            Self::Tls(tls) => tls.shutdown().await,
+        }
+    }
+}
+
+struct IdleConn<S> {
+    scheme: Scheme,
+    host: String,
+    port: u16,
+    stream: ActiveStream<S>,
+}
+
+impl<S: AsyncRead + AsyncWrite> IdleConn<S> {
+    fn matches(&self, scheme: &Scheme, host: &str, port: u16) -> bool {
+        self.scheme == *scheme && self.port == port && self.host.eq_ignore_ascii_case(host)
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn close(self, buffers: &mut RunnerBuffers) {
+        self.stream.close(buffers).await;
+        buffers.app_rx.clear();
+    }
+}
+
+fn request_wants_close(request: &http::Request<Body>) -> bool {
+    request
+        .headers()
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case("close"))
+}
+
+fn clone_replayable_request(request: &http::Request<Body>) -> Option<http::Request<Body>> {
+    let body = if request.body().is_empty() == Some(true) {
+        Body::empty()
+    } else {
+        request.body().try_clone()?
+    };
+    let mut out = http::Request::new(body);
+    *out.method_mut() = request.method().clone();
+    *out.uri_mut() = request.uri().clone();
+    *out.version_mut() = request.version();
+    *out.headers_mut() = request.headers().clone();
+    *out.extensions_mut() = request.extensions().clone();
+    Some(out)
+}
+
+fn shape_embedded_request(
+    request: &mut http::Request<Body>,
+    scheme: &Scheme,
+    host: &str,
+    port: u16,
+    keep_alive_enabled: bool,
+) -> bool {
+    if request.headers().get(header::HOST).is_none() {
+        let host_header = if (*scheme == Scheme::HTTP && port == 80)
+            || (*scheme == Scheme::HTTPS && port == 443)
+        {
+            host.to_owned()
+        } else {
+            format!("{host}:{port}")
+        };
+        if let Ok(val) = HeaderValue::from_str(&host_header) {
+            request.headers_mut().insert(header::HOST, val);
+        }
+    }
+    if !keep_alive_enabled && request.headers().get(header::CONNECTION).is_none() {
+        request
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    }
+    !keep_alive_enabled || request_wants_close(request)
+}
+
+#[allow(clippy::too_many_arguments, clippy::future_not_send)]
+async fn exchange_one<'a, C, D, T>(
     transport: &Transport,
     limits: &Limits,
+    keep_alive_enabled: bool,
     buffers: &mut RunnerBuffers,
-    tcp: &C,
+    idle: &mut Option<IdleConn<C::Connection<'a>>>,
+    tcp: &'a C,
     dns: &D,
     timer: Option<&T>,
     cmd: RequestCommand,
@@ -1010,75 +1215,142 @@ async fn exchange_one<C, D, T>(
         }
     };
 
-    if request.headers().get(header::HOST).is_none() {
-        let host_header =
-            if (scheme == Scheme::HTTP && port == 80) || (scheme == Scheme::HTTPS && port == 443) {
-                host.clone()
-            } else {
-                format!("{host}:{port}")
-            };
-        if let Ok(val) = HeaderValue::from_str(&host_header) {
-            request.headers_mut().insert(header::HOST, val);
+    let req_wants_close =
+        shape_embedded_request(&mut request, &scheme, &host, port, keep_alive_enabled);
+    let mut reply_slot = Some(reply);
+
+    if let Some(mut pooled) = idle.take() {
+        if pooled.matches(&scheme, &host, port) {
+            let backup = clone_replayable_request(&request);
+            match drive_http_exchange(
+                &mut pooled.stream,
+                &mut buffers.app_rx,
+                &mut buffers.head_buf,
+                limits,
+                timer,
+                &timeouts,
+                request,
+                &mut reply_slot,
+                true,
+            )
+            .await
+            {
+                outcome @ ExchangeOutcome::Completed { .. } => {
+                    park_or_close(pooled, outcome, req_wants_close, buffers, idle).await;
+                    return;
+                }
+                ExchangeOutcome::StaleReuse(err) => {
+                    // Release the stale socket before dialing so single-slot
+                    // `embassy-net` `TcpClient<'_, 1, ...>` pools never exhaust.
+                    pooled.close(buffers).await;
+                    buffers.reset();
+                    if let Some(replayed) = backup {
+                        request = replayed;
+                    } else {
+                        if let Some(tx) = reply_slot.take() {
+                            let _ = tx.send(Err(err));
+                        }
+                        return;
+                    }
+                }
+            }
+        } else {
+            pooled.close(buffers).await;
+            buffers.reset();
         }
     }
-    if request.headers().get(header::CONNECTION).is_none() {
-        request
-            .headers_mut()
-            .insert(header::CONNECTION, HeaderValue::from_static("close"));
-    }
 
-    if scheme == Scheme::HTTPS {
-        exchange_https(
-            transport, limits, buffers, tcp, dns, timer, &host, port, request, &timeouts, reply,
-        )
-        .await;
+    let dial_res = if scheme == Scheme::HTTPS {
+        dial_https(transport, buffers, tcp, dns, timer, &host, port, &timeouts).await
+    } else {
+        #[cfg(not(embedded_tls))]
+        let _ = transport;
+        dial_http(buffers, tcp, dns, timer, &host, port, &timeouts).await
+    };
+
+    let Ok(mut stream) = dial_res else {
+        if let (Err(err), Some(tx)) = (dial_res, reply_slot.take()) {
+            let _ = tx.send(Err(err));
+        }
         return;
-    }
+    };
 
-    #[cfg(not(embedded_tls))]
-    let _ = transport;
-
-    exchange_http(
-        limits, buffers, tcp, dns, timer, &host, port, request, &timeouts, reply,
+    let outcome = drive_http_exchange(
+        &mut stream,
+        &mut buffers.app_rx,
+        &mut buffers.head_buf,
+        limits,
+        timer,
+        &timeouts,
+        request,
+        &mut reply_slot,
+        false,
+    )
+    .await;
+    park_or_close(
+        IdleConn {
+            scheme,
+            host,
+            port,
+            stream,
+        },
+        outcome,
+        req_wants_close,
+        buffers,
+        idle,
     )
     .await;
 }
 
-#[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(embedded_tls), allow(clippy::unused_async))]
-async fn exchange_https<C, D, T>(
-    transport: &Transport,
-    limits: &Limits,
+#[allow(clippy::future_not_send)]
+async fn park_or_close<S: AsyncRead + AsyncWrite>(
+    conn: IdleConn<S>,
+    outcome: ExchangeOutcome,
+    req_wants_close: bool,
     buffers: &mut RunnerBuffers,
-    tcp: &C,
+    idle: &mut Option<IdleConn<S>>,
+) {
+    if matches!(outcome, ExchangeOutcome::Completed { keep_alive: true })
+        && !req_wants_close
+        && conn.stream.is_reusable()
+        && buffers.app_rx.is_empty()
+    {
+        *idle = Some(conn);
+    } else {
+        conn.close(buffers).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::future_not_send)]
+#[cfg_attr(not(embedded_tls), allow(clippy::unused_async))]
+async fn dial_https<'a, C, D, T>(
+    transport: &Transport,
+    buffers: &mut RunnerBuffers,
+    tcp: &'a C,
     dns: &D,
     timer: Option<&T>,
     host: &str,
     port: u16,
-    request: http::Request<Body>,
     timeouts: &Timeouts,
-    reply: oneshot::Sender<Result<Response, Error>>,
-) where
+) -> Result<ActiveStream<C::Connection<'a>>, Error>
+where
     C: TcpConnect,
     D: Dns,
     T: EmbeddedTimer,
 {
     #[cfg(not(embedded_tls))]
     {
-        let _ = (
-            transport, limits, buffers, tcp, dns, timer, host, port, request, timeouts,
-        );
-        let _ = reply.send(Err(Error::Config(ConfigError::Unsupported {
+        let _ = (transport, buffers, tcp, dns, timer, host, port, timeouts);
+        Err(Error::Config(ConfigError::Unsupported {
             what: "HTTPS without the `embedded-tls` feature",
-        })));
+        }))
     }
     #[cfg(embedded_tls)]
     {
         let Some(tls_config) = transport.embedded_tls().cloned() else {
-            let _ = reply.send(Err(Error::tls_config(Cause::Detail(
+            return Err(Error::tls_config(Cause::Detail(
                 "HTTPS on EmbeddedBackend requires TransportBuilder::embedded_tls_provider or embedded_tls_config".to_owned(),
-            ))));
-            return;
+            )));
         };
         let phase = core::cell::Cell::new(ConnectPhase::Resolve);
         buffers.app_rx.clear();
@@ -1088,7 +1360,7 @@ async fn exchange_https<C, D, T>(
             tx_tls,
             ..
         } = buffers;
-        let dial = timed(
+        let tls_stream = timed(
             timer,
             timeouts.connect,
             || {
@@ -1116,52 +1388,29 @@ async fn exchange_https<C, D, T>(
                     .await
             },
         )
-        .await;
-
-        match dial {
-            Ok(mut tls_stream) => {
-                drive_http_exchange(
-                    &mut tls_stream,
-                    &mut buffers.app_rx,
-                    &mut buffers.head_buf,
-                    limits,
-                    timer,
-                    timeouts,
-                    request,
-                    reply,
-                )
-                .await;
-                tls_stream.shutdown().await;
-                let (rx_b, tx_b) = tls_stream.into_buffers();
-                buffers.rx_tls = rx_b;
-                buffers.tx_tls = tx_b;
-            }
-            Err(err) => {
-                let _ = reply.send(Err(err));
-            }
-        }
+        .await?;
+        Ok(ActiveStream::Tls(Box::new(tls_stream)))
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn exchange_http<C, D, T>(
-    limits: &Limits,
+#[allow(clippy::too_many_arguments, clippy::future_not_send)]
+async fn dial_http<'a, C, D, T>(
     buffers: &mut RunnerBuffers,
-    tcp: &C,
+    tcp: &'a C,
     dns: &D,
     timer: Option<&T>,
     host: &str,
     port: u16,
-    request: http::Request<Body>,
     timeouts: &Timeouts,
-    reply: oneshot::Sender<Result<Response, Error>>,
-) where
+) -> Result<ActiveStream<C::Connection<'a>>, Error>
+where
     C: TcpConnect,
     D: Dns,
     T: EmbeddedTimer,
 {
+    buffers.app_rx.clear();
     let phase = core::cell::Cell::new(ConnectPhase::Resolve);
-    let dial = timed(
+    let plain = timed(
         timer,
         timeouts.connect,
         || {
@@ -1187,28 +1436,8 @@ async fn exchange_http<C, D, T>(
             Ok(PlainStream(sock))
         },
     )
-    .await;
-
-    match dial {
-        Ok(mut plain_stream) => {
-            buffers.app_rx.clear();
-            drive_http_exchange(
-                &mut plain_stream,
-                &mut buffers.app_rx,
-                &mut buffers.head_buf,
-                limits,
-                timer,
-                timeouts,
-                request,
-                reply,
-            )
-            .await;
-            plain_stream.shutdown().await;
-        }
-        Err(err) => {
-            let _ = reply.send(Err(err));
-        }
-    }
+    .await?;
+    Ok(ActiveStream::Plain(plain))
 }
 
 #[allow(clippy::future_not_send)]
@@ -1317,6 +1546,19 @@ fn build_response(parts: http::response::Parts, body: Body) -> Response {
     resp
 }
 
+enum ExchangeOutcome {
+    Completed { keep_alive: bool },
+    StaleReuse(Error),
+}
+
+const fn is_stale_reuse_error(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Exchange(ex)
+            if matches!(ex.failure, ExchangeFailure::Terminated | ExchangeFailure::Io)
+    )
+}
+
 #[allow(clippy::too_many_arguments, clippy::future_not_send)]
 async fn drive_http_exchange<S, T>(
     stream: &mut S,
@@ -1326,15 +1568,22 @@ async fn drive_http_exchange<S, T>(
     timer: Option<&T>,
     timeouts: &Timeouts,
     request: http::Request<Body>,
-    reply: oneshot::Sender<Result<Response, Error>>,
-) where
+    reply: &mut Option<oneshot::Sender<Result<Response, Error>>>,
+    reused: bool,
+) -> ExchangeOutcome
+where
     S: StreamIo,
     T: EmbeddedTimer,
 {
     let request_method = request.method().clone();
     if let Err(err) = write_request(stream, head_buf, request).await {
-        let _ = reply.send(Err(err));
-        return;
+        if reused && is_stale_reuse_error(&err) {
+            return ExchangeOutcome::StaleReuse(err);
+        }
+        if let Some(tx) = reply.take() {
+            let _ = tx.send(Err(err));
+        }
+        return ExchangeOutcome::Completed { keep_alive: false };
     }
 
     let head = match timed(
@@ -1347,14 +1596,25 @@ async fn drive_http_exchange<S, T>(
     {
         Ok(head) => head,
         Err(err) => {
-            let _ = reply.send(Err(err));
-            return;
+            if reused && is_stale_reuse_error(&err) {
+                return ExchangeOutcome::StaleReuse(err);
+            }
+            if let Some(tx) = reply.take() {
+                let _ = tx.send(Err(err));
+            }
+            return ExchangeOutcome::Completed { keep_alive: false };
         }
     };
 
+    let head_allows_keep_alive = head.keep_alive && !matches!(head.body, BodyKind::CloseDelimited);
+
     if matches!(head.body, BodyKind::Empty) {
-        let _ = reply.send(Ok(build_response(head.parts, Body::empty())));
-        return;
+        if let Some(tx) = reply.take() {
+            let _ = tx.send(Ok(build_response(head.parts, Body::empty())));
+        }
+        return ExchangeOutcome::Completed {
+            keep_alive: head_allows_keep_alive,
+        };
     }
 
     let mut decoder = BodyDecoder::new(head.body);
@@ -1365,8 +1625,12 @@ async fn drive_http_exchange<S, T>(
             } else {
                 Body::from_bytes(bytes)
             };
-            let _ = reply.send(Ok(build_response(head.parts, body)));
-            return;
+            if let Some(tx) = reply.take() {
+                let _ = tx.send(Ok(build_response(head.parts, body)));
+            }
+            return ExchangeOutcome::Completed {
+                keep_alive: head_allows_keep_alive,
+            };
         }
         EagerBody::Streaming(frames) => frames,
     };
@@ -1375,18 +1639,21 @@ async fn drive_http_exchange<S, T>(
         async_channel::bounded::<Result<BodyFrame, BodyError>>(BODY_CHANNEL_CAPACITY);
     let resp = build_response(head.parts, Body::from_frames(body_rx));
 
-    if reply.send(Ok(resp)).is_err() {
-        return;
+    let Some(tx) = reply.take() else {
+        return ExchangeOutcome::Completed { keep_alive: false };
+    };
+    if tx.send(Ok(resp)).is_err() {
+        return ExchangeOutcome::Completed { keep_alive: false };
     }
 
     for frame in initial_frames {
         let is_err = frame.is_err();
         if body_tx.send(frame).await.is_err() || is_err {
-            return;
+            return ExchangeOutcome::Completed { keep_alive: false };
         }
     }
 
-    stream_response_body(
+    let clean_end = stream_response_body(
         stream,
         rx_buf,
         decoder,
@@ -1396,6 +1663,9 @@ async fn drive_http_exchange<S, T>(
         body_tx,
     )
     .await;
+    ExchangeOutcome::Completed {
+        keep_alive: head_allows_keep_alive && clean_end,
+    }
 }
 
 #[allow(clippy::future_not_send)]
@@ -1500,7 +1770,8 @@ async fn stream_response_body<S, T>(
     timer: Option<&T>,
     body_idle: Option<Duration>,
     body_tx: async_channel::Sender<Result<BodyFrame, BodyError>>,
-) where
+) -> bool
+where
     S: StreamIo,
     T: EmbeddedTimer,
 {
@@ -1508,13 +1779,19 @@ async fn stream_response_body<S, T>(
         match decoder.decode(rx_buf, limits) {
             Ok(Some(Decoded::Data(bytes))) => {
                 if body_tx.send(Ok(BodyFrame::Data(bytes))).await.is_err() {
-                    return;
+                    return false;
                 }
             }
             Ok(Some(Decoded::Trailers(trailers))) => {
-                let _ = body_tx.send(Ok(BodyFrame::Trailers(trailers))).await;
+                if body_tx
+                    .send(Ok(BodyFrame::Trailers(trailers)))
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
             }
-            Ok(Some(Decoded::End)) => return,
+            Ok(Some(Decoded::End)) => return true,
             Ok(None) => {
                 let read_res = timed(
                     timer,
@@ -1528,18 +1805,19 @@ async fn stream_response_body<S, T>(
                         match decoder.decode_eof(rx_buf, limits) {
                             Ok(Decoded::Data(bytes)) => {
                                 if body_tx.send(Ok(BodyFrame::Data(bytes))).await.is_err() {
-                                    return;
+                                    return false;
                                 }
                             }
                             Ok(Decoded::Trailers(trailers)) => {
                                 let _ = body_tx.send(Ok(BodyFrame::Trailers(trailers))).await;
                             }
-                            Ok(Decoded::End) => return,
+                            // Peer closed TCP EOF to terminate the body, so the socket cannot be reused.
+                            Ok(Decoded::End) => return false,
                             Err(err) => {
                                 let _ = body_tx
                                     .send(Err(BodyError::from(http_kit_h1::Error::Parse(err))))
                                     .await;
-                                return;
+                                return false;
                             }
                         }
                     },
@@ -1548,11 +1826,11 @@ async fn stream_response_body<S, T>(
                         let _ = body_tx
                             .send(Err(BodyError::Receive(ReceiveError::Stalled)))
                             .await;
-                        return;
+                        return false;
                     }
                     Err(err) => {
                         let _ = body_tx.send(Err(BodyError::Other(Box::new(err)))).await;
-                        return;
+                        return false;
                     }
                 }
             }
@@ -1560,7 +1838,7 @@ async fn stream_response_body<S, T>(
                 let _ = body_tx
                     .send(Err(BodyError::from(http_kit_h1::Error::Parse(err))))
                     .await;
-                return;
+                return false;
             }
         }
     }
@@ -2117,5 +2395,314 @@ mod tests {
             let ((), ((), ())) =
                 join(runner.run(&stack, &stack), join(server_task, client_task)).await;
         });
+    }
+
+    #[test]
+    fn embedded_runner_reuses_http_keep_alive_and_recovers_from_stale_eof() {
+        let first_conn = vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo".to_vec(),
+        ];
+        // After the second response on `first_conn`, the peer closes (EOF), so
+        // the third request must transparently redial onto `second_conn`.
+        let second_conn = vec![
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nthree".to_vec(),
+        ];
+
+        let stack = MockEmbeddedStack::with_responses([first_conn, second_conn]);
+        let (mut client, runner) = EmbeddedBackend::channel(Transport::system());
+
+        block_on(async {
+            let client_task = async {
+                let b1 = client
+                    .get("http://10.0.2.1:8080/1")
+                    .unwrap()
+                    .await
+                    .unwrap()
+                    .into_string()
+                    .await
+                    .unwrap();
+                assert_eq!(b1.as_str(), "one");
+
+                let b2 = client
+                    .get("http://10.0.2.1:8080/2")
+                    .unwrap()
+                    .await
+                    .unwrap()
+                    .into_string()
+                    .await
+                    .unwrap();
+                assert_eq!(b2.as_str(), "two");
+
+                let b3 = client
+                    .get("http://10.0.2.1:8080/3")
+                    .unwrap()
+                    .await
+                    .unwrap()
+                    .into_string()
+                    .await
+                    .unwrap();
+                assert_eq!(b3.as_str(), "three");
+                drop(client);
+            };
+            join(runner.run(&stack, &stack), client_task).await;
+        });
+
+        // Two TCP dials served three HTTP exchanges (`exchanges` started with 2 entries and is now empty).
+        assert!(stack.exchanges.borrow().is_empty());
+        assert_eq!(stack.recorded_requests.borrow().len(), 2);
+    }
+
+    #[cfg(embedded_tls)]
+    struct MultiDuplexStack {
+        slots: RefCell<Vec<DuplexSocket>>,
+        dials: core::cell::Cell<usize>,
+    }
+
+    #[cfg(embedded_tls)]
+    impl TcpConnect for MultiDuplexStack {
+        type Error = MockIoError;
+        type Connection<'a> = DuplexSocket;
+        fn connect(
+            &self,
+            _remote: SocketAddr,
+        ) -> impl Future<Output = Result<Self::Connection<'_>, Self::Error>> {
+            self.dials.set(self.dials.get() + 1);
+            ready(Ok(self.slots.borrow_mut().remove(0)))
+        }
+    }
+
+    #[cfg(embedded_tls)]
+    impl Dns for MultiDuplexStack {
+        type Error = MockIoError;
+        fn get_host_by_name(
+            &self,
+            _host: &str,
+            _addr_type: AddrType,
+        ) -> impl Future<Output = Result<IpAddr, Self::Error>> {
+            ready(Ok(IpAddr::V4(Ipv4Addr::LOCALHOST)))
+        }
+        fn get_host_by_address(
+            &self,
+            _addr: IpAddr,
+            _result: &mut [u8],
+        ) -> impl Future<Output = Result<usize, Self::Error>> {
+            ready(Err(MockIoError))
+        }
+    }
+
+    #[cfg(embedded_tls)]
+    async fn serve_keepalive_https(
+        server_cfg: Arc<rustls::ServerConfig>,
+        c2s_rx: async_channel::Receiver<Vec<u8>>,
+        s2c_tx: async_channel::Sender<Vec<u8>>,
+        responses: Vec<&'static str>,
+    ) -> rustls::HandshakeKind {
+        use rustls::{server::UnbufferedServerConnection, unbuffered::ConnectionState};
+
+        let mut srv = UnbufferedServerConnection::new(server_cfg).unwrap();
+        let mut rx_buf = Vec::new();
+        let mut app_req = Vec::new();
+        let mut resp_idx = 0usize;
+        loop {
+            let status = srv.process_tls_records(&mut rx_buf);
+            let mut discard = status.discard;
+            match status.state.unwrap() {
+                ConnectionState::EncodeTlsData(mut enc) => {
+                    let mut out = vec![0u8; 4096];
+                    let n = match enc.encode(&mut out) {
+                        Ok(n) => n,
+                        Err(rustls::unbuffered::EncodeError::InsufficientSize(need)) => {
+                            out.resize(need.required_size, 0);
+                            enc.encode(&mut out).unwrap()
+                        }
+                        Err(err) => panic!("server encode: {err}"),
+                    };
+                    out.truncate(n);
+                    let _ = s2c_tx.send(out).await;
+                    rx_buf.drain(..discard);
+                }
+                ConnectionState::TransmitTlsData(tx) => {
+                    tx.done();
+                    rx_buf.drain(..discard);
+                }
+                ConnectionState::BlockedHandshake => {
+                    rx_buf.drain(..discard);
+                    let chunk = c2s_rx.recv().await.expect("client handshake bytes");
+                    rx_buf.extend_from_slice(&chunk);
+                }
+                ConnectionState::ReadTraffic(mut rt) => {
+                    while let Some(rec) = rt.next_record() {
+                        let rec = rec.unwrap();
+                        discard += rec.discard;
+                        app_req.extend_from_slice(rec.payload);
+                    }
+                    rx_buf.drain(..discard);
+                }
+                ConnectionState::WriteTraffic(mut wt) => {
+                    rx_buf.drain(..discard);
+                    if let Some(pos) = app_req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        app_req.drain(..pos + 4);
+                        let raw = responses[resp_idx];
+                        resp_idx += 1;
+                        let mut out = vec![0u8; raw.len() + 256];
+                        let n = wt.encrypt(raw.as_bytes(), &mut out).unwrap();
+                        out.truncate(n);
+                        let _ = s2c_tx.send(out).await;
+                        if resp_idx >= responses.len() {
+                            let mut close_buf = vec![0u8; 128];
+                            let cn = wt.queue_close_notify(&mut close_buf).unwrap();
+                            close_buf.truncate(cn);
+                            let _ = s2c_tx.send(close_buf).await;
+                            break;
+                        }
+                        continue;
+                    }
+                    let Ok(chunk) = c2s_rx.recv().await else {
+                        break;
+                    };
+                    rx_buf.extend_from_slice(&chunk);
+                }
+                ConnectionState::PeerClosed | ConnectionState::Closed => break,
+                _ => {
+                    rx_buf.drain(..discard);
+                }
+            }
+        }
+        srv.handshake_kind().expect("completed handshake")
+    }
+
+    #[cfg(embedded_tls)]
+    fn make_test_tls_pair(tickets: usize) -> (Arc<rustls::ServerConfig>, Transport) {
+        let certified = rcgen::generate_simple_self_signed(vec!["esp32c6.local".to_owned()])
+            .expect("generate self-signed cert");
+        let cert_pem = certified.cert.pem();
+        let cert_der = rustls_pki_types::CertificateDer::from(certified.cert.der().to_vec());
+        let key_der = rustls_pki_types::PrivateKeyDer::Pkcs8(
+            rustls_pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der()),
+        );
+        let now = rustls_pki_types::UnixTime::since_unix_epoch(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap(),
+        );
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let time_provider: Arc<dyn rustls::time_provider::TimeProvider> =
+            Arc::new(FixedTimeProvider(now));
+
+        let mut server_cfg_raw = rustls::ServerConfig::builder_with_details(
+            Arc::clone(&provider),
+            Arc::clone(&time_provider),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .unwrap();
+        server_cfg_raw.send_tls13_tickets = tickets;
+
+        let transport = Transport::builder()
+            .extra_root_certificates_pem(cert_pem.as_bytes())
+            .unwrap()
+            .embedded_tls_provider(provider, time_provider)
+            .build()
+            .unwrap();
+        (Arc::new(server_cfg_raw), transport)
+    }
+
+    #[cfg(embedded_tls)]
+    #[test]
+    fn embedded_tls_reuses_keep_alive_and_resumes_session_via_ticket() {
+        use core::cell::Cell;
+        use rustls::HandshakeKind;
+
+        let (server_cfg, transport) = make_test_tls_pair(2);
+
+        let (c2s1_tx, c2s1_rx) = async_channel::unbounded::<Vec<u8>>();
+        let (s2c1_tx, s2c1_rx) = async_channel::unbounded::<Vec<u8>>();
+        let (c2s2_tx, c2s2_rx) = async_channel::unbounded::<Vec<u8>>();
+        let (s2c2_tx, s2c2_rx) = async_channel::unbounded::<Vec<u8>>();
+
+        let stack = MultiDuplexStack {
+            slots: RefCell::new(vec![
+                DuplexSocket {
+                    rx: s2c1_rx,
+                    tx: c2s1_tx,
+                    pending: Vec::new(),
+                    offset: 0,
+                },
+                DuplexSocket {
+                    rx: s2c2_rx,
+                    tx: c2s2_tx,
+                    pending: Vec::new(),
+                    offset: 0,
+                },
+            ]),
+            dials: Cell::new(0),
+        };
+
+        let srv1 = serve_keepalive_https(
+            Arc::clone(&server_cfg),
+            c2s1_rx,
+            s2c1_tx,
+            vec![
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nh1",
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nh2",
+            ],
+        );
+        let srv2 = serve_keepalive_https(
+            Arc::clone(&server_cfg),
+            c2s2_rx,
+            s2c2_tx,
+            vec!["HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nh3"],
+        );
+
+        let (mut client, runner) = EmbeddedBackend::channel(transport);
+        let ((), ((kind1, kind2), ())) = block_on(async {
+            let client_task = async {
+                let r1 = client
+                    .get("https://esp32c6.local/a")
+                    .unwrap()
+                    .await
+                    .unwrap()
+                    .into_string()
+                    .await
+                    .unwrap();
+                assert_eq!(r1.as_str(), "h1");
+
+                // Reuses the open TLS 1.3 connection (`dials` stays 1).
+                let r2 = client
+                    .get("https://esp32c6.local/b")
+                    .unwrap()
+                    .await
+                    .unwrap()
+                    .into_string()
+                    .await
+                    .unwrap();
+                assert_eq!(r2.as_str(), "h2");
+
+                // Server sent `Connection: close` on r2, so r3 dials a fresh socket
+                // and resumes the TLS 1.3 session via PSK ticket.
+                let r3 = client
+                    .get("https://esp32c6.local/c")
+                    .unwrap()
+                    .await
+                    .unwrap()
+                    .into_string()
+                    .await
+                    .unwrap();
+                assert_eq!(r3.as_str(), "h3");
+                drop(client);
+            };
+            join(
+                runner.run(&stack, &stack),
+                join(join(srv1, srv2), client_task),
+            )
+            .await
+        });
+
+        assert_eq!(stack.dials.get(), 2);
+        assert_eq!(kind1, HandshakeKind::Full);
+        assert_eq!(kind2, HandshakeKind::Resumed);
     }
 }

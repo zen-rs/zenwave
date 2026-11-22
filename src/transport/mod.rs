@@ -403,6 +403,8 @@ pub struct TransportBuilder {
     extra_roots: Vec<CertificateDer<'static>>,
     #[cfg(embedded_tls)]
     embedded_tls: Option<EmbeddedTlsSetup>,
+    #[cfg(embedded_tls)]
+    embedded_tls_session_cache: Option<usize>,
     #[cfg(unix_socket)]
     unix_socket: Option<PathBuf>,
     #[cfg(transport_timeouts)]
@@ -515,6 +517,17 @@ impl TransportBuilder {
             provider,
             time_provider,
         });
+        self
+    }
+
+    /// Set the bounded origin capacity for `embedded-tls` session resumption
+    /// built from [`embedded_tls_provider`](Self::embedded_tls_provider)
+    /// (defaults to `4` origins, up to 4 TLS 1.3 tickets each; pass `0` to
+    /// disable TLS session resumption).
+    #[cfg(embedded_tls)]
+    #[must_use]
+    pub const fn embedded_tls_session_cache_capacity(mut self, capacity: usize) -> Self {
+        self.embedded_tls_session_cache = Some(capacity);
         self
     }
 
@@ -686,7 +699,12 @@ impl TransportBuilder {
             #[cfg(all(https_lookup, target_os = "android"))]
             let dns = dns::Config;
             #[cfg(embedded_tls)]
-            let embedded_tls = build_embedded_tls(self.embedded_tls, &self.extra_roots)?;
+            let embedded_tls = build_embedded_tls(
+                self.embedded_tls,
+                &self.extra_roots,
+                self.embedded_tls_session_cache
+                    .unwrap_or(DEFAULT_EMBEDDED_TLS_SESSION_CACHE_CAPACITY),
+            )?;
             let transport = Transport {
                 inner: Arc::new(Inner {
                     proxy: self.proxy.unwrap_or_else(Proxy::system),
@@ -736,7 +754,12 @@ impl TransportBuilder {
     #[allow(clippy::missing_const_for_fn)]
     pub fn build(self) -> Result<Transport, Error> {
         #[cfg(embedded_tls)]
-        let embedded_tls = build_embedded_tls(self.embedded_tls, &self.extra_roots)?;
+        let embedded_tls = build_embedded_tls(
+            self.embedded_tls,
+            &self.extra_roots,
+            self.embedded_tls_session_cache
+                .unwrap_or(DEFAULT_EMBEDDED_TLS_SESSION_CACHE_CAPACITY),
+        )?;
         Ok(Transport {
             #[cfg(any(wasi_backend, embedded_backend))]
             timeouts: self.timeouts,
@@ -746,10 +769,165 @@ impl TransportBuilder {
     }
 }
 
+/// Default bounded origin count for embedded TLS session resumption.
+#[cfg(embedded_tls)]
+const DEFAULT_EMBEDDED_TLS_SESSION_CACHE_CAPACITY: usize = 4;
+
+/// Bounded `no_std + alloc` [`rustls::client::ClientSessionStore`] implemented
+/// directly against the feature-invariant trait so Cargo feature unification of
+/// `rustls/std` in downstream dependency graphs never changes its constructor.
+#[cfg(embedded_tls)]
+mod embedded_session_store {
+    use alloc::{collections::VecDeque, vec::Vec};
+    use core::fmt;
+
+    use rustls::{
+        NamedGroup,
+        client::{ClientSessionStore, Tls12ClientSessionValue, Tls13ClientSessionValue},
+    };
+    use rustls_pki_types::ServerName;
+
+    const MAX_TICKETS_PER_ORIGIN: usize = 4;
+
+    struct OriginEntry {
+        name: ServerName<'static>,
+        kx_hint: Option<NamedGroup>,
+        tls12: Option<Tls12ClientSessionValue>,
+        tls13: VecDeque<Tls13ClientSessionValue>,
+    }
+
+    impl OriginEntry {
+        fn new(name: ServerName<'static>) -> Self {
+            Self {
+                name,
+                kx_hint: None,
+                tls12: None,
+                tls13: VecDeque::with_capacity(MAX_TICKETS_PER_ORIGIN),
+            }
+        }
+    }
+
+    pub struct BoundedSessionStore {
+        max_origins: usize,
+        entries: async_lock::Mutex<Vec<OriginEntry>>,
+    }
+
+    impl BoundedSessionStore {
+        pub fn new(max_origins: usize) -> Self {
+            Self {
+                max_origins,
+                entries: async_lock::Mutex::new(Vec::with_capacity(max_origins)),
+            }
+        }
+
+        fn touch<'a>(
+            entries: &'a mut Vec<OriginEntry>,
+            max_origins: usize,
+            server_name: ServerName<'static>,
+        ) -> Option<&'a mut OriginEntry> {
+            if max_origins == 0 {
+                return None;
+            }
+            if let Some(idx) = entries.iter().position(|e| e.name == server_name) {
+                let entry = entries.remove(idx);
+                entries.push(entry);
+            } else {
+                if entries.len() >= max_origins {
+                    entries.remove(0);
+                }
+                entries.push(OriginEntry::new(server_name));
+            }
+            entries.last_mut()
+        }
+    }
+
+    impl fmt::Debug for BoundedSessionStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BoundedSessionStore")
+                .field("max_origins", &self.max_origins)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl ClientSessionStore for BoundedSessionStore {
+        fn set_kx_hint(&self, server_name: ServerName<'static>, group: NamedGroup) {
+            if let Some(mut guard) = self.entries.try_lock()
+                && let Some(entry) = Self::touch(&mut guard, self.max_origins, server_name)
+            {
+                entry.kx_hint = Some(group);
+            }
+        }
+
+        fn kx_hint(&self, server_name: &ServerName<'_>) -> Option<NamedGroup> {
+            self.entries
+                .try_lock()?
+                .iter()
+                .find(|e| e.name == *server_name)
+                .and_then(|e| e.kx_hint)
+        }
+
+        fn set_tls12_session(
+            &self,
+            server_name: ServerName<'static>,
+            value: Tls12ClientSessionValue,
+        ) {
+            if let Some(mut guard) = self.entries.try_lock()
+                && let Some(entry) = Self::touch(&mut guard, self.max_origins, server_name)
+            {
+                entry.tls12 = Some(value);
+            }
+        }
+
+        fn tls12_session(&self, server_name: &ServerName<'_>) -> Option<Tls12ClientSessionValue> {
+            self.entries
+                .try_lock()?
+                .iter()
+                .find(|e| e.name == *server_name)
+                .and_then(|e| e.tls12.clone())
+        }
+
+        fn remove_tls12_session(&self, server_name: &ServerName<'static>) {
+            if let Some(mut guard) = self.entries.try_lock()
+                && let Some(entry) = guard.iter_mut().find(|e| e.name == *server_name)
+            {
+                entry.tls12 = None;
+            }
+        }
+
+        fn insert_tls13_ticket(
+            &self,
+            server_name: ServerName<'static>,
+            value: Tls13ClientSessionValue,
+        ) {
+            if let Some(mut guard) = self.entries.try_lock()
+                && let Some(entry) = Self::touch(&mut guard, self.max_origins, server_name)
+            {
+                if entry.tls13.len() >= MAX_TICKETS_PER_ORIGIN {
+                    entry.tls13.pop_front();
+                }
+                entry.tls13.push_back(value);
+            }
+        }
+
+        fn take_tls13_ticket(
+            &self,
+            server_name: &ServerName<'static>,
+        ) -> Option<Tls13ClientSessionValue> {
+            self.entries
+                .try_lock()?
+                .iter_mut()
+                .find(|e| e.name == *server_name)?
+                .tls13
+                .pop_back()
+        }
+    }
+}
+
 #[cfg(embedded_tls)]
 fn build_embedded_tls(
     setup: Option<EmbeddedTlsSetup>,
     extra_roots: &[CertificateDer<'static>],
+    session_cache_capacity: usize,
 ) -> Result<Option<Arc<rustls::ClientConfig>>, Error> {
     match setup {
         None => Ok(None),
@@ -774,6 +952,13 @@ fn build_embedded_tls(
                 .map_err(Error::tls_config)?
                 .with_root_certificates(roots)
                 .with_no_client_auth();
+            config.resumption = if session_cache_capacity == 0 {
+                rustls::client::Resumption::disabled()
+            } else {
+                rustls::client::Resumption::store(Arc::new(
+                    embedded_session_store::BoundedSessionStore::new(session_cache_capacity),
+                ))
+            };
             config.alpn_protocols.push(b"http/1.1".to_vec());
             Ok(Some(Arc::new(config)))
         }

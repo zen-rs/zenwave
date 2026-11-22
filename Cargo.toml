@@ -156,6 +156,7 @@ embedded-backend = [
 # `CryptoProvider` and `TimeProvider`.
 embedded-tls = [
     "embedded-backend",
+    "dep:async-lock",
     "dep:rustls",
     "dep:rustls-pki-types",
     "rustls?/hashbrown",
