@@ -67,16 +67,19 @@ use crate::{TlsError, TlsFailure};
 const BODY_CHANNEL_CAPACITY: usize = 2;
 
 /// Scratch read chunk size when pulling bytes from an `embedded-io-async` socket
-/// (fits standard 1500-byte Wi-Fi / Ethernet MTUs without inflating task stacks).
-const SOCKET_READ_CHUNK: usize = 2048;
+/// (fits a 1500-byte Wi-Fi / Ethernet frame without inflating task stacks).
+const SOCKET_READ_CHUNK: usize = 1536;
 
 /// Initial capacity for the reusable request-head encoding buffer.
 const HEAD_INITIAL_CAP: usize = 512;
 
-/// Initial TLS record scratch buffer capacity (grows dynamically on demand when
-/// `rustls` reports [`InsufficientSizeError`](rustls::unbuffered::InsufficientSizeError)).
+/// Initial inbound TLS record buffer capacity (grows from the 5-byte record header on demand).
 #[cfg(embedded_tls)]
-const TLS_INITIAL_BUF: usize = 4096;
+const TLS_RX_INITIAL_BUF: usize = 2048;
+
+/// Initial outbound TLS record buffer capacity (grows via `InsufficientSizeError` on demand).
+#[cfg(embedded_tls)]
+const TLS_TX_INITIAL_BUF: usize = 1024;
 
 /// TLS record header size (`ContentType` + `ProtocolVersion` + 16-bit length, RFC 8446 §5.1).
 #[cfg(embedded_tls)]
@@ -265,19 +268,19 @@ struct RunnerBuffers {
 impl RunnerBuffers {
     fn new() -> Self {
         Self {
-            head_buf: BytesMut::with_capacity(HEAD_INITIAL_CAP),
-            app_rx: BytesMut::with_capacity(SOCKET_READ_CHUNK),
+            head_buf: BytesMut::new(),
+            app_rx: BytesMut::new(),
             #[cfg(embedded_tls)]
-            rx_tls: vec![0u8; TLS_INITIAL_BUF],
+            rx_tls: Vec::new(),
             #[cfg(embedded_tls)]
-            tx_tls: vec![0u8; TLS_INITIAL_BUF],
+            tx_tls: Vec::new(),
         }
     }
 
     fn reset_head_only(&mut self) {
         self.head_buf.clear();
         if self.head_buf.capacity() > HEAD_INITIAL_CAP * 2 {
-            self.head_buf = BytesMut::with_capacity(HEAD_INITIAL_CAP);
+            self.head_buf = BytesMut::new();
         }
     }
 
@@ -289,18 +292,28 @@ impl RunnerBuffers {
         }
         #[cfg(embedded_tls)]
         {
-            reset_tls_vec(&mut self.rx_tls);
-            reset_tls_vec(&mut self.tx_tls);
+            reset_tls_vec(&mut self.rx_tls, TLS_RX_INITIAL_BUF);
+            reset_tls_vec(&mut self.tx_tls, TLS_TX_INITIAL_BUF);
+        }
+    }
+
+    fn release(&mut self) {
+        self.head_buf = BytesMut::new();
+        self.app_rx = BytesMut::new();
+        #[cfg(embedded_tls)]
+        {
+            self.rx_tls = Vec::new();
+            self.tx_tls = Vec::new();
         }
     }
 }
 
 #[cfg(embedded_tls)]
-fn reset_tls_vec(buf: &mut Vec<u8>) {
-    if buf.capacity() > TLS_INITIAL_BUF * 2 {
-        *buf = vec![0u8; TLS_INITIAL_BUF];
-    } else if buf.len() != TLS_INITIAL_BUF {
-        buf.resize(TLS_INITIAL_BUF, 0);
+fn reset_tls_vec(buf: &mut Vec<u8>, initial: usize) {
+    if buf.capacity() > initial * 2 {
+        *buf = vec![0u8; initial];
+    } else if !buf.is_empty() && buf.len() != initial {
+        buf.resize(initial, 0);
     }
 }
 
@@ -382,11 +395,12 @@ impl EmbeddedRunner {
             if idle.is_some() {
                 self.buffers.reset_head_only();
             } else {
-                self.buffers.reset();
+                self.buffers.release();
             }
         }
         if let Some(conn) = idle {
             conn.close(&mut self.buffers).await;
+            self.buffers.release();
         }
     }
 
@@ -420,11 +434,12 @@ impl EmbeddedRunner {
             if idle.is_some() {
                 self.buffers.reset_head_only();
             } else {
-                self.buffers.reset();
+                self.buffers.release();
             }
         }
         if let Some(conn) = idle {
             conn.close(&mut self.buffers).await;
+            self.buffers.release();
         }
     }
 }
@@ -614,11 +629,11 @@ impl<S: AsyncRead + AsyncWrite> UnbufferedTlsStream<S> {
         )?;
         let mut rx_tls = core::mem::take(rx_slot);
         let mut tx_tls = core::mem::take(tx_slot);
-        if rx_tls.len() < TLS_INITIAL_BUF {
-            rx_tls.resize(TLS_INITIAL_BUF, 0);
+        if rx_tls.len() < TLS_RX_INITIAL_BUF {
+            rx_tls.resize(TLS_RX_INITIAL_BUF, 0);
         }
-        if tx_tls.len() < TLS_INITIAL_BUF {
-            tx_tls.resize(TLS_INITIAL_BUF, 0);
+        if tx_tls.len() < TLS_TX_INITIAL_BUF {
+            tx_tls.resize(TLS_TX_INITIAL_BUF, 0);
         }
         let mut tls = Self {
             socket,
@@ -1682,6 +1697,9 @@ async fn write_request<S: StreamIo>(
     };
 
     head_buf.clear();
+    if head_buf.capacity() == 0 {
+        head_buf.reserve(HEAD_INITIAL_CAP);
+    }
     let mut plan = encode_request_head(&parts, RequestTarget::Origin, known_len, head_buf)
         .map_err(map_h1_encode_error)?;
     stream.write_bytes(head_buf).await?;

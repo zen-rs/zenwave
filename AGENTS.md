@@ -23,7 +23,9 @@ cargo test --no-default-features --features native-tokio,native-http2,native-htt
 # Embedded no_std + alloc backend (ESP32-C6 / embedded-io-async + embedded-nal-async + unbuffered rustls)
 cargo clippy --lib --no-default-features --features embedded-backend -- -D warnings
 cargo clippy --lib --no-default-features --features embedded-tls -- -D warnings
-cargo nextest run --lib --no-default-features --features embedded-tls
+cargo clippy --lib --no-default-features --features embedded-tls-ecdsa -- -D warnings
+cargo clippy --lib --no-default-features --features embedded-tls12 -- -D warnings
+cargo nextest run --lib --no-default-features --features embedded-tls-ecdsa
 
 # Clippy (treat warnings as errors, matches CI)
 cargo clippy --all-targets --all-features -- -D warnings

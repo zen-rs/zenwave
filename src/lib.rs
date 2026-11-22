@@ -96,6 +96,13 @@ extern crate std;
 extern crate alloc;
 
 #[cfg(all(
+    not(browser),
+    any(feature = "onecrl", feature = "public-suffix"),
+    not(embedded_tls_ecdsa)
+))]
+use sha2 as _;
+
+#[cfg(all(
     native,
     any(feature = "hyper-backend", feature = "ws"),
     not(any(feature = "rustls", feature = "native-tls"))
