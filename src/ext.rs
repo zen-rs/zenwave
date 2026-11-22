@@ -1,3 +1,5 @@
+use alloc::{borrow::ToOwned, boxed::Box, string::ToString, vec::Vec};
+
 use futures_util::StreamExt;
 use http_kit::{
     BodyError,
@@ -138,7 +140,7 @@ mod tests {
     #[test]
     fn bounded_response_rejects_stream_when_limit_is_exceeded() {
         let chunks = stream::iter([
-            Ok::<_, std::io::Error>(Bytes::from_static(b"license")),
+            Ok::<_, core::convert::Infallible>(Bytes::from_static(b"license")),
             Ok(Bytes::from_static(b"-response")),
         ]);
         let response = Response::new(Body::from_stream(chunks));

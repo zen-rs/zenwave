@@ -1,7 +1,6 @@
-use std::{
-    borrow::Cow,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use alloc::{borrow::Cow, format, string::String, vec::Vec};
+#[cfg(has_std)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Representation of a multipart/form-data field.
 #[derive(Debug)]
@@ -124,7 +123,7 @@ pub fn encode(parts: Vec<MultipartPart>) -> (String, Vec<u8>) {
 }
 
 fn encode_with(boundary_override: Option<String>, parts: Vec<MultipartPart>) -> (String, Vec<u8>) {
-    let boundary = boundary_override.unwrap_or_else(default_boundary);
+    let boundary = boundary_override.unwrap_or_else(|| default_boundary(&parts));
     let mut body = Vec::new();
 
     for part in parts {
@@ -134,7 +133,7 @@ fn encode_with(boundary_override: Option<String>, parts: Vec<MultipartPart>) -> 
                 "Content-Disposition: form-data; name=\"{}\"{}\r\n",
                 part.name(),
                 part.filename()
-                    .map_or_default(|name| format!("; filename=\"{name}\""))
+                    .map_or_else(String::new, |name| format!("; filename=\"{name}\""))
             )
             .as_bytes(),
         );
@@ -150,12 +149,30 @@ fn encode_with(boundary_override: Option<String>, parts: Vec<MultipartPart>) -> 
     (boundary, body)
 }
 
-fn default_boundary() -> String {
-    format!("zenwave-{:#x}", monotonic_suffix())
+#[cfg(has_std)]
+fn default_boundary(_parts: &[MultipartPart]) -> String {
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_micros());
+    format!("zenwave-{micros:#x}")
 }
 
-fn monotonic_suffix() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_micros())
+#[cfg(not(has_std))]
+fn default_boundary(parts: &[MultipartPart]) -> String {
+    // 64-bit FNV-1a offset basis and prime (IETF draft-eastlake-fnv-21 §2).
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in parts {
+        for slice in [
+            part.name().as_bytes(),
+            part.filename().map_or(&[][..], |s| s.as_bytes()),
+            part.content_type().map_or(&[][..], |s| s.as_bytes()),
+            part.data(),
+        ] {
+            for &byte in slice {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+    }
+    format!("zenwave-{hash:#x}")
 }

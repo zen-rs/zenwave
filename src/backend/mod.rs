@@ -50,8 +50,15 @@
 //! trusted roots; `Default` uses [`crate::Transport::system`].
 
 // Request and response handling shared across backends.
-#[cfg(any(default_hyper, native_backend, wasi_backend))]
+#[cfg(any(default_hyper, native_backend, wasi_backend, embedded_backend))]
 mod shared;
+
+#[cfg(embedded_backend)]
+pub mod embedded;
+#[cfg(embedded_backend)]
+pub use embedded::{
+    ClockedEmbeddedBackend, EmbeddedBackend, EmbeddedRunner, EmbeddedTimer, TimerClock,
+};
 
 #[cfg(all(reactor, feature = "hyper-backend"))]
 mod hyper;
@@ -154,18 +161,20 @@ pub type DefaultBackend = WasiBackend;
 // need a `DefaultBackend` (`zenwave::client()`, `DefaultClient`, the
 // one-shot request functions) are absent.
 #[cfg(all(
-    any(native, target_os = "wasi"),
+    any(native, target_os = "wasi", target_os = "none", not(has_std)),
     not(apple_backend),
     not(feature = "hyper-backend"),
     not(feature = "curl-backend"),
     not(native_backend),
-    not(wasi_backend)
+    not(wasi_backend),
+    not(embedded_backend)
 ))]
 compile_error!(
     "No backend enabled for this platform. \
      Please enable one of: `hyper-backend` (recommended on desktop/mobile), `curl-backend`, \
      `native-compio` or `native-tokio` (the native backend with a runtime of its own), \
      `native-backend` (the native backend on the caller's runtime, with no default client), \
+     `embedded-backend` / `embedded-tls` (`no_std + alloc` MCUs such as ESP32-C6), \
      `wasi-backend` (WASI Preview 3 `wasi:http/client`), \
      or `apple-backend` (Apple platforms only). \
      The default feature set includes `hyper-backend` with `rustls` TLS."

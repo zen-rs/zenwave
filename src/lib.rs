@@ -11,6 +11,7 @@
 //!
 //! # Quick start
 //! ```rust,no_run
+//! # #[cfg(feature = "hyper-backend")]
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! use zenwave::get;
 //! let response = get("https://example.com/").await?;
@@ -66,6 +67,11 @@
 //!   `rustls-ring` adds `ring` as the default `CryptoProvider`; `rustls` alone
 //!   uses the process-default `CryptoProvider`. Both `rustls` and `native-tls`
 //!   may be enabled; `rustls` takes precedence.
+//! - **`embedded-backend`** / **`embedded-tls`**: `no_std + alloc` HTTP/1.1
+//!   client over `embedded-io-async` and `embedded-nal-async` (such as
+//!   `embassy-net` on ESP32-C6 `riscv32imac-unknown-none-elf`), driven by
+//!   sans-IO `http_kit_h1::proto` and, with `embedded-tls`, unbuffered
+//!   `rustls`. Construct via [`backend::EmbeddedBackend::channel`].
 //! - **`curl-backend`**: libcurl-based backend with its own TLS.
 //! - **`apple-backend`**: Apple's native `NSURLSession` (macOS/iOS only).
 //! - **`ws`**: websocket support.
@@ -76,9 +82,18 @@
 //!
 //! # Use hyper with native-tls explicitly
 //! zenwave = { version = "*", default-features = false, features = ["hyper-native-tls", "ws"] }
+//!
+//! # Bare-metal no_std + alloc (e.g. ESP32-C6 with embassy-net + rustls)
+//! zenwave = { version = "*", default-features = false, features = ["embedded-tls"] }
 //! ```
 
+#![cfg_attr(not(has_std), no_std)]
 #![allow(clippy::multiple_crate_versions)]
+
+#[cfg(any(has_std, test))]
+extern crate std;
+
+extern crate alloc;
 
 #[cfg(all(
     native,
@@ -91,8 +106,10 @@ compile_error!(
 
 pub mod backend;
 pub use auth::{BasicAuth, BearerAuth};
+#[cfg(has_std)]
 pub use cache::Cache;
 pub use client::Client;
+#[cfg(has_std)]
 pub use cookie::CookieStore;
 pub use http_kit::*;
 #[cfg(default_backend)]
@@ -103,7 +120,9 @@ pub use transport::{Proxy, ProxyBuilder};
 pub use transport::{Transport, TransportBuilder};
 
 pub mod auth;
+#[cfg(has_std)]
 pub mod cache;
+#[cfg(has_std)]
 pub mod cookie;
 pub mod error;
 #[cfg(default_backend)]
