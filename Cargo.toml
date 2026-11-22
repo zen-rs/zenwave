@@ -162,8 +162,11 @@ native-compio = ["native-backend", "native-ring", "getaddrinfo", "http-kit-io/co
 native-tokio = ["native-backend", "native-ring", "getaddrinfo", "http-kit-io/tokio", "executor-core/tokio", "dep:tokio"]
 # The ring CryptoProvider for the native backend's TLS, without the
 # connector's `rustls` engine feature: pure-Rust builds (`native-backend`
-# alone, e.g. WASI) skip it and let the caller install a provider.
-native-ring = ["rustls/ring"]
+# alone, e.g. WASI) skip it and let the caller install a provider. `rustls?/`
+# keeps the dep spec weak so it does not activate the same-named `rustls`
+# feature, which would pull the connector's `futures-rustls` into native
+# builds that never compile it.
+native-ring = ["rustls?/ring"]
 # HTTP/2 for the native backend through `http-kit-h2`, negotiated with the
 # server through ALPN.
 native-http2 = ["native-backend", "dep:http-kit-h2", "http-kit-h2/pipe"]
@@ -382,7 +385,7 @@ clippy.style = "warn"
 clippy.correctness = "warn"
 clippy.complexity = "warn"
 clippy.suspicious = "warn"
-cargo.unused_dependencies = "warn"
+cargo.unused_dependencies = "deny"
 clippy.perf = "warn"
 clippy.pedantic = "warn"
 clippy.nursery = "warn"
