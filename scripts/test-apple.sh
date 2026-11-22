@@ -2,4 +2,4 @@
 set -euo pipefail
 
 echo "Running tests (apple backend)..."
-cargo nextest run --no-default-features --features apple-backend --workspace
+cargo nextest run --no-default-features --features apple-backend,cookie --workspace

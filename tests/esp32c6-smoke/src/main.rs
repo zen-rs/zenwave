@@ -1,60 +1,127 @@
 //! ESP32-C6 e2e smoke for zenwave's embedded `no_std + alloc` backend.
 //!
 //! Runs in `esp-emu`: joins the emulator's virtual SoftAP (`myssid` /
-//! `mypassword`), takes DHCP from `10.0.2.0/24`, then issues an HTTP GET to
-//! the host-side fixture at `10.0.2.1:8080` through zenwave's
-//! `EmbeddedBackend` + `FollowRedirect` middleware and prints the response.
+//! `mypassword`), takes DHCP from `10.0.2.0/24`, wires ESP32-C6's hardware RNG
+//! and hardware SHA-256 accelerator into `zenwave::backend::ecdsa_tls13_provider_with_sha256`,
+//! and verifies HTTP/1.1 keep-alive connection reuse plus TLS 1.3 PSK ticket
+//! session resumption against the host fixture.
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
-use alloc::string::ToString;
-use alloc::sync::Arc;
+use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};
+use core::cell::RefCell;
+use critical_section::Mutex;
 use embassy_executor::Spawner;
 use embassy_net::{
-    Runner,
-    StackResources,
+    Runner, StackResources,
     dns::DnsSocket,
     tcp::client::{TcpClient, TcpClientState},
 };
 use embassy_time::{Duration, Timer};
 use esp_alloc as _;
 use esp_backtrace as _;
-use esp_hal::{clock::CpuClock, ram, rng::Rng, timer::timg::TimerGroup};
+use esp_hal::{
+    clock::CpuClock,
+    ram,
+    rng::Rng,
+    sha::{Sha, Sha256},
+    timer::timg::TimerGroup,
+};
 use esp_println::println;
 use esp_radio::wifi::{
-    AuthenticationMethodConfig,
-    Config,
-    ControllerConfig,
-    Interface,
-    WifiController,
+    AuthenticationMethodConfig, Config, ControllerConfig, Interface, WifiController,
     sta::StationConfig,
 };
+use rustls::crypto::{
+    GetRandomFailed, SecureRandom,
+    hash::{self, Hash, HashAlgorithm},
+};
 use zenwave::{
-    Client,
-    ResponseExt,
-    Transport,
-    backend::{EmbeddedBackend, EmbeddedRunner},
+    Client, ResponseExt, Transport,
+    backend::{EmbeddedBackend, EmbeddedRunner, ecdsa_tls13_provider_with_sha256},
 };
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-/// `getrandom` custom backend: fills from the ESP32-C6 hardware RNG so
-/// `rustls-rustcrypto` can draw key-exchange secrets on `*-none-elf`.
-#[unsafe(no_mangle)]
-unsafe extern "Rust" fn __getrandom_v03_custom(
-    dest: *mut u8,
-    len: usize,
-) -> Result<(), getrandom::Error> {
-    let buf = unsafe { core::slice::from_raw_parts_mut(dest, len) };
-    let rng = esp_hal::rng::Rng::new();
-    for chunk in buf.chunks_mut(4) {
-        let word = rng.random().to_le_bytes();
-        chunk.copy_from_slice(&word[..chunk.len()]);
+/// Hardware TRNG adapter for `rustls::crypto::SecureRandom` over `esp_hal::rng::Rng`
+/// — requires no global `getrandom` symbol or `unsafe` shim.
+#[derive(Debug, Clone, Copy)]
+struct EspRng;
+
+impl SecureRandom for EspRng {
+    fn fill(&self, dest: &mut [u8]) -> Result<(), GetRandomFailed> {
+        let rng = Rng::new();
+        for chunk in dest.chunks_mut(4) {
+            let word = rng.random().to_le_bytes();
+            chunk.copy_from_slice(&word[..chunk.len()]);
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+/// Hardware SHA-256 adapter routing TLS 1.3 transcript hashes, HKDF key
+/// derivation, and ECDSA-P256 prehash verification through ESP32-C6's SHA
+/// peripheral (`esp_hal::sha::Sha`).
+#[derive(Clone, Copy)]
+struct EspHwSha256(&'static Mutex<RefCell<Sha<'static>>>);
+
+#[derive(Clone)]
+struct EspHwSha256Ctx {
+    sha: &'static Mutex<RefCell<Sha<'static>>>,
+    buf: Vec<u8>,
+}
+
+impl Hash for EspHwSha256 {
+    fn start(&self) -> Box<dyn hash::Context> {
+        Box::new(EspHwSha256Ctx {
+            sha: self.0,
+            buf: Vec::with_capacity(128),
+        })
+    }
+
+    fn hash(&self, mut data: &[u8]) -> hash::Output {
+        let mut out = [0u8; 32];
+        critical_section::with(|cs| {
+            let mut sha = self.0.borrow_ref_mut(cs);
+            let mut digest = sha.start::<Sha256>();
+            while !data.is_empty() {
+                if let Ok(rest) = digest.update(data) {
+                    data = rest;
+                }
+            }
+            while digest.finish(&mut out).is_err() {}
+        });
+        hash::Output::new(&out)
+    }
+
+    fn output_len(&self) -> usize {
+        32
+    }
+
+    fn algorithm(&self) -> HashAlgorithm {
+        HashAlgorithm::SHA256
+    }
+}
+
+impl hash::Context for EspHwSha256Ctx {
+    fn fork_finish(&self) -> hash::Output {
+        EspHwSha256(self.sha).hash(&self.buf)
+    }
+
+    fn fork(&self) -> Box<dyn hash::Context> {
+        Box::new(self.clone())
+    }
+
+    fn finish(self: Box<Self>) -> hash::Output {
+        EspHwSha256(self.sha).hash(&self.buf)
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+    }
 }
 
 // Full `.dram2_uninit` region for this chip.
@@ -72,26 +139,19 @@ macro_rules! mk_static {
     }};
 }
 
-// esp-emu's built-in virtual SoftAP defaults.
 const SSID: &str = "myssid";
 const PASSWORD: &str = "mypassword";
 
-// The esp-emu `user` network maps the subnet gateway 10.0.2.1 to the host's
-// 127.0.0.1, where the smoke fixture listens on :8080 (HTTP) and :8443 (HTTPS).
-const HTTP_URL: &str = "http://10.0.2.1:8080/zenwave-smoke";
-const HTTPS_URL: &str = "https://10.0.2.1:8443/zenwave-smoke";
+const HTTP_KEEPALIVE_URL: &str = "http://10.0.2.1:8080/zenwave-smoke?seq=1";
+const HTTP_CLOSE_URL: &str = "http://10.0.2.1:8080/zenwave-smoke?seq=2&close=1";
+const HTTPS_KEEPALIVE_URL: &str = "https://10.0.2.1:8443/zenwave-smoke?seq=1";
+const HTTPS_CLOSE_URL: &str = "https://10.0.2.1:8443/zenwave-smoke?seq=2&close=1";
+const HTTPS_RESUMED_URL: &str = "https://10.0.2.1:8443/zenwave-smoke?seq=3&close=1";
 const SMOKE_MARKER: &str = "ZENWAVE_ESP32C6_SMOKE_OK";
 
-// Throwaway CA for the fixture server certificate (SAN `IP:10.0.2.1`),
-// generated next to `fixture.py` and embedded as the only trust anchor.
 const CA_DER: &[u8] = include_bytes!("../certs/ca.der");
-
-// Build instant baked in by build.rs; the fixture cert is valid for 30 days
-// around it, so this is a real timestamp inside its validity window.
 const SMOKE_UNIX_TIME: &str = env!("SMOKE_UNIX_TIME");
 
-/// rustls `TimeProvider` for the emulator: certificates are verified against
-/// the fixed build instant (no RTC/SNTP needed for the smoke run).
 #[derive(Debug)]
 struct SmokeTimeProvider;
 
@@ -115,6 +175,12 @@ async fn main(spawner: Spawner) -> ! {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
+    // Initialize ESP32-C6's hardware SHA accelerator peripheral.
+    let hw_sha = mk_static!(
+        Mutex<RefCell<Sha<'static>>>,
+        Mutex::new(RefCell::new(Sha::new(peripherals.SHA)))
+    );
+
     let station_config = Config::Station(
         StationConfig::default()
             .with_ssid(SSID.try_into().unwrap())
@@ -133,7 +199,7 @@ async fn main(spawner: Spawner) -> ! {
 
     let config = embassy_net::Config::dhcpv4(Default::default());
     let rng = Rng::new();
-    let seed = (rng.random() as u64) << 32 | rng.random() as u64;
+    let seed = u64::from(rng.random()) << 32 | u64::from(rng.random());
 
     let (stack, net_runner) = embassy_net::new(
         wifi_interface,
@@ -162,18 +228,15 @@ async fn main(spawner: Spawner) -> ! {
     );
     let dns = mk_static!(DnsSocket<'static>, DnsSocket::new(stack));
 
+    let crypto = ecdsa_tls13_provider_with_sha256(EspRng, EspHwSha256(hw_sha));
     let transport = Transport::builder()
-        .embedded_tls_provider(
-            Arc::new(rustls_rustcrypto::provider()),
-            Arc::new(SmokeTimeProvider),
-        )
+        .embedded_tls_provider(Arc::new(crypto), Arc::new(SmokeTimeProvider))
         .extra_root_certificate_der(CA_DER.to_vec())
         .build()
         .unwrap();
     let (client, runner) = EmbeddedBackend::channel(transport);
     spawner.spawn(zenwave_driver(runner, tcp, dns).unwrap());
 
-    // Give the driver task a beat to start draining the request channel.
     Timer::after(Duration::from_millis(100)).await;
 
     let mut client = client.follow_redirect().error_for_status();
@@ -182,19 +245,25 @@ async fn main(spawner: Spawner) -> ! {
         esp_alloc::HEAP.used(),
         esp_alloc::HEAP.free()
     );
-    for (name, url) in [("HTTP", HTTP_URL), ("HTTPS", HTTPS_URL)] {
+
+    for (name, url, expected_sub) in [
+        ("HTTP", HTTP_KEEPALIVE_URL, SMOKE_MARKER),
+        ("HTTP_KA", HTTP_CLOSE_URL, SMOKE_MARKER),
+        ("HTTPS", HTTPS_KEEPALIVE_URL, "reused=False"),
+        ("HTTPS_KA", HTTPS_CLOSE_URL, "reused=False"),
+        ("HTTPS_RESUMED", HTTPS_RESUMED_URL, "reused=True"),
+    ] {
         println!("REQ_START {} {}", name, url);
         match client.get(url).unwrap().await {
             Ok(resp) => {
                 println!("{}_STATUS {}", name, resp.status().as_u16());
                 match resp.into_string().await {
                     Ok(body) => {
-                        let text = alloc::string::String::from_utf8_lossy(body.as_ref());
-                        println!("{}_BODY {}", name, text);
-                        if text.contains(SMOKE_MARKER) {
+                        println!("{}_BODY {}", name, body.trim());
+                        if body.contains(SMOKE_MARKER) && body.contains(expected_sub) {
                             println!("{}_RESULT PASS", name);
                         } else {
-                            println!("{}_RESULT FAIL_NO_MARKER", name);
+                            println!("{}_RESULT FAIL_BODY_MISMATCH", name);
                         }
                     }
                     Err(e) => println!("{}_RESULT FAIL_BODY {:?}", name, e.to_string()),
@@ -202,8 +271,12 @@ async fn main(spawner: Spawner) -> ! {
             }
             Err(e) => println!("{}_RESULT FAIL_REQ {:?}", name, e.to_string()),
         }
-        println!("HEAP_MID used={}", esp_alloc::HEAP.used());
+        println!("HEAP_MID {} used={}", name, esp_alloc::HEAP.used());
     }
+
+    // Let the runner task process `close_notify` and reset scratch buffers so
+    // `HEAP_POST` reflects steady-state post-exchange memory.
+    Timer::after(Duration::from_millis(20)).await;
     println!(
         "HEAP_POST used={} free={}",
         esp_alloc::HEAP.used(),

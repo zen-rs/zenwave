@@ -36,12 +36,13 @@ fn backend_and_transport_build_with_timeouts() {
 }
 
 fn combined_client() -> impl Clocked {
-    client()
+    let base = client()
         .timeout(Duration::from_secs(5))
         .retry(2)
-        .bearer_auth("token")
-        .enable_cookie()
-        .error_for_status()
+        .bearer_auth("token");
+    #[cfg(feature = "cookie")]
+    let base = base.enable_cookie();
+    base.error_for_status()
 }
 
 async fn exercises_api_bounds() {

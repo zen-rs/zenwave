@@ -108,6 +108,10 @@ async fn test_gzip_compression() {
     assert!(!bytes.is_empty());
 }
 
+#[cfg(any(
+    feature = "cookie",
+    all(target_arch = "wasm32", not(target_os = "wasi"))
+))]
 #[test_executors::async_test]
 async fn test_cookie_persistence() {
     let mut client = client().enable_cookie();

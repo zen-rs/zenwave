@@ -11,6 +11,10 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
+#[cfg(any(
+    feature = "cookie",
+    all(target_arch = "wasm32", not(target_os = "wasi"))
+))]
 use zenwave::cookie::CookieStore;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -18,9 +22,18 @@ use zenwave::HttpError;
 use zenwave::redirect::FollowRedirect;
 use zenwave::{Body, Client, Endpoint, Middleware, Request, Response, StatusCode, client};
 
-use common::{httpbin_base, httpbin_uri};
+#[cfg(any(
+    feature = "cookie",
+    all(target_arch = "wasm32", not(target_os = "wasi"))
+))]
+use common::httpbin_base;
+use common::httpbin_uri;
 use zenwave_test_fixture as common;
 
+#[cfg(any(
+    feature = "cookie",
+    all(target_arch = "wasm32", not(target_os = "wasi"))
+))]
 #[test_executors::async_test]
 async fn test_cookie_store_middleware() {
     let mut client = client().enable_cookie();
@@ -42,6 +55,10 @@ async fn test_cookie_store_middleware() {
     assert!(body.contains("value"));
 }
 
+#[cfg(any(
+    feature = "cookie",
+    all(target_arch = "wasm32", not(target_os = "wasi"))
+))]
 #[test_executors::async_test]
 async fn test_cookies_sent_only_to_matching_path() {
     let mut client = client().enable_cookie();
@@ -83,6 +100,10 @@ async fn test_cookies_sent_only_to_matching_path() {
     );
 }
 
+#[cfg(any(
+    feature = "cookie",
+    all(target_arch = "wasm32", not(target_os = "wasi"))
+))]
 #[test_executors::async_test]
 async fn test_cookie_set_by_redirect_reaches_next_hop() {
     let mut client = client().enable_cookie();
@@ -100,6 +121,10 @@ async fn test_cookie_set_by_redirect_reaches_next_hop() {
     );
 }
 
+#[cfg(any(
+    feature = "cookie",
+    all(target_arch = "wasm32", not(target_os = "wasi"))
+))]
 #[test_executors::async_test]
 async fn test_origin_scoped_cookie_not_sent_after_cross_origin_redirect() {
     let mut client = client().enable_cookie();
@@ -212,6 +237,10 @@ async fn test_public_suffix_domain_cookie_from_suffix_host_is_host_only() {
     );
 }
 
+#[cfg(any(
+    feature = "cookie",
+    all(target_arch = "wasm32", not(target_os = "wasi"))
+))]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn test_cookie_store_creation() {
@@ -249,6 +278,10 @@ async fn test_follow_redirect_multiple_redirects() {
     assert!(response.status().is_success());
 }
 
+#[cfg(any(
+    feature = "cookie",
+    all(target_arch = "wasm32", not(target_os = "wasi"))
+))]
 #[test_executors::async_test]
 async fn test_client_with_multiple_middleware() {
     let mut client = client().enable_cookie();

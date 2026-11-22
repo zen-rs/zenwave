@@ -43,7 +43,7 @@ http-kit = { git = "https://github.com/zen-rs/http-kit", branch = "main", defaul
 serde = { version = "1.0.229", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1.0.154", default-features = false, features = ["alloc"] }
 base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
-url = { version = "2.5.8", default-features = false }
+url = { version = "2.5.8", default-features = false, optional = true }
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc", "sink"] }
 futures-channel = { version = "0.3.34", default-features = false, features = ["alloc"] }
 thiserror = { version = "2.0.21", default-features = false }
@@ -94,19 +94,17 @@ minreq = { version = "3.0.0", optional = true, default-features = false, feature
 # store (`rustls-platform-verifier`), websockets, HTTP/2 and HTTP/3. On wasm32
 # the built-in Fetch backend is always used and none of the native features
 # apply.
-default = ["std", "hyper-backend", "rustls-ring", "ws", "http2", "http3", "onecrl", "public-suffix"]
+default = ["std", "cookie", "hyper-backend", "rustls-ring", "ws", "http2", "http3", "onecrl", "public-suffix"]
 
-# Standard library support and OS/host middleware (`Cache`, `CookieStore`,
-# `reader_body`, `form`). Disabled on `no_std + alloc` embedded targets.
+# Standard library support and OS/host middleware (`Cache`, `reader_body`,
+# `form`). Disabled on `no_std + alloc` embedded targets.
 std = [
     "http-kit/std",
     "http-kit/form",
-    "http-kit/cookie",
     "http/std",
     "serde/std",
     "serde_json?/std",
     "base64?/std",
-    "url/std",
     "futures-util/std",
     "futures-util/async-await-macro",
     "futures-util/io",
@@ -116,9 +114,7 @@ std = [
     "dep:futures-io",
     "dep:async-lock",
     "dep:httpdate",
-    "dep:cookie_store",
     "dep:async-fs",
-    "dep:dirs",
     "dep:once_cell",
     "dep:async-io",
     "dep:hyper-util",
@@ -131,6 +127,19 @@ std = [
     "http-kit-h1?/std",
 ]
 
+# In-memory and persistent RFC 6265 cookie jar middleware (`CookieStore`,
+# `Client::enable_cookie`, `Client::enable_persistent_cookie`). Kept separate
+# from `std` so builds that need no cookie jar do not pull `cookie_store`,
+# `url`, `idna` and the ICU4X normalization tables.
+cookie = [
+    "std",
+    "http-kit/cookie",
+    "dep:cookie_store",
+    "dep:dirs",
+    "dep:url",
+    "url/std",
+]
+
 # Embedded `no_std + alloc` HTTP/1.1 client backend over `embedded-io-async` and
 # `embedded-nal-async`, driven by sans-IO `http_kit_h1::proto` (targets MCUs
 # such as ESP32-C6 on `riscv32imac-unknown-none-elf` with `esp-hal` + `embassy-net`).
@@ -141,15 +150,38 @@ embedded-backend = [
     "dep:bytes",
     "dep:http-kit-h1",
 ]
-# Unbuffered `rustls` TLS 1.2 / 1.3 for `embedded-backend` in `no_std + alloc`
-# mode, verified against roots configured on `Transport` with a caller-supplied
+# Unbuffered `rustls` TLS 1.3 for `embedded-backend` in `no_std + alloc` mode
+# (add `embedded-tls12` when legacy TLS 1.2 servers must also be reached),
+# verified against roots configured on `Transport` with a caller-supplied
 # `CryptoProvider` and `TimeProvider`.
 embedded-tls = [
     "embedded-backend",
+    "dep:async-lock",
     "dep:rustls",
     "dep:rustls-pki-types",
     "rustls?/hashbrown",
+]
+# Enable TLS 1.2 alongside TLS 1.3 on `embedded-tls` builds.
+embedded-tls12 = [
+    "embedded-tls",
     "rustls?/tls12",
+]
+# Lean `no_std + alloc` TLS 1.3 `CryptoProvider` (`TLS13_AES_128_GCM_SHA256`,
+# X25519 + P-256 ECDHE, ECDSA P-256 SHA-256 verification) accepting a caller
+# `SecureRandom` and optional hardware SHA-256 — links no RSA (`crypto_bigint`),
+# SHA-384/512, P-384, Ed25519, ChaCha20 or global `getrandom` shim.
+embedded-tls-ecdsa = [
+    "embedded-tls",
+    "aes-gcm?/aes",
+    "aes-gcm?/alloc",
+    "dep:aes-gcm",
+    "dep:p256",
+    "dep:rand_core",
+    "dep:sha2",
+    "dep:x25519-dalek",
+    "p256?/alloc",
+    "p256?/ecdh",
+    "p256?/ecdsa",
 ]
 
 # HTTP backends (native platforms only). At least one must be enabled.
@@ -183,6 +215,7 @@ rustls = ["std", "rustls-engine", "dep:futures-rustls"]
 rustls-engine = [
     "std",
     "dep:rustls",
+    "rustls?/tls12",
     "dep:rustls-pki-types",
     "dep:rustls-platform-verifier",
     "dep:webpki-root-certs",
@@ -266,7 +299,7 @@ onecrl = ["rustls", "getaddrinfo", "dep:webpki", "dep:ring", "dep:sha2", "dep:mi
 # the cookie middleware: `build.rs` compiles the pinned, hash-verified Public
 # Suffix List in and `cookie_store` checks each Domain against it.
 public-suffix = [
-    "std",
+    "cookie",
     "cookie_store/public_suffix",
     "dep:publicsuffix",
     "dep:minreq",
@@ -315,6 +348,7 @@ gloo-timers = { version = "0.4.0", features = ["futures"] }
 cookie_store = { version = "0.22.1", default-features = false, features = [
     "wasm-bindgen",
 ] }
+url = "2.5.8"
 
 [target.'cfg(all(target_arch = "wasm32", not(target_os = "wasi")))'.dev-dependencies]
 wasm-bindgen-test = "0.3.79"
@@ -341,8 +375,13 @@ http-kit-h2 = { git = "https://github.com/zen-rs/http-kit", branch = "main", opt
 http-kit-h3 = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
 http-kit-tls = { git = "https://github.com/zen-rs/http-kit", branch = "main", optional = true }
 futures-rustls = { version = "0.26.0", optional = true, default-features = false, features = ["tls12"] }
-rustls = { version = "0.23.46", optional = true, default-features = false, features = ["tls12"] }
+rustls = { version = "0.23.46", optional = true, default-features = false }
 rustls-pki-types = { version = "1.15.1", default-features = false, features = ["alloc"], optional = true }
+aes-gcm = { version = "0.11.1", default-features = false, optional = true }
+p256 = { version = "0.14.0", default-features = false, optional = true }
+rand_core = { version = "0.10.1", default-features = false, optional = true }
+sha2 = { version = "0.11.1", default-features = false, optional = true }
+x25519-dalek = { version = "3.0.0", default-features = false, optional = true }
 bytes = { version = "1.12.1", default-features = false, optional = true }
 
 # WASI Preview 3 HTTP client and monotonic clock (`wasi-backend` feature):
@@ -441,7 +480,7 @@ required-features = ["hyper-backend"]
 
 [[example]]
 name = "custom_client"
-required-features = ["hyper-backend"]
+required-features = ["hyper-backend", "cookie"]
 
 [[example]]
 name = "websocket_echo"

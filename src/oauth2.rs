@@ -10,7 +10,6 @@ use http_kit::{
     middleware::MiddlewareError,
 };
 use serde::Deserialize;
-use url::form_urlencoded::Serializer;
 
 use crate::{Client, backend::DefaultBackend, client};
 
@@ -216,17 +215,44 @@ impl OAuth2ClientCredentials {
     }
 
     fn build_body(&self) -> String {
-        let mut serializer = Serializer::new(String::new());
-        serializer.append_pair("grant_type", "client_credentials");
-        serializer.append_pair("client_id", &self.config.client_id);
-        serializer.append_pair("client_secret", &self.config.client_secret);
+        let mut out = String::new();
+        push_form_pair(&mut out, "grant_type", "client_credentials");
+        push_form_pair(&mut out, "client_id", &self.config.client_id);
+        push_form_pair(&mut out, "client_secret", &self.config.client_secret);
         if let Some(scope) = &self.config.scope {
-            serializer.append_pair("scope", scope);
+            push_form_pair(&mut out, "scope", scope);
         }
         if let Some(audience) = &self.config.audience {
-            serializer.append_pair("audience", audience);
+            push_form_pair(&mut out, "audience", audience);
         }
-        serializer.finish()
+        out
+    }
+}
+
+fn push_form_pair(out: &mut String, key: &str, value: &str) {
+    if !out.is_empty() {
+        out.push('&');
+    }
+    push_form_component(out, key);
+    out.push('=');
+    push_form_component(out, value);
+}
+
+/// Encodes a component per `application/x-www-form-urlencoded` (WHATWG URL §5.2).
+fn push_form_component(out: &mut String, input: &str) {
+    for &byte in input.as_bytes() {
+        match byte {
+            b' ' => out.push('+'),
+            b'*' | b'-' | b'.' | b'0'..=b'9' | b'A'..=b'Z' | b'_' | b'a'..=b'z' => {
+                out.push(char::from(byte));
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                out.push('%');
+                out.push(char::from(HEX[usize::from(byte >> 4)]));
+                out.push(char::from(HEX[usize::from(byte & 0x0F)]));
+            }
+        }
     }
 }
 

@@ -60,6 +60,11 @@ pub use embedded::{
     ClockedEmbeddedBackend, EmbeddedBackend, EmbeddedRunner, EmbeddedTimer, TimerClock,
 };
 
+#[cfg(embedded_tls_ecdsa)]
+pub mod embedded_crypto;
+#[cfg(embedded_tls_ecdsa)]
+pub use embedded_crypto::{SoftwareSha256, ecdsa_tls13_provider, ecdsa_tls13_provider_with_sha256};
+
 #[cfg(all(reactor, feature = "hyper-backend"))]
 mod hyper;
 #[cfg(all(reactor, feature = "hyper-backend"))]

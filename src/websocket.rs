@@ -16,7 +16,7 @@ pub enum WebSocketError {
 
     /// Provided websocket URI was invalid.
     #[error("Invalid URI: {0}")]
-    InvalidUri(#[from] url::ParseError),
+    InvalidUri(#[from] http::uri::InvalidUri),
 
     /// The URI parsed but names no reachable target.
     #[error("Invalid websocket target: {0}")]
@@ -134,7 +134,6 @@ mod native {
     use futures_util::StreamExt;
     use http_kit::utils::{ByteStr, Bytes};
     use std::{fmt, sync::Arc};
-    use url::Url;
 
     use crate::{
         Transport,
@@ -218,18 +217,24 @@ mod native {
         transport: &Transport,
         websocket_config: WebSocketConfig,
     ) -> Result<WebSocket, WebSocketError> {
-        let url = Url::parse(uri.as_ref())?;
-        let tls = match url.scheme() {
-            "ws" => false,
-            "wss" => true,
-            other => return Err(WebSocketError::UnsupportedScheme(other.to_string())),
+        let parsed: http::Uri = uri.as_ref().parse()?;
+        let tls = match parsed.scheme_str() {
+            Some("ws") => false,
+            Some("wss") => true,
+            Some(other) => return Err(WebSocketError::UnsupportedScheme(other.to_string())),
+            None => {
+                return Err(WebSocketError::InvalidTarget(
+                    "websocket URI is missing a scheme",
+                ));
+            }
         };
-        let host = url
-            .host_str()
-            .ok_or_else(|| WebSocketError::InvalidTarget("websocket URI is missing a host"))?;
-        let port = url
-            .port_or_known_default()
-            .ok_or_else(|| WebSocketError::InvalidTarget("websocket URI does not imply a port"))?;
+        let host = parsed
+            .host()
+            .filter(|h| !h.is_empty())
+            .ok_or(WebSocketError::InvalidTarget(
+                "websocket URI is missing a host",
+            ))?;
+        let port = parsed.port_u16().unwrap_or(if tls { 443 } else { 80 });
         // The websocket handshake is an HTTP/1.1 upgrade, so the TLS layer
         // must not offer h2.
         let Connection { stream, via, .. } = connect_stream(
@@ -252,8 +257,7 @@ mod native {
         let mut config = TungsteniteConfig::default();
         config.max_message_size = websocket_config.max_message_size;
         config.max_frame_size = websocket_config.max_frame_size;
-        let request: String = url.into();
-        let (ws_stream, _) = client_async_with_config(request, stream, Some(config))
+        let (ws_stream, _) = client_async_with_config(parsed, stream, Some(config))
             .await
             .map_err(|e| WebSocketError::ConnectionFailed(Box::new(e)))?;
 

@@ -1,5 +1,10 @@
 //! Emits `cfg` aliases so platform and feature conditions read the same everywhere.
 use cfg_aliases::cfg_aliases;
+#[cfg(all(
+    feature = "embedded-tls-ecdsa",
+    not(any(feature = "onecrl", feature = "public-suffix"))
+))]
+use sha2 as _;
 
 /// The changeset record parser — the same file `src/transport/onecrl.rs`
 /// compiles, so the snapshot and the refresher's fetched records decode
@@ -90,6 +95,10 @@ fn main() {
         // Whether `std` is linked: enabled by the `std` feature (and every OS /
         // WASI backend) and always present on the browser wasm32 target.
         has_std: { any(feature = "std", browser) },
+        // Whether `CookieStore` and its `cookie_store` / `url` dependencies are
+        // compiled in: explicit `cookie` feature on `std` targets, always on
+        // the browser wasm32 target.
+        has_cookie: { any(feature = "cookie", browser) },
         // async-io's reactor, which drives the sockets, timers and filesystem
         // I/O of every desktop/mobile backend. Bare-metal `target_os = "none"`
         // and `no_std` builds have none.
@@ -101,7 +110,9 @@ fn main() {
         // Embedded `no_std + alloc` HTTP/1.1 backend over `embedded-io-async`
         // and `embedded-nal-async`, plus optional unbuffered `rustls`.
         embedded_backend: { feature = "embedded-backend" },
-        embedded_tls: { all(embedded_backend, feature = "embedded-tls") },
+        embedded_tls: { all(not(browser), embedded_backend, feature = "embedded-tls") },
+        embedded_tls12: { all(embedded_tls, feature = "embedded-tls12") },
+        embedded_tls_ecdsa: { all(embedded_tls, feature = "embedded-tls-ecdsa") },
         // WASI Preview 3 HTTP client backend (`wasi:http/client` +
         // `wasi:clocks/monotonic-clock`) on Component Model WASI targets.
         wasi_backend: { all(target_os = "wasi", not(target_env = "p1"), feature = "wasi-backend") },

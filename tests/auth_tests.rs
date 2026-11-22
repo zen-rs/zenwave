@@ -149,6 +149,10 @@ async fn test_multiple_auth_requests() {
     }
 }
 
+#[cfg(any(
+    feature = "cookie",
+    all(target_arch = "wasm32", not(target_os = "wasi"))
+))]
 #[test_executors::async_test]
 async fn test_auth_with_other_middleware() {
     // Test auth combined with other middleware

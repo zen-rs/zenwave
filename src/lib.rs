@@ -96,6 +96,13 @@ extern crate std;
 extern crate alloc;
 
 #[cfg(all(
+    not(browser),
+    any(feature = "onecrl", feature = "public-suffix"),
+    not(embedded_tls_ecdsa)
+))]
+use sha2 as _;
+
+#[cfg(all(
     native,
     any(feature = "hyper-backend", feature = "ws"),
     not(any(feature = "rustls", feature = "native-tls"))
@@ -109,7 +116,7 @@ pub use auth::{BasicAuth, BearerAuth};
 #[cfg(has_std)]
 pub use cache::Cache;
 pub use client::Client;
-#[cfg(has_std)]
+#[cfg(has_cookie)]
 pub use cookie::CookieStore;
 pub use http_kit::*;
 #[cfg(default_backend)]
@@ -122,7 +129,7 @@ pub use transport::{Transport, TransportBuilder};
 pub mod auth;
 #[cfg(has_std)]
 pub mod cache;
-#[cfg(has_std)]
+#[cfg(has_cookie)]
 pub mod cookie;
 pub mod error;
 #[cfg(default_backend)]

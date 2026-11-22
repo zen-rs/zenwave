@@ -12,9 +12,9 @@ publish = false
 
 [dependencies]
 zenwave = { path = "../..", default-features = false, features = [
-    "embedded-backend",
-    "embedded-tls",
+    "embedded-tls-ecdsa",
 ] }
+critical-section = "1.2.0"
 embassy-executor = "0.10.0"
 embassy-net = { version = "0.9.1", features = [
     "dhcpv4",
@@ -23,7 +23,6 @@ embassy-net = { version = "0.9.1", features = [
     "dns",
 ] }
 embassy-time = "0.5.1"
-getrandom = { version = "0.4", default-features = false }
 esp-alloc = { version = "0.11.0", features = ["esp32c6"] }
 esp-backtrace = { version = "0.20.0", features = [
     "esp32c6",
@@ -53,13 +52,8 @@ esp-radio = { version = "1.0.0-beta.1", features = [
 ] }
 rustls = { version = "0.23.46", default-features = false, features = [
     "hashbrown",
-    "tls12",
 ] }
 rustls-pki-types = { version = "1", default-features = false, features = ["alloc"] }
-rustls-rustcrypto = { version = "=0.1.0-pre.0", default-features = false, features = [
-    "alloc",
-    "tls12",
-] }
 static_cell = "2.1.0"
 
 [patch.crates-io]
