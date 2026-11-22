@@ -5,8 +5,10 @@
 [![License](https://img.shields.io/crates/l/zenwave.svg)](LICENSE)
 [![Coverage](https://img.shields.io/codecov/c/github/zen-rs/zenwave?logo=codecov)](https://app.codecov.io/gh/zen-rs/zenwave)
 
-Async HTTP client for Rust. Works on native (Tokio/Hyper, Apple URLSession, libcurl) and
-wasm32 (Fetch API). Same API everywhere, middleware you compose yourself.
+Async HTTP client for Rust. Works on native (Tokio/Hyper, compio, Apple URLSession, libcurl),
+wasm32 (Fetch API, WASI Preview 3), and `no_std + alloc` microcontrollers such as ESP32-C6
+(see the [Embedded & `[patch.crates-io]` Guide](docs/embedded.md)). Same API everywhere,
+middleware you compose yourself.
 
 ## Getting started
 
@@ -257,6 +259,7 @@ On native, pick a backend, and for hyper a TLS engine:
 | `native-compio` / `native-tokio` | Native (`http-kit`) | rustls (`http-kit-tls`) | Owned-buffer I/O; add `native-http2` / `native-http3` for HTTP/2 and HTTP/3 |
 | `curl-backend` | libcurl | libcurl's | Smaller binary if you have system libcurl |
 | `apple-backend` | URLSession | Security.framework | Experimental. macOS/iOS only |
+| `embedded-backend` / `embedded-tls` | `EmbeddedBackend` (`embedded-io-async` + `embedded-nal-async`) | Unbuffered `rustls` (`embedded-tls`) | `no_std + alloc` MCUs (ESP32-C6); see [docs/embedded.md](docs/embedded.md) |
 
 `ws` (websockets) uses the same engine as hyper. When `rustls` and `native-tls`
 are both enabled, `rustls` takes precedence. The `default` feature enables

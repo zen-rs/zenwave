@@ -1,7 +1,7 @@
 # Zenwave
 
 Async HTTP client library for Rust. Single crate, multiple backends
-(Hyper, libcurl, Apple URLSession, browser Fetch, WASI Preview 3), same API surface.
+(Hyper, Native, libcurl, Apple URLSession, browser Fetch, WASI Preview 3, embedded `no_std + alloc`), same API surface.
 
 ## Build and test
 
@@ -19,6 +19,11 @@ cargo test --no-default-features --features hyper-backend,native-tls,ws
 cargo test --no-default-features --features apple-backend  # macOS only
 cargo test --no-default-features --features native-compio,native-http2,native-http3
 cargo test --no-default-features --features native-tokio,native-http2,native-http3
+
+# Embedded no_std + alloc backend (ESP32-C6 / embedded-io-async + embedded-nal-async + unbuffered rustls)
+cargo clippy --lib --no-default-features --features embedded-backend -- -D warnings
+cargo clippy --lib --no-default-features --features embedded-tls -- -D warnings
+cargo nextest run --lib --no-default-features --features embedded-tls
 
 # Clippy (treat warnings as errors, matches CI)
 cargo clippy --all-targets --all-features -- -D warnings
@@ -84,6 +89,7 @@ src/
     apple.rs      — URLSession backend (Apple platforms)
     web.rs        — Fetch API backend (wasm32)
     wasi.rs       — WASI Preview 3 (`wasi:http/client`) backend
+    embedded.rs   — `no_std + alloc` HTTP/1.1 backend over `embedded-io-async` / `embedded-nal-async` + unbuffered `rustls`
   transport/
     mod.rs        — Transport / TransportBuilder (proxy rules + trusted roots; all targets)
     proxy.rs      — Proxy / ProxyBuilder over hyper-util's matcher (env + OS settings)

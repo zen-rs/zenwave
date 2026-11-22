@@ -1,6 +1,7 @@
 //! Authentication middlewares for HTTP requests.
 
-use std::convert::Infallible;
+use alloc::{format, string::String};
+use core::convert::Infallible;
 
 use http_kit::{Endpoint, Middleware, Request, Response, header, middleware::MiddlewareError};
 
@@ -56,7 +57,7 @@ impl BasicAuth {
     pub fn new(username: impl Into<String>, password: Option<impl Into<String>>) -> Self {
         Self {
             username: username.into(),
-            password: password.map(std::convert::Into::into),
+            password: password.map(core::convert::Into::into),
         }
     }
 }

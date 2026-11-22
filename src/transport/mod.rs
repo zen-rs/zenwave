@@ -29,20 +29,24 @@
 //! # }
 //! ```
 
-use std::fmt;
+#[cfg(all(native, not(extra_roots)))]
+use alloc::sync::Arc;
+#[cfg(all(feature = "curl-backend", not(extra_roots)))]
+use alloc::vec::Vec;
+#[cfg(extra_roots)]
+use alloc::{borrow::ToOwned, sync::Arc, vec::Vec};
+use core::fmt;
+#[cfg(any(onecrl_refresh, transport_timeouts))]
+use core::time::Duration;
 #[cfg(unix_socket)]
 use std::path::{Path, PathBuf};
-#[cfg(native)]
-use std::sync::Arc;
-#[cfg(any(onecrl_refresh, transport_timeouts))]
-use std::time::Duration;
 #[cfg(any(all(connector, feature = "hyper-backend"), https_lookup))]
 use std::{future::Future, pin::Pin};
 
-#[cfg(native)]
+#[cfg(extra_roots)]
 use rustls_pki_types::{CertificateDer, pem::PemObject};
 
-#[cfg(native)]
+#[cfg(extra_roots)]
 use crate::Cause;
 use crate::Error;
 #[cfg(transport_timeouts)]
@@ -129,8 +133,19 @@ pub(crate) fn spawn_thread(future: Pin<Box<dyn Future<Output = ()> + Send>>) {
 pub struct Transport {
     #[cfg(native)]
     inner: Arc<Inner>,
-    #[cfg(all(not(native), wasi_backend))]
+    #[cfg(all(not(native), any(wasi_backend, embedded_backend)))]
     timeouts: Timeouts,
+    #[cfg(all(not(native), embedded_tls))]
+    embedded_tls: Option<Arc<rustls::ClientConfig>>,
+}
+
+#[cfg(embedded_tls)]
+enum EmbeddedTlsSetup {
+    Config(Arc<rustls::ClientConfig>),
+    Provider {
+        provider: Arc<rustls::crypto::CryptoProvider>,
+        time_provider: Arc<dyn rustls::time_provider::TimeProvider>,
+    },
 }
 
 #[cfg(native)]
@@ -149,6 +164,8 @@ struct Inner {
     ca_bundle: Option<Vec<u8>>,
     #[cfg(tls_engine)]
     tls: tls::TlsConnector,
+    #[cfg(embedded_tls)]
+    embedded_tls: Option<Arc<rustls::ClientConfig>>,
     /// Connections the hyper backend reuses, keyed by origin.
     #[cfg(all(connector, feature = "hyper-backend"))]
     pool: pool::Pool,
@@ -199,13 +216,16 @@ impl Transport {
             .clone()
     }
 
-    /// The platform default: the WASI host owns proxying and trust, and no
-    /// default timeouts are applied.
-    #[cfg(all(not(native), wasi_backend))]
+    /// The platform default: no proxy and no default timeouts. On WASI the
+    /// host owns trust; on `embedded-backend` TLS requires explicit roots and
+    /// providers via [`Transport::builder`].
+    #[cfg(all(not(native), any(wasi_backend, embedded_backend)))]
     #[must_use]
     pub fn system() -> Self {
         Self {
             timeouts: Timeouts::default(),
+            #[cfg(embedded_tls)]
+            embedded_tls: None,
         }
     }
 
@@ -213,7 +233,7 @@ impl Transport {
     ///
     /// On wasm32 the browser owns proxying and trust, so the transport
     /// carries no configuration at all.
-    #[cfg(all(not(native), not(wasi_backend)))]
+    #[cfg(all(not(native), not(wasi_backend), not(embedded_backend)))]
     #[must_use]
     pub const fn system() -> Self {
         Self {}
@@ -266,6 +286,19 @@ impl Transport {
     #[cfg(tls_engine)]
     pub(crate) fn tls(&self) -> &tls::TlsConnector {
         &self.inner.tls
+    }
+
+    #[cfg(embedded_tls)]
+    #[allow(clippy::missing_const_for_fn)]
+    pub(crate) fn embedded_tls(&self) -> Option<&Arc<rustls::ClientConfig>> {
+        #[cfg(native)]
+        {
+            self.inner.embedded_tls.as_ref()
+        }
+        #[cfg(not(native))]
+        {
+            self.embedded_tls.as_ref()
+        }
     }
 
     /// The full PEM bundle libcurl should trust, when extra roots were added.
@@ -366,8 +399,10 @@ impl fmt::Debug for Transport {
 pub struct TransportBuilder {
     #[cfg(native)]
     proxy: Option<Proxy>,
-    #[cfg(native)]
+    #[cfg(extra_roots)]
     extra_roots: Vec<CertificateDer<'static>>,
+    #[cfg(embedded_tls)]
+    embedded_tls: Option<EmbeddedTlsSetup>,
     #[cfg(unix_socket)]
     unix_socket: Option<PathBuf>,
     #[cfg(transport_timeouts)]
@@ -405,9 +440,9 @@ impl fmt::Debug for TransportBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = f.debug_struct("TransportBuilder");
         #[cfg(native)]
-        debug
-            .field("proxy", &self.proxy)
-            .field("extra_roots", &self.extra_roots.len());
+        debug.field("proxy", &self.proxy);
+        #[cfg(extra_roots)]
+        debug.field("extra_roots", &self.extra_roots.len());
         #[cfg(unix_socket)]
         debug.field("unix_socket", &self.unix_socket);
         #[cfg(transport_timeouts)]
@@ -433,7 +468,7 @@ impl TransportBuilder {
     ///
     /// Returns [`ConfigError::TrustStore`](crate::ConfigError::TrustStore)
     /// when the input is not PEM or holds no certificate.
-    #[cfg(native)]
+    #[cfg(extra_roots)]
     pub fn extra_root_certificates_pem(mut self, pem: &[u8]) -> Result<Self, Error> {
         let before = self.extra_roots.len();
         for certificate in CertificateDer::pem_slice_iter(pem) {
@@ -449,10 +484,37 @@ impl TransportBuilder {
     }
 
     /// Trust one DER-encoded certificate in addition to the platform roots.
-    #[cfg(native)]
+    #[cfg(extra_roots)]
     #[must_use]
     pub fn extra_root_certificate_der(mut self, der: impl Into<Vec<u8>>) -> Self {
         self.extra_roots.push(CertificateDer::from(der.into()));
+        self
+    }
+
+    /// Supply a pre-configured `rustls::ClientConfig` for [`EmbeddedBackend`](crate::backend::EmbeddedBackend)
+    /// HTTPS connections.
+    #[cfg(embedded_tls)]
+    #[must_use]
+    pub fn embedded_tls_config(mut self, config: Arc<rustls::ClientConfig>) -> Self {
+        self.embedded_tls = Some(EmbeddedTlsSetup::Config(config));
+        self
+    }
+
+    /// Configure unbuffered `rustls` for [`EmbeddedBackend`](crate::backend::EmbeddedBackend)
+    /// using `provider`, `time_provider` and the root certificates added via
+    /// [`extra_root_certificates_pem`](Self::extra_root_certificates_pem) or
+    /// [`extra_root_certificate_der`](Self::extra_root_certificate_der).
+    #[cfg(embedded_tls)]
+    #[must_use]
+    pub fn embedded_tls_provider(
+        mut self,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+        time_provider: Arc<dyn rustls::time_provider::TimeProvider>,
+    ) -> Self {
+        self.embedded_tls = Some(EmbeddedTlsSetup::Provider {
+            provider,
+            time_provider,
+        });
         self
     }
 
@@ -623,6 +685,8 @@ impl TransportBuilder {
             });
             #[cfg(all(https_lookup, target_os = "android"))]
             let dns = dns::Config;
+            #[cfg(embedded_tls)]
+            let embedded_tls = build_embedded_tls(self.embedded_tls, &self.extra_roots)?;
             let transport = Transport {
                 inner: Arc::new(Inner {
                     proxy: self.proxy.unwrap_or_else(Proxy::system),
@@ -635,6 +699,8 @@ impl TransportBuilder {
                     ca_bundle,
                     #[cfg(tls_engine)]
                     tls,
+                    #[cfg(embedded_tls)]
+                    embedded_tls,
                     #[cfg(all(connector, feature = "hyper-backend"))]
                     pool: pool::Pool::new(),
                     #[cfg(http3)]
@@ -659,18 +725,57 @@ impl TransportBuilder {
         }
     }
 
-    /// Build the transport. The host owns proxying and trust, so there is
-    /// nothing to load.
+    /// Build the transport.
     ///
     /// # Errors
     ///
-    /// Never fails on browser or pure WASI targets; the `Result` keeps the
-    /// native signature.
+    /// On `embedded-tls` builds, returns [`Error::Config`] when trust anchors
+    /// or protocol versions cannot be configured; infallible on browser and
+    /// WASI targets.
     #[cfg(not(native))]
-    pub const fn build(self) -> Result<Transport, Error> {
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn build(self) -> Result<Transport, Error> {
+        #[cfg(embedded_tls)]
+        let embedded_tls = build_embedded_tls(self.embedded_tls, &self.extra_roots)?;
         Ok(Transport {
-            #[cfg(wasi_backend)]
+            #[cfg(any(wasi_backend, embedded_backend))]
             timeouts: self.timeouts,
+            #[cfg(embedded_tls)]
+            embedded_tls,
         })
+    }
+}
+
+#[cfg(embedded_tls)]
+fn build_embedded_tls(
+    setup: Option<EmbeddedTlsSetup>,
+    extra_roots: &[CertificateDer<'static>],
+) -> Result<Option<Arc<rustls::ClientConfig>>, Error> {
+    match setup {
+        None => Ok(None),
+        Some(EmbeddedTlsSetup::Config(config)) => Ok(Some(config)),
+        Some(EmbeddedTlsSetup::Provider {
+            provider,
+            time_provider,
+        }) => {
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in extra_roots {
+                roots
+                    .add(cert.clone())
+                    .map_err(|err| Error::trust_store(Cause::Rustls(err)))?;
+            }
+            if roots.is_empty() {
+                return Err(Error::trust_store(Cause::Detail(
+                    "embedded TLS needs at least one root certificate".to_owned(),
+                )));
+            }
+            let mut config = rustls::ClientConfig::builder_with_details(provider, time_provider)
+                .with_safe_default_protocol_versions()
+                .map_err(Error::tls_config)?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            config.alpn_protocols.push(b"http/1.1".to_vec());
+            Ok(Some(Arc::new(config)))
+        }
     }
 }

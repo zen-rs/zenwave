@@ -70,8 +70,13 @@ native() {
     --at-least-one-of native-backend,native-compio,native-tokio,native-http2,native-http3,native-kernel-tls -- -D warnings
   echo "::endgroup::"
 
-  echo "::group::native backend beside the default features"
-  cargo clippy --all-targets --features native-compio,native-tokio,native-http2,native-http3,native-kernel-tls -- -D warnings
+  echo "::group::native and embedded backends beside the default features"
+  cargo clippy --all-targets --features native-compio,native-tokio,native-http2,native-http3,native-kernel-tls,embedded-tls -- -D warnings
+  echo "::endgroup::"
+
+  echo "::group::embedded no_std + alloc backend"
+  cargo clippy --lib --no-default-features --features embedded-backend -- -D warnings
+  cargo clippy --lib --no-default-features --features embedded-tls -- -D warnings
   echo "::endgroup::"
 }
 

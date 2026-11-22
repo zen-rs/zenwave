@@ -1,5 +1,7 @@
 //! Middleware for following HTTP redirects.
 
+use alloc::string::ToString;
+
 use http::{HeaderMap, Uri};
 use http_kit::{
     Endpoint, HttpError, Method, SendEndpoint,
@@ -11,6 +13,7 @@ use http_kit::{
 use url::Url;
 
 use crate::clock::Clocked;
+#[cfg(has_std)]
 use crate::cookie::{RequestCookieJar, cookie_header, store_response_cookies};
 use crate::{Body, Request, Response, StatusCode, client::Client};
 
@@ -75,6 +78,7 @@ impl<C: Client> FollowRedirect<C> {
     ///
     /// `Ok(None)` means the redirect must be handed back to the caller untouched: the hop
     /// would preserve a body that cannot be replayed.
+    #[cfg_attr(not(has_std), allow(clippy::needless_pass_by_ref_mut))]
     fn next_hop(
         request: &mut Request,
         response: &Response,
@@ -140,6 +144,7 @@ impl<C: Client> FollowRedirect<C> {
 
         // A response that redirects is a hop: its `Set-Cookie` headers
         // belong to this hop's URL.
+        #[cfg(has_std)]
         if let Some(jar) = request.extensions_mut().get_mut::<RequestCookieJar>() {
             jar.changed |= store_response_cookies(&mut jar.store, response.headers(), &state.url);
         }
@@ -151,6 +156,7 @@ impl<C: Client> FollowRedirect<C> {
         // `Cookie` header comes from it for the new URL — replacing the carried-over one,
         // including the value just stripped on a cross-origin hop.
         *new_request.extensions_mut() = request.extensions().clone();
+        #[cfg(has_std)]
         if let Some(jar) = new_request.extensions_mut().get_mut::<RequestCookieJar>() {
             match cookie_header(&jar.store, &redirect_url) {
                 Some(cookie) => {
@@ -270,6 +276,7 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
 
             // `request` holds whatever the endpoint left behind — the jar,
             // when the chain carries one, rides along in its extensions.
+            #[cfg(has_std)]
             if let Some(jar) = request.extensions_mut().get_mut::<RequestCookieJar>() {
                 jar.response_url = Some(state.url.clone());
             }
@@ -300,6 +307,7 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
     use std::{
         collections::VecDeque,
         convert::Infallible,

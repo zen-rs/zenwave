@@ -84,21 +84,31 @@ mod pinned {
 
 fn main() {
     cfg_aliases! {
-        // Everything that uses guest transport configuration (proxy rules,
-        // extra roots): every non-wasm32 target, and WASI when the native
-        // backend is compiled in.
-        native: { any(not(target_arch = "wasm32"), all(target_os = "wasi", feature = "native-backend")) },
         // The browser/Workers Fetch backend and its JS timers: wasm32 without
         // a WASI host.
         browser: { all(target_arch = "wasm32", not(target_os = "wasi")) },
+        // Whether `std` is linked: enabled by the `std` feature (and every OS /
+        // WASI backend) and always present on the browser wasm32 target.
+        has_std: { any(feature = "std", browser) },
         // async-io's reactor, which drives the sockets, timers and filesystem
-        // I/O of every desktop/mobile backend.
-        reactor: { not(target_arch = "wasm32") },
+        // I/O of every desktop/mobile backend. Bare-metal `target_os = "none"`
+        // and `no_std` builds have none.
+        reactor: { all(not(target_arch = "wasm32"), not(target_os = "none"), feature = "std") },
+        // Everything that uses OS/WASI guest transport configuration (proxy
+        // rules, extra roots): every OS reactor target, and WASI when the
+        // native backend is compiled in.
+        native: { any(reactor, all(target_os = "wasi", feature = "native-backend")) },
+        // Embedded `no_std + alloc` HTTP/1.1 backend over `embedded-io-async`
+        // and `embedded-nal-async`, plus optional unbuffered `rustls`.
+        embedded_backend: { feature = "embedded-backend" },
+        embedded_tls: { all(embedded_backend, feature = "embedded-tls") },
         // WASI Preview 3 HTTP client backend (`wasi:http/client` +
         // `wasi:clocks/monotonic-clock`) on Component Model WASI targets.
         wasi_backend: { all(target_os = "wasi", not(target_env = "p1"), feature = "wasi-backend") },
         // Transport-level defaults for `Timeouts`.
-        transport_timeouts: { any(native_backend, wasi_backend) },
+        transport_timeouts: { any(native_backend, wasi_backend, embedded_backend) },
+        // Extra DER/PEM root certificates on `TransportBuilder`.
+        extra_roots: { any(native, embedded_tls) },
         // The `getaddrinfo` resolver and the `http-kit-io` it implements.
         getaddrinfo: { all(reactor, feature = "getaddrinfo") },
         // The shared async-net TCP/TLS connector is needed by hyper, by native
@@ -129,6 +139,7 @@ fn main() {
         // other provider choice).
         ring: { any(feature = "rustls-ring", feature = "native-ring") },
         tls_rustls: { all(dialer, feature = "rustls-engine") },
+        rustls_error: { any(tls_rustls, embedded_tls) },
         // The async-net connector's TLS stream over futures-rustls: only the
         // `rustls` feature supplies the `futures-rustls` crate; `rustls-engine`
         // alone (what the native backend pulls) does not give the connector a
