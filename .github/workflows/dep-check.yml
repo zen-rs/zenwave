@@ -34,7 +34,7 @@ jobs:
 
       - name: Rust cache
         if: steps.detect.outputs.type == 'rust'
-        uses: Swatinem/rust-cache@v2
+        uses: water-rs/stow@main
 
       - name: Check Rust dependencies
         if: steps.detect.outputs.type == 'rust'

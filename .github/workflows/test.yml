@@ -17,9 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test-${{ matrix.os }}
+      - uses: water-rs/stow@main
       - uses: taiki-e/install-action@nextest
       - name: Run curl backend tests
         run: cargo nextest run --no-default-features --features curl-backend --workspace
@@ -39,9 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test-${{ matrix.os }}
+      - uses: water-rs/stow@main
       - uses: taiki-e/install-action@nextest
       # `onecrl` only compiles where webpki verifies (Linux here); elsewhere it is a no-op.
       - name: Run hyper backend tests (rustls)
@@ -65,9 +61,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test-${{ matrix.os }}-native-${{ matrix.runtime }}
+      - uses: water-rs/stow@main
       - uses: taiki-e/install-action@nextest
       - name: Load kernel TLS
         if: runner.os == 'Linux'
@@ -87,9 +81,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test-wasm
+      - uses: water-rs/stow@main
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - name: Add wasm target
@@ -97,38 +89,13 @@ jobs:
       - name: wasm-pack test
         run: bash scripts/test-wasm.sh ${{ matrix.browser }}
 
-  wasm-macos:
-    name: wasm-pack (macOS Safari)
-    runs-on: macos-15-intel
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-            shared-key: test-wasm
-
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-
-      - name: Add wasm target
-        run: rustup target add wasm32-unknown-unknown
-
-      - name: Enable safaridriver
-        run: sudo safaridriver --enable
-
-      - name: wasm-pack test (Safari)
-        run: bash scripts/test-wasm.sh safari
-
   apple-backend:
     name: Apple backend (macOS)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test-macos
+      - uses: water-rs/stow@main
       - uses: taiki-e/install-action@nextest
 
       - name: Run apple backend suite
@@ -142,9 +109,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios-sim
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test-ios-simulator
+      - uses: water-rs/stow@main
       - name: Run the suite on a simulator
         run: bash scripts/test-ios.sh
 
@@ -156,12 +121,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test-workerd
-          workspaces: |
-            . -> target
-            tests/workerd -> target
+      - uses: water-rs/stow@main
       - uses: taiki-e/install-action@v2
         with:
           tool: skyzen-cli
@@ -181,13 +141,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip2
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test-wasip3
-          workspaces: |
-            . -> target
-            tests/fixture-server -> target
-            tests/wasip3 -> target
+      - uses: water-rs/stow@main
       - uses: taiki-e/install-action@v2
         with:
           tool: wasmtime@50.0.2

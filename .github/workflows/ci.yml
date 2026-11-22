@@ -57,9 +57,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: features-${{ matrix.os }}
+      - uses: water-rs/stow@main
       - uses: taiki-e/install-action@cargo-hack
       - run: bash scripts/check-features.sh ${{ matrix.engine }}
         shell: bash
@@ -74,9 +72,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown,wasm32-wasip2
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-ubuntu
+      - uses: water-rs/stow@main
       - run: cargo build --target wasm32-unknown-unknown
       # The desktop clippy lanes never compile the wasm32-only code. The
       # examples block on async-io and are native-only, so they stay out.
@@ -189,9 +185,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: mobile-${{ matrix.target }}
+      - uses: water-rs/stow@main
       - name: Configure Android NDK compiler
         if: matrix.android-api != ''
         shell: bash
@@ -227,9 +221,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-ubuntu
+      - uses: water-rs/stow@main
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
       - run: cargo llvm-cov nextest --features curl-backend --workspace --lcov --output-path lcov.info
@@ -245,9 +237,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-ubuntu
+      - uses: water-rs/stow@main
       - name: Generate Lockfile
         run: cargo generate-lockfile
       - uses: taiki-e/install-action@cargo-audit
