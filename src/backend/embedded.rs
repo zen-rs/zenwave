@@ -35,7 +35,7 @@ use core::{
     time::Duration,
 };
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use embedded_io_async::{Read as AsyncRead, Write as AsyncWrite};
 use embedded_nal_async::{AddrType, Dns, TcpConnect};
 use futures_channel::oneshot;
@@ -70,10 +70,21 @@ const BODY_CHANNEL_CAPACITY: usize = 2;
 /// (fits standard 1500-byte Wi-Fi / Ethernet MTUs without inflating task stacks).
 const SOCKET_READ_CHUNK: usize = 2048;
 
+/// Initial capacity for the reusable request-head encoding buffer.
+const HEAD_INITIAL_CAP: usize = 512;
+
 /// Initial TLS record scratch buffer capacity (grows dynamically on demand when
 /// `rustls` reports [`InsufficientSizeError`](rustls::unbuffered::InsufficientSizeError)).
 #[cfg(embedded_tls)]
 const TLS_INITIAL_BUF: usize = 4096;
+
+/// TLS record header size (`ContentType` + `ProtocolVersion` + 16-bit length, RFC 8446 §5.1).
+#[cfg(embedded_tls)]
+const TLS_RECORD_HEADER_LEN: usize = 5;
+
+/// Maximum wire length of one encrypted TLS 1.3 record (`5 + 16384 + 256`, RFC 8446 §5.2).
+#[cfg(embedded_tls)]
+const TLS_MAX_RECORD_WIRE: usize = TLS_RECORD_HEADER_LEN + 16_384 + 256;
 
 /// Monotonic timer source for [`EmbeddedRunner::run_with_timer`] and [`TimerClock`].
 pub trait EmbeddedTimer {
@@ -142,6 +153,7 @@ impl EmbeddedBackend {
             transport: transport.clone(),
             limits: Limits::default(),
             receiver,
+            buffers: RunnerBuffers::new(),
         };
         (Self { transport, sender }, runner)
     }
@@ -238,6 +250,55 @@ where
     }
 }
 
+/// Reusable scratch buffers owned by [`EmbeddedRunner`] across sequential exchanges
+/// so steady-state requests avoid repeated 2–16 KiB heap allocations on MCU allocators.
+struct RunnerBuffers {
+    head_buf: BytesMut,
+    app_rx: BytesMut,
+    #[cfg(embedded_tls)]
+    rx_tls: Vec<u8>,
+    #[cfg(embedded_tls)]
+    tx_tls: Vec<u8>,
+}
+
+impl RunnerBuffers {
+    fn new() -> Self {
+        Self {
+            head_buf: BytesMut::with_capacity(HEAD_INITIAL_CAP),
+            app_rx: BytesMut::with_capacity(SOCKET_READ_CHUNK),
+            #[cfg(embedded_tls)]
+            rx_tls: vec![0u8; TLS_INITIAL_BUF],
+            #[cfg(embedded_tls)]
+            tx_tls: vec![0u8; TLS_INITIAL_BUF],
+        }
+    }
+
+    fn reset(&mut self) {
+        self.head_buf.clear();
+        if self.head_buf.capacity() > HEAD_INITIAL_CAP * 2 {
+            self.head_buf = BytesMut::with_capacity(HEAD_INITIAL_CAP);
+        }
+        self.app_rx.clear();
+        if self.app_rx.capacity() > SOCKET_READ_CHUNK * 2 {
+            self.app_rx = BytesMut::with_capacity(SOCKET_READ_CHUNK);
+        }
+        #[cfg(embedded_tls)]
+        {
+            reset_tls_vec(&mut self.rx_tls);
+            reset_tls_vec(&mut self.tx_tls);
+        }
+    }
+}
+
+#[cfg(embedded_tls)]
+fn reset_tls_vec(buf: &mut Vec<u8>) {
+    if buf.capacity() > TLS_INITIAL_BUF * 2 {
+        *buf = vec![0u8; TLS_INITIAL_BUF];
+    } else if buf.len() != TLS_INITIAL_BUF {
+        buf.resize(TLS_INITIAL_BUF, 0);
+    }
+}
+
 /// Network driver task paired with an [`EmbeddedBackend`].
 ///
 /// Its `run` futures intentionally borrow `!Send` embedded peripheral stacks
@@ -246,6 +307,7 @@ pub struct EmbeddedRunner {
     transport: Transport,
     limits: Limits,
     receiver: async_channel::Receiver<RequestCommand>,
+    buffers: RunnerBuffers,
 }
 
 impl fmt::Debug for EmbeddedRunner {
@@ -274,7 +336,7 @@ impl EmbeddedRunner {
     /// Per-request or transport [`Timeouts`] require a timer source; use
     /// [`run_with_timer`](Self::run_with_timer) when timeouts are configured.
     #[allow(clippy::future_not_send)]
-    pub async fn run<C, D>(self, tcp: &C, dns: &D)
+    pub async fn run<C, D>(mut self, tcp: &C, dns: &D)
     where
         C: TcpConnect,
         D: Dns,
@@ -292,12 +354,14 @@ impl EmbeddedRunner {
             exchange_one(
                 &self.transport,
                 &self.limits,
+                &mut self.buffers,
                 tcp,
                 dns,
                 None::<&NoTimer>,
                 cmd,
             )
             .await;
+            self.buffers.reset();
         }
     }
 
@@ -305,7 +369,7 @@ impl EmbeddedRunner {
     /// response-head and body-idle deadlines until every [`EmbeddedBackend`]
     /// handle is dropped.
     #[allow(clippy::future_not_send)]
-    pub async fn run_with_timer<C, D, T>(self, tcp: &C, dns: &D, timer: &T)
+    pub async fn run_with_timer<C, D, T>(mut self, tcp: &C, dns: &D, timer: &T)
     where
         C: TcpConnect,
         D: Dns,
@@ -315,7 +379,17 @@ impl EmbeddedRunner {
             if cmd.reply.is_canceled() {
                 continue;
             }
-            exchange_one(&self.transport, &self.limits, tcp, dns, Some(timer), cmd).await;
+            exchange_one(
+                &self.transport,
+                &self.limits,
+                &mut self.buffers,
+                tcp,
+                dns,
+                Some(timer),
+                cmd,
+            )
+            .await;
+            self.buffers.reset();
         }
     }
 }
@@ -379,14 +453,21 @@ struct PlainStream<S>(S);
 impl<S: AsyncRead + AsyncWrite> StreamIo for PlainStream<S> {
     #[allow(clippy::future_not_send)]
     async fn read_into(&mut self, dst: &mut BytesMut) -> Result<usize, Error> {
-        let mut scratch = [0u8; SOCKET_READ_CHUNK];
-        let n = self.0.read(&mut scratch).await.map_err(|err| {
-            Error::exchange(ExchangeFailure::Io, Cause::Detail(format!("{err:?}")))
-        })?;
-        if n > 0 {
-            dst.extend_from_slice(&scratch[..n]);
+        let old_len = dst.len();
+        dst.resize(old_len + SOCKET_READ_CHUNK, 0);
+        match self.0.read(&mut dst[old_len..]).await {
+            Ok(n) => {
+                dst.truncate(old_len + n);
+                Ok(n)
+            }
+            Err(err) => {
+                dst.truncate(old_len);
+                Err(Error::exchange(
+                    ExchangeFailure::Io,
+                    Cause::Detail(format!("{err:?}")),
+                ))
+            }
         }
-        Ok(n)
     }
 
     #[allow(clippy::future_not_send)]
@@ -431,6 +512,23 @@ fn encode_tls_record<D>(
     }
 }
 
+/// Grows `rx_tls` using the 5-byte TLS record header's declared length when
+/// available so a single certificate record does not double past what it needs.
+#[cfg(embedded_tls)]
+fn grow_tls_rx(rx_tls: &mut Vec<u8>, rx_filled: usize) {
+    let min_next = rx_tls.len().saturating_add(SOCKET_READ_CHUNK);
+    let target = if rx_filled >= TLS_RECORD_HEADER_LEN {
+        let payload_len = usize::from(u16::from_be_bytes([rx_tls[3], rx_tls[4]]));
+        let record_wire = TLS_RECORD_HEADER_LEN
+            .saturating_add(payload_len)
+            .min(TLS_MAX_RECORD_WIRE);
+        record_wire.max(min_next)
+    } else {
+        min_next
+    };
+    rx_tls.resize(target, 0);
+}
+
 #[cfg(embedded_tls)]
 struct UnbufferedTlsStream<S> {
     socket: S,
@@ -450,6 +548,8 @@ impl<S: AsyncRead + AsyncWrite> UnbufferedTlsStream<S> {
         host: &str,
         port: u16,
         socket: S,
+        rx_slot: &mut Vec<u8>,
+        tx_slot: &mut Vec<u8>,
         app_rx: &mut BytesMut,
     ) -> Result<Self, Error> {
         let server_name =
@@ -477,17 +577,34 @@ impl<S: AsyncRead + AsyncWrite> UnbufferedTlsStream<S> {
                 )
             },
         )?;
+        let mut rx_tls = core::mem::take(rx_slot);
+        let mut tx_tls = core::mem::take(tx_slot);
+        if rx_tls.len() < TLS_INITIAL_BUF {
+            rx_tls.resize(TLS_INITIAL_BUF, 0);
+        }
+        if tx_tls.len() < TLS_INITIAL_BUF {
+            tx_tls.resize(TLS_INITIAL_BUF, 0);
+        }
         let mut tls = Self {
             socket,
             conn,
-            rx_tls: vec![0u8; TLS_INITIAL_BUF],
+            rx_tls,
             rx_filled: 0,
-            tx_tls: vec![0u8; TLS_INITIAL_BUF],
+            tx_tls,
             tx_filled: 0,
             peer_closed: false,
         };
-        tls.handshake(host, port, app_rx).await?;
+        if let Err(err) = tls.handshake(host, port, app_rx).await {
+            let (rx_b, tx_b) = tls.into_buffers();
+            *rx_slot = rx_b;
+            *tx_slot = tx_b;
+            return Err(err);
+        }
         Ok(tls)
+    }
+
+    fn into_buffers(self) -> (Vec<u8>, Vec<u8>) {
+        (self.rx_tls, self.tx_tls)
     }
 
     fn discard_rx(&mut self, discard: usize) {
@@ -538,7 +655,7 @@ impl<S: AsyncRead + AsyncWrite> UnbufferedTlsStream<S> {
     #[allow(clippy::future_not_send)]
     async fn read_rx_ciphertext_handshake(&mut self, host: &str, port: u16) -> Result<(), Error> {
         if self.rx_filled == self.rx_tls.len() {
-            self.rx_tls.resize(self.rx_tls.len() * 2, 0);
+            grow_tls_rx(&mut self.rx_tls, self.rx_filled);
         }
         let n = self
             .socket
@@ -734,7 +851,7 @@ impl<S: AsyncRead + AsyncWrite> StreamIo for UnbufferedTlsStream<S> {
                     self.discard_rx(discard);
                     self.flush_tx_exchange().await?;
                     if self.rx_filled == self.rx_tls.len() {
-                        self.rx_tls.resize(self.rx_tls.len() * 2, 0);
+                        grow_tls_rx(&mut self.rx_tls, self.rx_filled);
                     }
                     let n = self
                         .socket
@@ -869,6 +986,7 @@ impl<S: AsyncRead + AsyncWrite> StreamIo for UnbufferedTlsStream<S> {
 async fn exchange_one<C, D, T>(
     transport: &Transport,
     limits: &Limits,
+    buffers: &mut RunnerBuffers,
     tcp: &C,
     dns: &D,
     timer: Option<&T>,
@@ -911,7 +1029,7 @@ async fn exchange_one<C, D, T>(
 
     if scheme == Scheme::HTTPS {
         exchange_https(
-            transport, limits, tcp, dns, timer, &host, port, request, &timeouts, reply,
+            transport, limits, buffers, tcp, dns, timer, &host, port, request, &timeouts, reply,
         )
         .await;
         return;
@@ -921,7 +1039,7 @@ async fn exchange_one<C, D, T>(
     let _ = transport;
 
     exchange_http(
-        limits, tcp, dns, timer, &host, port, request, &timeouts, reply,
+        limits, buffers, tcp, dns, timer, &host, port, request, &timeouts, reply,
     )
     .await;
 }
@@ -931,6 +1049,7 @@ async fn exchange_one<C, D, T>(
 async fn exchange_https<C, D, T>(
     transport: &Transport,
     limits: &Limits,
+    buffers: &mut RunnerBuffers,
     tcp: &C,
     dns: &D,
     timer: Option<&T>,
@@ -947,7 +1066,7 @@ async fn exchange_https<C, D, T>(
     #[cfg(not(embedded_tls))]
     {
         let _ = (
-            transport, limits, tcp, dns, timer, host, port, request, timeouts,
+            transport, limits, buffers, tcp, dns, timer, host, port, request, timeouts,
         );
         let _ = reply.send(Err(Error::Config(ConfigError::Unsupported {
             what: "HTTPS without the `embedded-tls` feature",
@@ -962,7 +1081,13 @@ async fn exchange_https<C, D, T>(
             return;
         };
         let phase = core::cell::Cell::new(ConnectPhase::Resolve);
-        let mut app_rx = BytesMut::with_capacity(SOCKET_READ_CHUNK);
+        buffers.app_rx.clear();
+        let RunnerBuffers {
+            app_rx,
+            rx_tls,
+            tx_tls,
+            ..
+        } = buffers;
         let dial = timed(
             timer,
             timeouts.connect,
@@ -987,7 +1112,8 @@ async fn exchange_https<C, D, T>(
                     )
                 })?;
                 phase.set(ConnectPhase::Tls);
-                UnbufferedTlsStream::connect(tls_config, host, port, sock, &mut app_rx).await
+                UnbufferedTlsStream::connect(tls_config, host, port, sock, rx_tls, tx_tls, app_rx)
+                    .await
             },
         )
         .await;
@@ -996,7 +1122,8 @@ async fn exchange_https<C, D, T>(
             Ok(mut tls_stream) => {
                 drive_http_exchange(
                     &mut tls_stream,
-                    app_rx,
+                    &mut buffers.app_rx,
+                    &mut buffers.head_buf,
                     limits,
                     timer,
                     timeouts,
@@ -1005,6 +1132,9 @@ async fn exchange_https<C, D, T>(
                 )
                 .await;
                 tls_stream.shutdown().await;
+                let (rx_b, tx_b) = tls_stream.into_buffers();
+                buffers.rx_tls = rx_b;
+                buffers.tx_tls = tx_b;
             }
             Err(err) => {
                 let _ = reply.send(Err(err));
@@ -1016,6 +1146,7 @@ async fn exchange_https<C, D, T>(
 #[allow(clippy::too_many_arguments)]
 async fn exchange_http<C, D, T>(
     limits: &Limits,
+    buffers: &mut RunnerBuffers,
     tcp: &C,
     dns: &D,
     timer: Option<&T>,
@@ -1060,10 +1191,11 @@ async fn exchange_http<C, D, T>(
 
     match dial {
         Ok(mut plain_stream) => {
-            let app_rx = BytesMut::with_capacity(SOCKET_READ_CHUNK);
+            buffers.app_rx.clear();
             drive_http_exchange(
                 &mut plain_stream,
-                app_rx,
+                &mut buffers.app_rx,
+                &mut buffers.head_buf,
                 limits,
                 timer,
                 timeouts,
@@ -1112,10 +1244,84 @@ fn make_attempt(remote: SocketAddr, detail: String) -> Attempt {
     }
 }
 
-#[allow(clippy::future_not_send)]
+enum EagerBody {
+    Complete(Bytes),
+    Streaming(Vec<Result<BodyFrame, BodyError>>),
+}
+
+/// Drains whatever body frames are already buffered alongside the response head.
+/// When the entire body arrived in that first read (and carried no trailers), returns
+/// [`EagerBody::Complete`] so [`drive_http_exchange`] hands back an in-memory [`Body`]
+/// without allocating a bounded `async_channel`.
+fn decode_buffered_body(
+    decoder: &mut BodyDecoder,
+    rx_buf: &mut BytesMut,
+    limits: &Limits,
+) -> EagerBody {
+    let mut data_chunks: Vec<Bytes> = Vec::new();
+    loop {
+        match decoder.decode(rx_buf, limits) {
+            Ok(Some(Decoded::Data(bytes))) => {
+                if !bytes.is_empty() {
+                    data_chunks.push(bytes);
+                }
+            }
+            Ok(Some(Decoded::End)) => {
+                let merged = match data_chunks.len() {
+                    0 => Bytes::new(),
+                    1 => data_chunks.pop().expect("single chunk"),
+                    _ => {
+                        let total: usize = data_chunks.iter().map(Bytes::len).sum();
+                        let mut out = BytesMut::with_capacity(total);
+                        for chunk in data_chunks {
+                            out.extend_from_slice(&chunk);
+                        }
+                        out.freeze()
+                    }
+                };
+                return EagerBody::Complete(merged);
+            }
+            Ok(Some(Decoded::Trailers(trailers))) => {
+                let mut frames: Vec<Result<BodyFrame, BodyError>> = data_chunks
+                    .into_iter()
+                    .map(|b| Ok(BodyFrame::Data(b)))
+                    .collect();
+                frames.push(Ok(BodyFrame::Trailers(trailers)));
+                return EagerBody::Streaming(frames);
+            }
+            Ok(None) => {
+                let frames = data_chunks
+                    .into_iter()
+                    .map(|b| Ok(BodyFrame::Data(b)))
+                    .collect();
+                return EagerBody::Streaming(frames);
+            }
+            Err(err) => {
+                let mut frames: Vec<Result<BodyFrame, BodyError>> = data_chunks
+                    .into_iter()
+                    .map(|b| Ok(BodyFrame::Data(b)))
+                    .collect();
+                frames.push(Err(BodyError::from(http_kit_h1::Error::Parse(err))));
+                return EagerBody::Streaming(frames);
+            }
+        }
+    }
+}
+
+fn build_response(parts: http::response::Parts, body: Body) -> Response {
+    let mut resp = Response::new(body);
+    *resp.status_mut() = parts.status;
+    *resp.version_mut() = parts.version;
+    *resp.headers_mut() = parts.headers;
+    *resp.extensions_mut() = parts.extensions;
+    resp
+}
+
+#[allow(clippy::too_many_arguments, clippy::future_not_send)]
 async fn drive_http_exchange<S, T>(
     stream: &mut S,
-    mut rx_buf: BytesMut,
+    rx_buf: &mut BytesMut,
+    head_buf: &mut BytesMut,
     limits: &Limits,
     timer: Option<&T>,
     timeouts: &Timeouts,
@@ -1126,7 +1332,7 @@ async fn drive_http_exchange<S, T>(
     T: EmbeddedTimer,
 {
     let request_method = request.method().clone();
-    if let Err(err) = write_request(stream, request).await {
+    if let Err(err) = write_request(stream, head_buf, request).await {
         let _ = reply.send(Err(err));
         return;
     }
@@ -1135,7 +1341,7 @@ async fn drive_http_exchange<S, T>(
         timer,
         timeouts.exchange.response_head,
         || Error::Timeout(TimedOut::ResponseHead),
-        read_final_response_head(stream, &mut rx_buf, &request_method, limits),
+        read_final_response_head(stream, rx_buf, &request_method, limits),
     )
     .await
     {
@@ -1147,31 +1353,43 @@ async fn drive_http_exchange<S, T>(
     };
 
     if matches!(head.body, BodyKind::Empty) {
-        let mut resp = Response::new(Body::empty());
-        *resp.status_mut() = head.parts.status;
-        *resp.version_mut() = head.parts.version;
-        *resp.headers_mut() = head.parts.headers;
-        *resp.extensions_mut() = head.parts.extensions;
-        let _ = reply.send(Ok(resp));
+        let _ = reply.send(Ok(build_response(head.parts, Body::empty())));
         return;
     }
 
+    let mut decoder = BodyDecoder::new(head.body);
+    let initial_frames = match decode_buffered_body(&mut decoder, rx_buf, limits) {
+        EagerBody::Complete(bytes) => {
+            let body = if bytes.is_empty() {
+                Body::empty()
+            } else {
+                Body::from_bytes(bytes)
+            };
+            let _ = reply.send(Ok(build_response(head.parts, body)));
+            return;
+        }
+        EagerBody::Streaming(frames) => frames,
+    };
+
     let (body_tx, body_rx) =
         async_channel::bounded::<Result<BodyFrame, BodyError>>(BODY_CHANNEL_CAPACITY);
-    let mut resp = Response::new(Body::from_frames(body_rx));
-    *resp.status_mut() = head.parts.status;
-    *resp.version_mut() = head.parts.version;
-    *resp.headers_mut() = head.parts.headers;
-    *resp.extensions_mut() = head.parts.extensions;
+    let resp = build_response(head.parts, Body::from_frames(body_rx));
 
     if reply.send(Ok(resp)).is_err() {
         return;
     }
 
+    for frame in initial_frames {
+        let is_err = frame.is_err();
+        if body_tx.send(frame).await.is_err() || is_err {
+            return;
+        }
+    }
+
     stream_response_body(
         stream,
-        &mut rx_buf,
-        head.body,
+        rx_buf,
+        decoder,
         limits,
         timer,
         timeouts.exchange.body_idle,
@@ -1183,6 +1401,7 @@ async fn drive_http_exchange<S, T>(
 #[allow(clippy::future_not_send)]
 async fn write_request<S: StreamIo>(
     stream: &mut S,
+    head_buf: &mut BytesMut,
     request: http::Request<Body>,
 ) -> Result<(), Error> {
     let (parts, mut body) = request.into_parts();
@@ -1192,10 +1411,10 @@ async fn write_request<S: StreamIo>(
         body.len().and_then(|len| u64::try_from(len).ok())
     };
 
-    let mut head_buf = BytesMut::with_capacity(512);
-    let mut plan = encode_request_head(&parts, RequestTarget::Origin, known_len, &mut head_buf)
+    head_buf.clear();
+    let mut plan = encode_request_head(&parts, RequestTarget::Origin, known_len, head_buf)
         .map_err(map_h1_encode_error)?;
-    stream.write_bytes(&head_buf).await?;
+    stream.write_bytes(head_buf).await?;
 
     if !plan.encoder.sends_body() {
         return stream.flush_bytes().await;
@@ -1276,7 +1495,7 @@ async fn read_final_response_head<S: StreamIo>(
 async fn stream_response_body<S, T>(
     stream: &mut S,
     rx_buf: &mut BytesMut,
-    kind: BodyKind,
+    mut decoder: BodyDecoder,
     limits: &Limits,
     timer: Option<&T>,
     body_idle: Option<Duration>,
@@ -1285,7 +1504,6 @@ async fn stream_response_body<S, T>(
     S: StreamIo,
     T: EmbeddedTimer,
 {
-    let mut decoder = BodyDecoder::new(kind);
     loop {
         match decoder.decode(rx_buf, limits) {
             Ok(Some(Decoded::Data(bytes))) => {

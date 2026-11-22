@@ -109,7 +109,7 @@ pub use auth::{BasicAuth, BearerAuth};
 #[cfg(has_std)]
 pub use cache::Cache;
 pub use client::Client;
-#[cfg(has_std)]
+#[cfg(has_cookie)]
 pub use cookie::CookieStore;
 pub use http_kit::*;
 #[cfg(default_backend)]
@@ -122,7 +122,7 @@ pub use transport::{Transport, TransportBuilder};
 pub mod auth;
 #[cfg(has_std)]
 pub mod cache;
-#[cfg(has_std)]
+#[cfg(has_cookie)]
 pub mod cookie;
 pub mod error;
 #[cfg(default_backend)]

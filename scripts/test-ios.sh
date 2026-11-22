@@ -15,7 +15,7 @@ set -euo pipefail
 
 feature_sets=("$@")
 if [[ ${#feature_sets[@]} -eq 0 ]]; then
-  feature_sets=("apple-backend,ws,rustls-ring" "hyper-backend,rustls-ring,ws")
+  feature_sets=("apple-backend,cookie,ws,rustls-ring" "hyper-backend,cookie,rustls-ring,ws")
 fi
 
 case "$(uname -m)" in

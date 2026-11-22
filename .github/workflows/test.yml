@@ -20,12 +20,12 @@ jobs:
       - uses: water-rs/stow@main
       - uses: taiki-e/install-action@nextest
       - name: Run curl backend tests
-        run: cargo nextest run --no-default-features --features curl-backend --workspace
+        run: cargo nextest run --no-default-features --features curl-backend,cookie --workspace
       - name: Run curl backend doctests
-        run: cargo test --doc --no-default-features --features curl-backend --workspace
+        run: cargo test --doc --no-default-features --features curl-backend,cookie --workspace
       - name: Run curl backend tests with websockets
         if: matrix.os == 'ubuntu-latest'
-        run: cargo nextest run --no-default-features --features curl-backend,ws,rustls-ring --workspace
+        run: cargo nextest run --no-default-features --features curl-backend,cookie,ws,rustls-ring --workspace
 
   hyper-backend:
     name: Hyper backend (${{ matrix.os }})
@@ -41,13 +41,13 @@ jobs:
       - uses: taiki-e/install-action@nextest
       # `onecrl` only compiles where webpki verifies (Linux here); elsewhere it is a no-op.
       - name: Run hyper backend tests (rustls)
-        run: cargo nextest run --no-default-features --features hyper-backend,rustls-ring,ws,onecrl --workspace
+        run: cargo nextest run --no-default-features --features hyper-backend,cookie,rustls-ring,ws,onecrl --workspace
       - name: Run rustls without rustls-ring (installed CryptoProvider)
         run: cargo nextest run --no-default-features --features hyper-backend,rustls --test custom_crypto_provider
       - name: Run hyper backend tests (native-tls)
-        run: cargo nextest run --no-default-features --features hyper-backend,native-tls,ws --workspace
+        run: cargo nextest run --no-default-features --features hyper-backend,cookie,native-tls,ws --workspace
       - name: Run hyper backend doctests
-        run: cargo test --doc --no-default-features --features hyper-backend,rustls-ring,ws --workspace
+        run: cargo test --doc --no-default-features --features hyper-backend,cookie,rustls-ring,ws --workspace
 
   native-backend:
     # The native backend on each driver runtime, HTTP/2 and HTTP/3 included.
@@ -67,9 +67,9 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo modprobe tls
       - name: Run native backend tests
-        run: cargo nextest run --no-default-features --features native-${{ matrix.runtime }},native-http2,native-http3,native-kernel-tls --workspace
+        run: cargo nextest run --no-default-features --features native-${{ matrix.runtime }},cookie,native-http2,native-http3,native-kernel-tls --workspace
       - name: Run native backend doctests
-        run: cargo test --doc --no-default-features --features native-${{ matrix.runtime }},native-http2,native-http3,native-kernel-tls --workspace
+        run: cargo test --doc --no-default-features --features native-${{ matrix.runtime }},cookie,native-http2,native-http3,native-kernel-tls --workspace
 
   wasm-linux:
     name: wasm-pack (Linux - ${{ matrix.browser }})

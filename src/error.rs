@@ -111,7 +111,7 @@ pub enum Error {
     },
 
     /// Cookie management error.
-    #[cfg(has_std)]
+    #[cfg(has_cookie)]
     #[error("cookie error: {0}")]
     Cookie(#[from] CookieErrorKind),
 
@@ -721,7 +721,7 @@ pub enum ConfigError {
 }
 
 /// Cookie-related errors.
-#[cfg(has_std)]
+#[cfg(has_cookie)]
 #[derive(Debug, Error)]
 pub enum CookieErrorKind {
     /// Failed to load cookies from disk.
@@ -975,7 +975,7 @@ impl Error {
             Self::InvalidUri(_) | Self::InvalidRequest(_) => ErrorKind::Request,
             Self::BodyParse(_) => ErrorKind::BodyParse,
             Self::ResponseBodyTooLarge { .. } => ErrorKind::ResponseBodyLimit,
-            #[cfg(has_std)]
+            #[cfg(has_cookie)]
             Self::Cookie(_) => ErrorKind::Cookie,
             Self::OAuth2(_) => ErrorKind::OAuth2,
             #[cfg(has_std)]

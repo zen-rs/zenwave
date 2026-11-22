@@ -81,6 +81,11 @@ pub(crate) struct RequestCookieJar {
     pub(crate) changed: bool,
 }
 
+/// Converts an `http::Uri` into `url::Url` for `cookie_store` operations.
+pub(crate) fn parse_uri(uri: &http::Uri) -> Option<Url> {
+    Url::parse(&uri.to_string()).ok()
+}
+
 /// The `Cookie` header value `store` sends with a request to `url`, or
 /// `None` when no stored cookie matches it.
 pub(crate) fn cookie_header(store: &Store, url: &Url) -> Option<HeaderValue> {
@@ -260,7 +265,7 @@ impl Middleware for CookieStore {
         #[cfg(reactor)]
         self.prepare().await.map_err(MiddlewareError::Middleware)?;
 
-        let request_url = Url::parse(&request.uri().to_string()).ok();
+        let request_url = parse_uri(request.uri());
         if let Some(url) = &request_url
             && let Some(cookie) = cookie_header(&self.store, url)
         {

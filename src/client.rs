@@ -33,6 +33,10 @@ mod download;
 #[cfg(reactor)]
 pub use download::{DownloadError, DownloadOptions, DownloadReport};
 
+#[cfg(has_std)]
+use crate::cache::Cache;
+#[cfg(has_cookie)]
+use crate::cookie::CookieStore;
 use crate::{
     auth::{BasicAuth, BearerAuth},
     clock::Clocked,
@@ -42,8 +46,6 @@ use crate::{
     timeout::Timeout,
     timeouts::Timeouts,
 };
-#[cfg(has_std)]
-use crate::{cache::Cache, cookie::CookieStore};
 
 /// Builder for HTTP requests using a Client.
 #[derive(Debug)]
@@ -608,13 +610,13 @@ pub trait Client: SendEndpoint + Sized {
     }
 
     /// Enable cookie management.
-    #[cfg(has_std)]
+    #[cfg(has_cookie)]
     fn enable_cookie(self) -> WithMiddleware<Self, CookieStore> {
         WithMiddleware::new(self, CookieStore::default())
     }
 
     /// Enable cookie management with persistent backing storage.
-    #[cfg(reactor)]
+    #[cfg(all(reactor, has_cookie))]
     fn enable_persistent_cookie(self) -> WithMiddleware<Self, CookieStore> {
         WithMiddleware::new(self, CookieStore::persistent_default())
     }

@@ -11,11 +11,13 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "cookie")]
+use zenwave::CookieStore;
 use zenwave::{
     Client, DefaultClient, Timeout, client,
     clock::Clocked,
     endpoint::WithMiddleware,
-    {BasicAuth, BearerAuth, Cache, CookieStore},
+    {BasicAuth, BearerAuth, Cache},
 };
 
 /// Serves `connections` HTTP/1.1 responses with `status` and closes each
@@ -59,10 +61,12 @@ async fn error_for_status_then_timeout_composes() {
 fn every_combinator_keeps_the_clock() {
     assert_clocked(&client().with(zenwave::ErrorForStatus));
     assert_clocked(&client().enable_cache());
+    #[cfg(feature = "cookie")]
     assert_clocked(&client().enable_cookie());
     assert_clocked(&client().bearer_auth("token"));
     assert_clocked(&client().basic_auth("user", Some("password")));
     assert_clocked(&client().follow_redirect());
+    #[cfg(feature = "cookie")]
     assert_clocked(
         &client()
             .enable_cookie()
@@ -92,5 +96,6 @@ struct Named {
     bearer: WithMiddleware<DefaultClient, BearerAuth>,
     basic: WithMiddleware<DefaultClient, BasicAuth>,
     cache: WithMiddleware<DefaultClient, Cache>,
+    #[cfg(feature = "cookie")]
     cookies: WithMiddleware<DefaultClient, CookieStore>,
 }

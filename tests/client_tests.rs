@@ -87,6 +87,10 @@ async fn test_request_builder_json() {
     assert!(json.is_object());
 }
 
+#[cfg(any(
+    feature = "cookie",
+    all(target_arch = "wasm32", not(target_os = "wasi"))
+))]
 #[test_executors::async_test]
 async fn test_client_with_middleware() {
     let mut client = client().enable_cookie();
