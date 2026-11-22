@@ -1820,8 +1820,8 @@ dependencies = [
 
 [[package]]
 name = "http-kit"
-version = "0.8.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#6165752d54534269bc39c89b9a00b030fe2aec06"
+version = "0.8.3"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#09e220c2693e1a1e59203b3f21c57e4eee4e4ec3"
 dependencies = [
  "bytes",
  "bytestr",
@@ -1839,8 +1839,8 @@ dependencies = [
 
 [[package]]
 name = "http-kit-h1"
-version = "0.6.2"
-source = "git+https://github.com/zen-rs/http-kit?branch=main#6165752d54534269bc39c89b9a00b030fe2aec06"
+version = "0.6.3"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#09e220c2693e1a1e59203b3f21c57e4eee4e4ec3"
 dependencies = [
  "bytes",
  "http",

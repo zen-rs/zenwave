@@ -51,12 +51,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.104"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
-
-[[package]]
 name = "ar_archive_writer"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -583,6 +577,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "compio-buf"
+version = "0.8.3"
+source = "git+https://github.com/lexoliu/compio?branch=skyzen#23ce721e472045310d6bf09894836698d8914ae9"
+dependencies = [
+ "bytes",
+ "libc",
+]
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -918,6 +921,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-io"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb1aa714776b75c7e67e1da744b81a129b3ff919c8712b5e1b32252c1f07cc7"
+
+[[package]]
+name = "embedded-io-async"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2564b9f813c544241430e147d8bc454815ef9ac998878d30cc3055449f7fd4c0"
+dependencies = [
+ "embedded-io",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -994,6 +1012,15 @@ dependencies = [
  "async-executor",
  "async-task",
  "smol",
+]
+
+[[package]]
+name = "executor-core"
+version = "0.7.2"
+source = "git+https://github.com/lexoliu/executor-core?branch=main#823322fac4f8a547e330c43cf7033f65fb31aef3"
+dependencies = [
+ "async-channel 2.5.0",
+ "async-task",
 ]
 
 [[package]]
@@ -1583,6 +1610,55 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
+]
+
+[[package]]
+name = "http-kit"
+version = "0.8.3"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#09e220c2693e1a1e59203b3f21c57e4eee4e4ec3"
+dependencies = [
+ "bytes",
+ "bytestr",
+ "cookie",
+ "eyre",
+ "futures-lite 2.6.1",
+ "http",
+ "http-body",
+ "mime",
+ "pin-project-lite",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+]
+
+[[package]]
+name = "http-kit-h1"
+version = "0.6.3"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#09e220c2693e1a1e59203b3f21c57e4eee4e4ec3"
+dependencies = [
+ "async-channel 2.5.0",
+ "bytes",
+ "futures-lite 2.6.1",
+ "http",
+ "http-kit 0.8.3",
+ "http-kit-io",
+ "httparse",
+ "httpdate",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "http-kit-io"
+version = "0.7.0"
+source = "git+https://github.com/zen-rs/http-kit?branch=main#09e220c2693e1a1e59203b3f21c57e4eee4e4ec3"
+dependencies = [
+ "bytes",
+ "compio-buf",
+ "futures-core",
+ "futures-io",
+ "futures-lite 2.6.1",
+ "libc",
 ]
 
 [[package]]
@@ -3222,6 +3298,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha2"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.1",
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3294,7 +3381,7 @@ dependencies = [
  "color-eyre",
  "cookie",
  "ctrlc",
- "executor-core",
+ "executor-core 0.7.1",
  "flate2",
  "futures-channel",
  "futures-core",
@@ -3302,7 +3389,7 @@ dependencies = [
  "headers",
  "http",
  "http-body-util",
- "http-kit",
+ "http-kit 0.4.4",
  "hyper",
  "include_dir",
  "itoa",
@@ -3340,8 +3427,8 @@ version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a72a944a6e08fad83e2c310738bdbd883d1760717b8e5900be5a5d694993c8af"
 dependencies = [
- "executor-core",
- "http-kit",
+ "executor-core 0.7.1",
+ "http-kit 0.4.4",
  "secrecy",
  "serde",
  "serde_json",
@@ -3356,11 +3443,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e9f7b28923f07116c0a493b8737af2039152c9228fecd15851eea66c2138e82"
 dependencies = [
  "async-io 2.6.0",
- "executor-core",
+ "executor-core 0.7.1",
  "futures-util",
  "http-body",
  "http-body-util",
- "http-kit",
+ "http-kit 0.4.4",
  "hyper",
  "skyzen-core",
  "tracing",
@@ -3387,7 +3474,7 @@ dependencies = [
  "hex",
  "humantime-serde",
  "serde",
- "sha2",
+ "sha2 0.10.9",
  "thiserror",
  "toml",
 ]
@@ -3404,7 +3491,7 @@ dependencies = [
  "chrono",
  "futures-core",
  "hex",
- "http-kit",
+ "http-kit 0.4.4",
  "serde",
  "serde_json",
  "skyzen-core",
@@ -3539,7 +3626,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.10.9",
  "smallvec",
  "thiserror",
  "tracing",
@@ -3576,7 +3663,7 @@ dependencies = [
  "quote",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.10.9",
  "sqlx-core",
  "sqlx-mysql",
  "sqlx-postgres",
@@ -3620,7 +3707,7 @@ dependencies = [
  "rsa",
  "serde",
  "sha1 0.10.7",
- "sha2",
+ "sha2 0.10.9",
  "smallvec",
  "sqlx-core",
  "stringprep",
@@ -3661,7 +3748,7 @@ dependencies = [
  "rand 0.8.8",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.10.9",
  "smallvec",
  "sqlx-core",
  "stringprep",
@@ -3800,7 +3887,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand 2.5.0",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.6",
  "windows-sys 0.61.2",
@@ -4390,7 +4477,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -4660,10 +4747,10 @@ dependencies = [
 
 [[package]]
 name = "zenwave"
-version = "0.7.1"
+version = "0.12.0"
 dependencies = [
- "anyhow",
  "arc-swap",
+ "async-channel 2.5.0",
  "async-fs",
  "async-io 2.6.0",
  "async-lock 3.4.2",
@@ -4676,7 +4763,8 @@ dependencies = [
  "cookie_store",
  "dirs",
  "dns-lookup",
- "executor-core",
+ "embedded-io-async",
+ "executor-core 0.7.2",
  "futures-channel",
  "futures-io",
  "futures-rustls",
@@ -4689,7 +4777,9 @@ dependencies = [
  "hickory-resolver",
  "http",
  "http-body-util",
- "http-kit",
+ "http-kit 0.8.3",
+ "http-kit-h1",
+ "http-kit-io",
  "httpdate",
  "hyper",
  "hyper-util",
@@ -4709,10 +4799,9 @@ dependencies = [
  "rustls-webpki",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "socket2 0.6.5",
  "thiserror",
- "time",
- "tower-service",
  "tracing",
  "url",
  "wasm-bindgen",

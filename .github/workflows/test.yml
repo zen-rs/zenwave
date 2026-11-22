@@ -141,11 +141,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           targets: riscv32imac-unknown-none-elf
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test-esp32c6
-          workspaces: |
-            tests/esp32c6-smoke -> target
+      - uses: water-rs/stow@main
       - uses: taiki-e/install-action@v2
         with:
           tool: espflash
