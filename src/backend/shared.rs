@@ -2,18 +2,23 @@
 //! what origin a request belongs to, how an HTTP/1.1 request is shaped for
 //! the path its connection took, and how a received response is logged.
 
-use std::mem::replace;
-
 #[cfg(any(default_hyper, native_backend))]
-use http::{HeaderValue, header, uri::Scheme};
+use alloc::format;
+#[cfg(any(default_hyper, native_backend, embedded_backend))]
+use alloc::{borrow::ToOwned, string::ToString};
+use core::mem::{replace, swap};
+
+#[cfg(any(default_hyper, native_backend, embedded_backend))]
+use http::uri::Scheme;
+#[cfg(any(default_hyper, native_backend))]
+use http::{HeaderValue, header};
 use http_kit::{Body, Method, Request, Response};
 use tracing::debug;
 
+#[cfg(any(default_hyper, native_backend, embedded_backend))]
+use crate::Error;
 #[cfg(any(default_hyper, native_backend))]
-use crate::{
-    Error,
-    transport::route::{Origin, Via},
-};
+use crate::transport::route::{Origin, Via};
 
 /// Takes the request out of the endpoint's slot. Extensions are caller
 /// context, not wire data: they stay on the slot so middleware (the cookie
@@ -24,7 +29,7 @@ pub fn take_request(slot: &mut Request) -> http::Request<Body> {
         .uri("/")
         .body(Body::empty())
         .expect("a GET to `/` is a valid request");
-    std::mem::swap(placeholder.extensions_mut(), slot.extensions_mut());
+    swap(placeholder.extensions_mut(), slot.extensions_mut());
     replace(slot, placeholder)
 }
 
@@ -102,6 +107,23 @@ pub fn shape_h1_request(request: &mut http::Request<Body>, via: &Via) -> Result<
         }
     }
     Ok(())
+}
+
+/// Parses the request URI into `(scheme, host, port)`.
+#[cfg(embedded_backend)]
+pub fn parse_authority(uri: &http::Uri) -> Result<(Scheme, alloc::string::String, u16), Error> {
+    let host = uri
+        .host()
+        .ok_or_else(|| Error::InvalidUri(uri.to_string()))?;
+    let scheme = match uri.scheme_str().unwrap_or("http") {
+        "https" => Scheme::HTTPS,
+        "http" => Scheme::HTTP,
+        other => return Err(Error::InvalidUri(other.to_string())),
+    };
+    let port = uri
+        .port_u16()
+        .unwrap_or(if scheme == Scheme::HTTPS { 443 } else { 80 });
+    Ok((scheme, host.to_owned(), port))
 }
 
 /// Logs the head of a response the backend is about to return. Its status

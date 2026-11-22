@@ -21,9 +21,14 @@
 //! The [`Error`] type implements [`http_kit::HttpError`] trait and provides
 //! rich helper methods for error classification and handling.
 
+#[cfg(has_std)]
+use alloc::sync::Arc;
+use alloc::{boxed::Box, string::String, vec::Vec};
+use core::{error::Error as StdError, fmt, net::SocketAddr};
+#[cfg(has_std)]
+use std::io;
 #[cfg(unix_socket)]
 use std::path::PathBuf;
-use std::{error::Error as StdError, fmt, io, net::SocketAddr, sync::Arc};
 
 use http_kit::{BodyError, ReceiveError, Response, StatusCode};
 use thiserror::Error;
@@ -106,6 +111,7 @@ pub enum Error {
     },
 
     /// Cookie management error.
+    #[cfg(has_std)]
     #[error("cookie error: {0}")]
     Cookie(#[from] CookieErrorKind),
 
@@ -114,6 +120,7 @@ pub enum Error {
     OAuth2(#[from] OAuth2ErrorKind),
 
     /// File download error.
+    #[cfg(has_std)]
     #[error("download error: {0}")]
     Download(#[from] DownloadErrorKind),
 
@@ -122,8 +129,9 @@ pub enum Error {
     WebSocket(#[from] WebSocketErrorKind),
 
     /// I/O error (file operations, etc.).
+    #[cfg(has_std)]
     #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
 
     /// Other uncategorized error.
     #[error("other error: {0}")]
@@ -144,8 +152,8 @@ pub struct HttpErrorResponse {
 
 impl StdError for HttpErrorResponse {}
 
-impl std::fmt::Display for HttpErrorResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for HttpErrorResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "HTTP response with status {}", self.response.status())
     }
 }
@@ -300,6 +308,7 @@ pub enum ResolveError {
     NoAddress,
     /// The resolver failed: every answer was an error other than a missing
     /// name. The first is kept typed, the rest as they came.
+    #[cfg(has_std)]
     #[error("the resolver failed: {first}")]
     Failed {
         /// The first failure.
@@ -338,26 +347,39 @@ pub struct Attempt {
     /// (libcurl, `URLSession`).
     pub addr: Option<SocketAddr>,
     /// What the attempt reported.
+    #[cfg(has_std)]
     pub error: io::Error,
+    /// What the attempt reported on `no_std` targets.
+    #[cfg(not(has_std))]
+    pub error: String,
 }
 
 impl Attempt {
     /// An attempt at `addr` that failed with `error`.
+    #[cfg(has_std)]
     #[must_use]
     pub const fn new(addr: Option<SocketAddr>, error: io::Error) -> Self {
         Self { addr, error }
     }
 
+    /// An attempt at `addr` that failed with `error` on `no_std` targets.
+    #[cfg(not(has_std))]
+    #[must_use]
+    pub const fn new(addr: Option<SocketAddr>, error: String) -> Self {
+        Self { addr, error }
+    }
+
     /// The attempts as `: addr: error; addr: error`, or nothing for none.
     fn summary(attempts: &[Self]) -> String {
+        use core::fmt::Write as _;
+
         let mut text = String::new();
         for (index, attempt) in attempts.iter().enumerate() {
             text.push_str(if index == 0 { ": " } else { "; " });
             if let Some(addr) = attempt.addr {
-                text.push_str(&addr.to_string());
-                text.push_str(": ");
+                let _ = write!(text, "{addr}: ");
             }
-            text.push_str(&attempt.error.to_string());
+            let _ = write!(text, "{}", attempt.error);
         }
         text
     }
@@ -438,6 +460,7 @@ pub enum SocksError {
     #[error("the SOCKS5 proxy refused the credentials")]
     Auth,
     /// The connection to the proxy failed during the handshake.
+    #[cfg(has_std)]
     #[error("the connection to the SOCKS5 proxy failed: {0}")]
     Io(#[source] io::Error),
 }
@@ -533,13 +556,14 @@ pub enum ExchangeFailure {
 #[non_exhaustive]
 pub enum Cause {
     /// A socket or file operation failed.
+    #[cfg(has_std)]
     #[error(transparent)]
     Io(Arc<io::Error>),
     /// A response body a peer was sending ended early.
     #[error(transparent)]
     Receive(ReceiveError),
-    /// The native backend's HTTP/1.1 client.
-    #[cfg(native_backend)]
+    /// The native or embedded backend's HTTP/1.1 client.
+    #[cfg(any(native_backend, embedded_backend))]
     #[error(transparent)]
     H1(http_kit_h1::Error),
     /// The native backend's HTTP/2 client.
@@ -555,16 +579,18 @@ pub enum Cause {
     #[error(transparent)]
     H3(http_kit_h3::Error),
     /// rustls.
-    #[cfg(tls_rustls)]
-    #[error(transparent)]
+    #[cfg(rustls_error)]
+    #[cfg_attr(has_std, error(transparent))]
+    #[cfg_attr(not(has_std), error("{0}"))]
     Rustls(rustls::Error),
     /// The platform's TLS library through `native-tls`.
     #[cfg(tls_native)]
     #[error(transparent)]
     NativeTls(native_tls::Error),
     /// A PEM document that is not one.
-    #[cfg(native)]
-    #[error(transparent)]
+    #[cfg(extra_roots)]
+    #[cfg_attr(has_std, error(transparent))]
+    #[cfg_attr(not(has_std), error("{0}"))]
     Pem(rustls_pki_types::pem::Error),
     /// hyper.
     #[cfg(connector)]
@@ -622,13 +648,14 @@ pub enum Cause {
     Detail(String),
 }
 
+#[cfg(has_std)]
 impl From<io::Error> for Cause {
     fn from(error: io::Error) -> Self {
         Self::Io(Arc::new(error))
     }
 }
 
-#[cfg(tls_rustls)]
+#[cfg(rustls_error)]
 impl From<rustls::Error> for Cause {
     fn from(error: rustls::Error) -> Self {
         Self::Rustls(error)
@@ -642,7 +669,7 @@ impl From<native_tls::Error> for Cause {
     }
 }
 
-#[cfg(tls_rustls)]
+#[cfg(rustls_error)]
 impl TlsFailure {
     /// How rustls's error classifies: a certificate that did not verify, a
     /// received alert, or any other protocol failure.
@@ -694,6 +721,7 @@ pub enum ConfigError {
 }
 
 /// Cookie-related errors.
+#[cfg(has_std)]
 #[derive(Debug, Error)]
 pub enum CookieErrorKind {
     /// Failed to load cookies from disk.
@@ -735,6 +763,7 @@ pub enum OAuth2ErrorKind {
 }
 
 /// Download-related errors.
+#[cfg(has_std)]
 #[derive(Debug, Error)]
 pub enum DownloadErrorKind {
     /// Server returned an error status.
@@ -769,19 +798,25 @@ pub enum WebSocketErrorKind {
 impl Error {
     /// A TLS configuration failure: the engine could not be built from the
     /// transport's settings.
-    #[cfg(any(tls_engine, http3, native_h3, all(reactor, feature = "curl-backend")))]
+    #[cfg(any(
+        tls_engine,
+        embedded_tls,
+        http3,
+        native_h3,
+        all(reactor, feature = "curl-backend")
+    ))]
     pub(crate) fn tls_config(cause: impl Into<Cause>) -> Self {
         Self::Config(ConfigError::Tls(cause.into()))
     }
 
     /// A trust-store failure.
-    #[cfg(native)]
+    #[cfg(extra_roots)]
     pub(crate) fn trust_store(cause: impl Into<Cause>) -> Self {
         Self::Config(ConfigError::TrustStore(cause.into()))
     }
 
     /// A failure to connect to `host`:`port`, the `hop` of the route.
-    #[cfg(any(native, wasi_backend))]
+    #[cfg(any(native, wasi_backend, embedded_backend))]
     pub(crate) fn connect(
         hop: Hop,
         host: impl Into<String>,
@@ -830,7 +865,9 @@ impl Error {
                 error.failure,
                 ExchangeFailure::Terminated | ExchangeFailure::Incomplete | ExchangeFailure::Io
             ),
-            Self::Timeout(_) | Self::Io(_) => true,
+            Self::Timeout(_) => true,
+            #[cfg(has_std)]
+            Self::Io(_) => true,
             _ => false,
         }
     }
@@ -895,8 +932,10 @@ impl Error {
     ///     message: String,
     /// }
     ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut client = zenwave::client().error_for_status();
+    /// # async fn example<C: zenwave::Client<Error = zenwave::Error>>(
+    /// #     base: C,
+    /// # ) -> Result<(), Box<dyn core::error::Error>> {
+    /// let mut client = base.error_for_status();
     /// let result = client.get("https://api.example.com/data")?.await;
     /// match result.map_err(zenwave::Error::from) {
     ///     Err(e) => {
@@ -936,10 +975,13 @@ impl Error {
             Self::InvalidUri(_) | Self::InvalidRequest(_) => ErrorKind::Request,
             Self::BodyParse(_) => ErrorKind::BodyParse,
             Self::ResponseBodyTooLarge { .. } => ErrorKind::ResponseBodyLimit,
+            #[cfg(has_std)]
             Self::Cookie(_) => ErrorKind::Cookie,
             Self::OAuth2(_) => ErrorKind::OAuth2,
+            #[cfg(has_std)]
             Self::Download(_) => ErrorKind::Download,
             Self::WebSocket(_) => ErrorKind::WebSocket,
+            #[cfg(has_std)]
             Self::Io(_) => ErrorKind::Io,
             Self::Other(_) => ErrorKind::Other,
         }
@@ -986,8 +1028,8 @@ pub enum ErrorKind {
     Other,
 }
 
-impl std::fmt::Display for ErrorKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Http => write!(f, "http"),
             Self::Connect => write!(f, "connect"),
@@ -1016,8 +1058,9 @@ impl http_kit::HttpError for Error {
             Self::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             Self::Connect(_) | Self::Exchange(_) => StatusCode::BAD_GATEWAY,
             Self::Http { status, .. }
-            | Self::OAuth2(OAuth2ErrorKind::TokenEndpointError { status, .. })
-            | Self::Download(DownloadErrorKind::UpstreamError(status)) => *status,
+            | Self::OAuth2(OAuth2ErrorKind::TokenEndpointError { status, .. }) => *status,
+            #[cfg(has_std)]
+            Self::Download(DownloadErrorKind::UpstreamError(status)) => *status,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -1053,6 +1096,12 @@ impl From<ReceiveError> for Error {
             _ => ExchangeFailure::Io,
         };
         Self::exchange(failure, Cause::Receive(error))
+    }
+}
+
+impl From<core::convert::Infallible> for Error {
+    fn from(never: core::convert::Infallible) -> Self {
+        match never {}
     }
 }
 

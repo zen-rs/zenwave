@@ -7,11 +7,13 @@
 //! names a `Send` sleep future; each backend supplies the one that works on
 //! its own runtime through [`Clocked`].
 
-use std::{future::Future, time::Duration};
+use core::{future::Future, time::Duration};
 
 use http_kit::endpoint::WithMiddleware;
 
 use crate::Client;
+#[cfg(embedded_backend)]
+pub use crate::backend::embedded::TimerClock;
 #[cfg(native_backend)]
 pub use crate::backend::native::{PoolClock, PoolSleep};
 #[cfg(browser)]

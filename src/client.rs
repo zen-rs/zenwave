@@ -1,9 +1,22 @@
 #![allow(clippy::cast_sign_loss)]
 
-use core::{fmt::Display, pin::Pin, time::Duration};
-use std::marker::PhantomData;
-use std::{fmt::Debug, future::Future};
+#[cfg(has_std)]
+use alloc::vec;
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+use core::{
+    fmt::{Debug, Display},
+    future::Future,
+    marker::PhantomData,
+    pin::Pin,
+    time::Duration,
+};
 
+#[cfg(has_std)]
 use futures_io::AsyncRead;
 use futures_util::{Stream, StreamExt};
 use http::{HeaderName, HeaderValue, header};
@@ -22,15 +35,15 @@ pub use download::{DownloadError, DownloadOptions, DownloadReport};
 
 use crate::{
     auth::{BasicAuth, BearerAuth},
-    cache::Cache,
     clock::Clocked,
-    cookie::CookieStore,
     redirect::FollowRedirect,
     retry::Retry,
     status::ErrorForStatus,
     timeout::Timeout,
     timeouts::Timeouts,
 };
+#[cfg(has_std)]
+use crate::{cache::Cache, cookie::CookieStore};
 
 /// Builder for HTTP requests using a Client.
 #[derive(Debug)]
@@ -174,6 +187,7 @@ impl<T: Client> RequestBuilder<'_, T> {
     }
 
     /// Provide an async reader as the request body.
+    #[cfg(has_std)]
     pub fn reader_body<R>(mut self, reader: R, length: Option<u64>) -> Self
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
@@ -227,7 +241,7 @@ impl<T: Client> RequestBuilder<'_, T> {
     where
         Chunk: Into<Bytes> + Send + 'static,
         ErrType: Into<Box<dyn core::error::Error + Send + Sync>> + Send + Sync + 'static,
-        S: Stream<Item = std::result::Result<Chunk, ErrType>> + Send + Sync + 'static,
+        S: Stream<Item = core::result::Result<Chunk, ErrType>> + Send + Sync + 'static,
     {
         let mapped = stream.map(|result| result.map_err(Into::into));
         *self.request.body_mut() = http_kit::Body::from_stream(mapped);
@@ -297,6 +311,7 @@ where
     /// # Errors
     ///
     /// Returns an error if the request fails or the response body cannot be decoded into `Res`.
+    #[cfg(has_std)]
     pub async fn form<Res: DeserializeOwned>(self) -> Result<Res, crate::Error> {
         let response = self.await.map_err(Into::into)?;
         let mut body = response.into_body();
@@ -587,11 +602,13 @@ pub trait Client: SendEndpoint + Sized {
     }
 
     /// Enable HTTP caching middleware.
+    #[cfg(has_std)]
     fn enable_cache(self) -> WithMiddleware<Self, Cache> {
         WithMiddleware::new(self, Cache::new())
     }
 
     /// Enable cookie management.
+    #[cfg(has_std)]
     fn enable_cookie(self) -> WithMiddleware<Self, CookieStore> {
         WithMiddleware::new(self, CookieStore::default())
     }
