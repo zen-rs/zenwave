@@ -57,7 +57,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: water-rs/stow@main
         with:
           shared-key: features-${{ matrix.os }}
       - uses: taiki-e/install-action@cargo-hack
@@ -74,7 +74,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown,wasm32-wasip2
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: water-rs/stow@main
         with:
           shared-key: ci-ubuntu
       - run: cargo build --target wasm32-unknown-unknown
@@ -189,7 +189,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: water-rs/stow@main
         with:
           shared-key: mobile-${{ matrix.target }}
       - name: Configure Android NDK compiler
@@ -227,7 +227,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
+      - uses: water-rs/stow@main
         with:
           shared-key: ci-ubuntu
       - uses: taiki-e/install-action@cargo-llvm-cov
@@ -245,7 +245,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: water-rs/stow@main
         with:
           shared-key: ci-ubuntu
       - name: Generate Lockfile
