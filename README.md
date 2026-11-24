@@ -95,29 +95,49 @@ Built-in middleware:
 Redirects are on by default. Call `zenwave::client().disable_redirect()` to get the
 raw backend, or build one with `DefaultClient::raw(transport)`.
 
-## File downloads with resume
+## Concurrent downloads with resume and progress
 
 ```rust
-use zenwave::Client;
+use std::num::{NonZeroU64, NonZeroUsize};
+use zenwave::{Client, ConnectionMode, ResumeMode};
 
 async fn example() -> zenwave::Result<()> {
     let mut client = zenwave::client();
+
+    // Concurrent in-memory download
+    let bytes = client
+        .get("https://example.com/archive.tar.gz")?
+        .download()
+        .max_bytes(64 * 1024 * 1024)
+        .on_progress(|p| println!("{}/{:?}", p.downloaded, p.total))
+        .bytes()
+        .await?;
+
+    // Concurrent file download with crash-safe .part/.part.json sidecar resume
     let report = client
         .get("https://example.com/big.iso")?
-        .download_to_path("big.iso")
+        .download()
+        .concurrency(NonZeroUsize::new(8).unwrap())
+        .chunk_size(NonZeroU64::new(2 * 1024 * 1024).unwrap())
+        .connection_mode(ConnectionMode::SharedPool)
+        .to_path("big.iso")
+        .resume_mode(ResumeMode::Sidecar)
         .await?;
 
     println!(
-        "resumed from {} bytes, wrote {} new bytes",
-        report.resumed_from, report.bytes_written
+        "resumed from {} bytes, wrote {} new bytes from {}",
+        report.resumed_from, report.bytes_written, report.effective_uri
     );
+    let _ = bytes;
     Ok(())
 }
 ```
 
-If the file already exists, zenwave sends a `Range` header and appends. Pass
-`DownloadOptions { resume_existing: false }` via `.download_to_path_with()` to
-start from scratch. Native only.
+Use `.download_bytes()` or `.download_to_path(path)` for defaults. When the
+optional `progressor` feature is enabled, `BytesDownload` and `FileDownload`
+implement `progressor::Progress<Update = DownloadProgress>` so callers can use
+`progressor::ProgressExt::observe`. File downloads require a native OS reactor;
+in-memory downloads work everywhere `std` is available.
 
 ## WebSockets
 

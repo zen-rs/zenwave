@@ -45,7 +45,7 @@ pub trait ResponseExt {
     /// `limit`, or a body parsing error when the response stream fails.
     fn into_bytes_with_limit(
         self,
-        limit: usize,
+        limit: u64,
     ) -> impl Future<Output = Result<Bytes, crate::Error>> + Send;
 
     /// Consumes the response, returning it unchanged unless its status is a
@@ -83,18 +83,21 @@ impl ResponseExt for crate::Response {
         self.into_body().into_bytes()
     }
 
-    async fn into_bytes_with_limit(self, limit: usize) -> Result<Bytes, crate::Error> {
+    async fn into_bytes_with_limit(self, limit: u64) -> Result<Bytes, crate::Error> {
         let mut body = self.into_body().into_data_stream();
         let mut bytes = Vec::new();
+        let mut total = 0_u64;
         while let Some(chunk) = body.next().await {
             let chunk = chunk?;
-            let next_len = bytes
-                .len()
-                .checked_add(chunk.len())
+            let chunk_len = u64::try_from(chunk.len())
+                .map_err(|_| crate::Error::ResponseBodyTooLarge { limit })?;
+            let next_len = total
+                .checked_add(chunk_len)
                 .ok_or(crate::Error::ResponseBodyTooLarge { limit })?;
             if next_len > limit {
                 return Err(crate::Error::ResponseBodyTooLarge { limit });
             }
+            total = next_len;
             bytes.extend_from_slice(&chunk);
         }
         Ok(bytes.into())

@@ -54,9 +54,10 @@ use crate::{
 unsafe extern "C" {}
 
 /// HTTP backend backed by Apple's `URLSession`.
+#[derive(Clone)]
 pub struct AppleBackend {
     transport: Transport,
-    sessions: HashMap<SessionKey, Session>,
+    sessions: Arc<Mutex<HashMap<SessionKey, Session>>>,
 }
 
 /// A request `URLSession` cannot be given.
@@ -102,13 +103,13 @@ impl AppleBackend {
     pub fn new(transport: Transport) -> Self {
         Self {
             transport,
-            sessions: HashMap::new(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// The session whose proxy configuration matches `destination`, and the
     /// header the request itself must carry to get through.
-    fn route_for(&mut self, destination: &Uri) -> Result<Route, Error> {
+    fn route_for(&self, destination: &Uri) -> Result<Route, Error> {
         let rules = self.transport.proxy();
         let key = match rules.source() {
             Source::System => SessionKey::System,
@@ -119,14 +120,19 @@ impl AppleBackend {
                 })?,
         };
         let proxy_authorization = key.preemptive_authorization(destination);
-        let session = if let Some(session) = self.sessions.get(&key) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session = if let Some(session) = sessions.get(&key) {
             session.handle()
         } else {
             let session = Session::open(&key, self.transport.extra_roots())?;
             let handle = session.handle();
-            self.sessions.insert(key, session);
+            sessions.insert(key, session);
             handle
         };
+        drop(sessions);
         Ok(Route {
             session,
             proxy_authorization,
@@ -167,9 +173,14 @@ impl Endpoint for AppleBackend {
 
 impl core::fmt::Debug for AppleBackend {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let session_count = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
         f.debug_struct("AppleBackend")
             .field("transport", &self.transport)
-            .field("sessions", &self.sessions.len())
+            .field("sessions", &session_count)
             .finish()
     }
 }
@@ -320,6 +331,11 @@ struct Session {
     _delegate: StrongPtr,
     _queue: StrongPtr,
 }
+
+#[allow(clippy::non_send_fields_in_send_ty)]
+unsafe impl Send for Session {}
+#[allow(clippy::non_send_fields_in_send_ty)]
+unsafe impl Sync for Session {}
 
 impl Session {
     fn open(key: &SessionKey, extra_roots: &[CertificateDer<'static>]) -> Result<Self, Error> {
@@ -1056,7 +1072,7 @@ mod tests {
             .proxy(rules)
             .build()
             .expect("transport builds");
-        let mut backend = AppleBackend::new(transport);
+        let backend = AppleBackend::new(transport);
 
         let proxied = |path: &str| format!("https://github.com/zen-rs/{path}").parse().unwrap();
         let first = backend.route_for(&proxied("zenwave")).unwrap().session;
@@ -1072,12 +1088,12 @@ mod tests {
             direct.as_ptr(),
             "direct traffic gets its own session"
         );
-        assert_eq!(backend.sessions.len(), 2);
+        assert_eq!(backend.sessions.lock().unwrap().len(), 2);
     }
 
     #[test]
     fn system_rules_share_one_session() {
-        let mut backend = AppleBackend::default();
+        let backend = AppleBackend::default();
         let a = backend
             .route_for(&"https://github.com/".parse().unwrap())
             .unwrap()
@@ -1087,7 +1103,7 @@ mod tests {
             .unwrap()
             .session;
         assert_eq!(a.as_ptr(), b.as_ptr());
-        assert_eq!(backend.sessions.len(), 1);
+        assert_eq!(backend.sessions.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -1099,7 +1115,7 @@ mod tests {
             .proxy(rules)
             .build()
             .expect("transport builds");
-        let mut backend = AppleBackend::new(transport);
+        let backend = AppleBackend::new(transport);
 
         let plaintext = backend
             .route_for(&"http://github.com/".parse().unwrap())

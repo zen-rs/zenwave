@@ -16,6 +16,18 @@ use crate::clock::Clocked;
 use crate::cookie::{RequestCookieJar, cookie_header, parse_uri, store_response_cookies};
 use crate::{Body, Request, Response, StatusCode, client::Client};
 
+/// Final redirect state attached to a response by [`FollowRedirect`] so
+/// callers (such as multi-range downloads) can pin subsequent requests to the
+/// resolved URI and know whether credentials were stripped across origins.
+#[cfg_attr(not(has_std), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub(crate) struct RedirectOutcome {
+    /// Final URI that produced the response.
+    pub(crate) effective_uri: Uri,
+    /// Whether any hop crossed origins and stripped `Authorization` / `Cookie`.
+    pub(crate) stripped_credentials: bool,
+}
+
 /// Middleware that follows HTTP redirects.
 ///
 /// A `301`/`302` converts a `POST` — and only a `POST` — into a bodyless `GET`, a `303`
@@ -136,6 +148,7 @@ impl<C: Client> FollowRedirect<C> {
         if !same_origin(&state.uri, &next_uri) {
             state.headers.remove(AUTHORIZATION);
             state.headers.remove(COOKIE);
+            state.stripped_credentials = true;
         }
 
         // A response that redirects is a hop: its `Set-Cookie` headers
@@ -144,6 +157,9 @@ impl<C: Client> FollowRedirect<C> {
         if let Some(jar) = request.extensions_mut().get_mut::<RequestCookieJar>()
             && let Some(hop_url) = parse_uri(&state.uri)
         {
+            for value in response.headers().get_all(http_kit::header::SET_COOKIE) {
+                jar.hop_set_cookies.push((hop_url.clone(), value.clone()));
+            }
             jar.changed |= store_response_cookies(&mut jar.store, response.headers(), &hop_url);
         }
 
@@ -336,7 +352,7 @@ fn build_uri(scheme: &str, authority: &str, path_and_query: &str) -> Option<Uri>
         .ok()
 }
 
-fn same_origin(left: &Uri, right: &Uri) -> bool {
+pub(crate) fn same_origin(left: &Uri, right: &Uri) -> bool {
     let (Some(ls), Some(rs)) = (left.scheme_str(), right.scheme_str()) else {
         return false;
     };
@@ -382,6 +398,8 @@ struct RedirectState {
     had_body: bool,
     /// Hops taken so far.
     count: u32,
+    /// Whether any hop crossed origins and stripped credentials.
+    stripped_credentials: bool,
 }
 
 /// Errors encountered while following HTTP redirects.
@@ -461,10 +479,11 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
             },
             had_body,
             count: 0,
+            stripped_credentials: false,
         };
 
         loop {
-            let response = self
+            let mut response = self
                 .client
                 .respond_send(request)
                 .await
@@ -487,6 +506,10 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
                     | StatusCode::TEMPORARY_REDIRECT
                     | StatusCode::PERMANENT_REDIRECT
             ) {
+                response.extensions_mut().insert(RedirectOutcome {
+                    effective_uri: state.uri,
+                    stripped_credentials: state.stripped_credentials,
+                });
                 return Ok(response);
             }
 
@@ -495,9 +518,14 @@ impl<C: Client> Endpoint for FollowRedirect<C> {
             }
             state.count += 1;
 
-            match Self::next_hop(request, &response, &mut state)? {
-                Some(next_request) => *request = next_request,
-                None => return Ok(response),
+            if let Some(next_request) = Self::next_hop(request, &response, &mut state)? {
+                *request = next_request;
+            } else {
+                response.extensions_mut().insert(RedirectOutcome {
+                    effective_uri: state.uri,
+                    stripped_credentials: state.stripped_credentials,
+                });
+                return Ok(response);
             }
         }
     }

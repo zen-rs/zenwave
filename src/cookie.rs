@@ -9,6 +9,8 @@ use http_kit::header::HeaderValue;
 use http_kit::middleware::MiddlewareError;
 use url::Url;
 
+use std::sync::{Arc, Mutex, PoisonError};
+
 #[cfg(reactor)]
 use {
     async_fs,
@@ -17,22 +19,22 @@ use {
         collections::HashMap,
         io::ErrorKind,
         path::{Path, PathBuf},
-        sync::{Arc, LazyLock},
+        sync::LazyLock,
     },
 };
 
 /// Middleware for managing cookies in HTTP requests and responses.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CookieStore {
-    store: Store,
+    store: Arc<Mutex<Store>>,
     #[cfg(reactor)]
-    persistence: Option<Persistence>,
+    persistence: Option<Arc<AsyncMutex<Persistence>>>,
 }
 
 impl Default for CookieStore {
     fn default() -> Self {
         Self {
-            store: new_store(),
+            store: Arc::new(Mutex::new(new_store())),
             #[cfg(reactor)]
             persistence: None,
         }
@@ -70,8 +72,11 @@ fn new_store() -> Store {
 /// only ever replaces the request it came from.
 #[derive(Debug, Clone)]
 pub(crate) struct RequestCookieJar {
-    /// The jar, owned by the request until `CookieStore` takes it back.
+    /// Snapshot of the jar for building `Cookie` headers across redirect hops.
     pub(crate) store: Store,
+    /// `Set-Cookie` headers received on intermediate redirect hops, replayed
+    /// back into the shared store once the request finishes.
+    pub(crate) hop_set_cookies: Vec<(Url, HeaderValue)>,
     /// The URL the chain's last response came from — the final redirect
     /// hop — or `None` when the request URL never changed. `CookieStore`
     /// stores the returned response's `Set-Cookie` headers against it.
@@ -163,41 +168,37 @@ impl CookieStore {
     #[cfg(reactor)]
     pub fn persistent_with_path(path: impl Into<PathBuf>) -> Self {
         Self {
-            store: new_store(),
-            persistence: Some(Persistence::new(path.into())),
+            store: Arc::new(Mutex::new(new_store())),
+            persistence: Some(Arc::new(AsyncMutex::new(Persistence::new(path.into())))),
         }
     }
 
     #[cfg(reactor)]
-    async fn prepare(&mut self) -> Result<(), CookieError> {
-        if let Some(path) = self
-            .persistence
-            .as_ref()
-            .filter(|p| !p.initialized)
-            .map(|p| p.path.clone())
-        {
+    async fn prepare(&self) -> Result<(), CookieError> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        let mut guard = persistence.lock().await;
+        if !guard.initialized {
+            let path = guard.path.clone();
             self.load_from_disk(&path).await?;
-            if let Some(persistence) = self
-                .persistence
-                .as_mut()
-                .filter(|persist| persist.path == path)
-            {
-                persistence.initialized = true;
-            }
+            guard.initialized = true;
         }
+        drop(guard);
         Ok(())
     }
 
     #[cfg(reactor)]
     async fn finalize(&self, updated: bool) -> Result<(), CookieError> {
         if updated && let Some(persistence) = &self.persistence {
-            self.persist_to_path(&persistence.path).await?;
+            let path = persistence.lock().await.path.clone();
+            self.persist_to_path(&path).await?;
         }
         Ok(())
     }
 
     #[cfg(reactor)]
-    async fn load_from_disk(&mut self, path: &Path) -> Result<(), CookieError> {
+    async fn load_from_disk(&self, path: &Path) -> Result<(), CookieError> {
         let lock = file_mutex(path).await;
         let _guard = lock.lock().await;
 
@@ -216,7 +217,7 @@ impl CookieStore {
                 .map_err(CookieError::FailToParseCookiesFromDisk)?;
             #[cfg(feature = "public-suffix")]
             let loaded = loaded.with_suffix_list(public_suffix_list());
-            self.store = loaded;
+            *self.store.lock().unwrap_or_else(PoisonError::into_inner) = loaded;
         }
 
         Ok(())
@@ -228,10 +229,13 @@ impl CookieStore {
         let _guard = lock.lock().await;
 
         let mut data = Vec::new();
-        // Everything in the jar is written, session cookies included — a
-        // reload reproduces the jar exactly.
-        cookie_store::serde::json::save_incl_expired_and_nonpersistent(&self.store, &mut data)
-            .map_err(CookieError::FailToPersistCookiesToDisk)?;
+        {
+            let store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+            // Everything in the jar is written, session cookies included — a
+            // reload reproduces the jar exactly.
+            cookie_store::serde::json::save_incl_expired_and_nonpersistent(&store, &mut data)
+                .map_err(CookieError::FailToPersistCookiesToDisk)?;
+        }
 
         if let Some(parent) = path.parent() {
             async_fs::create_dir_all(parent)
@@ -266,44 +270,64 @@ impl Middleware for CookieStore {
         self.prepare().await.map_err(MiddlewareError::Middleware)?;
 
         let request_url = parse_uri(request.uri());
-        if let Some(url) = &request_url
-            && let Some(cookie) = cookie_header(&self.store, url)
-        {
-            request.headers_mut().insert(header::COOKIE, cookie);
-        }
+        let snapshot = {
+            let store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(url) = &request_url
+                && let Some(cookie) = cookie_header(&store, url)
+            {
+                request.headers_mut().insert(header::COOKIE, cookie);
+            }
+            store.clone()
+        };
 
-        // Lend the jar to the chain: `FollowRedirect` finds it in the
-        // request's extensions and handles cookies per hop. It is taken
-        // back below on both paths — `next` erroring must not strand it.
+        // Lend a jar snapshot to the chain: `FollowRedirect` updates it per
+        // hop and records hop `Set-Cookie` headers so concurrent requests on
+        // cloned `CookieStore`s never serialize behind a lock across awaits.
         request.extensions_mut().insert(RequestCookieJar {
-            store: std::mem::take(&mut self.store),
+            store: snapshot,
+            hop_set_cookies: Vec::new(),
             response_url: None,
             changed: false,
         });
 
         let result = next.respond(request).await;
 
-        let mut jar = request
+        let jar = request
             .extensions_mut()
             .remove::<RequestCookieJar>()
             .expect("an endpoint below CookieStore dropped the request's extensions");
-        self.store = std::mem::take(&mut jar.store);
+
+        let mut changed = false;
+        {
+            let mut store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+            for (hop_url, value) in &jar.hop_set_cookies {
+                if let Ok(raw) = value.to_str()
+                    && let Ok(cookie) = RawCookie::parse(raw.to_owned())
+                {
+                    changed |= store.insert_raw(&cookie, hop_url).is_ok();
+                }
+            }
+            if let Ok(response) = &result
+                && let Some(url) = jar.response_url.or(request_url)
+            {
+                changed |= store_response_cookies(&mut store, response.headers(), &url);
+            }
+            drop(store);
+        }
+        #[cfg(not(reactor))]
+        let _ = changed;
 
         match result {
             Ok(response) => {
-                if let Some(url) = jar.response_url.or(request_url) {
-                    jar.changed |=
-                        store_response_cookies(&mut self.store, response.headers(), &url);
-                }
                 #[cfg(reactor)]
-                self.finalize(jar.changed)
+                self.finalize(changed)
                     .await
                     .map_err(MiddlewareError::Middleware)?;
                 Ok(response)
             }
             Err(err) => {
                 #[cfg(reactor)]
-                if let Err(persist) = self.finalize(jar.changed).await {
+                if let Err(persist) = self.finalize(changed).await {
                     tracing::warn!(error = %persist, "failed to persist cookies after endpoint error");
                 }
                 Err(MiddlewareError::Endpoint(err))

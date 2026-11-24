@@ -30,8 +30,14 @@ impl Middleware for BearerAuth {
         request: &mut Request,
         mut next: E,
     ) -> Result<Response, http_kit::middleware::MiddlewareError<E::Error, Self::Error>> {
-        // Only add auth header if one isn't already present
-        if !request.headers().contains_key(header::AUTHORIZATION) {
+        // Only add auth header if one isn't already present and not suppressed
+        // (e.g. follow-up chunks after a cross-origin redirect stripped credentials).
+        if !request.headers().contains_key(header::AUTHORIZATION)
+            && request
+                .extensions()
+                .get::<crate::client::SuppressAuth>()
+                .is_none()
+        {
             let auth_value = format!("Bearer {}", self.token);
             request
                 .headers_mut()
@@ -69,8 +75,14 @@ impl Middleware for BasicAuth {
         request: &mut Request,
         mut next: E,
     ) -> Result<Response, http_kit::middleware::MiddlewareError<E::Error, Self::Error>> {
-        // Only add auth header if one isn't already present
-        if !request.headers().contains_key(header::AUTHORIZATION) {
+        // Only add auth header if one isn't already present and not suppressed
+        // (e.g. follow-up chunks after a cross-origin redirect stripped credentials).
+        if !request.headers().contains_key(header::AUTHORIZATION)
+            && request
+                .extensions()
+                .get::<crate::client::SuppressAuth>()
+                .is_none()
+        {
             use base64::Engine;
 
             let credentials = match &self.password {

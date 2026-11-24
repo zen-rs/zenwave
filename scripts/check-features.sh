@@ -56,6 +56,7 @@ without_engine() {
 
   echo "::group::default features and the engine shorthands"
   cargo clippy --all-targets -- -D warnings
+  cargo clippy --all-targets --features progressor -- -D warnings
   cargo clippy --all-targets --no-default-features --features hyper-rustls,ws -- -D warnings
   cargo clippy --all-targets --no-default-features --features hyper-native-tls,ws -- -D warnings
   echo "::endgroup::"

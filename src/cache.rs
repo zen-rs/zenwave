@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -16,9 +17,9 @@ use http_kit::{Endpoint, HttpError, Middleware, Request, Response, middleware::M
 /// The cache honors the core HTTP caching directives (`Cache-Control`, `Expires`, `ETag`,
 /// `Last-Modified`) so it can serve fresh responses locally and transparently revalidate stale
 /// entries using conditional requests.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Cache {
-    entries: HashMap<String, CachedResponse>,
+    entries: Arc<Mutex<HashMap<String, CachedResponse>>>,
 }
 
 impl Cache {
@@ -26,7 +27,7 @@ impl Cache {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -56,7 +57,10 @@ impl Middleware for Cache {
 
         let request_cc = CacheControl::from_header_map(request.headers());
         if request_cc.no_store {
-            self.entries.remove(&key);
+            self.entries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&key);
             return next
                 .respond(request)
                 .await
@@ -64,30 +68,33 @@ impl Middleware for Cache {
         }
 
         let now = Instant::now();
-        if let Some(entry) = self.entries.get(&key)
-            && !request_cc.no_cache
-            && !entry.must_revalidate
-            && entry.is_fresh(now)
+        let mut cached_entry = None;
         {
-            return Ok(entry.to_response(now));
+            let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(entry) = entries.get(&key)
+                && !request_cc.no_cache
+                && !entry.must_revalidate
+                && entry.is_fresh(now)
+            {
+                return Ok(entry.to_response(now));
+            }
+
+            if let Some(entry) = entries.get(&key) {
+                let entry_requires_revalidation = entry.must_revalidate || !entry.is_fresh(now);
+                let needs_revalidation = request_cc.no_cache || entry_requires_revalidation;
+                if needs_revalidation && entry.can_revalidate() {
+                    let owned_entry = entries.remove(&key).unwrap();
+                    owned_entry.apply_conditional_headers(request.headers_mut());
+                    cached_entry = Some(owned_entry);
+                } else if entry_requires_revalidation && !entry.can_revalidate() {
+                    entries.remove(&key);
+                }
+            }
         }
 
         // Read before sending: the backend takes the request out of `request`,
         // so its headers are gone once `respond` returns.
         let auth_present = request.headers().contains_key(header::AUTHORIZATION);
-
-        let mut cached_entry = None;
-        if let Some(entry) = self.entries.get(&key) {
-            let entry_requires_revalidation = entry.must_revalidate || !entry.is_fresh(now);
-            let needs_revalidation = request_cc.no_cache || entry_requires_revalidation;
-            if needs_revalidation && entry.can_revalidate() {
-                let owned_entry = self.entries.remove(&key).unwrap();
-                owned_entry.apply_conditional_headers(request.headers_mut());
-                cached_entry = Some(owned_entry);
-            } else if entry_requires_revalidation && !entry.can_revalidate() {
-                self.entries.remove(&key);
-            }
-        }
 
         let response = next
             .respond(request)
@@ -97,7 +104,10 @@ impl Middleware for Cache {
             if let Some(mut entry) = cached_entry {
                 entry.update_from_304(&response, now);
                 let response = entry.to_response(now);
-                self.entries.insert(key, entry);
+                self.entries
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(key, entry);
                 return Ok(response);
             }
 
@@ -115,7 +125,10 @@ impl Middleware for Cache {
                     .map_err(MiddlewareError::Middleware)?;
             if let Some(entry) = entry {
                 let result = entry.to_response(now);
-                self.entries.insert(key, entry);
+                self.entries
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(key, entry);
                 return Ok(result);
             }
             return Ok(response);

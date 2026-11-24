@@ -61,6 +61,7 @@ pub use runtime::Tokio;
 pub use upgrade::{Switched, Upgrade};
 
 use super::shared::{received, replayable_request, request_origin, shape_h1_request, take_request};
+use crate::client::DedicatedConnection;
 use crate::{
     Cause, Client, Error, ExchangeFailure, TimedOut, Timeouts, Transport,
     clock::Clocked,
@@ -460,6 +461,7 @@ impl Endpoint for NativeBackend {
     type Error = Error;
 
     async fn respond(&mut self, slot: &mut Request) -> Result<Response, Self::Error> {
+        let dedicated = slot.extensions().get::<DedicatedConnection>().is_some();
         let mut request = take_request(slot);
         // The absolute URI, kept so a request handed back can be reshaped for
         // whichever connection serves the retry.
@@ -480,7 +482,7 @@ impl Endpoint for NativeBackend {
         #[cfg(native_h2)]
         let mut avoid_h2 = None;
         #[cfg(native_h3)]
-        let h3 = if upgrade_requested {
+        let h3 = if upgrade_requested || dedicated {
             pool::H3Use::Blocked
         } else {
             self.h3_use(&origin)?
@@ -489,9 +491,9 @@ impl Endpoint for NativeBackend {
         let _ = upgrade_requested;
         loop {
             let want = Want {
-                fresh: retried,
+                fresh: retried || dedicated,
                 #[cfg(native_h2)]
-                allow_h2: !upgrade_requested,
+                allow_h2: !upgrade_requested && !dedicated,
                 #[cfg(native_h2)]
                 avoid_h2,
                 #[cfg(native_h3)]

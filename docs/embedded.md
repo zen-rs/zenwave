@@ -58,9 +58,9 @@ Always set `default-features = false` on bare-metal targets. `FollowRedirect` re
 | `Client` (`get`, `post`, `put`, `delete`, `json_body`, `bytes_body`, `stream_body`) | Yes | Yes | Yes | Yes | No |
 | `ResponseExt` (`into_json`, `into_string`, `into_bytes`, `into_bytes_with_limit`, `into_sse`, `error_for_status`) | Yes | Yes | Yes | Yes | No |
 | `FollowRedirect`, `BearerAuth`, `BasicAuth`, `ErrorForStatus`, `Timeout`, `Retry`, `Multipart` | Yes | Yes | Yes | Yes | No |
-| `Cache`, `.form()`, `.reader_body()` | No | No | No | No | Yes (`std`) |
+| `Cache`, `.form()`, `.reader_body()`, `.download()`, `.download_bytes()` | No | No | No | No | Yes (`std`) |
 | `CookieStore` | No | No | No | No | Yes (`cookie`) |
-| `.file_body()`, `.download_to_path()`, `.enable_persistent_cookie()` | No | No | No | No | Yes (OS reactor) |
+| `.file_body()`, `.download().to_path()`, `.download_to_path()`, `.enable_persistent_cookie()` | No | No | No | No | Yes (OS reactor) |
 
 ## Target setup: ESP32-C6 (`riscv32imac-unknown-none-elf`)
 
