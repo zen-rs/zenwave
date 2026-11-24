@@ -3,7 +3,7 @@ members = ["tests/fixture"]
 
 [package]
 name = "zenwave"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 authors = ["Lexo Liu<me@lexo.cool>"]
 repository = "https://github.com/zen-rs/zenwave"
@@ -500,11 +500,11 @@ clippy.style = "warn"
 clippy.correctness = "warn"
 clippy.complexity = "warn"
 clippy.suspicious = "warn"
-cargo.unused_dependencies = "deny"
 clippy.perf = "warn"
 clippy.pedantic = "warn"
 clippy.nursery = "warn"
 clippy.cargo = "allow"
+cargo.unused_dependencies = "deny"
 
 [patch.crates-io]
 http = { git = "https://github.com/lexoliu/http", branch = "v1.5-no-std" }
