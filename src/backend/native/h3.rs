@@ -53,6 +53,15 @@ use crate::{
 /// head limit, so both protocols bound a head alike.
 const MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
 
+/// Per-stream QUIC receive window (`16 MiB`): sustains >850 Mbps on a single
+/// stream at 150 ms RTT instead of `http_kit_h3`'s 1 MiB default.
+const H3_STREAM_RECEIVE_WINDOW: u64 = 16 * 1024 * 1024;
+
+/// Connection-level QUIC receive window (`64 MiB`): gives multiplexed streams
+/// headroom above [`H3_STREAM_RECEIVE_WINDOW`] and keeps quiche from clamping
+/// auto-tuned `MAX_DATA` updates to its 24 MiB default ceiling.
+const H3_CONNECTION_RECEIVE_WINDOW: u64 = 64 * 1024 * 1024;
+
 /// A QUIC connection whose handshake completed, and the future that drives
 /// it from here on.
 type Established = (
@@ -430,7 +439,7 @@ fn client_config(transport: &Transport) -> ClientConfig {
 /// asks each server to staple an OCSP response, which reaches `verifier`
 /// as it does over TLS.
 fn verifying(verifier: Arc<dyn ServerCertVerifier>) -> ClientConfig {
-    ClientConfig::with_verifier(
+    let mut config = ClientConfig::with_verifier(
         Verifier::new(move |presented: &Presented<'_>| {
             verify(
                 &*verifier,
@@ -440,7 +449,12 @@ fn verifying(verifier: Arc<dyn ServerCertVerifier>) -> ClientConfig {
             )
         }),
         MAX_FIELD_SECTION_SIZE,
-    )
+    );
+    config.transport.initial_max_stream_data_bidi = H3_STREAM_RECEIVE_WINDOW;
+    config.transport.max_stream_window = H3_STREAM_RECEIVE_WINDOW;
+    config.transport.initial_max_data = H3_CONNECTION_RECEIVE_WINDOW;
+    config.transport.max_connection_window = H3_CONNECTION_RECEIVE_WINDOW;
+    config
 }
 
 /// Judges the DER `chain` (leaf first) a server presented for `name`, with
@@ -1105,6 +1119,19 @@ mod tests {
         let (outcome, seen) = handshake(&io, executor, None).await;
         assert!(outcome.is_ok(), "no staple passes: {outcome:?}");
         assert_eq!(seen, vec![Vec::<u8>::new()]);
+    }
+
+    #[test]
+    fn client_config_uses_high_bdp_receive_windows() {
+        let transport = Transport::builder().build().expect("transport builds");
+        let config = client_config(&transport);
+        assert_eq!(
+            config.transport.initial_max_stream_data_bidi,
+            16 * 1024 * 1024
+        );
+        assert_eq!(config.transport.max_stream_window, 16 * 1024 * 1024);
+        assert_eq!(config.transport.initial_max_data, 64 * 1024 * 1024);
+        assert_eq!(config.transport.max_connection_window, 64 * 1024 * 1024);
     }
 
     #[cfg(feature = "native-compio")]

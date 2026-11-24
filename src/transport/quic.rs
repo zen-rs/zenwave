@@ -218,6 +218,11 @@ const QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// mid-wait even though nothing is wrong with the connection (#93).
 const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Per-stream QUIC receive window (`16 MiB`): sustains >850 Mbps on a single
+/// stream at 150 ms RTT (versus quinn's 1.25 MB default) while the connection
+/// `receive_window` remains `quinn::VarInt::MAX`.
+const QUIC_STREAM_RECEIVE_WINDOW: quinn::VarInt = quinn::VarInt::from_u32(16 * 1024 * 1024);
+
 /// QUIC client TLS derived from the transport's shared rustls configuration:
 /// the same verifier and extra roots, with ALPN fixed to `h3`.
 pub fn client_config(base: &rustls::ClientConfig) -> Result<quinn::ClientConfig, Error> {
@@ -239,7 +244,8 @@ fn client_config_with_timeouts(
                 Error::tls_config(Cause::Detail(error.to_string()))
             },
         )?))
-        .keep_alive_interval(keep_alive_interval);
+        .keep_alive_interval(keep_alive_interval)
+        .stream_receive_window(QUIC_STREAM_RECEIVE_WINDOW);
     let mut config = base.clone();
     config.alpn_protocols = vec![b"h3".to_vec()];
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(config)

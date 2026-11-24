@@ -596,6 +596,29 @@ where
     }
 }
 
+/// Per-stream HTTP/2 receive window (`SETTINGS_INITIAL_WINDOW_SIZE`, 16 MiB):
+/// sustains >850 Mbps on a single stream at 150 ms RTT instead of stalling on
+/// `http_kit_h2`'s 1 MiB default.
+#[cfg(native_h2)]
+const H2_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
+
+/// Connection-level HTTP/2 receive window (64 MiB): gives concurrent streams
+/// headroom above [`H2_STREAM_RECEIVE_WINDOW`] instead of the 10 MiB default.
+#[cfg(native_h2)]
+const H2_CONNECTION_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024;
+
+/// Builds the HTTP/2 client configuration with high-BDP receive windows and
+/// keepalive.
+#[cfg(native_h2)]
+fn h2_client_config() -> http_kit_h2::ClientConfig {
+    let mut config = http_kit_h2::ClientConfig::default();
+    config.flow_control.initial_stream_window_size = H2_STREAM_RECEIVE_WINDOW;
+    config.flow_control.initial_connection_window_size = H2_CONNECTION_RECEIVE_WINDOW;
+    config.keep_alive_interval = Some(std::time::Duration::from_secs(30));
+    config.keep_alive_timeout = std::time::Duration::from_secs(10);
+    config
+}
+
 /// Runs the HTTP/2 client over `stream`.
 #[cfg(native_h2)]
 fn start_h2<S, T>(stream: S, timer: T) -> DialedConn
@@ -605,10 +628,7 @@ where
     S::WriteHalf: Write + SendFile + SpliceWrite + 'static,
     T: http_kit_io::Timer + Clone + 'static,
 {
-    let mut config = http_kit_h2::ClientConfig::default();
-    config.keep_alive_interval = Some(std::time::Duration::from_secs(30));
-    config.keep_alive_timeout = std::time::Duration::from_secs(10);
-    let (send, connection) = http_kit_h2::handshake_stream(stream, timer, config);
+    let (send, connection) = http_kit_h2::handshake_stream(stream, timer, h2_client_config());
     DialedConn::H2 {
         send,
         driver: connection.run().boxed_local(),
@@ -762,6 +782,24 @@ impl<S: Read + Write> Handshake for OwnedBytes<S> {
             }
         }
         Ok(bytes)
+    }
+}
+
+#[cfg(all(test, native_h2))]
+mod h2_config_tests {
+    use super::h2_client_config;
+
+    #[test]
+    fn h2_client_config_uses_high_bdp_receive_windows() {
+        let config = h2_client_config();
+        assert_eq!(
+            config.flow_control.initial_stream_window_size,
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            config.flow_control.initial_connection_window_size,
+            64 * 1024 * 1024
+        );
     }
 }
 
