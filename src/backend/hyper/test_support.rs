@@ -54,6 +54,19 @@ use crate::transport::{
     quic::{self, AsyncIoRuntime},
 };
 
+/// Size of the multi-megabyte regression payload (> 6 MiB, exceeding hyper's
+/// old 5 MiB H2 connection window and native's 1 MiB stream window).
+#[cfg(any(feature = "http2", http3))]
+pub const LARGE_BODY_SIZE: usize = 7 * 1024 * 1024;
+
+/// Deterministic multi-megabyte payload for H2/H3 flow-control tests.
+#[cfg(any(feature = "http2", http3))]
+pub fn large_body() -> Bytes {
+    Bytes::from_iter(
+        (0..LARGE_BODY_SIZE).map(|index| u8::try_from(index % 251).expect("mod 251 fits in u8")),
+    )
+}
+
 /// How long a test waits for a server-side observation.
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -541,7 +554,12 @@ async fn serve_tls(
             // reusable.
             #[cfg(not(feature = "http2"))]
             drop((parts, body));
-            let mut response = hyper::Response::new(Full::new(Bytes::from_static(b"zenwave")));
+            let payload = if parts.uri.path() == "/large" {
+                large_body()
+            } else {
+                Bytes::from_static(b"zenwave")
+            };
+            let mut response = hyper::Response::new(Full::new(payload));
             for value in &alt_svc {
                 response.headers_mut().append(
                     http::header::ALT_SVC,
@@ -745,6 +763,7 @@ async fn serve_h3_request(
     let (request, mut stream) = resolver.resolve_request().await.expect("request resolves");
     let result = match (request.method().as_str(), request.uri().path()) {
         ("GET", "/hello") => serve_body(&mut stream, Bytes::from_static(b"hello over h3")).await,
+        ("GET", "/large") => serve_body(&mut stream, large_body()).await,
         ("POST", "/echo") => serve_echo(&mut stream).await,
         // A complete response without reading the request body: dropping
         // the stream then stops the request side (STOP_SENDING).

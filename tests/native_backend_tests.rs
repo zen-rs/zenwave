@@ -75,6 +75,19 @@ fn backend<I: TestIo, E: LocalExecutor>(
 /// server below.
 const GREETING: &str = "你好，世界。こんにちは、世界。안녕하세요, 세계.";
 
+/// Size of the multi-megabyte regression payload (> 6 MiB, exceeding hyper's
+/// old 5 MiB H2 connection window and native's 1 MiB stream window).
+#[cfg(any(feature = "native-http2", feature = "native-http3"))]
+const LARGE_BODY_SIZE: usize = 7 * 1024 * 1024;
+
+/// Deterministic multi-megabyte payload for H2/H3 flow-control tests.
+#[cfg(any(feature = "native-http2", feature = "native-http3"))]
+fn large_body() -> Vec<u8> {
+    (0..LARGE_BODY_SIZE)
+        .map(|index| u8::try_from(index % 251).expect("mod 251 fits in u8"))
+        .collect()
+}
+
 /// A throwaway CA and one `localhost` leaf it signed.
 struct Pki {
     ca_der: CertificateDer<'static>,
@@ -169,6 +182,19 @@ struct H1Options {
 async fn echo(request: Request, protocol: &'static str, options: &H1Options) -> Response {
     if request.uri().path() == "/trailers" {
         return trailers_response(protocol);
+    }
+    #[cfg(any(feature = "native-http2", feature = "native-http3"))]
+    if request.uri().path() == "/large" {
+        let mut response = Response::new(Body::from_bytes(large_body()));
+        let headers = response.headers_mut();
+        headers.insert("x-protocol", protocol.parse().expect("header value"));
+        if let Some(alt_svc) = &options.alt_svc {
+            headers.insert(
+                http::header::ALT_SVC,
+                alt_svc.parse().expect("header value"),
+            );
+        }
+        return response;
     }
     let head = format!("{} {} ", request.method(), request.uri().path());
     let body = request
@@ -1794,6 +1820,12 @@ mod compio_runtime {
         run(super::h2::upgrade_to_h3);
     }
 
+    #[cfg(feature = "native-http2")]
+    #[test]
+    fn h2_streams_large_response_body() {
+        run(super::h2::large_response_body);
+    }
+
     #[cfg(feature = "native-http3")]
     #[test]
     fn h3_after_alt_svc() {
@@ -1822,6 +1854,12 @@ mod compio_runtime {
     #[test]
     fn h3_black_hole_falls_back() {
         run(super::h3::black_hole);
+    }
+
+    #[cfg(feature = "native-http3")]
+    #[test]
+    fn h3_streams_large_response_body() {
+        run(super::h3::large_response_body);
     }
 }
 
@@ -2015,6 +2053,12 @@ mod tokio_runtime {
         run(super::h2::upgrade_to_h3);
     }
 
+    #[cfg(feature = "native-http2")]
+    #[test]
+    fn h2_streams_large_response_body() {
+        run(super::h2::large_response_body);
+    }
+
     #[cfg(feature = "native-http3")]
     #[test]
     fn h3_after_alt_svc() {
@@ -2043,6 +2087,12 @@ mod tokio_runtime {
     #[test]
     fn h3_black_hole_falls_back() {
         run(super::h3::black_hole);
+    }
+
+    #[cfg(feature = "native-http3")]
+    #[test]
+    fn h3_streams_large_response_body() {
+        run(super::h3::large_response_body);
     }
 }
 
@@ -2294,6 +2344,40 @@ mod h3 {
             for _ in 0..5 {
                 assert_eq!(get(&mut client, &uri, true).await, "h1");
                 io.sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+    }
+
+    /// Multi-megabyte response bodies stream cleanly over a pooled HTTP/3
+    /// connection configured with high-BDP receive windows.
+    pub async fn large_response_body<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
+        let pki = Pki::new();
+        let (server, port) = advertised(&io, executor, &pki, &pki, None);
+        let mut client = backend(pki.transport(), io.clone(), executor);
+        let expected = large_body();
+        against(server, async {
+            let warm_uri = format!("https://localhost:{port}/upgrade");
+            let mut protocol = String::new();
+            for _ in 0..50 {
+                protocol = get(&mut client, &warm_uri, true).await;
+                if protocol == "h3" {
+                    break;
+                }
+                io.sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(protocol, "h3", "the advertised h3 endpoint takes over");
+
+            for _ in 0..2 {
+                let response = client
+                    .get(format!("https://localhost:{port}/large"))
+                    .expect("request builds")
+                    .await
+                    .expect("large GET over HTTP/3 succeeds");
+                assert_eq!(response.headers()["x-protocol"], "h3");
+                let body = response.into_bytes().await.expect("large H3 body reads");
+                assert_eq!(body.len(), expected.len());
+                assert_eq!(body.as_ref(), expected.as_slice());
             }
         })
         .await;
@@ -3140,5 +3224,45 @@ mod h2 {
             assert_eq!(protocol, "h3", "advertised h3 takes over from pooled h2");
         })
         .await;
+    }
+
+    /// Multi-megabyte response bodies stream cleanly over a pooled HTTP/2
+    /// connection configured with high-BDP receive windows.
+    pub async fn large_response_body<I: TestIo, E: LocalExecutor>(io: I, executor: &E) {
+        let pki = Pki::new();
+        let listener = io.bind_tcp(loopback()).expect("bind");
+        let port = listener.local_addr().expect("local address").port();
+        let accepted = Rc::new(Cell::new(0));
+        let server = serve_h2(
+            io.clone(),
+            executor,
+            listener,
+            pki.tls_acceptor_with_alpn(&[b"h2"]),
+            H2Options {
+                accepted: Rc::clone(&accepted),
+                ..H2Options::default()
+            },
+        );
+        let mut client = backend(pki.transport(), io, executor);
+        let expected = large_body();
+        against(server, async {
+            for _ in 0..2 {
+                let response = client
+                    .get(format!("https://localhost:{port}/large"))
+                    .expect("request builds")
+                    .await
+                    .expect("large H2 GET succeeds");
+                assert_eq!(response.headers()["x-protocol"], "h2");
+                let body = response.into_bytes().await.expect("large H2 body reads");
+                assert_eq!(body.len(), expected.len());
+                assert_eq!(body.as_ref(), expected.as_slice());
+            }
+        })
+        .await;
+        assert_eq!(
+            accepted.get(),
+            1,
+            "pooled H2 connection must carry sequential multi-megabyte transfers"
+        );
     }
 }
