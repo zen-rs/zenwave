@@ -103,11 +103,11 @@ pub enum Error {
     #[error("failed to parse response body: {0}")]
     BodyParse(#[source] BodyError),
 
-    /// Response body exceeded the caller-provided in-memory limit.
+    /// Response body exceeded the caller-provided size limit.
     #[error("response body exceeds the {limit}-byte limit")]
     ResponseBodyTooLarge {
         /// Maximum response body size accepted by the caller.
-        limit: usize,
+        limit: u64,
     },
 
     /// Cookie management error.
@@ -765,10 +765,33 @@ pub enum OAuth2ErrorKind {
 /// Download-related errors.
 #[cfg(has_std)]
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum DownloadErrorKind {
-    /// Server returned an error status.
-    #[error("upstream returned error: {0}")]
-    UpstreamError(StatusCode),
+    /// The remote resource changed while the download was in progress
+    /// (`412 Precondition Failed` or a changed `ETag` / `Last-Modified`).
+    #[error("remote resource changed during download")]
+    ResourceChanged,
+
+    /// A `206 Partial Content` response carried a missing or mismatched
+    /// `Content-Range` header, or its body length disagreed with the requested
+    /// byte range.
+    #[error("invalid Content-Range: expected `{expected}`, got {actual:?}")]
+    InvalidContentRange {
+        /// Expected range specification.
+        expected: String,
+        /// Actual `Content-Range` header or length mismatch detail, if any.
+        actual: Option<String>,
+    },
+
+    /// The downloaded or announced size differed from `expected_size` or the
+    /// server's announced length.
+    #[error("download size mismatch: expected {expected} bytes, got {actual}")]
+    SizeMismatch {
+        /// Expected byte count.
+        expected: u64,
+        /// Actual byte count.
+        actual: u64,
+    },
 
     /// File system error during download.
     #[error("file system error: {0}")]
@@ -776,7 +799,7 @@ pub enum DownloadErrorKind {
 
     /// Failed to read response body.
     #[error("failed to read response body: {0}")]
-    BodyRead(String),
+    BodyRead(#[source] BodyError),
 }
 
 /// WebSocket-related errors.
@@ -868,6 +891,17 @@ impl Error {
             Self::Timeout(_) => true,
             #[cfg(has_std)]
             Self::Io(_) => true,
+            #[cfg(has_std)]
+            Self::Download(DownloadErrorKind::BodyRead(body_err)) => match body_err {
+                BodyError::Receive(receive) => !matches!(
+                    receive,
+                    ReceiveError::Framing { .. }
+                        | ReceiveError::TrailersTooLarge { .. }
+                        | ReceiveError::TooManyTrailers { .. }
+                ),
+                BodyError::Other(_) => true,
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -1060,7 +1094,13 @@ impl http_kit::HttpError for Error {
             Self::Http { status, .. }
             | Self::OAuth2(OAuth2ErrorKind::TokenEndpointError { status, .. }) => *status,
             #[cfg(has_std)]
-            Self::Download(DownloadErrorKind::UpstreamError(status)) => *status,
+            Self::Download(DownloadErrorKind::ResourceChanged) => StatusCode::PRECONDITION_FAILED,
+            #[cfg(has_std)]
+            Self::Download(
+                DownloadErrorKind::InvalidContentRange { .. }
+                | DownloadErrorKind::SizeMismatch { .. }
+                | DownloadErrorKind::BodyRead(_),
+            ) => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

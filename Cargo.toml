@@ -45,7 +45,7 @@ serde_json = { version = "1.0.154", default-features = false, features = ["alloc
 base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
 url = { version = "2.5.8", default-features = false, optional = true }
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc", "sink"] }
-futures-channel = { version = "0.3.34", default-features = false, features = ["alloc"] }
+futures-channel = { version = "0.3.34", default-features = false, features = ["alloc", "sink"] }
 thiserror = { version = "2.0.21", default-features = false }
 futures-io = { version = "0.3.34", optional = true }
 async-lock = { version = "3.4.2", default-features = false, optional = true }
@@ -61,6 +61,7 @@ async-channel = { version = "2.5.0", default-features = false, optional = true }
 # The list itself is compiled in by `build.rs` from the pinned, hash-verified
 # `public_suffix_list.dat`.
 publicsuffix = { version = "2.3.0", default-features = false, optional = true }
+progressor = { version = "0.2.0", default-features = false, optional = true }
 
 [dev-dependencies]
 serde_json = "1.0.154"
@@ -139,6 +140,10 @@ cookie = [
     "dep:url",
     "url/std",
 ]
+
+# Optional `progressor::Progress<Update = DownloadProgress>` integration on
+# `BytesDownload` and `FileDownload`.
+progressor = ["std", "progressor/std", "dep:progressor"]
 
 # Embedded `no_std + alloc` HTTP/1.1 client backend over `embedded-io-async` and
 # `embedded-nal-async`, driven by sans-IO `http_kit_h1::proto` (targets MCUs
@@ -313,7 +318,7 @@ public-suffix = [
 http-kit = { git = "https://github.com/zen-rs/http-kit", branch = "main", default-features = false, features = ["std", "json", "form", "cookie", "ws"] }
 http = { version = "1.5.0", default-features = false, features = ["std"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "io", "sink"] }
-futures-channel = { version = "0.3.34", default-features = false, features = ["std"] }
+futures-channel = { version = "0.3.34", default-features = false, features = ["std", "sink"] }
 futures-io = "0.3.34"
 async-lock = "3.4.2"
 httpdate = "1.0.3"

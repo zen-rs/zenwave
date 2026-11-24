@@ -265,7 +265,12 @@ impl Middleware for OAuth2ClientCredentials {
         request: &mut Request,
         mut next: E,
     ) -> Result<Response, http_kit::middleware::MiddlewareError<E::Error, Self::Error>> {
-        if !request.headers().contains_key(header::AUTHORIZATION) {
+        if !request.headers().contains_key(header::AUTHORIZATION)
+            && request
+                .extensions()
+                .get::<crate::client::SuppressAuth>()
+                .is_none()
+        {
             let token = self
                 .ensure_token()
                 .await

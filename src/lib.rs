@@ -115,7 +115,13 @@ pub mod backend;
 pub use auth::{BasicAuth, BearerAuth};
 #[cfg(has_std)]
 pub use cache::Cache;
-pub use client::Client;
+#[cfg(has_std)]
+pub use client::{
+    BytesDownload, ConnectionMode, Download, DownloadProgress, NoObserver, ProgressObserver,
+};
+pub use client::{Client, RequestBuilder, ShareClient};
+#[cfg(reactor)]
+pub use client::{DownloadReport, FileDownload, ResumeMode};
 #[cfg(has_cookie)]
 pub use cookie::CookieStore;
 pub use http_kit::*;
@@ -149,6 +155,8 @@ pub mod status;
 
 // Re-export the unified error type and the types its variants carry, so a
 // caller matches on them without reaching into `error`.
+#[cfg(has_std)]
+pub use error::DownloadErrorKind;
 pub use error::{
     Attempt, Cause, ConfigError, ConnectError, ConnectFailure, ConnectPhase, Error, ExchangeError,
     ExchangeFailure, Hop, ResolveError, SocksError, TcpFailure, TimedOut, TlsError, TlsFailure,

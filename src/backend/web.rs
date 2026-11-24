@@ -1,7 +1,7 @@
 use core::{fmt, future::Future};
 
 use http_kit::{BodyError, Endpoint, StatusCode, utils::StreamExt};
-use std::io;
+use std::{io, rc::Rc};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::wasm_bindgen::{JsCast, JsValue};
 
@@ -11,8 +11,9 @@ use crate::{
     clock::{BrowserClock, Clocked},
 };
 /// HTTP client backend for browser environments using `fetch`.
+#[derive(Clone)]
 pub struct WebBackend {
-    scope: SingleThreaded<FetchScope>,
+    scope: SingleThreaded<Rc<FetchScope>>,
     transport: Transport,
 }
 
@@ -76,7 +77,7 @@ impl WebBackend {
         );
 
         Self {
-            scope: SingleThreaded(scope),
+            scope: SingleThreaded(Rc::new(scope)),
             transport,
         }
     }

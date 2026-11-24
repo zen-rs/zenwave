@@ -29,6 +29,7 @@ use tracing::warn;
 #[cfg(feature = "http2")]
 use super::shared::replayable_request;
 use super::shared::{received, request_origin, shape_h1_request, take_request};
+use crate::client::DedicatedConnection;
 #[cfg(http3)]
 use crate::dns::Getaddrinfo;
 #[cfg(http3)]
@@ -62,7 +63,7 @@ pub mod h3;
 pub mod test_support;
 
 /// Hyper-based HTTP client backend powered by `async-io`/`async-net`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HyperBackend {
     transport: Transport,
     spawner: Spawner,
@@ -436,6 +437,42 @@ impl HyperBackend {
             .record_alt_svc(&origin.host, response.headers());
     }
 
+    /// Dial an unpooled HTTP/1.1 connection directly for `request`, bypassing
+    /// the origin pool, dial coalescing, HTTP/2 multiplexing, and HTTP/3.
+    async fn send_dedicated(
+        &self,
+        origin: &Origin,
+        mut request: http::Request<http_kit::Body>,
+    ) -> Result<Response, crate::Error> {
+        let connection = connect(
+            &self.transport,
+            Target {
+                host: &origin.host,
+                port: origin.port,
+                tls: origin.scheme == Scheme::HTTPS,
+                tunnel_plaintext: false,
+                protocols: Protocols::Http1,
+            },
+        )
+        .await?;
+        let (mut sender, driver) = hyper::client::conn::http1::Builder::new()
+            .handshake(HyperIo(connection.stream))
+            .await
+            .map_err(hyper_error)?;
+        self.spawner.spawn(drive(driver));
+        shape_h1_request(&mut request, &connection.via)?;
+        sender.ready().await.map_err(hyper_error)?;
+        let response = sender.send_request(request).await.map_err(hyper_error)?;
+        let response = into_body(response).map(|body| {
+            http_kit::Body::from_frames(DedicatedBody {
+                inner: body,
+                _sender: sender,
+            })
+        });
+        received(&response);
+        Ok(response)
+    }
+
     /// Wrap the h1 lease around its body's tail. The response comes back
     /// whatever its status, its body still streaming.
     fn finish_response(
@@ -457,12 +494,17 @@ impl Endpoint for HyperBackend {
     type Error = crate::Error;
     async fn respond(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         crate::timeouts::refuse(request)?;
+        let dedicated = request.extensions().get::<DedicatedConnection>().is_some();
         let mut request = take_request(request);
         // The absolute URI, kept so a request taken back from a dead
         // connection can be reshaped for whichever checkout serves the retry.
         let uri = request.uri().clone();
 
         let origin = request_origin(&uri)?;
+
+        if dedicated {
+            return self.send_dedicated(&origin, request).await;
+        }
 
         #[cfg(http3)]
         let h3 = self.h3_gate(&origin)?;
@@ -679,6 +721,21 @@ impl<S> Drop for LeaseReturn<S> {
         if let Some(lease) = self.lease.take() {
             lease.release();
         }
+    }
+}
+
+/// Keeps a dedicated HTTP/1.1 `SendRequest` handle alive until the response
+/// body finishes or is dropped, then closes the connection cleanly.
+struct DedicatedBody {
+    inner: http_kit::Body,
+    _sender: hyper::client::conn::http1::SendRequest<http_kit::Body>,
+}
+
+impl Stream for DedicatedBody {
+    type Item = Result<http_kit::BodyFrame, http_kit::BodyError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().inner).poll_next(cx)
     }
 }
 

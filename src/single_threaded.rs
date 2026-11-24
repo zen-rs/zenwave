@@ -19,7 +19,7 @@ use core::{
 
 use http_kit::utils::Stream;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SingleThreaded<T>(pub T);
 
 // SAFETY: without `atomics` there is no shared memory, hence no second

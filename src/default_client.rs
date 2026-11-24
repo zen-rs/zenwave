@@ -11,7 +11,7 @@ use crate::{
 ///
 /// This wraps the platform backend with redirect following enabled so
 /// `zenwave::client()` behaves like a modern HTTP client out of the box.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DefaultClient {
     inner: redirect::FollowRedirect<DefaultBackend>,
 }

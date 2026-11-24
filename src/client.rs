@@ -28,10 +28,28 @@ use http_kit::{
 };
 use serde::de::DeserializeOwned;
 
-#[cfg(reactor)]
+#[cfg(has_std)]
 mod download;
+#[cfg(has_std)]
+pub use download::{
+    BytesDownload, ConnectionMode, Download, DownloadProgress, NoObserver, ProgressObserver,
+};
 #[cfg(reactor)]
-pub use download::{DownloadError, DownloadOptions, DownloadReport};
+pub use download::{DownloadReport, FileDownload, ResumeMode};
+
+/// Internal request extension asking pooled backends (`HyperBackend`,
+/// `NativeBackend`) to open a dedicated connection rather than reusing a pooled
+/// connection or multiplexing over HTTP/2 or HTTP/3.
+#[cfg_attr(not(has_std), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+pub struct DedicatedConnection;
+
+/// Internal request extension telling auth middlewares (`BearerAuth`,
+/// `BasicAuth`, `OAuth2ClientCredentials`) not to re-attach `Authorization`
+/// on follow-up requests pinned to a cross-origin redirect target.
+#[cfg_attr(not(has_std), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+pub struct SuppressAuth;
 
 #[cfg(has_std)]
 use crate::cache::Cache;
@@ -87,6 +105,12 @@ fn invalid_request_with_prefix(prefix: &str, error: impl Display) -> crate::Erro
 }
 
 impl<T: Client> RequestBuilder<'_, T> {
+    /// Attach an `Authorization: Bearer <token>` header to this request.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `token` contains bytes that are not valid in an HTTP header value.
+    #[must_use]
     pub fn bearer_auth(mut self, token: impl Into<String>) -> Self {
         let auth_value = format!("Bearer {}", token.into());
         self.request
@@ -95,6 +119,12 @@ impl<T: Client> RequestBuilder<'_, T> {
         self
     }
 
+    /// Attach an `Authorization: Basic <credentials>` header to this request.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the encoded credentials cannot be represented as an HTTP header value.
+    #[must_use]
     pub fn basic_auth(
         mut self,
         username: impl Into<String>,
@@ -183,6 +213,8 @@ impl<T: Client> RequestBuilder<'_, T> {
         Ok(self)
     }
 
+    /// Set raw bytes as the request body.
+    #[must_use]
     pub fn bytes_body(mut self, bytes: Vec<u8>) -> Self {
         *self.request.body_mut() = http_kit::Body::from(bytes);
         self
@@ -190,6 +222,7 @@ impl<T: Client> RequestBuilder<'_, T> {
 
     /// Provide an async reader as the request body.
     #[cfg(has_std)]
+    #[must_use]
     pub fn reader_body<R>(mut self, reader: R, length: Option<u64>) -> Self
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
@@ -239,6 +272,7 @@ impl<T: Client> RequestBuilder<'_, T> {
     }
 
     /// Attach a streaming body composed from arbitrary async chunks.
+    #[must_use]
     pub fn stream_body<Chunk, ErrType, S>(mut self, stream: S) -> Self
     where
         Chunk: Into<Bytes> + Send + 'static,
@@ -249,24 +283,161 @@ impl<T: Client> RequestBuilder<'_, T> {
         *self.request.body_mut() = http_kit::Body::from_stream(mapped);
         self
     }
+}
 
-    /// Download the response body into the provided path, resuming partial files automatically.
-    #[cfg(reactor)]
-    pub async fn download_to_path(
-        self,
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<DownloadReport, DownloadError<T::Error>> {
-        download::download_to_path(self, path, DownloadOptions::default()).await
+/// A client or mutable client reference that can produce owned, cloneable
+/// handles for concurrent requests such as parallel [`Download`] transfers.
+pub trait ShareClient: Client {
+    /// Owned, cloneable client produced by sharing `self`.
+    type Shared: Client + Clone + Send + 'static;
+
+    /// Produce an owned, cloneable handle to this client.
+    fn share_client(&self) -> Self::Shared;
+}
+
+impl<C> ShareClient for &mut C
+where
+    C: Client + Clone + Send + 'static,
+{
+    type Shared = C;
+
+    fn share_client(&self) -> Self::Shared {
+        (**self).clone()
+    }
+}
+
+impl<C> ShareClient for FollowRedirect<C>
+where
+    C: Client + Clone + Send + 'static,
+{
+    type Shared = Self;
+
+    fn share_client(&self) -> Self::Shared {
+        self.clone()
+    }
+}
+
+impl<C, K> ShareClient for Retry<C, K>
+where
+    C: Client + Clone + Send + 'static,
+    C::Error: Into<crate::Error>,
+    K: crate::clock::Clock,
+{
+    type Shared = Self;
+
+    fn share_client(&self) -> Self::Shared {
+        self.clone()
+    }
+}
+
+impl<C, M> ShareClient for WithMiddleware<C, M>
+where
+    C: Client + Clone + Send + 'static,
+    M: SendMiddleware + Clone + Send + 'static,
+{
+    type Shared = Self;
+
+    fn share_client(&self) -> Self::Shared {
+        self.clone()
+    }
+}
+
+#[cfg(default_backend)]
+impl ShareClient for crate::DefaultClient {
+    type Shared = Self;
+
+    fn share_client(&self) -> Self::Shared {
+        self.clone()
+    }
+}
+
+#[cfg(all(reactor, feature = "hyper-backend"))]
+impl ShareClient for crate::backend::HyperBackend {
+    type Shared = Self;
+
+    fn share_client(&self) -> Self::Shared {
+        self.clone()
+    }
+}
+
+#[cfg(native_backend)]
+impl ShareClient for crate::backend::NativeBackend {
+    type Shared = Self;
+
+    fn share_client(&self) -> Self::Shared {
+        self.clone()
+    }
+}
+
+#[cfg(all(reactor, feature = "curl-backend"))]
+impl ShareClient for crate::backend::CurlBackend {
+    type Shared = Self;
+
+    fn share_client(&self) -> Self::Shared {
+        self.clone()
+    }
+}
+
+#[cfg(apple_backend)]
+impl ShareClient for crate::backend::AppleBackend {
+    type Shared = Self;
+
+    fn share_client(&self) -> Self::Shared {
+        self.clone()
+    }
+}
+
+#[cfg(browser)]
+impl ShareClient for crate::backend::WebBackend {
+    type Shared = Self;
+
+    fn share_client(&self) -> Self::Shared {
+        self.clone()
+    }
+}
+
+#[cfg(wasi_backend)]
+impl ShareClient for crate::backend::WasiBackend {
+    type Shared = Self;
+
+    fn share_client(&self) -> Self::Shared {
+        self.clone()
+    }
+}
+
+#[cfg(embedded_backend)]
+impl ShareClient for crate::backend::EmbeddedBackend {
+    type Shared = Self;
+
+    fn share_client(&self) -> Self::Shared {
+        self.clone()
+    }
+}
+
+#[cfg(has_std)]
+impl<T: ShareClient> RequestBuilder<'_, T>
+where
+    <T::Shared as http_kit::Endpoint>::Error: Into<crate::Error>,
+{
+    /// Configure a concurrent HTTP `Range` download into memory or a file path.
+    #[must_use]
+    pub fn download(self) -> Download<T::Shared> {
+        let client = self.client.share_client();
+        Download::new(client, self.request)
     }
 
-    /// Download the response body into a path using custom [`DownloadOptions`].
+    /// Download the response body into memory with default concurrent settings.
+    #[must_use]
+    pub fn download_bytes(self) -> BytesDownload<T::Shared> {
+        self.download().bytes()
+    }
+
+    /// Download the response body into `path`, resuming from a sibling `.part`
+    /// sidecar when the remote validator matches.
     #[cfg(reactor)]
-    pub async fn download_to_path_with(
-        self,
-        path: impl AsRef<std::path::Path>,
-        options: DownloadOptions,
-    ) -> Result<DownloadReport, DownloadError<T::Error>> {
-        download::download_to_path(self, path, options).await
+    #[must_use]
+    pub fn download_to_path(self, path: impl Into<std::path::PathBuf>) -> FileDownload<T::Shared> {
+        self.download().to_path(path)
     }
 }
 
@@ -344,42 +515,44 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn download_to_path_resumes_existing_file() {
+    fn download_to_path_downloads_with_range_support() {
         let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
         let dir = tempdir().unwrap();
         let path = dir.path().join("download.bin");
         async_io::block_on(async {
-            fs::write(&path, &payload[..1024]).await.unwrap();
-
             let mut client = FakeBackend::with_payload(payload.clone());
-            client
+            let report = client
                 .get("http://example.com/file.bin")
                 .unwrap()
-                .download_to_path(&path)
+                .download()
+                .min_split_size(core::num::NonZeroU64::new(512).unwrap())
+                .chunk_size(core::num::NonZeroU64::new(1024).unwrap())
+                .to_path(&path)
                 .await
                 .unwrap();
 
+            assert_eq!(report.total_bytes(), payload.len() as u64);
             let final_bytes = fs::read(&path).await.unwrap();
             assert_eq!(final_bytes, payload);
         });
     }
 
     #[test]
-    fn download_to_path_restarts_when_range_is_not_supported() {
+    fn download_to_path_falls_back_when_range_is_not_supported() {
         let payload: Vec<u8> = (0..2048).map(|i| (i % 199) as u8).collect();
         let dir = tempdir().unwrap();
         let path = dir.path().join("download.bin");
         async_io::block_on(async {
-            fs::write(&path, &[1_u8, 2, 3, 4]).await.unwrap();
-
             let mut client = FakeBackend::without_range(payload.clone());
-            client
+            let report = client
                 .get("http://example.com/file.bin")
                 .unwrap()
                 .download_to_path(&path)
                 .await
                 .unwrap();
 
+            assert_eq!(report.resumed_from, 0);
+            assert_eq!(report.bytes_written, payload.len() as u64);
             let final_bytes = fs::read(&path).await.unwrap();
             assert_eq!(final_bytes, payload);
         });
@@ -475,20 +648,22 @@ mod tests {
             request: &mut Request,
         ) -> impl std::future::Future<Output = Result<Response<http_kit::Body>, Self::Error>>
         {
-            let start = if self.honor_range {
-                parse_range(request)
+            let range = if self.honor_range {
+                parse_range(request, self.payload.len())
             } else {
-                0
+                None
             };
-            let start = start.min(self.payload.len());
-            let data = self.payload[start..].to_vec();
+            let (status, data, content_range) = match range {
+                Some((start, end)) => (
+                    StatusCode::PARTIAL_CONTENT,
+                    self.payload[start..=end].to_vec(),
+                    Some(format!("bytes {start}-{end}/{}", self.payload.len())),
+                ),
+                None => (StatusCode::OK, self.payload.to_vec(), None),
+            };
 
             let mut response = Response::builder()
-                .status(if start > 0 && self.honor_range {
-                    StatusCode::PARTIAL_CONTENT
-                } else {
-                    StatusCode::OK
-                })
+                .status(status)
                 .body(http_kit::Body::from(data))
                 .unwrap();
 
@@ -499,18 +674,10 @@ mod tests {
                 );
             }
 
-            if start > 0 && self.honor_range {
-                response.headers_mut().insert(
-                    http_kit::header::CONTENT_RANGE,
-                    format!(
-                        "bytes {}-{}/{}",
-                        start,
-                        self.payload.len().saturating_sub(1),
-                        self.payload.len()
-                    )
-                    .parse()
-                    .unwrap(),
-                );
+            if let Some(cr) = content_range {
+                response
+                    .headers_mut()
+                    .insert(http_kit::header::CONTENT_RANGE, cr.parse().unwrap());
             }
 
             std::future::ready(Ok(response))
@@ -548,15 +715,24 @@ mod tests {
 
     impl Client for RecordingBackend {}
 
-    fn parse_range(request: &Request) -> usize {
-        request
+    fn parse_range(request: &Request, total: usize) -> Option<(usize, usize)> {
+        let spec = request
             .headers()
-            .get(http_kit::header::RANGE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|text| text.strip_prefix("bytes="))
-            .and_then(|range| range.split('-').next())
-            .and_then(|start| start.trim().parse().ok())
-            .unwrap_or(0)
+            .get(http_kit::header::RANGE)?
+            .to_str()
+            .ok()?
+            .strip_prefix("bytes=")?;
+        let (start, end) = spec.split_once('-')?;
+        let start: usize = start.trim().parse().ok()?;
+        if start >= total {
+            return None;
+        }
+        let end = if end.trim().is_empty() {
+            total - 1
+        } else {
+            end.trim().parse::<usize>().ok()?.min(total - 1)
+        };
+        (start <= end).then_some((start, end))
     }
 }
 
