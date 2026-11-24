@@ -1207,6 +1207,10 @@ where
     Ok(())
 }
 
+#[cfg_attr(
+    all(not(reactor), not(browser), not(wasi_backend)),
+    allow(clippy::unused_async)
+)]
 async fn sleep_backoff(attempt: usize) {
     let shift = u32::try_from(attempt.saturating_sub(1))
         .unwrap_or(16)
