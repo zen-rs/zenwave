@@ -549,16 +549,16 @@ async fn serve_tls(
                     body,
                 })
                 .expect("observed channel must be open");
-            // Nothing observes the request under http3-only builds, but the
-            // body still has to be drained for the connection to stay
-            // reusable.
-            #[cfg(not(feature = "http2"))]
-            drop((parts, body));
             let payload = if parts.uri.path() == "/large" {
                 large_body()
             } else {
                 Bytes::from_static(b"zenwave")
             };
+            // Nothing observes the request under http3-only builds, but the
+            // body still has to be drained for the connection to stay
+            // reusable.
+            #[cfg(not(feature = "http2"))]
+            drop((parts, body));
             let mut response = hyper::Response::new(Full::new(payload));
             for value in &alt_svc {
                 response.headers_mut().append(
