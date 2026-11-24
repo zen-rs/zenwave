@@ -144,6 +144,7 @@ impl HyperBackend {
                 let mut builder = hyper::client::conn::http2::Builder::new(self.spawner.clone());
                 builder
                     .timer(rt::Timer)
+                    .adaptive_window(true)
                     .keep_alive_interval(KEEP_ALIVE_INTERVAL)
                     .keep_alive_timeout(KEEP_ALIVE_TIMEOUT);
                 let (mut sender, driver) = builder
@@ -1338,6 +1339,38 @@ mod tests {
                 "a refused request must be replayed on a fresh connection"
             );
         }
+
+        #[test]
+        fn large_response_body_streams_over_pooled_h2() {
+            let ca = TestCa::new();
+            let server = TlsServer::start(&ca, &[b"h2"]);
+            let mut client = HyperBackend::new(ca.transport());
+            let expected = super::super::test_support::large_body();
+
+            block_on(async {
+                for _ in 0..2 {
+                    let response = client
+                        .get(server.uri("/large"))
+                        .expect("test request must build")
+                        .await
+                        .expect("large h2 request must succeed");
+                    let body = response
+                        .into_bytes()
+                        .await
+                        .expect("large h2 body must stream cleanly");
+                    assert_eq!(body.len(), expected.len());
+                    assert_eq!(body, expected);
+                }
+            });
+
+            assert_eq!(server.next_request().version, Version::HTTP_2);
+            assert_eq!(server.next_request().version, Version::HTTP_2);
+            assert_eq!(
+                server.accept_count(),
+                1,
+                "pooled h2 connection must carry sequential multi-megabyte transfers"
+            );
+        }
     }
 
     /// The QUIC/TCP race tests of issue #69: Alt-Svc and HTTPS-RR discovery,
@@ -1758,6 +1791,49 @@ mod tests {
                 assert!(
                     entry.h3_connection().is_none(),
                     "the dead handle must be evicted at checkout"
+                );
+            });
+        }
+
+        #[test]
+        fn large_response_body_streams_over_pooled_h3() {
+            let ca = TestCa::new();
+            let h3 = H3Server::start(&ca);
+            let tcp = TlsServer::serve(
+                &ca,
+                &[b"h2", b"http/1.1"],
+                vec![format!(r#"h3=":{}"; ma=60"#, h3.addr().port())],
+                TCP_STALL,
+            );
+            let mut client = HyperBackend::new(ca.transport());
+            let expected = super::super::test_support::large_body();
+
+            block_on_test(async {
+                let first = client
+                    .get(tcp.uri("/hello"))
+                    .expect("test request must build")
+                    .await
+                    .expect("first request must succeed over TCP");
+                assert_eq!(protocol(&first), None);
+
+                for expected_served in 1..=2 {
+                    let response = client
+                        .get(tcp.uri("/large"))
+                        .expect("test request must build")
+                        .await
+                        .expect("large h3 request must succeed");
+                    assert_eq!(protocol(&response), Some("h3".to_owned()));
+                    let body = crate::ResponseExt::into_bytes(response)
+                        .await
+                        .expect("large h3 body must stream cleanly");
+                    assert_eq!(body.len(), expected.len());
+                    assert_eq!(body, expected);
+                    wait_until(|| h3.served() == expected_served).await;
+                }
+                assert_eq!(
+                    h3.connection_count(),
+                    1,
+                    "pooled h3 connection must carry sequential multi-megabyte transfers"
                 );
             });
         }
